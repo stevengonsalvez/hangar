@@ -13,7 +13,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AINB="${AINB_BIN:-}"
 if [ -z "$AINB" ]; then
-  AINB="$(find "$ROOT/ainb-tui/target/release" "$ROOT/ainb-tui/target/debug" \
+  AINB="$(find "$ROOT/target/release" "$ROOT/target/debug" \
             -maxdepth 1 -name ainb -type f -perm +111 2>/dev/null | head -1)"
 fi
 [ -x "$AINB" ] || { echo "ainb binary not found (set AINB_BIN or cargo build)"; exit 2; }
