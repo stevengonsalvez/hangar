@@ -642,41 +642,33 @@ agents-in-a-box/
 ├── config/                     # Shipped config: example.config.toml, tmux.conf,
 │                               # tmux-helpers/, zellij.kdl, default-presets/
 ├── install.sh                  # One-liner installer
+├── man/                        # Generated from the binary; the build gates diff them
+│   ├── ainb.1                  #   The ainb(1) man page
+│   ├── cli.md                  #   Full CLI reference
+│   └── keyboard-shortcuts.md   #   Effective built-in keymap
 │
-# reflect (the `reflect` CLI + GraphRAG/QMD engine and its Claude Code plugin)
-# now lives in a SEPARATE repo: github.com/stevengonsalvez/ainb-reflect-memory
-# — flattened, with the engine at its repo root and the plugin under plugin/.
-#
-├── plugins/                    # Claude Code plugins (root-level)
-│   ├── ainb-fleet/             #   Backs the `ainb fleet` CLI (standup/broadcast/sequence/needs/daemon)
-│   └── ainb-hooks/             #   ainb lifecycle hooks
+├── apps/
+│   └── ainb-fleet-macos/       # The native macOS Fleet app (Swift + Xcode)
 │
-# The portable toolkit (94 skills, 16 agents, workflows, utilities,
-# bootstrap.js, external-dependencies.yaml, catalog.yaml) lives in a
-# SEPARATE repo: github.com/stevengonsalvez/ainb-toolkit — flattened at
-# its repo root. `ainb` consumes it as a pinned external source.
-#
-├── plans/skill-manager/spec.md # v1 design + acceptance criteria
+├── plugins/
+│   └── ainb-hooks/             # Claude / Codex / Copilot lifecycle hooks,
+│                               # compiled into the binary by ainb-plugin-notifyd
 │
-├── docs/                       # Documentation hub (Markdown source of truth)
-│   ├── README.md               #   Docs TOC
-│   ├── product/                #   What ainb is, value, architecture
-│   ├── tui/                    #   ainb CLI reference, FAQ, keyboard shortcuts
-│   ├── toolkit/                #   ainb-toolkit reference (skills/agents/bootstrap)
-│   ├── plugins/                #   v2 plugin overview, user guide, authoring, spec
-│   ├── knowledge/              #   reflect/recall (GraphRAG + QMD)
-│   ├── contributing/           #   Build, CI/CD, release
-│   └── reference/              #   Architecture deep-dive, glossary
+├── docs/README.md              # What was left behind, and where it lives now
 │
-├── website/                    # Website source (Astro + Starlight)
-│   └── BRIEF.md                #   Original design brief (historical)      
-│
-└── .github/workflows/
-    ├── ci.yml                  #   Rust CI (fmt, clippy, test, deny, machete)
-    ├── toolkit-validation.yml  #   Skill Manager & Catalog CI (ainb + ainb-toolkit)
-    ├── release.yml             #   Cross-platform binary releases
-    └── deploy-pages.yml        #   Build & deploy the website to GitHub Pages
+└── .github/workflows/          # Rebuilt for this layout; see the CI section
 ```
+
+The documentation hub, the website, the research notes and the other harness
+plugins are not in this repository yet: they are in its history and still live
+in `stevengonsalvez/agents-in-a-box`. See [`docs/README.md`](docs/README.md).
+
+The `reflect` CLI (the GraphRAG/QMD engine and its Claude Code plugin) lives
+in [`ainb-reflect-memory`](https://github.com/stevengonsalvez/ainb-reflect-memory),
+and the portable toolkit (94 skills, 16 agents, workflows, utilities,
+`bootstrap.js`, `external-dependencies.yaml`, `catalog.yaml`) in
+[`ainb-toolkit`](https://github.com/stevengonsalvez/ainb-toolkit), which
+`ainb` consumes as a pinned external source.
 
 ---
 
