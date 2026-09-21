@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install script for ainb
-# Usage: curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/hangar/main/install.sh | bash
 #
 # Options:
 #   INSTALL_DIR=/custom/path  - Custom install directory (default: /usr/local/bin or ~/.local/bin)
