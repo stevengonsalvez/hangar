@@ -13,11 +13,10 @@
 set -euo pipefail
 
 WS="$(cd "$(dirname "$0")/.." && pwd)"            # worktree root == workspace root
-ROOT="$WS"
 AINB="$WS/target/debug/ainb"
 DAEMON="$WS/target/debug/ainb-hangar-daemon"
 PLUGIN_ROOT="$WS/dist/plugins"
-OUT="$ROOT/docs/hangar/proofs/p4-tui.cast"
+OUT="$WS/docs/hangar/proofs/p4-tui.cast"
 SESSION="hangar-p4-proof-$$"
 
 for b in "$AINB" "$DAEMON" "$PLUGIN_ROOT/hangar-tui/hangar-tui"; do
