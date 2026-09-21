@@ -615,20 +615,32 @@ The `/reflect` skill captures learnings. The `/research` and `/prime` skills ret
 agents-in-a-box/
 │
 ├── Cargo.toml                  # Cargo workspace root (the repository root)
-├── crates/                     # Workspace members
-│   ├── ainb-core/              #   TUI application (app, components, tmux, git, claude, config)
-│   ├── ainb-plugin-runtime/            #   Plugin host runtime
-│   ├── ainb-plugin-protocol/           #   Plugin JSON-RPC protocol
-│   ├── ainb-plugin-sdk-rust/           #   Rust plugin SDK
-│   ├── ainb-plugin-types-sessions/     #   Shared session types
-│   ├── ainb-plugin-burndown/           #   v2 analytics plugin
-│   ├── ainb-plugin-notifyd/            #   v2 notifications plugin
-│   ├── ainb-plugin-session-reader/     #   v2 data-backend plugin
-│   ├── ainb-plugin-cts-v2/             #   Conformance test suite (21 axes)
-│   └── ainb-plugin-testkit/            #   Plugin author test harness
+├── crates/                     # Workspace members: the `ainb` binary, the TUI,
+│   │                           # the skill-manager CLI and the v2 plugins
+│   ├── ainb-core/              #   TUI application + the `ainb` binary
+│   ├── ainb-app/               #   Application state, screens, wire surface
+│   ├── ainb-cli/               #   ainb source/skill/doctor subcommands
+│   ├── ainb-fetch/             #   git2 / http / local fetchers
+│   ├── ainb-adapters-source/   #   marketplace / manifest / raw / single
+│   ├── ainb-adapters-tool/     #   9 tool adapters (claude/codex/copilot/…)
+│   ├── ainb-diff/              #   Diff render + pager driver
+│   ├── ainb-skill-core/        #   Manifest/lockfile/URI/paths/error
+│   ├── ainb-usage/             #   JSONL invocation parser + cache
+│   ├── ainb-plugin-runtime/    #   Plugin host runtime
+│   ├── ainb-plugin-protocol/   #   Plugin JSON-RPC protocol
+│   ├── ainb-plugin-sdk-rust/   #   Rust plugin SDK
+│   ├── ainb-plugin-types-sessions/ # Shared session types
+│   ├── ainb-plugin-burndown/   #   v2 analytics plugin
+│   ├── ainb-plugin-notifyd/    #   v2 notifications plugin
+│   ├── ainb-plugin-session-reader/ # v2 data-backend plugin
+│   ├── ainb-plugin-cts-v2/     #   Conformance test suite (21 axes)
+│   ├── ainb-plugin-testkit/    #   Plugin author test harness
+│   ├── ainb-hangar-*/          #   Hangar daemon, store, proto, client, sandbox, core
+│   └── ainb-desktop/           #   Tauri desktop shell (own workspace + lockfile)
 ├── xtask/                      # Workspace task runner
 ├── scripts/                    # Build, proof harness and journey scripts
-├── config/                     # Homebrew formula & packaging
+├── config/                     # Shipped config: example.config.toml, tmux.conf,
+│                               # tmux-helpers/, zellij.kdl, default-presets/
 ├── install.sh                  # One-liner installer
 │
 # reflect (the `reflect` CLI + GraphRAG/QMD engine and its Claude Code plugin)
@@ -644,15 +656,6 @@ agents-in-a-box/
 # SEPARATE repo: github.com/stevengonsalvez/ainb-toolkit — flattened at
 # its repo root. `ainb` consumes it as a pinned external source.
 #
-├── crates/                     # `ainb` binary (Rust) — TUI + skill-manager CLI
-│   ├── ainb-cli/               #   ainb source/skill/doctor subcommands
-│   ├── ainb-core/              #   ratatui app + manifest/lockfile/URI types
-│   ├── ainb-fetch/             #   git2 / http / local fetchers
-│   ├── ainb-adapters-source/   #   marketplace / manifest / raw / single
-│   ├── ainb-adapters-tool/     #   9 tool adapters (claude/codex/copilot/…)
-│   ├── ainb-diff/              #   Diff render + pager driver
-│   ├── ainb-skill-core/        #   Manifest/lockfile/URI/paths/error
-│   └── ainb-usage/             #   JSONL invocation parser + cache
 ├── plans/skill-manager/spec.md # v1 design + acceptance criteria
 │
 ├── docs/                       # Documentation hub (Markdown source of truth)
