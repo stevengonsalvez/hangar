@@ -217,7 +217,7 @@ impl Plugin for BurndownPlugin {
     /// Dispatch a single keystroke forwarded by the host's
     /// `PluginScreen::handle_key`.
     ///
-    /// The plan in `ainb-tui/plans/plugin-interactive-keys-and-cache.md`
+    /// The plan in `plans/plugin-interactive-keys-and-cache.md`
     /// §Phase 4 enumerates the canonical key → UI binding. A few binds
     /// were renamed during implementation to match what actually
     /// exists in `ui.rs`:
