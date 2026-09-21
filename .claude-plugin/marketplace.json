@@ -1,0 +1,28 @@
+{
+  "name": "agents-in-a-box",
+  "owner": {
+    "name": "stevengonsalvez",
+    "url": "https://github.com/stevengonsalvez"
+  },
+  "metadata": {
+    "description": "Marketplace for plugins shipped with agents-in-a-box. Plugins live under plugins/ at the repo root and are installable via `claude plugin install <name>@agents-in-a-box`.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ainb-hooks",
+      "source": "./plugins/ainb-hooks",
+      "description": "Emit actionable host-agent lifecycle events to the ainb notification inbox: Claude/Copilot Notification, Codex PermissionRequest, and Stop/agentStop are delivered to ainb-notifyd over a Unix socket, surfacing as native OS banners, the ainb-tui Inbox screen, and per-session attention markers. Telemetry events are intentionally not hooked. Install via `/plugin install ainb-hooks@agents-in-a-box` (Claude); Codex/Copilot wiring is handled by `ainb notifyd install`.",
+      "strict": false,
+      "keywords": [
+        "ainb",
+        "notifications",
+        "hooks",
+        "inbox",
+        "notifyd",
+        "claude-code",
+        "awaiting-input"
+      ]
+    }
+  ]
+}
