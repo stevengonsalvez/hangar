@@ -25,28 +25,28 @@
 # unpiped, so we don't lose its failure signal.
 set -eu
 
-# Repo paths — script lives in ainb-tui/scripts/, docs live at repo-root docs/.
+# Repo paths — script lives in scripts/, docs live at repo-root docs/, and
+# the repo root is the cargo workspace root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AINB_TUI_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REPO_ROOT="$(cd "$AINB_TUI_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT="$REPO_ROOT/docs/tui/cli.md"
 
 # Resolve the binary: explicit AINB_BIN, else build release.
 if [[ -n "${AINB_BIN:-}" ]]; then
   # Accept an absolute path, a path relative to the current dir, or a path
-  # relative to ainb-tui/ (the CI form: AINB_BIN=target/debug/ainb). Resolve in
+  # relative to the repo root (the CI form: AINB_BIN=target/debug/ainb). Resolve in
   # that order so a wrong cwd can't silently pick a stale binary.
   if [[ "$AINB_BIN" = /* ]]; then
     BIN="$AINB_BIN"
   elif [[ -x "$AINB_BIN" ]]; then
     BIN="$(cd "$(dirname "$AINB_BIN")" && pwd)/$(basename "$AINB_BIN")"
   else
-    BIN="$AINB_TUI_DIR/$AINB_BIN"
+    BIN="$REPO_ROOT/$AINB_BIN"
   fi
 else
   echo "[gen-cli-reference] building ainb (release)…" >&2
-  ( cd "$AINB_TUI_DIR" && cargo build --release -p ainb >&2 )
-  BIN="$AINB_TUI_DIR/target/release/ainb"
+  ( cd "$REPO_ROOT" && cargo build --release -p ainb >&2 )
+  BIN="$REPO_ROOT/target/release/ainb"
 fi
 [[ -x "$BIN" ]] || { echo "[gen-cli-reference] binary not found: $BIN" >&2; exit 1; }
 
@@ -85,7 +85,7 @@ scripts. Run `ainb` with no arguments to launch the TUI; use any subcommand
 below for non-interactive work.
 
 > **Generated — do not edit by hand.** This page is produced from the live
-> binary by [`ainb-tui/scripts/gen-cli-reference.sh`](https://github.com/stevengonsalvez/agents-in-a-box/blob/main/ainb-tui/scripts/gen-cli-reference.sh),
+> binary by [`scripts/gen-cli-reference.sh`](https://github.com/stevengonsalvez/hangar/blob/main/scripts/gen-cli-reference.sh),
 > which walks `ainb <cmd> --help` for every command. CI fails if it drifts, so
 > the output of `ainb --help` stays the source of truth. To update: run the
 > script and commit the result.
