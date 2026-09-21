@@ -31,7 +31,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE="$REPO_ROOT/ainb-tui"
+WORKSPACE="$REPO_ROOT"
 E2E_DIR="$WORKSPACE/crates/ainb-web/e2e"
 
 # Shared target dir keeps this in step with the rest of the ccc build (avoids a
