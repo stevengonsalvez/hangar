@@ -16,7 +16,7 @@ cargo build --release
 
 | Path | Purpose |
 |------|---------|
-| `crates/` | The `ainb` binary (Rust) — TUI plus `source`, `skill`, `doctor`, `usage` CLI subcommands. This is the canonical deploy / update / sync surface. |
+| `crates/` | The `ainb` binary (Rust): TUI plus `source`, `skill`, `doctor`, `usage` CLI subcommands. This is the canonical deploy / update / sync surface. |
 | `plans/skill-manager/spec.md` | Full design + acceptance criteria for the unit manager. |
 | `.claude-plugin/marketplace.json` | This repo's Claude plugin marketplace manifest |
 
