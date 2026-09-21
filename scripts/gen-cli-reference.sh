@@ -25,7 +25,7 @@
 # unpiped, so we don't lose its failure signal.
 set -eu
 
-# Repo paths — script lives in scripts/, docs live at repo-root docs/, and
+# Repo paths: script lives in scripts/, docs live at repo-root docs/, and
 # the repo root is the cargo workspace root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
