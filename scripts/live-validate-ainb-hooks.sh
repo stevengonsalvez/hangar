@@ -31,13 +31,13 @@ for arg in "$@"; do
 done
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-NOTIFYD="${AINB_NOTIFYD_BIN:-$REPO_ROOT/ainb-tui/target/debug/ainb-notifyd}"
+NOTIFYD="${AINB_NOTIFYD_BIN:-$REPO_ROOT/target/debug/ainb-notifyd}"
 HOOK="${HOME}/.agents-in-a-box/hooks/notify.sh"
 DB="${HOME}/.agents-in-a-box/notifications.db"
 
 if ! [ -x "$NOTIFYD" ]; then
   echo "building ainb-notifyd..."
-  (cd "$REPO_ROOT/ainb-tui" && cargo build -p ainb-plugin-notifyd --bin ainb-notifyd)
+  (cd "$REPO_ROOT" && cargo build -p ainb-plugin-notifyd --bin ainb-notifyd)
 fi
 
 echo "==> 1. install --all"
