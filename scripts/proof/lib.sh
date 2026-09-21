@@ -26,8 +26,8 @@
 # shellcheck disable=SC2034  # several globals are read by the scenarios
 
 PROOF_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AINB_TUI_DIR="$(cd "$PROOF_LIB_DIR/../.." && pwd)"
-AINB_BIN="${AINB_BIN:-${CARGO_TARGET_DIR:-$AINB_TUI_DIR/target}/debug/ainb}"
+WORKSPACE_DIR="$(cd "$PROOF_LIB_DIR/../.." && pwd)"
+AINB_BIN="${AINB_BIN:-${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}/debug/ainb}"
 : "${PROOF_OUT:?run.sh exports PROOF_OUT}"
 PROOF_COLS=160
 PROOF_ROWS=48
@@ -144,7 +144,7 @@ world_up() {
   mkdir -p "$HOME/.agents-in-a-box/config" "$TMUX_TMPDIR" "$PROOF_WORLD/bin"
   PATH="$PROOF_WORLD/bin:${AINB_BIN%/*}:$PROOF_BASE_PATH"
   export PATH
-  export AINB_PLUGIN_ROOT="$AINB_TUI_DIR/dist/plugins"
+  export AINB_PLUGIN_ROOT="$WORKSPACE_DIR/dist/plugins"
 
   # `ainb init` records onboarding, so the setup wizard never opens.
   "$AINB_BIN" init --format json </dev/null >"$PROOF_WORLD/init.json" 2>&1
@@ -635,9 +635,9 @@ open_session_list() {
 # The window under test: a debug build of the desktop shell, built with the
 # `bundled` feature so it serves `ui/dist` itself rather than a dev server
 # (`cargo build --features bundled` in `crates/ainb-desktop`).
-DESKTOP_BIN="${AINB_DESKTOP_BIN:-$AINB_TUI_DIR/crates/ainb-desktop/target/debug/ainb-desktop}"
+DESKTOP_BIN="${AINB_DESKTOP_BIN:-$WORKSPACE_DIR/crates/ainb-desktop/target/debug/ainb-desktop}"
 # A debug build takes its sidecar from here; a bundle carries it beside itself.
-DESKTOP_DAEMON_BIN="${AINB_DESKTOP_DAEMON_BIN:-${CARGO_TARGET_DIR:-$AINB_TUI_DIR/target}/debug/ainb-hangar-daemon}"
+DESKTOP_DAEMON_BIN="${AINB_DESKTOP_DAEMON_BIN:-${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}/debug/ainb-hangar-daemon}"
 
 DESKTOP_LOG=""
 
