@@ -656,7 +656,8 @@ agents-in-a-box/
 │
 ├── docs/README.md              # What was left behind, and where it lives now
 │
-└── .github/workflows/          # Rebuilt for this layout; see the CI section
+└── .github/workflows/          # Carried over unchanged; rebuilt for this
+                                # layout in a later step
 ```
 
 The documentation hub, the website, the research notes and the other harness
