@@ -445,7 +445,7 @@ There are four ways to filter plugins, with the following precedence (most speci
 
 Resolution order: `AINB_DISABLE_PLUGINS` → `AINB_ONLY_PLUGINS` → `AINB_DISABLE_PLUGIN` → config `enabled` → config `disabled` → default all-on. **Env always beats config**, and an allowlist always beats a denylist.
 
-Config lives at `~/.agents-in-a-box/config/config.toml` under a `[plugins]` table — see [`example.config.toml`](config/example.config.toml) for the annotated block. When a screen's plugin is disabled, the TUI shows a placeholder naming the exact variable that turned it off, rather than hanging.
+Config lives at `~/.agents-in-a-box/config/config.toml` under a `[plugins]` table, see [`example.config.toml`](config/example.config.toml) for the annotated block. When a screen's plugin is disabled, the TUI shows a placeholder naming the exact variable that turned it off, rather than hanging.
 
 ### Keyboard Shortcuts
 
