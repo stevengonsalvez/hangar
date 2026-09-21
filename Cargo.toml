@@ -157,7 +157,7 @@ two-face = "0.5"
 # 2026-06-11; no Cargo.lock is tracked, so CI always resolves the latest).
 # time reaches us via syntect→plist and ratatui-widgets. Remove this cap when
 # a fixed time release (>0.3.48) compiles: `cargo update -p time` + build.
-time = ">=0.3.36, <0.3.48"
+time = ">=0.3.36, <0.3.56"
 
 # Persistent usage analytics cache
 # Bumped 0.31 -> 0.32 so `libsqlite3-sys` (links = "sqlite3") resolves to a
