@@ -14,8 +14,9 @@
 //!   daemon and stage it at `crates/ainb-desktop/binaries/ainb-hangar-daemon-<triple>`
 //!   for the desktop bundle; `--target` is the cross-compiled release leg.
 //!   See [`desktop_sidecar`].
-//! * `ci-lint` — assert `.github/workflows/ci.yml` satisfies the real Hangar
-//!   e2e CI contract (the `hangar-e2e` job). See [`ci_lint`].
+//! * `ci-lint`: assert `.github/workflows/nightly.yml` satisfies the real Hangar
+//!   e2e CI contract (the `hangar-e2e` job). Run from `ci.yml`'s required `Lint`
+//!   job, so the contract is still checked on every PR. See [`ci_lint`].
 //!
 //! No external CLI parser dependency on purpose — this binary is meant to
 //! be cheap to compile and stay out of the way.
