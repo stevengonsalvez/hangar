@@ -70,8 +70,8 @@ Before declaring done, FETCH the live URL and confirm: every link resolves, ever
 ## Quick start
 
 ```bash
-SK=ainb-tui/.claude/skills/tmux-verify
-AINB=$(find ainb-tui/target -name ainb -type f -perm +111 | head -1)   # or: cargo build -p ainb-core
+SK=.claude/skills/tmux-verify
+AINB=$(find target -name ainb -type f -perm -u+x | head -1)   # or: cargo build -p ainb
 
 # 1. one journey: render tape, record, extract+OCR frames, print checklist
 bash $SK/scripts/verify-journey.sh \
