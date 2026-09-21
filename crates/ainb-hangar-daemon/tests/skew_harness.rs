@@ -40,7 +40,7 @@ const FIXTURES: &str = include_str!("fixtures/skew_frames.json");
 
 /// The Swift client's own copy of the same frames.
 const SWIFT_TESTS: &str = include_str!(
-    "../../../../apps/ainb-fleet-macos/Tests/FleetRPCTests/CanonicalFixtureTests.swift"
+    "../../../apps/ainb-fleet-macos/Tests/FleetRPCTests/CanonicalFixtureTests.swift"
 );
 
 fn fixture(name: &str) -> String {
