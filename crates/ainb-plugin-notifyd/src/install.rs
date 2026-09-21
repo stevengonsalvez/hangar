@@ -59,33 +59,33 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 /// The bash hook script, baked into the binary.
-const HOOK_SCRIPT: &str = include_str!("../../../../plugins/ainb-hooks/hooks/notify.sh");
+const HOOK_SCRIPT: &str = include_str!("../../../plugins/ainb-hooks/hooks/notify.sh");
 
 /// The Stop-hook stall guard, baked into the binary. Claude reaches it through
 /// the plugin directory; Codex has no plugin runtime, so it needs the same
 /// extract-and-point treatment as `notify.sh`.
 const STALL_GUARD_SCRIPT: &str =
-    include_str!("../../../../plugins/ainb-hooks/hooks/stall_guard.py");
+    include_str!("../../../plugins/ainb-hooks/hooks/stall_guard.py");
 
 /// The Claude plugin manifest, baked into the binary.
 const CLAUDE_PLUGIN_JSON: &str =
-    include_str!("../../../../plugins/ainb-hooks/.claude-plugin/plugin.json");
+    include_str!("../../../plugins/ainb-hooks/.claude-plugin/plugin.json");
 
 /// The Codex hooks.json merge template (with the `__AINB_HOOK_SCRIPT__`
 /// placeholder that gets substituted at install time).
-const CODEX_HOOKS_TEMPLATE: &str = include_str!("../../../../plugins/ainb-hooks/codex/hooks.json");
+const CODEX_HOOKS_TEMPLATE: &str = include_str!("../../../plugins/ainb-hooks/codex/hooks.json");
 
 /// The Copilot drop-in template (with the `__AINB_HOOK_SCRIPT__`
 /// placeholder substituted at install time). Unlike Codex, this is
 /// written verbatim as a standalone file — Copilot loads + combines
 /// every `*.json` in `~/.copilot/hooks/`, so ainb owns one file.
 const COPILOT_HOOKS_TEMPLATE: &str =
-    include_str!("../../../../plugins/ainb-hooks/copilot/hooks.json");
+    include_str!("../../../plugins/ainb-hooks/copilot/hooks.json");
 
 /// The Antigravity drop-in template (with the `__AINB_HOOK_SCRIPT__`
 /// placeholder substituted at install time).
 const ANTIGRAVITY_HOOKS_TEMPLATE: &str =
-    include_str!("../../../../plugins/ainb-hooks/antigravity/hooks.json");
+    include_str!("../../../plugins/ainb-hooks/antigravity/hooks.json");
 
 /// The host CLI agent being installed for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
