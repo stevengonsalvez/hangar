@@ -11,10 +11,11 @@
 #   ./diagnose-tripwire.sh amfi            # AMFI standalone probe only
 #   ./diagnose-tripwire.sh logs            # last log tail only
 #
-# Run from the ainb-tui workspace root.
+# Run from anywhere: the cd below resolves the repository root from this
+# script's own location.
 set -euo pipefail
 
-cd "$(dirname "$0")/../../../.."  # ainb-tui workspace root
+cd "$(dirname "$0")/../../../.."  # .claude/skills/<skill>/scripts -> repo root
 
 CHECK="${1:-all}"
 
