@@ -26,7 +26,7 @@ default:
 
 # Compile the `ainb` binary (debug profile).
 build:
-    cd ainb-tui && cargo build
+    cargo build
 
 # ── sandbox lifecycle ─────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ tui: build
     # ~/.cargo/) then exec the built binary with HOME redirected to
     # the sandbox. Doing `HOME=sandbox cargo run` breaks rustup's
     # toolchain resolution.
-    HOME={{sandbox_root}} ainb-tui/target/debug/ainb
+    HOME={{sandbox_root}} target/debug/ainb
 
 # Convenience: full bring-up — sandbox + launch TUI in one go.
 run tier="minimal": (up tier) tui
@@ -92,20 +92,20 @@ cli *args: build
     #   just skill-manager cli skill check
     #   just skill-manager cli skill sync --to-repo --yes
     #   just skill-manager cli source list
-    HOME={{sandbox_root}} ainb-tui/target/debug/ainb {{args}}
+    HOME={{sandbox_root}} target/debug/ainb {{args}}
 
 # ── tests ─────────────────────────────────────────────────────────
 
 # Scoped acceptance: skill-core + cli (matches the PR #178 verify bar).
 test:
-    cd ainb-tui && cargo test -p ainb-skill-core -p ainb-cli
+    cargo test -p ainb-skill-core -p ainb-cli
 
 # Just the sandbox fixture smoke (fast).
 test-fixture:
-    cd ainb-tui && cargo test -p ainb-skill-core --test sandbox_fixture_smoke
+    cargo test -p ainb-skill-core --test sandbox_fixture_smoke
 
 # Both sandbox tripwires — TestBackend + live tmux.
 test-tripwires:
-    cd ainb-tui && cargo test -p ainb \
+    cargo test -p ainb \
       --test tripwire_core_skill_manager_sandbox_loads \
       --test tripwire_core_skill_manager_sandbox_e2e
