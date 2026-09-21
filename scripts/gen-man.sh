@@ -21,7 +21,8 @@
 #   scripts/gen-man.sh                                  # builds ainb (release)
 #   AINB_BIN=target/debug/ainb scripts/gen-man.sh       # reuse a built bin
 #
-# CI freshness gate (see .github/workflows/ci.yml, job `cli-docs`):
+# CI freshness gate (see .github/workflows/ci.yml, job `Generated artifacts
+# freshness`):
 #   AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
 #   git diff --exit-code -- man/ainb.1
 #
