@@ -17,7 +17,7 @@ still live at the paths named in `stevengonsalvez/agents-in-a-box` on branch
 | `explainers/` | Generated HTML walkthroughs |
 | `website/` | The Astro + Starlight site |
 | `reflect-kb/` | The reflect knowledge base |
-| `plans/` | Design plans and acceptance criteria, including `plans/skill-manager/spec.md` |
+| `plans/` | Design plans and acceptance criteria |
 | `.agents/`, `.claude/`, `.claude-plugin/` | Agent-harness configuration and the plugin marketplace manifest |
 | `plugins/` other than `ainb-hooks/` | The `ainb-fleet`, `caveman-stats` and `illustration` Claude Code plugins |
 | `scripts/raycast/` | Personal Raycast commands for pushing a clipboard image to a host over ssh |
