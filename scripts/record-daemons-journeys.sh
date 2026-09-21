@@ -56,4 +56,4 @@ for j in "${journeys[@]}"; do
 done
 
 echo "recordings in $CRATE/tests/recordings/"
-echo "to publish them as PR proof: cp $CRATE/tests/recordings/*.gif ../docs/assets/screenshots/"
+echo "to publish them as PR proof: cp $CRATE/tests/recordings/*.gif docs/assets/screenshots/"
