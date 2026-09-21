@@ -5,7 +5,7 @@
 #
 #   --build        rebuild ainb, ainb-hangar-daemon and the plugins first
 #   --only <node>  run one scenario (repeatable); default is every scenario
-#   --out <dir>    where results go; default ainb-tui/proof-out
+#   --out <dir>    where results go; default <repo root>/proof-out
 #
 # Each scenario under scenarios/<node>.sh sets EXPECT (one line) and defines
 # `scenario`, which drives the real TUI and CLI through tmux in a private
@@ -24,7 +24,7 @@
 set -uo pipefail
 
 PROOF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AINB_TUI_DIR="$(cd "$PROOF_DIR/../.." && pwd)"
+WORKSPACE_DIR="$(cd "$PROOF_DIR/../.." && pwd)"
 
 BUILD=0
 ONLY=()
@@ -40,7 +40,7 @@ while (($#)); do
   shift
 done
 
-export PROOF_OUT="${OUT:-$AINB_TUI_DIR/proof-out}"
+export PROOF_OUT="${OUT:-$WORKSPACE_DIR/proof-out}"
 # The PATH a world starts from: system tools only, so nothing from the
 # operator's own PATH (a real `claude`, a real `headroom`) leaks in.
 export PROOF_BASE_PATH="/usr/local/bin:/usr/bin:/bin"
@@ -53,7 +53,7 @@ done
 
 if ((BUILD)); then
   echo "building ainb, ainb-hangar-daemon and plugins" >&2
-  (cd "$AINB_TUI_DIR" \
+  (cd "$WORKSPACE_DIR" \
     && CARGO_INCREMENTAL=0 cargo build -j 4 -p ainb -p ainb-hangar-daemon \
     && bash scripts/build-plugins.sh) || { echo "build failed" >&2; exit 2; }
   # The desktop shell (d1-shell) is its own cargo workspace and needs the
@@ -63,7 +63,7 @@ if ((BUILD)); then
   # so the binary lands where d1-shell looks for it by default.
   if pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
     echo "building the desktop shell (ui/dist, then --features bundled)" >&2
-    (cd "$AINB_TUI_DIR/crates/ainb-desktop" \
+    (cd "$WORKSPACE_DIR/crates/ainb-desktop" \
       && npm --prefix ui ci \
       && npm --prefix ui run build \
       && env -u CARGO_TARGET_DIR CARGO_INCREMENTAL=0 cargo build -j 4 --features bundled) \
@@ -75,9 +75,9 @@ fi
 
 # A shared cargo target (CARGO_TARGET_DIR) is where the build put the binary;
 # the plugins are always staged under this checkout's dist/.
-AINB_BIN="${CARGO_TARGET_DIR:-$AINB_TUI_DIR/target}/debug/ainb"
+AINB_BIN="${CARGO_TARGET_DIR:-$WORKSPACE_DIR/target}/debug/ainb"
 [[ -x "$AINB_BIN" ]] || { echo "no binary at $AINB_BIN (run with --build)" >&2; exit 2; }
-[[ -x "$AINB_TUI_DIR/dist/plugins/hangar-tui/hangar-tui" ]] \
+[[ -x "$WORKSPACE_DIR/dist/plugins/hangar-tui/hangar-tui" ]] \
   || { echo "plugins are not staged (run with --build)" >&2; exit 2; }
 BINARY_LINE="$("$AINB_BIN" --version 2>&1 | head -1)"
 export AINB_BIN BINARY_LINE
