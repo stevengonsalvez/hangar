@@ -32,7 +32,7 @@ const CWD: &str = "/w/app";
 /// The repo-root path of the hook script under test.
 fn notify_sh() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../plugins/ainb-hooks/hooks/notify.sh")
+        .join("../../plugins/ainb-hooks/hooks/notify.sh")
         .canonicalize()
         .expect("notify.sh is in the repo")
 }
