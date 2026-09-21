@@ -11,7 +11,7 @@
 # invalidates that signature and AMFI SIGKILLs the process at exec time
 # (silent — no stderr, exit 137). We re-sign in place after each copy.
 #
-# Run from the ainb-tui workspace root:
+# Run from the workspace root:
 #   ./scripts/build-plugins.sh
 #   ./scripts/build-plugins.sh --release
 set -euo pipefail
@@ -71,15 +71,15 @@ build_plugin() {
     resign_macos "$out_dir/$plugin_id"
 
     # The manifest lives next to the crate. Most plugin crates are under
-    # `crates/<crate>/`, but the Hangar plugin lives outside the workspace root
-    # at `../plugins/<plugin_id>/` (its crate dir is named by plugin id, not
-    # crate name). Search every known layout for a `manifest.toml`/`plugin.toml`.
+    # `crates/<crate>/`; the legacy harness layout kept a plugin at
+    # `plugins/<plugin_id>/` (its crate dir is named by plugin id, not crate
+    # name). Search every known layout for a `manifest.toml`/`plugin.toml`.
     local manifest_src=""
     for cand in \
         "crates/$crate/manifest.toml" \
         "crates/$crate/plugin.toml" \
-        "../plugins/$plugin_id/manifest.toml" \
-        "../plugins/$plugin_id/plugin.toml"; do
+        "plugins/$plugin_id/manifest.toml" \
+        "plugins/$plugin_id/plugin.toml"; do
         if [[ -f "$cand" ]]; then
             manifest_src="$cand"
             break
