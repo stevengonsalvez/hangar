@@ -158,13 +158,12 @@ impl Options {
     }
 }
 
-/// Repo root = the workspace root's parent (the workspace lives at
-/// `<repo>/ainb-tui`, this crate at `<repo>/ainb-tui/xtask`).
+/// Repo root = the workspace root, which this crate sits directly under
+/// (`<repo>/xtask`).
 fn repo_root() -> Result<PathBuf> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // <repo>/ainb-tui/xtask
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // <repo>/xtask
     manifest
-        .parent() // <repo>/ainb-tui
-        .and_then(Path::parent) // <repo>
+        .parent() // <repo>
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("cannot resolve repo root from {}", manifest.display()))
 }
