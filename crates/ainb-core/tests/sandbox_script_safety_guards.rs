@@ -21,7 +21,6 @@
 //! (both present on every CI runner). No tmux. To run just this file:
 //!
 //! ```bash
-//! cd ainb-tui
 //! cargo test -p ainb --test sandbox_script_safety_guards
 //! ```
 //!

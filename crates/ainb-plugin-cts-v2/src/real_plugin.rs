@@ -104,7 +104,7 @@ fn crates_dir() -> PathBuf {
         .to_path_buf()
 }
 
-/// Cargo workspace root (`ainb-tui/`).
+/// Cargo workspace root (the repository root).
 pub fn workspace_root() -> PathBuf {
     crates_dir()
         .parent()

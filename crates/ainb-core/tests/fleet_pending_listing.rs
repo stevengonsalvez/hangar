@@ -18,7 +18,7 @@
 //!  -E 'not binary(/^tripwire_/)'`, and no script globs
 //! `crates/ainb-core/tests/tripwire_fleet_*`, so under the tripwire prefix this
 //! binary was selected by NO CI command and the whole listing contract was
-//! ungated (`ainb-tui/CLAUDE.md`: "A test package must be reachable by the CI
+//! ungated (`CLAUDE.md`: "A test package must be reachable by the CI
 //! command that claims to run it"). The prefix is reserved for tests that drive
 //! a real `ainb tui` under tmux against staged plugins, which the `Test` job
 //! deliberately does not provision. This one needs neither: no tmux, no staged

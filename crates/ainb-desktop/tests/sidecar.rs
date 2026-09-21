@@ -27,8 +27,8 @@ fn daemon_bin() -> PathBuf {
     );
     assert!(
         bin.is_file(),
-        "no daemon binary at {}: run `cargo build -p ainb-hangar-daemon` in ainb-tui \
-         or set AINB_DESKTOP_DAEMON_BIN",
+        "no daemon binary at {}: run `cargo build -p ainb-hangar-daemon` at the \
+         workspace root or set AINB_DESKTOP_DAEMON_BIN",
         bin.display()
     );
     bin
