@@ -7,6 +7,6 @@
     "check": "tsc --noEmit --strict --skipLibCheck --target es2022 --moduleResolution bundler --module esnext AppState.ts sample.check.ts"
   },
   "devDependencies": {
-    "typescript": "5.6.3"
+    "typescript": "5.9.3"
   }
 }
