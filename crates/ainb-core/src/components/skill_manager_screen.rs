@@ -22,7 +22,7 @@ use ratatui::{
 
 use ainb_skill_core::drift::DriftStatus;
 
-// Style guide constants — match the rest of the TUI's components
+// Style guide constants: match the rest of the TUI's components
 // (cornflower borders, gold titles, soft white text, muted gray for
 // helper text). These mirror the sibling home_screen_v2.rs.
 const CORNFLOWER_BLUE: Color = Color::Rgb(100, 149, 237);
