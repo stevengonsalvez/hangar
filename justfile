@@ -30,10 +30,10 @@ run *args:
 # Rebuild plugins + both binaries + restart the daemon, then run the TUI
 #
 # The complete dev launch (replaces `./scripts/build-plugins.sh && cargo run`):
-#   1. build-plugins.sh — restages every subprocess plugin (the hangar TUI is
+#   1. build-plugins.sh restages every subprocess plugin (the hangar TUI is
 #      one; `cargo run` alone never rebuilds it → you'd get a STALE plugin).
 #   2. build ainb + ainb-hangar-daemon.
-#   3. daemon restart — `daemon start` no-ops on a live pid, so a rebuild alone
+#   3. daemon restart: `daemon start` no-ops on a live pid, so a rebuild alone
 #      leaves the OLD daemon serving the DB (the blank-board trap). Restarting
 #      puts the fresh binary in charge; the health pane then shows no drift.
 #   4. run the TUI. AINB_BIN is pinned so every self-spawn resolves to the fresh
@@ -117,7 +117,7 @@ test-live-branch:
 # The codex leg of `test-live`: same law (assert the on-disk nonce artifact
 # FIRST, task=done only as a cross-check), one provider over. Skips CLEAN + LOUD
 # (exit 0) when there is no authenticated `codex` on PATH, via a bounded
-# liveness probe (`codex exec -- "reply PONG"`) — macOS has no `timeout`, so a
+# liveness probe (`codex exec -- "reply PONG"`). macOS has no `timeout`, so a
 # background killer bounds it. The Rust test carries the same skip gate, so this
 # recipe only fast-fails the build when codex is plainly absent.
 test-live-codex:
