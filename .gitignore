@@ -88,7 +88,7 @@ __pycache__/
 
 /target/
 # Cargo.lock IS tracked. `ainb` ships as a binary, so the lock is what makes a
-# build reproducible — and CI has no other pin: without it every run re-resolves
+# build reproducible, and CI has no other pin: without it every run re-resolves
 # the whole graph and inherits whatever the ecosystem published that hour. That
 # is not hypothetical: zune-core 0.5.2 (2026-08-07) broke zune-jpeg 0.5.15, and
 # every macOS job went red on a dependency nobody here had touched.
@@ -99,7 +99,7 @@ __pycache__/
 *~
 Thumbs.db
 
-# CTS canary artifacts — built on demand via `cargo xtask build-canaries`
+# CTS canary artifacts: built on demand via `cargo xtask build-canaries`
 crates/ainb-plugin-host/tests/cts/canaries/target/
 crates/ainb-plugin-host/tests/cts/fixtures/
 
