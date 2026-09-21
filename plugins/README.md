@@ -1,148 +1,56 @@
 # Harness plugins
 
-This folder holds **harness plugins** — extensions that plug into the *coding
-agent itself* (Claude Code, Codex CLI, GitHub Copilot CLI). They add skills,
-lifecycle hooks, and notification wiring to whichever agent harness you run.
-
-They are installable through the `agents-in-a-box` plugin marketplace
-(`.claude-plugin/marketplace.json` at the repo root) or provisioned by the
-`ainb` setup wizard.
-
-> Think of the broader ecosystem's harness plugins — Codexplored, Hermes, and
-> friends. Same genre: they ride *inside* the agent. The ones here are ours.
-
-## What these are NOT
-
-These are **not** TUI plugins. For the canonical "two systems, same word"
-explainer, see [`docs/plugins/README.md`](../docs/plugins/README.md); the short
-version:
+A **harness plugin** extends the *coding agent itself* (Claude Code, Codex
+CLI, GitHub Copilot CLI) with skills, lifecycle hooks and notification
+wiring. They are a different system from the TUI plugins, which extend `ainb`
+and live in `crates/ainb-plugin-*` as workspace members:
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
-│  HARNESS plugins (this dir)   │        │  TUI plugins (crates/)        │
-│  extend the coding AGENT      │   vs   │  extend the ainb TUI itself   │
-│  Claude / Codex / Copilot     │        │  ratatui screens + commands   │
-│  skills · hooks · notifs      │        │  JSON-RPC subprocess, ABI v2  │
-│  installed via marketplace    │        │  spawned over stdio JSON-RPC  │
+│  HARNESS plugins (this dir)  │        │  TUI plugins (crates/)       │
+│  extend the coding AGENT     │   vs   │  extend the ainb TUI itself  │
+│  Claude / Codex / Copilot    │        │  ratatui screens + commands  │
+│  skills · hooks · notifs     │        │  JSON-RPC subprocess, ABI v2 │
+│  installed via marketplace   │        │  spawned over stdio JSON-RPC │
 └──────────────────────────────┘        └──────────────────────────────┘
 ```
 
-TUI plugins live in `crates/ainb-plugin-*` (burndown,
-session-reader, …) and are loaded by the TUI's plugin runtime, not by any
-agent harness. See `CLAUDE.md` for that system.
+See `CLAUDE.md` for the TUI plugin system.
 
-### ⚠️ `hangar-tui/` is the exception in this folder
+## What is here
 
-`plugins/hangar-tui/` is a **TUI plugin**, not a harness plugin. It is a Rust
-crate (`Cargo.toml` + `manifest.toml`, ABI v2, JSON-RPC over a Unix socket)
-and a member of the root Cargo workspace
-(`Cargo.toml` → `"plugins/hangar-tui"`). It builds as its own
-executable (`[[bin]] ainb-plugin-hangar`) that the host **spawns as a JSON-RPC
-subprocess** — it is *not* linked into the `ainb` binary, and there is nothing
-to "install" from the marketplace. It sits here only because that's where its
-source path was placed; ignore it when reasoning about harness plugins.
+| Plugin | Kind | What it does |
+|---|---|---|
+| `ainb-hooks` | hooks | Captures documented Claude and Codex events into Hangar; routes only attention to the inbox |
 
-## The harness plugins
+`ainb-hooks` is the one harness plugin this repository carries, because it is
+not only installed, it is **compiled in**: `crates/ainb-plugin-notifyd/src/install.rs`
+bakes its `notify.sh`, `stall_guard.py` and the Claude, Codex, Copilot and
+Antigravity manifests into the binary with `include_str!`, and two test
+suites fire the real `notify.sh` against a real daemon.
 
-| Plugin           | Kind   | What it does                                                          | Marketplace install                          |
-|------------------|--------|----------------------------------------------------------------------|----------------------------------------------|
-| `ainb-fleet`     | skills | Teaches agents the `ainb fleet …` multi-session orchestration verbs   | `ainb-fleet@agents-in-a-box`                 |
-| `ainb-hooks`     | hooks  | Captures documented Claude and Codex events into Hangar; routes only attention to inbox | `ainb-hooks@agents-in-a-box`                 |
-| `caveman-stats`  | hooks  | Caveman token-savings statusline + compaction-survival re-inject      | `caveman-stats@agents-in-a-box`              |
-| `illustration`   | skills | Popa-mascot brand-illustration workflow (sketchnote generation)       | `illustration@agents-in-a-box`               |
+One command writes all three hook formats:
 
-Two more harness plugins ship in this marketplace but are **sourced
-externally** (not files in this folder):
+```bash
+ainb notifyd install --all          # = --claude --codex --copilot
+```
 
-| Plugin     | Source                                              | What it does                                          |
-|------------|-----------------------------------------------------|-------------------------------------------------------|
-| `reflect`  | `github:stevengonsalvez/ainb-reflect-memory` (pinned) | Long-term memory: SessionStart recall + capture hooks |
-| `caveman`  | external `caveman` marketplace                      | Ultra-compressed token-saving response mode           |
+`ainb notifyd …` and the standalone `ainb-notifyd …` binary are the same
+entrypoint.
 
-## Install
+## What is not here yet
 
-### 1. Add the marketplace (once)
+`ainb-fleet`, `caveman-stats` and `illustration` are in this repository's
+history and still live in `stevengonsalvez/agents-in-a-box`; see
+`docs/README.md`. `reflect` has always been sourced externally from
+`github:stevengonsalvez/ainb-reflect-memory`, and `caveman` from its own
+marketplace. All of them remain installable by name:
 
 ```bash
 claude plugin marketplace add stevengonsalvez/agents-in-a-box
-```
-
-### 2. Install a plugin (Claude Code)
-
-```bash
 claude plugin install ainb-fleet@agents-in-a-box
-claude plugin install ainb-hooks@agents-in-a-box
-claude plugin install caveman-stats@agents-in-a-box
-claude plugin install illustration@agents-in-a-box
 ```
 
-`reflect` carries its own marketplace, so add that source first:
-
-```bash
-claude plugin marketplace add stevengonsalvez/ainb-reflect-memory
-claude plugin install reflect@ainb-reflect-memory
-```
-
-### 3. Or let the wizard do it
-
-```bash
-ainb init          # interactive setup, offers every plugin above
-ainb init --script # print the install script instead of running it
-```
-
-The catalog the wizard drives lives in
-`crates/ainb-app/src/setup/catalog.rs` (single source of truth for
-TUI onboarding **and** the `ainb init` CLI).
-
-## Cross-harness support
-
-Codex CLI and Copilot CLI now expose the same lifecycle hook events as Claude
-Code (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`,
-and — on recent builds — compaction). So cross-harness support is no longer an
-event problem; it's a wiring problem, and the wiring exists. The marketplace
-(`claude plugin install`) is still Claude-only, but Codex and Copilot reach the
-same functionality through these mechanisms:
-
-- **Skill plugins** (`ainb-fleet`, `illustration`) are portable Markdown.
-  Install each skill unit into the Codex/Copilot skill homes:
-
-  ```bash
-  ainb skill install gh:stevengonsalvez/agents-in-a-box@main/plugins/ainb-fleet/skills/<unit> \
-    --targets codex,copilot
-  ```
-
-- **Hook plugins** (`ainb-hooks`) need per-harness hook wiring. One command
-  writes all three formats (and `ainb init` now calls it with `--all`):
-
-  ```bash
-  ainb notifyd install --all          # = --claude --codex --copilot
-  ```
-
-  (`ainb notifyd …` and the standalone `ainb-notifyd …` binary are the same
-  entrypoint — the docsite's [plugin overview](../docs/toolkit/plugins/overview.md)
-  uses the `ainb-notifyd` form. `ainb-hooks` ships `codex/hooks.json` and
-  `copilot/hooks.json` next to the Claude manifest, plus a universal `notify.sh`.)
-
-### Support matrix
-
-| Plugin          | Claude Code | Codex CLI            | Copilot CLI          | Notes                                                                 |
-|-----------------|-------------|----------------------|----------------------|----------------------------------------------------------------------|
-| `ainb-fleet`    | ✅          | ➜ via `skill install`| ➜ via `skill install`| skills are harness-portable Markdown                                 |
-| `ainb-hooks`    | ✅          | ✅                   | ✅                   | ships all three hook formats; `ainb notifyd install --all`           |
-| `caveman-stats` | ✅          | ❌                   | ❌                   | **Claude-only** (matches the docsite plugin overview). The hook *events* exist everywhere, but the code is Claude-coupled (reads Claude JSONL via `CLAUDE_CONFIG_DIR`, writes the Claude statusline file) and no Codex/Copilot statusline consumes the token-savings suffix — porting would be dead code |
-| `illustration`  | ✅          | ➜ via `skill install`| ➜ via `skill install`| skills are harness-portable Markdown                                 |
-| `reflect`       | ✅          | ✅ Codex adapter     | ◑ Copilot adapter    | Codex + Copilot adapters ship (`plugin/adapters/{codex,copilot}` write native hook configs). One Copilot gap: it ignores `userPromptSubmitted` output, so per-prompt recall there is manual `/recall` — SessionStart auto-recall still fires |
-| `caveman`       | ✅          | ➜ via `skill install`| ➜ via `skill install`| external marketplace                                                 |
-
-Legend: ✅ first-class · ◑ works with one documented gap · ➜ supported via a sync/adapter step · ❌ not available / not worthwhile.
-
-## Authoring a new harness plugin
-
-1. Create `plugins/<name>/.claude-plugin/plugin.json` (name, version, hooks
-   and/or a `skills/` dir).
-2. Register it in the root `.claude-plugin/marketplace.json`.
-3. If it's a **hook** plugin and should reach Codex/Copilot, add
-   `codex/hooks.json` and `copilot/hooks.json` (see `ainb-hooks/` for the
-   reference layout).
-4. Add it to the setup catalog
-   (`crates/ainb-app/src/setup/catalog.rs`) so `ainb init` offers it.
+or through `ainb init`, whose catalog is
+`crates/ainb-app/src/setup/catalog.rs` (single source of truth for TUI
+onboarding and the `ainb init` CLI).

@@ -1,3 +1,0 @@
-seed
-sleep 22000
-capture flood

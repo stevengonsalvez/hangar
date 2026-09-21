@@ -58,7 +58,7 @@ separate, standalone repo — `ainb` consumes it as a pinned external source.
 | **[stevengonsalvez/ainb-toolkit](https://github.com/stevengonsalvez/ainb-toolkit)** | The canonical home for the 94 curated skills, 16 agents, workflows, utilities, the `external-dependencies.yaml` manifest, the `bootstrap.js` legacy installer, and the generated `catalog.yaml`. `ainb` browses + installs from it; the release CI pins a tag of it to generate the curated `catalog-index.json`. |
 
 <p align="center">
-  <img src="docs/assets/thumbs/home.png" alt="ainb home screen with sidebar navigation" width="700">
+  <img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/home.png" alt="ainb home screen with sidebar navigation" width="700">
   <br>
   <em>Every agent on one screen. Every agent in its own worktree.</em>
 </p>
@@ -72,96 +72,96 @@ Seventeen surfaces, one binary. Each links to its docs.
 <table>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/overview.md"><img src="docs/assets/thumbs/sessions.png" alt="Session list with workspace tree and live preview" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/overview.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/sessions.png" alt="Session list with workspace tree and live preview" width="100%"></a>
 <b>Sessions, one worktree each</b><br>
 <sub>Every agent gets its own branch and working directory. Watch them all from one tree.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/hangar/architecture.md"><img src="docs/assets/thumbs/hangar.png" alt="Hangar control center showing sessions and a pending question" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/hangar/architecture.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/hangar.png" alt="Hangar control center showing sessions and a pending question" width="100%"></a>
 <b>Hangar: work queues up</b><br>
 <sub>Boards, tasks, squads and autopilots. Agents pull work instead of waiting for you to start it.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/code-review.md"><img src="docs/assets/thumbs/code-review.png" alt="Code review diff with file tree and syntax highlighting" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/code-review.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/code-review.png" alt="Code review diff with file tree and syntax highlighting" width="100%"></a>
 <b>Read the diff before you trust it</b><br>
 <sub>File tree, per-file blocks, word-level emphasis, hunk navigation. Or <code>ainb diff-review</code>, headless.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/plugins/burndown.md"><img src="docs/assets/thumbs/burndown.png" alt="Burndown analytics dashboard" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/burndown.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/burndown.png" alt="Burndown analytics dashboard" width="100%"></a>
 <b>Spend, before the invoice</b><br>
 <sub>Daily activity, per-model and per-project breakdowns, live budget tracking, optimisation hints.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/plugins/burndown.md"><img src="docs/assets/thumbs/attribution.png" alt="Per-project token attribution table" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/burndown.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/attribution.png" alt="Per-project token attribution table" width="100%"></a>
 <b>Which repo burned the budget</b><br>
 <sub>Input, cache, output and session counts per project and per worktree.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/plugins/abtop.md"><img src="docs/assets/thumbs/abtop.png" alt="abtop live agent monitor" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/abtop.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/abtop.png" alt="abtop live agent monitor" width="100%"></a>
 <b>abtop: top, for agents</b><br>
 <sub>Quota, tokens, projects, ports, MCP servers and every live session in one pane.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/mcp-pool.mdx"><img src="docs/assets/thumbs/mcp-pool.png" alt="Shared MCP pool overlay" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/mcp-pool.mdx"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/mcp-pool.png" alt="Shared MCP pool overlay" width="100%"></a>
 <b>One MCP pool, not one per session</b><br>
 <sub>A single server process shared across every session, with idle reaping.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/tui/daemons.mdx"><img src="docs/assets/thumbs/daemons.png" alt="Daemons overlay showing MCP pool and headroom proxy health" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/daemons.mdx"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/daemons.png" alt="Daemons overlay showing MCP pool and headroom proxy health" width="100%"></a>
 <b>Daemons, and their health</b><br>
 <sub>Every background process ainb depends on, with restart in place when one dies.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/inbox-notifications.md"><img src="docs/assets/thumbs/inbox.png" alt="Inbox of agent notifications" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/inbox-notifications.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/inbox.png" alt="Inbox of agent notifications" width="100%"></a>
 <b>Every notification in one Inbox</b><br>
 <sub>Approvals, completions and errors from every agent, instead of scattered across panes.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/skill-manager/guide.mdx"><img src="docs/assets/thumbs/skill-manager.png" alt="Skill manager browsing a catalog" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/guide.mdx"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/skill-manager.png" alt="Skill manager browsing a catalog" width="100%"></a>
 <b>Skills, across every tool</b><br>
 <sub>Browse, install, sync and remove units. Write once, deploy to nine tool homes.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/plugins/learnings.md"><img src="docs/assets/thumbs/learnings.png" alt="Learnings browser with search and filters" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/learnings.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/learnings.png" alt="Learnings browser with search and filters" width="100%"></a>
 <b>Stop re-explaining the codebase</b><br>
 <sub>Search what past sessions learned, by entity, community or free text.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/plugins/witr.md"><img src="docs/assets/thumbs/witr.png" alt="witr process browser with ancestry" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/witr.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/witr.png" alt="witr process browser with ancestry" width="100%"></a>
 <b>What did that process touch</b><br>
 <sub>Process causality, ancestry, ports and locks, without leaving the TUI.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/attach.md"><img src="docs/assets/thumbs/attach.png" alt="Attached agent session" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/attach.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/attach.png" alt="Attached agent session" width="100%"></a>
 <b>Attach, detach, survive a sleep</b><br>
 <sub>tmux-backed. Reattach full-screen or in a pane and keep typing.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/tui/start-session.md"><img src="docs/assets/thumbs/new-session.png" alt="New session flow" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/start-session.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/new-session.png" alt="New session flow" width="100%"></a>
 <b>Start one any way you like</b><br>
 <sub>Local repo, clone from GitHub or GitLab, SSH to a remote box, or a favourite.</sub>
 </td>
 </tr>
 <tr>
 <td width="50%" valign="top">
-<a href="docs/tui/overview.md"><img src="docs/assets/thumbs/agent-picker.png" alt="Agent and model picker" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/overview.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/agent-picker.png" alt="Agent and model picker" width="100%"></a>
 <b>Pick the agent, pick the model</b><br>
 <sub>Claude Code, Codex, Gemini, Copilot, a raw shell or SSH. Sonnet, Opus or Haiku per session.</sub>
 </td>
 <td width="50%" valign="top">
-<a href="docs/tui/install.md"><img src="docs/assets/thumbs/setup.png" alt="Setup wizard" width="100%"></a>
+<a href="https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/install.md"><img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/thumbs/setup.png" alt="Setup wizard" width="100%"></a>
 <b>Guided first run</b><br>
 <sub>Dependency checks, auth, git paths, editor. Factory reset when you want to start over.</sub>
 </td>
@@ -172,14 +172,14 @@ Seventeen surfaces, one binary. Each links to its docs.
 
 | Surface | What it gives you | Docs |
 |---|---|---|
-| **Fleet panel** (`f`) | See which agents are blocked on you and answer them without attaching | [cli.md](docs/tui/cli.md) |
-| **ATC** | An always-on watcher that works the queue while you are away (opt-in) | [atc-plumbing.md](docs/atc-plumbing.md) |
-| **Recovery** | Find sessions orphaned by a crash and resume them | [cli.md](docs/tui/cli.md) |
-| **Fleet bridge** | Drive the fleet from Telegram, Slack or Discord | [fleet-bridge.md](docs/fleet-bridge.md) |
-| **`ainb web`** | A read-only browser dashboard over the fleet | [web.md](docs/tui/web.md) |
-| **Headroom** | Context compression so long runs stop hitting the wall | [token-optimization.mdx](docs/tui/token-optimization.mdx) |
-| **`ainb claudecode statusline`** | Live rate-limit and spend inside Claude Code's own status line | [cli.md](docs/tui/cli.md) |
-| **OTel to Grafana** | A wizard that wires Claude Code's telemetry into Grafana Alloy | [otel-grafana.md](docs/reference/otel-grafana.md) |
+| **Fleet panel** (`f`) | See which agents are blocked on you and answer them without attaching | [cli.md](man/cli.md) |
+| **ATC** | An always-on watcher that works the queue while you are away (opt-in) | [atc-plumbing.md](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/atc-plumbing.md) |
+| **Recovery** | Find sessions orphaned by a crash and resume them | [cli.md](man/cli.md) |
+| **Fleet bridge** | Drive the fleet from Telegram, Slack or Discord | [fleet-bridge.md](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/fleet-bridge.md) |
+| **`ainb web`** | A read-only browser dashboard over the fleet | [web.md](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/web.md) |
+| **Headroom** | Context compression so long runs stop hitting the wall | [token-optimization.mdx](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/tui/token-optimization.mdx) |
+| **`ainb claudecode statusline`** | Live rate-limit and spend inside Claude Code's own status line | [cli.md](man/cli.md) |
+| **OTel to Grafana** | A wizard that wires Claude Code's telemetry into Grafana Alloy | [otel-grafana.md](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/reference/otel-grafana.md) |
 
 ---
 
@@ -189,7 +189,7 @@ Seventeen surfaces, one binary. Each links to its docs.
 |-----------|-------------|-------|
 | **[ainb TUI](#ainb--terminal-ui)** | Rust terminal app for managing Claude Code sessions | 34 crates |
 | **[Toolkit](#toolkit)** | Portable skills, agents, and workflows for AI coding tools | 94 skills, 16 agents |
-| **[Knowledge System](#knowledge-system)** | GraphRAG + QMD learning capture and retrieval | [Architecture docs](docs/knowledge/overview.md) |
+| **[Knowledge System](#knowledge-system)** | GraphRAG + QMD learning capture and retrieval | [Architecture docs](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/knowledge/overview.md) |
 
 ---
 
@@ -321,7 +321,7 @@ A Rust-based terminal application for managing AI coding sessions with git workt
 - **Usage analytics** — Built-in token + session tracking by day, week, provider, and project. Know where your budget went — then cut it with [The Token Optimisation Playbook](https://stevengonsalvez.com/blog/token-optimisation-playbook)
 - **Easy onboarding** — First-run setup wizard checks dependencies, configures auth, and gets you creating sessions in minutes
 - **Live log streaming** — Real-time viewer with level filtering and search across all running sessions
-- **Scriptable CLI** — 41 commands (every TUI action, plus headless `witr`, `learnings search`, `diff-review --format json`, …), with `--format json` on session state, config, git, usage, fleet, and most daemons. **[📘 Full CLI reference →](docs/tui/cli.md)** — a generated, multi-hierarchy man page covering every subcommand.
+- **Scriptable CLI**: 41 commands (every TUI action, plus headless `witr`, `learnings search`, `diff-review --format json`, …), with `--format json` on session state, config, git, usage, fleet, and most daemons. **[📘 Full CLI reference →](man/cli.md)**, a generated, multi-hierarchy man page covering every subcommand.
 
 ### CLI — Scriptable Equivalent of Every TUI Feature
 
@@ -339,7 +339,7 @@ ainb completion zsh > ~/.zsh/completions/_ainb
 
 **41 top-level commands** — `tui`, `run`, `list`, `label`, `logs`, `attach`, `status`, `kill`, `auth`, `recover`, `config`, `git`, `favorites`, `init`, `doctor`, `reflect`, `presets`, `usage`, `statusline`, `claudecode`, `codex`, `tmux`, `otel`, `completion`, `abtop`, `web`, `witr`, `learnings`, `plugin`, `fleet`, `headroom`, `daemon`, `mcp`, `notifyd`, `hangar`, `rtk`, `update`, `diff-review`, `skill`, `source`, `search` — with nested subcommands for recover / config / git / favorites / presets / plugin / fleet / hangar / mcp / daemon / usage / skill / source.
 
-**[📘 Full CLI reference → docs/tui/cli.md](docs/tui/cli.md)**
+**[📘 Full CLI reference → docs/tui/cli.md](man/cli.md)**
 
 ### Installation
 
@@ -427,10 +427,10 @@ brew install ainb   # or brew upgrade ainb
 `ainb` boots a plugin host at startup. Some screens — notably **Analytics / Usage (the burndown dashboard)** — are provided by subprocess plugins that the host discovers and loads automatically. **All plugins are enabled by default**; you only need the controls below to turn them off or scope which ones load.
 
 <p align="center">
-  <img src="docs/assets/diagrams/plugin-architecture.svg" alt="ainb v2 plugin architecture: the host and its runtime, the JSON-RPC method sets on each side of the wire, the six in-tree plugins, and the two ways a plugin can draw" width="860">
+  <img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/diagrams/plugin-architecture.svg" alt="ainb v2 plugin architecture: the host and its runtime, the JSON-RPC method sets on each side of the wire, the six in-tree plugins, and the two ways a plugin can draw" width="860">
 </p>
 
-**How it works (in brief):** a v2 plugin is a **native subprocess** that speaks **JSON-RPC 2.0 over Content-Length-framed stdio** — no wasm, no in-process linking. The host (`ainb-core`) discovers each plugin from `dist/plugins/<id>/`, spawns it, and exchanges messages: `plugin/render` (the plugin returns a `WireBuffer` of cells the host blits), `plugin/handle_key`, `plugin/cli_dispatch` (routes `ainb <namespace> …`), plus reverse `host/snapshot/publish` calls over an **event bus**. Each plugin declares its `[capabilities]` in `manifest.toml`; the runtime denies any ungranted host call with JSON-RPC `-32001`. A plugin screen can render **two ways**: in-process via a `WireBuffer` (host owns the terminal — e.g. **burndown**), or as a **host-embedded foreign TTY** where ainb suspends and hands the terminal to an external interactive program (e.g. **witr**'s `witr -i` browser). Full walkthrough: [`docs/plugins/`](docs/plugins/overview.md).
+**How it works (in brief):** a v2 plugin is a **native subprocess** that speaks **JSON-RPC 2.0 over Content-Length-framed stdio**, no wasm, no in-process linking. The host (`ainb-core`) discovers each plugin from `dist/plugins/<id>/`, spawns it, and exchanges messages: `plugin/render` (the plugin returns a `WireBuffer` of cells the host blits), `plugin/handle_key`, `plugin/cli_dispatch` (routes `ainb <namespace> …`), plus reverse `host/snapshot/publish` calls over an **event bus**. Each plugin declares its `[capabilities]` in `manifest.toml`; the runtime denies any ungranted host call with JSON-RPC `-32001`. A plugin screen can render **two ways**: in-process via a `WireBuffer` (host owns the terminal, e.g. **burndown**), or as a **host-embedded foreign TTY** where ainb suspends and hands the terminal to an external interactive program (e.g. **witr**'s `witr -i` browser). Full walkthrough: [`docs/plugins/`](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/overview.md).
 
 There are four ways to filter plugins, with the following precedence (most specific wins):
 
@@ -601,14 +601,14 @@ A two-tier learning system that captures insights during development and retriev
 
 The `/reflect` skill captures learnings. The `/research` and `/prime` skills retrieve them. The [`reflect`](https://github.com/stevengonsalvez/ainb-reflect-memory) Python library (installed as the `reflect` CLI) manages the knowledge base directly — it lives in its own repo, [stevengonsalvez/ainb-reflect-memory](https://github.com/stevengonsalvez/ainb-reflect-memory), and installs via `uv tool install --upgrade 'git+https://github.com/stevengonsalvez/ainb-reflect-memory.git[graph]'`.
 
-**[How the knowledge system works →](docs/knowledge/overview.md)**
+**[How the knowledge system works →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/knowledge/overview.md)**
 
 ---
 
 ## Architecture
 
 <p align="center">
-  <img src="docs/assets/diagrams/ecosystem-architecture.svg" alt="agents-in-a-box ecosystem architecture: the ainb TUI host, the v2 plugin host and its six in-tree plugins, the nine daemons the TUI supervises, the separate toolkit and reflect-memory repos, and how it is distributed" width="900">
+  <img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/diagrams/ecosystem-architecture.svg" alt="agents-in-a-box ecosystem architecture: the ainb TUI host, the v2 plugin host and its six in-tree plugins, the nine daemons the TUI supervises, the separate toolkit and reflect-memory repos, and how it is distributed" width="900">
 </p>
 
 ```
@@ -642,41 +642,34 @@ agents-in-a-box/
 ├── config/                     # Shipped config: example.config.toml, tmux.conf,
 │                               # tmux-helpers/, zellij.kdl, default-presets/
 ├── install.sh                  # One-liner installer
+├── man/                        # Generated from the binary; the build gates diff them
+│   ├── ainb.1                  #   The ainb(1) man page
+│   ├── cli.md                  #   Full CLI reference
+│   └── keyboard-shortcuts.md   #   Effective built-in keymap
 │
-# reflect (the `reflect` CLI + GraphRAG/QMD engine and its Claude Code plugin)
-# now lives in a SEPARATE repo: github.com/stevengonsalvez/ainb-reflect-memory
-# — flattened, with the engine at its repo root and the plugin under plugin/.
-#
-├── plugins/                    # Claude Code plugins (root-level)
-│   ├── ainb-fleet/             #   Backs the `ainb fleet` CLI (standup/broadcast/sequence/needs/daemon)
-│   └── ainb-hooks/             #   ainb lifecycle hooks
+├── apps/
+│   └── ainb-fleet-macos/       # The native macOS Fleet app (Swift + Xcode)
 │
-# The portable toolkit (94 skills, 16 agents, workflows, utilities,
-# bootstrap.js, external-dependencies.yaml, catalog.yaml) lives in a
-# SEPARATE repo: github.com/stevengonsalvez/ainb-toolkit — flattened at
-# its repo root. `ainb` consumes it as a pinned external source.
-#
-├── plans/skill-manager/spec.md # v1 design + acceptance criteria
+├── plugins/
+│   └── ainb-hooks/             # Claude / Codex / Copilot lifecycle hooks,
+│                               # compiled into the binary by ainb-plugin-notifyd
 │
-├── docs/                       # Documentation hub (Markdown source of truth)
-│   ├── README.md               #   Docs TOC
-│   ├── product/                #   What ainb is, value, architecture
-│   ├── tui/                    #   ainb CLI reference, FAQ, keyboard shortcuts
-│   ├── toolkit/                #   ainb-toolkit reference (skills/agents/bootstrap)
-│   ├── plugins/                #   v2 plugin overview, user guide, authoring, spec
-│   ├── knowledge/              #   reflect/recall (GraphRAG + QMD)
-│   ├── contributing/           #   Build, CI/CD, release
-│   └── reference/              #   Architecture deep-dive, glossary
+├── docs/README.md              # What was left behind, and where it lives now
 │
-├── website/                    # Website source (Astro + Starlight)
-│   └── BRIEF.md                #   Original design brief (historical)      
-│
-└── .github/workflows/
-    ├── ci.yml                  #   Rust CI (fmt, clippy, test, deny, machete)
-    ├── toolkit-validation.yml  #   Skill Manager & Catalog CI (ainb + ainb-toolkit)
-    ├── release.yml             #   Cross-platform binary releases
-    └── deploy-pages.yml        #   Build & deploy the website to GitHub Pages
+└── .github/workflows/          # Carried over unchanged; rebuilt for this
+                                # layout in a later step
 ```
+
+The documentation hub, the website, the research notes and the other harness
+plugins are not in this repository yet: they are in its history and still live
+in `stevengonsalvez/agents-in-a-box`. See [`docs/README.md`](docs/README.md).
+
+The `reflect` CLI (the GraphRAG/QMD engine and its Claude Code plugin) lives
+in [`ainb-reflect-memory`](https://github.com/stevengonsalvez/ainb-reflect-memory),
+and the portable toolkit (94 skills, 16 agents, workflows, utilities,
+`bootstrap.js`, `external-dependencies.yaml`, `catalog.yaml`) in
+[`ainb-toolkit`](https://github.com/stevengonsalvez/ainb-toolkit), which
+`ainb` consumes as a pinned external source.
 
 ---
 
@@ -747,7 +740,7 @@ ainb doctor                                   # health-check the deployment
 > Prefer the TUI? Press `m` for the Skill Manager to browse + install units
 > with `[i]` and remove them with `[r]` — no manual URIs.
 
-See `plans/skill-manager/spec.md` for the full §8 CLI
+See [the skill-manager guide](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/guide.mdx) for the full §8 CLI
 surface (`source`, `skill`, `doctor`, `usage`).
 
 #### v1.1 — Discovery + adoption + promote
@@ -767,15 +760,15 @@ a hand-edited orphan into a git-backed source in one shot:
 clones the target repo, copies the unit, commits + pushes, and
 rewrites the manifest URI from `local:` to `gh:`.
 
-- [Discovery flow reference →](docs/skill-manager/discovery.md) —
+- [Discovery flow reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/discovery.md)
   walker classes, reconciler conflict matrix, banner UX
-- [`ainb skill promote` reference →](docs/skill-manager/promote.md) —
+- [`ainb skill promote` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/promote.md)
   command surface, locked design, failure modes
-- [`ainb skill usage` reference →](docs/skill-manager/usage.md) —
+- [`ainb skill usage` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/usage.md)
   per-unit invocation counts + last-used in the Detail pane (v1.2)
-- [`ainb skill sync` reference →](docs/skill-manager/sync.md) —
+- [`ainb skill sync` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/sync.md)
   bidirectional home ↔ repo reconciliation with `[s]` keybind (v1.2)
-- [`ainb skill check` reference →](docs/skill-manager/check.md) —
+- [`ainb skill check` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/check.md)
   drift detection + Units-panel status column (v1.2)
 
 Full spec at `.agents/goals/ainb-skill-manager-v1.1-discovery-spec.md`
@@ -797,7 +790,7 @@ and `.agents/goals/ainb-skill-manager-v1.2-rollup-plan.md`.
 - [Releases](https://github.com/stevengonsalvez/agents-in-a-box/releases)
 - [Homebrew Tap](https://github.com/stevengonsalvez/homebrew-agents-in-a-box)
 - [Issues](https://github.com/stevengonsalvez/agents-in-a-box/issues)
-- [Knowledge System Architecture](docs/knowledge/overview.md)
+- [Knowledge System Architecture](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/knowledge/overview.md)
 - [Toolkit Repository (ainb-toolkit)](https://github.com/stevengonsalvez/ainb-toolkit)
 
 ---

@@ -1,133 +1,3 @@
-#!/usr/bin/env bash
-# Generate the ainb(1) man page (man/ainb.1) from the real `ainb` binary.
-#
-# The COMMANDS section is generated: every top-level command's one-line "about"
-# and its immediate subcommand names come straight from the binary's recursive
-# `--help`, so the index can never drift from the actual CLI. Everything else
-# (DESCRIPTION, EXAMPLES, SPAWNING SESSIONS FROM AN AGENT, FILES, ENVIRONMENT,
-# EXIT STATUS) is authored prose that a --help dump cannot express.
-#
-# Driving the real binary (rather than clap_mangen over the clap tree) is not a
-# style choice, it is the only faithful option:
-#   * `tui` and `diff-review` are attached in main.rs AFTER the reusable
-#     builders, so no library-visible `clap::Command` contains them. Proof:
-#     `ainb completion zsh | grep -c diff-review` is 0 while `ainb --help`
-#     lists it. clap_mangen wired the same way inherits the same hole.
-#   * `skill` / `source` / `search` are intercepted before clap exists at all
-#     and routed to ainb-cli, yet they answer `--help` and are advertised in
-#     `ainb --help`. No clap-tree generator can see them.
-#
-# Usage:
-#   scripts/gen-man.sh                                  # builds ainb (release)
-#   AINB_BIN=target/debug/ainb scripts/gen-man.sh       # reuse a built bin
-#
-# CI freshness gate (see .github/workflows/ci.yml, job `cli-docs`):
-#   AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
-#   git diff --exit-code -- man/ainb.1
-#
-# Output is deterministic: registry order, and NO version string, NO build date,
-# NO timestamp anywhere (including `.TH`). A version in the header would make
-# every Cargo.toml bump turn the gate red for a page whose content did not
-# change, so the gate only fires on real CLI-surface changes.
-# DO NOT edit man/ainb.1 by hand.
-#
-# NB: pipefail is intentionally OFF, for the same reason as
-# gen-cli-reference.sh: the shared walk helpers early-exit their `awk`, which
-# SIGPIPEs the producing `ainb --help`; with pipefail + `set -e` that non-zero
-# pipe status would abort generation mid-tree. cargo build runs unpiped, so its
-# failure signal is not lost.
-set -eu
-
-# Repo paths. The script lives in scripts/, the generated references at
-# repo-root man/, and the repo root is the cargo workspace root.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT="$REPO_ROOT/man/ainb.1"
-
-# Resolve the binary: explicit AINB_BIN, else build release. Same three-form
-# resolution as gen-cli-reference.sh so a wrong cwd cannot silently pick up a
-# stale `ainb` from $PATH.
-if [[ -n "${AINB_BIN:-}" ]]; then
-  if [[ "$AINB_BIN" = /* ]]; then
-    BIN="$AINB_BIN"
-  elif [[ -x "$AINB_BIN" ]]; then
-    BIN="$(cd "$(dirname "$AINB_BIN")" && pwd)/$(basename "$AINB_BIN")"
-  else
-    BIN="$REPO_ROOT/$AINB_BIN"
-  fi
-else
-  echo "[gen-man] building ainb (release)..." >&2
-  ( cd "$REPO_ROOT" && cargo build --release -p ainb >&2 )
-  BIN="$REPO_ROOT/target/release/ainb"
-fi
-[[ -x "$BIN" ]] || { echo "[gen-man] binary not found: $BIN" >&2; exit 1; }
-
-# `children()` / `about_of()`: shared with scripts/gen-cli-reference.sh.
-# shellcheck source=lib/cli-walk.sh
-. "$SCRIPT_DIR/lib/cli-walk.sh"
-
-# Make text captured from the binary safe to paste into roff:
-#   \        -> \e     (a bare backslash starts a roff escape)
-#   U+2014   -> \(em   (and U+2013 -> \(en, U+2026 -> ...): keeps the page pure
-#                       ASCII, which nroff/mandoc render identically everywhere
-#   -        -> \-     (a literal minus, so options stay copy-pasteable instead
-#                       of becoming the typographic hyphen U+2010)
-# Order matters: backslashes first, then the unicode folds (their replacements
-# contain no minus), then minus.
-roff_escape() {
-  perl -CSD -pe '
-    s/\\/\\e/g;
-    s/\x{2014}/\\(em/g;
-    s/\x{2013}/\\(en/g;
-    s/\x{2026}/.../g;
-    s/-/\\-/g;
-  '
-}
-
-# Escape, then hard-wrap to 76 columns on word boundaries, then guard any line
-# that now starts with `.` or `'` (roff would read it as a request) with `\&`.
-#
-# The wrap is cosmetic for the reader of the .1 source only: roff refills the
-# text regardless. It is done in perl, never with `fmt`/`fold`, because those
-# differ between BSD (macOS dev boxes) and GNU (ubuntu CI) and would make the
-# freshness gate flap depending on where it ran. This implementation never
-# splits a word, so a `\-` or `\(em` escape can never be cut in half.
-roff_text() {
-  roff_escape | perl -ne '
-    chomp;
-    my $line = "";
-    for my $tok (split /\s+/) {
-      next if $tok eq "";
-      if (length($line) && length($line) + 1 + length($tok) > 76) {
-        print "$line\n"; $line = $tok;
-      } else {
-        $line = length($line) ? "$line $tok" : $tok;
-      }
-    }
-    print "$line\n" if length($line);
-  ' | perl -pe 's/^([.\x27])/\\&$1/;'
-}
-
-# One COMMANDS entry: `.TP` tag + the about line + (for groups) the immediate
-# subcommand names. One line each, by design: this section is a navigable index,
-# the exhaustive per-flag reference is man/cli.md and `ainb <cmd> --help`.
-emit_command() {
-  local cmd="$1"
-  local about; about="$(about_of "$cmd" | roff_text)"
-  local subs; subs="$(children "$cmd" | tr '\n' ' ' | sed -e 's/ $//' -e 's/ /, /g')"
-  printf '.TP\n.B ainb %s\n' "$(printf '%s' "$cmd" | roff_escape)"
-  [[ -n "$about" ]] && printf '%s\n' "$about"
-  if [[ -n "$subs" ]]; then
-    printf '.br\n%s\n' "$(printf 'Subcommands: %s' "$subs" | roff_text)"
-  fi
-}
-
-mkdir -p "$(dirname "$OUT")"
-
-{
-  # ---- Header + authored front matter -------------------------------------
-  # `.TH` carries NO version and NO date on purpose (see the header comment).
-  cat <<'HEAD'
 .\" Generated by scripts/gen-man.sh from the real `ainb` binary.
 .\" DO NOT EDIT BY HAND. Run the script and commit the result.
 .\"
@@ -193,10 +63,6 @@ block.
 Print the build identity (commit and date).
 .B \-V
 alone prints the bare semver.
-HEAD
-
-  # ---- COMMANDS (generated) ------------------------------------------------
-  cat <<'CMDHEAD'
 .SH COMMANDS
 One line per command, generated from the binary. Run
 .RI "ainb " COMMAND " \-\-help"
@@ -205,18 +71,189 @@ at
 .UR https://github.com/stevengonsalvez/hangar/blob/main/man/cli.md
 man/cli.md
 .UE .
-CMDHEAD
-
-  # Registry order (deterministic). `skill`, `source` and `search` are appended
-  # explicitly: they are intercepted before clap, so they never appear in the
-  # root `Commands:` block, yet the binary answers `--help` for each.
-  while IFS= read -r c; do
-    [[ -z "$c" ]] && continue
-    emit_command "$c"
-  done < <(children; printf 'skill\nsource\nsearch\n')
-
-  # ---- Authored tail -------------------------------------------------------
-  cat <<'TAIL'
+.TP
+.B ainb tui
+Launch the TUI (default if no command given)
+.TP
+.B ainb diff\-review
+Review a repository's uncommitted changes in the Code Review surface
+.TP
+.B ainb keymap
+List effective terminal shortcuts
+.br
+Subcommands: list
+.TP
+.B ainb run
+Spawn a new AI coding session
+.TP
+.B ainb list
+List all sessions (running + idle)
+.TP
+.B ainb label
+Set or clear a durable session label
+.TP
+.B ainb logs
+View session output/logs
+.TP
+.B ainb attach
+Attach to a session (drops into tmux)
+.TP
+.B ainb status
+Show a session's status/health
+.TP
+.B ainb kill
+Terminate a session
+.TP
+.B ainb auth
+Set up authentication
+.TP
+.B ainb recover
+Recover orphaned or crashed sessions
+.br
+Subcommands: list, resume, cleanup
+.TP
+.B ainb config
+Manage configuration
+.br
+Subcommands: show, get, set, reset, path, edit
+.TP
+.B ainb git
+Manage git worktrees + inspect session changes
+.br
+Subcommands: worktrees, cleanup, status
+.TP
+.B ainb favorites
+Manage favorite repositories
+.br
+Subcommands: list, add, remove, use
+.TP
+.B ainb init
+First\-time setup and prerequisite checking
+.TP
+.B ainb doctor
+Health\-check skills, dependencies, hooks, and daemons
+.TP
+.B ainb reflect
+Reflect plugin lifecycle: bootstrap installer + dependency check
+.br
+Subcommands: bootstrap, check
+.TP
+.B ainb presets
+Manage session presets
+.br
+Subcommands: list, show, create, delete, apply
+.TP
+.B ainb usage
+Usage analytics, reports, export, and optimization
+.br
+Subcommands: report, status, today, month, export, plan, currency,
+model\-alias, optimize, savings, compare, yield, cache, models
+.TP
+.B ainb claudecode
+Claude Code\-specific commands (statusline, etc.). Provider\-namespaced \(em
+other providers grow their own.
+.br
+Subcommands: statusline
+.TP
+.B ainb codex
+Codex\-specific commands (statusline, etc.). Provider\-namespaced \(em the
+Codex analog of `claudecode`.
+.br
+Subcommands: statusline
+.TP
+.B ainb tmux
+Manage the rich tmux.conf shipped with ainb\-tui (Catppuccin Mocha + TPM +
+resurrect/continuum/yank + discoverable detach hints).
+.br
+Subcommands: install, status
+.TP
+.B ainb otel
+Set up OpenTelemetry export to Grafana Cloud (Grafana Alloy pipeline)
+.br
+Subcommands: setup, status, start
+.TP
+.B ainb completion
+Generate shell completions (bash, zsh, fish, powershell, elvish)
+.TP
+.B ainb abtop
+Snapshot running AI agents (top\-for\-agents) via `abtop \-\-once`
+.TP
+.B ainb web
+Serve an SSE\-live web dashboard (live terminal + web\-push) for the fleet
+.TP
+.B ainb witr
+Trace a running process's causality chain (via the witr plugin)
+.TP
+.B ainb learnings
+Search your learnings knowledge base (via the learnings plugin)
+.TP
+.B ainb plugin
+Manage ainb plugins
+.br
+Subcommands: install, update, remove, list, search, marketplace, lint,
+watch, tail
+.TP
+.B ainb fleet
+Fleet orchestration: standup / broadcast / sequence / needs / cost / runtime
+/ daemon / daemons / atc / bridge
+.br
+Subcommands: approve, deny, interview, open\-terminal, standup, broadcast,
+msg, acp, transcript, channel, pal, adapter, confirm, activity, sequence,
+needs, archived, cost, daemon, daemons, runtime, atc, bridge, enrich\-cache
+.TP
+.B ainb headroom
+Manage the ainb\-managed Headroom compression proxy
+.br
+Subcommands: status, stop
+.TP
+.B ainb daemon
+Start, stop, or restart any ainb daemon
+.br
+Subcommands: list, bridge, notifyd, approve\-broker, atc, fleet\-daemon,
+mcp\-pool, hangar\-daemon, headroom\-proxy, release\-checker
+.TP
+.B ainb mcp
+Shared MCP server pool: daemon / proxy / status / stop / import / install
+.br
+Subcommands: daemon, proxy, status, stop, import, install
+.TP
+.B ainb notifyd
+ainb\-hooks notification daemon: status, restart (the approve\-socket
+resume/repair command), install/uninstall hooks
+.br
+Subcommands: run, stop, reap, restart, install, uninstall, status, list
+.TP
+.B ainb hangar
+Hangar managed\-agents control plane (issue / task / beads / daemon)
+.br
+Subcommands: issue, task, beads, daemon, connections, auth, config, skills,
+templates, agent, member, squad, autopilot, workspace, logs, property,
+comment, inbox, pipeline
+.TP
+.B ainb rtk
+RTK (Rust Token Killer): compress CLI output in Claude Code via PreToolUse
+hook
+.br
+Subcommands: status, install, uninstall
+.TP
+.B ainb update
+Update ainb to the latest signed stable release
+.br
+Subcommands: check, status, schedule
+.TP
+.B ainb skill
+Install / remove units across one or more target tools
+.br
+Subcommands: install, remove, update, sync, promote, usage, check, scan,
+browse, library
+.TP
+.B ainb source
+Manage source repositories declared in the manifest
+.br
+Subcommands: add, list, remove, enable, disable
+.TP
+.B ainb search
+Search across all enabled sources for units matching a query
 .SH EXAMPLES
 .SS Launch the TUI
 .RS 4
@@ -459,12 +496,27 @@ Everything ainb persists, for the current user. Never
 .IR ~/.ainb/ .
 .TP
 .I ~/.agents\-in\-a\-box/sessions.json
-The session store: one record per session (id, workspace name, tmux session
-name, worktree path, branch, provider). This is what
+The session mirror: one record per session (id, workspace name, tmux session
+name, worktree path, branch, provider). The hangar daemon's
+.I sessions
+table is what
 .B ainb list
 reads and what
 .BR "ainb attach" / "status" / "kill"
-resolve against.
+resolve against; this file is written beside it, row by row under its lock, so
+a previous release still sees current sessions.
+.IP
+A session written here by an older binary is added to the table on the daemon's
+next pass. A session REMOVED here, by an older binary's
+.B ainb kill
+or by hand, is not: a pass only adds, because a release that cannot refuse a
+damaged mirror would otherwise decide what the table holds. Such a row stays
+listed until it is killed through a current surface:
+.B ainb kill <id>
+ends it in both. Restoring an old copy of this file can likewise bring back
+rows for sessions that have since been killed;
+.B ainb kill
+clears them.
 .TP
 .I ~/.agents\-in\-a\-box/config/config.toml
 User configuration. Edit through
@@ -490,6 +542,19 @@ misbehaves.
 .I ./.ainb/config.toml
 Per\-repository overrides, read from the repository ainb is pointed at.
 .SH ENVIRONMENT
+.TP
+.B AINB_SESSION_SOURCE
+Set to
+.B file
+to make this one process read and write
+.I ~/.agents\-in\-a\-box/sessions.json
+instead of the daemon's sessions table, with no daemon call at all. It is read
+before anything is dialled, so it works whatever the daemon is doing, and it is
+the way back if the table is ever wrong: run the command with
+.B AINB_SESSION_SOURCE=file
+and the file decides. Any other value is ignored with one warning. A process
+forced onto the file still sees current sessions, because every write through
+the daemon keeps the file current.
 .TP
 .B AINB_HOME
 Relocates ainb's state so a test run or a throwaway fleet does not touch your
@@ -566,7 +631,3 @@ Report issues at
 .UR https://github.com/stevengonsalvez/agents\-in\-a\-box/issues
 github.com/stevengonsalvez/agents\-in\-a\-box/issues
 .UE .
-TAIL
-} > "$OUT"
-
-echo "[gen-man] wrote $OUT" >&2
