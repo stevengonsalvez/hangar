@@ -65,7 +65,7 @@ fleet:
     export AINB_BIN="$AINB"
     "$AINB" fleet runtime install
     BUILD_DIR="${TMPDIR:-/tmp}/ainb-fleet-derived-data"
-    xcodebuild -project ../apps/ainb-fleet-macos/AINBFleet.xcodeproj -scheme AINBFleet -configuration Debug -destination 'platform=macOS,arch=arm64' -derivedDataPath "$BUILD_DIR" build
+    xcodebuild -project apps/ainb-fleet-macos/AINBFleet.xcodeproj -scheme AINBFleet -configuration Debug -destination 'platform=macOS,arch=arm64' -derivedDataPath "$BUILD_DIR" build
     open "$BUILD_DIR/Build/Products/Debug/AINBFleet.app"
 
 # Run tests
@@ -178,15 +178,14 @@ gen-cli-ref:
     AINB_BIN=target/debug/ainb bash scripts/gen-cli-reference.sh
 
 # Fail if docs/tui/cli.md has drifted from the binary
-# (docs/tui/ lives at the repo root, one level up from this justfile)
 #
 # `git ls-files --error-unmatch` FIRST: `git diff` ignores untracked files, so
 # a generated page that was never `git add`ed makes the diff a silent no-op and
 # the gate passes while nothing ships.
 check-cli-ref: gen-cli-ref
-    git ls-files --error-unmatch ../docs/tui/cli.md > /dev/null
-    test -f ../docs/tui/cli.md
-    git diff --exit-code -- ../docs/tui/cli.md
+    git ls-files --error-unmatch docs/tui/cli.md > /dev/null
+    test -f docs/tui/cli.md
+    git diff --exit-code -- docs/tui/cli.md
 
 # Regenerate docs/man/ainb.1 (the ainb(1) man page) from the ainb binary
 gen-man:
@@ -196,13 +195,13 @@ gen-man:
 # Fail if docs/man/ainb.1 has drifted from the binary, or was never committed
 # (see check-cli-ref for why the tracked-ness assertion comes first)
 check-man: gen-man
-    git ls-files --error-unmatch ../docs/man/ainb.1 > /dev/null
-    test -f ../docs/man/ainb.1
-    git diff --exit-code -- ../docs/man/ainb.1
+    git ls-files --error-unmatch docs/man/ainb.1 > /dev/null
+    test -f docs/man/ainb.1
+    git diff --exit-code -- docs/man/ainb.1
 
 # Render the man page locally exactly as `man ainb` will after install
 man-preview: gen-man
-    man ../docs/man/ainb.1
+    man docs/man/ainb.1
 
 # Run the v2 conformance axes against every in-tree plugin BINARY and print
 # the plugin x axis matrix. The synthetic-canary suite in
