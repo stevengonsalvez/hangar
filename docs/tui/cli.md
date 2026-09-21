@@ -10,7 +10,7 @@ scripts. Run `ainb` with no arguments to launch the TUI; use any subcommand
 below for non-interactive work.
 
 > **Generated — do not edit by hand.** This page is produced from the live
-> binary by [`ainb-tui/scripts/gen-cli-reference.sh`](https://github.com/stevengonsalvez/agents-in-a-box/blob/main/ainb-tui/scripts/gen-cli-reference.sh),
+> binary by [`scripts/gen-cli-reference.sh`](https://github.com/stevengonsalvez/hangar/blob/main/scripts/gen-cli-reference.sh),
 > which walks `ainb <cmd> --help` for every command. CI fails if it drifts, so
 > the output of `ainb --help` stays the source of truth. To update: run the
 > script and commit the result.
