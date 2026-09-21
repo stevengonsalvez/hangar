@@ -92,7 +92,7 @@ pub fn staged_plugin() -> Option<PathBuf> {
 
 /// The staged plugin root (`<workspace-root>/dist/plugins`).
 ///
-/// `build-plugins.sh` stages into `dist/plugins/<id>/<id>` — a path
+/// `build-plugins.sh` stages into `dist/plugins/<id>/<id>`, a path
 /// relative to the *repo workspace root* (`cd "$(dirname "$0")/.."`), NOT under
 /// any `target/` dir. So the anchor MUST be the repo, not the build output dir.
 ///
