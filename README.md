@@ -321,7 +321,7 @@ A Rust-based terminal application for managing AI coding sessions with git workt
 - **Usage analytics** — Built-in token + session tracking by day, week, provider, and project. Know where your budget went — then cut it with [The Token Optimisation Playbook](https://stevengonsalvez.com/blog/token-optimisation-playbook)
 - **Easy onboarding** — First-run setup wizard checks dependencies, configures auth, and gets you creating sessions in minutes
 - **Live log streaming** — Real-time viewer with level filtering and search across all running sessions
-- **Scriptable CLI** — 41 commands (every TUI action, plus headless `witr`, `learnings search`, `diff-review --format json`, …), with `--format json` on session state, config, git, usage, fleet, and most daemons. **[📘 Full CLI reference →](man/cli.md)** — a generated, multi-hierarchy man page covering every subcommand.
+- **Scriptable CLI**: 41 commands (every TUI action, plus headless `witr`, `learnings search`, `diff-review --format json`, …), with `--format json` on session state, config, git, usage, fleet, and most daemons. **[📘 Full CLI reference →](man/cli.md)**, a generated, multi-hierarchy man page covering every subcommand.
 
 ### CLI — Scriptable Equivalent of Every TUI Feature
 
@@ -430,7 +430,7 @@ brew install ainb   # or brew upgrade ainb
   <img src="https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/v2/docs/assets/diagrams/plugin-architecture.svg" alt="ainb v2 plugin architecture: the host and its runtime, the JSON-RPC method sets on each side of the wire, the six in-tree plugins, and the two ways a plugin can draw" width="860">
 </p>
 
-**How it works (in brief):** a v2 plugin is a **native subprocess** that speaks **JSON-RPC 2.0 over Content-Length-framed stdio** — no wasm, no in-process linking. The host (`ainb-core`) discovers each plugin from `dist/plugins/<id>/`, spawns it, and exchanges messages: `plugin/render` (the plugin returns a `WireBuffer` of cells the host blits), `plugin/handle_key`, `plugin/cli_dispatch` (routes `ainb <namespace> …`), plus reverse `host/snapshot/publish` calls over an **event bus**. Each plugin declares its `[capabilities]` in `manifest.toml`; the runtime denies any ungranted host call with JSON-RPC `-32001`. A plugin screen can render **two ways**: in-process via a `WireBuffer` (host owns the terminal — e.g. **burndown**), or as a **host-embedded foreign TTY** where ainb suspends and hands the terminal to an external interactive program (e.g. **witr**'s `witr -i` browser). Full walkthrough: [`docs/plugins/`](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/overview.md).
+**How it works (in brief):** a v2 plugin is a **native subprocess** that speaks **JSON-RPC 2.0 over Content-Length-framed stdio**, no wasm, no in-process linking. The host (`ainb-core`) discovers each plugin from `dist/plugins/<id>/`, spawns it, and exchanges messages: `plugin/render` (the plugin returns a `WireBuffer` of cells the host blits), `plugin/handle_key`, `plugin/cli_dispatch` (routes `ainb <namespace> …`), plus reverse `host/snapshot/publish` calls over an **event bus**. Each plugin declares its `[capabilities]` in `manifest.toml`; the runtime denies any ungranted host call with JSON-RPC `-32001`. A plugin screen can render **two ways**: in-process via a `WireBuffer` (host owns the terminal, e.g. **burndown**), or as a **host-embedded foreign TTY** where ainb suspends and hands the terminal to an external interactive program (e.g. **witr**'s `witr -i` browser). Full walkthrough: [`docs/plugins/`](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/plugins/overview.md).
 
 There are four ways to filter plugins, with the following precedence (most specific wins):
 
@@ -760,15 +760,15 @@ a hand-edited orphan into a git-backed source in one shot:
 clones the target repo, copies the unit, commits + pushes, and
 rewrites the manifest URI from `local:` to `gh:`.
 
-- [Discovery flow reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/discovery.md) —
+- [Discovery flow reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/discovery.md)
   walker classes, reconciler conflict matrix, banner UX
-- [`ainb skill promote` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/promote.md) —
+- [`ainb skill promote` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/promote.md)
   command surface, locked design, failure modes
-- [`ainb skill usage` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/usage.md) —
+- [`ainb skill usage` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/usage.md)
   per-unit invocation counts + last-used in the Detail pane (v1.2)
-- [`ainb skill sync` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/sync.md) —
+- [`ainb skill sync` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/sync.md)
   bidirectional home ↔ repo reconciliation with `[s]` keybind (v1.2)
-- [`ainb skill check` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/check.md) —
+- [`ainb skill check` reference →](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/check.md)
   drift detection + Units-panel status column (v1.2)
 
 Full spec at `.agents/goals/ainb-skill-manager-v1.1-discovery-spec.md`
