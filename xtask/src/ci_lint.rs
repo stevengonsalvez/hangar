@@ -24,7 +24,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_yaml::Value;
 
 /// Entry point for the `ci-lint` subcommand. Resolves the workflow file from the
-/// repo root (the cargo workspace's parent) and validates the Hangar contract.
+/// repository root (the cargo workspace root) and validates the Hangar contract.
 pub fn run() -> Result<()> {
     let ci_yml = ci_yml_path()?;
     let text = fs::read_to_string(&ci_yml).with_context(|| format!("read {}", ci_yml.display()))?;
@@ -33,16 +33,12 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-/// `<workspace>/xtask` → `<workspace>` → `<repo_root>/.github/workflows/ci.yml`.
-/// The cargo workspace is `ainb-tui/`; `.github` lives at the repo root, one
-/// level above.
+/// `<repo_root>/xtask` → `<repo_root>/.github/workflows/ci.yml`. The cargo
+/// workspace root IS the repository root, so `.github` is its direct child.
 fn ci_yml_path() -> Result<PathBuf> {
     let xtask_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace =
+    let repo_root =
         xtask_dir.parent().ok_or_else(|| anyhow!("xtask manifest dir has no parent"))?;
-    let repo_root = workspace
-        .parent()
-        .ok_or_else(|| anyhow!("workspace dir has no parent (repo root)"))?;
     Ok(repo_root.join(".github/workflows/ci.yml"))
 }
 
