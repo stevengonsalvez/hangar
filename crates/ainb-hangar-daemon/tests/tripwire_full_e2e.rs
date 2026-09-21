@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 const BASELINE_TRIPWIRES: usize = 34;
 
 /// `tests/` directories that hold Hangar tripwires, relative to the cargo
-/// workspace root (`ainb-tui/`).
+/// workspace root (the repository root).
 const TRIPWIRE_DIRS: &[&str] = &[
     "crates/ainb-hangar-daemon/tests",
     "crates/ainb-hangar-store/tests",
