@@ -21,7 +21,6 @@
 //! (both present on every CI runner). No tmux. To run just this file:
 //!
 //! ```bash
-//! cd ainb-tui
 //! cargo test -p ainb --test sandbox_script_safety_guards
 //! ```
 //!
@@ -33,10 +32,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 
 /// Absolute path to the script under test. `CARGO_MANIFEST_DIR` is the
-/// `ainb-core` crate dir; the repo root is three levels up.
+/// `ainb-core` crate dir; the repo root is two levels up.
 fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("..")
         .join("..")
         .join("scripts")
