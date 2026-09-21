@@ -276,7 +276,7 @@ cmd_tui() {
 # real app's UserDefaults - without it the two instances share preferences.
 cmd_macos() {
   guard
-  local app="${SBX_MACOS_APP:-$REPO_ROOT/../apps/ainb-fleet-macos/build/Debug/AINBFleet.app}"
+  local app="${SBX_MACOS_APP:-$REPO_ROOT/apps/ainb-fleet-macos/build/Debug/AINBFleet.app}"
   local exe="$app/Contents/MacOS/AINBFleet"
   [ -x "$exe" ] || die "no app binary at $exe
   build it first:
