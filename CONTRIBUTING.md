@@ -17,7 +17,7 @@ cargo build --release
 | Path | Purpose |
 |------|---------|
 | `crates/` | The `ainb` binary (Rust): TUI plus `source`, `skill`, `doctor`, `usage` CLI subcommands. This is the canonical deploy / update / sync surface. |
-| `plans/skill-manager/spec.md` | Full design + acceptance criteria for the unit manager. |
+| [The skill-manager guide](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/guide.mdx) | Design and acceptance criteria for the unit manager. Left behind for porting; see `docs/README.md`. |
 | `.claude-plugin/marketplace.json` | This repo's Claude plugin marketplace manifest |
 
 The `reflect` long-term-memory system (engine + plugin) was extracted from

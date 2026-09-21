@@ -1,22 +1,17 @@
-# Worktree-level just dispatch plus the Rust workspace recipes.
+# The Rust workspace's recipes.
 #
-# Domain-specific recipes live in sibling `.just` modules so other surfaces
-# (hangar, swarm, ...) can slot in later without recipe-name collisions; the
-# workspace recipes below came from ainb-tui/justfile when the Cargo workspace
-# moved to the repository root.
+# Domain-specific recipes can live in sibling `.just` modules, added back with
+# `mod <name> '<name>.just'`, so other surfaces can slot in without
+# recipe-name collisions.
 #
 # Usage:
-#   just --list-submodules           # see every domain
-#   just skill-manager --list        # see skill-manager's recipes
-#   just skill-manager up --tier full
+#   just --list                      # see every recipe
 #
 # Install: `brew install just` (or your platform's equivalent).
 
 set shell := ["bash", "-cu"]
 
-mod skill-manager 'skill-manager.just'
-
-# Default - list everything (top-level + submodules).
+# Default - list everything.
 default:
     @just --list
 
@@ -35,10 +30,10 @@ run *args:
 # Rebuild plugins + both binaries + restart the daemon, then run the TUI
 #
 # The complete dev launch (replaces `./scripts/build-plugins.sh && cargo run`):
-#   1. build-plugins.sh — restages every subprocess plugin (the hangar TUI is
+#   1. build-plugins.sh restages every subprocess plugin (the hangar TUI is
 #      one; `cargo run` alone never rebuilds it → you'd get a STALE plugin).
 #   2. build ainb + ainb-hangar-daemon.
-#   3. daemon restart — `daemon start` no-ops on a live pid, so a rebuild alone
+#   3. daemon restart: `daemon start` no-ops on a live pid, so a rebuild alone
 #      leaves the OLD daemon serving the DB (the blank-board trap). Restarting
 #      puts the fresh binary in charge; the health pane then shows no drift.
 #   4. run the TUI. AINB_BIN is pinned so every self-spawn resolves to the fresh
@@ -122,7 +117,7 @@ test-live-branch:
 # The codex leg of `test-live`: same law (assert the on-disk nonce artifact
 # FIRST, task=done only as a cross-check), one provider over. Skips CLEAN + LOUD
 # (exit 0) when there is no authenticated `codex` on PATH, via a bounded
-# liveness probe (`codex exec -- "reply PONG"`) — macOS has no `timeout`, so a
+# liveness probe (`codex exec -- "reply PONG"`). macOS has no `timeout`, so a
 # background killer bounds it. The Rust test carries the same skip gate, so this
 # recipe only fast-fails the build when codex is plainly absent.
 test-live-codex:
@@ -172,36 +167,36 @@ lint-fix:
 check-no-probes:
     bash scripts/check-no-probes.sh
 
-# Regenerate docs/tui/cli.md from the ainb binary (source of truth)
+# Regenerate man/cli.md from the ainb binary (source of truth)
 gen-cli-ref:
     cargo build -p ainb
     AINB_BIN=target/debug/ainb bash scripts/gen-cli-reference.sh
 
-# Fail if docs/tui/cli.md has drifted from the binary
+# Fail if man/cli.md has drifted from the binary
 #
 # `git ls-files --error-unmatch` FIRST: `git diff` ignores untracked files, so
 # a generated page that was never `git add`ed makes the diff a silent no-op and
 # the gate passes while nothing ships.
 check-cli-ref: gen-cli-ref
-    git ls-files --error-unmatch docs/tui/cli.md > /dev/null
-    test -f docs/tui/cli.md
-    git diff --exit-code -- docs/tui/cli.md
+    git ls-files --error-unmatch man/cli.md > /dev/null
+    test -f man/cli.md
+    git diff --exit-code -- man/cli.md
 
-# Regenerate docs/man/ainb.1 (the ainb(1) man page) from the ainb binary
+# Regenerate man/ainb.1 (the ainb(1) man page) from the ainb binary
 gen-man:
     cargo build -p ainb
     AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
 
-# Fail if docs/man/ainb.1 has drifted from the binary, or was never committed
+# Fail if man/ainb.1 has drifted from the binary, or was never committed
 # (see check-cli-ref for why the tracked-ness assertion comes first)
 check-man: gen-man
-    git ls-files --error-unmatch docs/man/ainb.1 > /dev/null
-    test -f docs/man/ainb.1
-    git diff --exit-code -- docs/man/ainb.1
+    git ls-files --error-unmatch man/ainb.1 > /dev/null
+    test -f man/ainb.1
+    git diff --exit-code -- man/ainb.1
 
 # Render the man page locally exactly as `man ainb` will after install
 man-preview: gen-man
-    man docs/man/ainb.1
+    man man/ainb.1
 
 # Run the v2 conformance axes against every in-tree plugin BINARY and print
 # the plugin x axis matrix. The synthetic-canary suite in

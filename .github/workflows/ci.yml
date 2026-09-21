@@ -1,287 +1,182 @@
 name: CI
 
-on:
-  push:
-    branches: [main, v2]
-    paths:
-      - "ainb-tui/**"
-      - "plugins/ainb-hooks/**"
-      - "ainb-tui/crates/ainb-plugin-hangar/**"
-      - "scripts/hangar/**"
-      - "Cargo.*"
-      - ".github/workflows/ci.yml"
-  pull_request:
-    branches: [main, v2]
-  # The chat-bus smoke lane is opt-in and boots real processes; manual dispatch
-  # is how an operator asks for it without labelling a PR.
-  workflow_dispatch:
-
-# Superseded pushes used to run to completion: four pushes to one branch in
-# half an hour queued four full runs, and the last one spent 190 minutes
-# waiting for a runner rather than working. Group per ref and cancel only on
-# pull_request, a push to main must still get its own complete run.
+# The five required checks, and nothing else. Everything slow, network-bound or
+# flaky-by-construction lives in nightly.yml.
 #
-# The gates below say `!cancelled()`, never `always()`. `always()` runs a job
-# or step even when the run has been CANCELLED, so with `always()` in place
-# this concurrency group would cancel a superseded run and then watch it keep
-# building anyway. `!cancelled()` keeps the same fail-open behaviour when the
-# `changes` job errors, which is the only reason the gates reach for a status
-# function at all.
+# DO NOT RENAME any `name:` below. Each one is matched as a literal string by
+# branch protection. A renamed job reports under its new name, the required
+# context stays "Expected" forever, and every open PR becomes unmergeable until
+# protection is edited to match. Widening what a job covers is free; renaming it
+# is not.
+#
+# There is deliberately NO `on.paths` and NO paths-filter job. A workflow skipped
+# by `on.paths` creates no check run at all, so a required context stays
+# "Expected" and the PR can never merge; the old file spent about 200 lines and a
+# whole job working around that. In a Rust monorepo where nearly every PR touches
+# crates/, the filter bought little and cost the entire footgun. The trade is
+# stated plainly: a README-only PR pays the full run.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Superseded pushes used to run to completion: four pushes to one branch in half
+# an hour queued four full runs. Group per ref and cancel only on pull_request,
+# because a push to main must still get its own complete run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
-  WORKING_DIR: ainb-tui
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  # Which paths changed?
-  #
-  # Path filtering lives HERE, on the jobs, and NOT on `on.pull_request.paths`.
-  # A workflow skipped by `on.paths` creates no check runs at all, so a required
-  # context stays "Expected" forever and the PR can never merge — that is what
-  # blocked every Swift-only and docs-only PR (bead mbl).
-  # A job skipped by an `if:` DOES report, and a skipped job satisfies a required
-  # check, so the gate stays honest while irrelevant PRs still cost no compute.
-  #
-  # `on.push` keeps its own `paths:` — push runs are not required checks, so
-  # main-branch CI cost is unchanged.
-  #
-  # WHAT HAPPENS WHEN THIS JOB ITSELF FAILS. The four matrix jobs below
-  # (`test`, `ainb-hooks`, `fleet-send-tmux`, `hangar-e2e`) gate their STEPS
-  # on `needs.changes.outputs.relevant != 'false'`. If a failed `changes`
-  # made that comparison false, all four would conclude GREEN having
-  # executed nothing: the required checks would be satisfied by four jobs
-  # that ran no tests, and a PR could merge untested. That is NOT what
-  # happens, and it is measured rather than assumed:
-  #
-  # Run 33393560903 forced this job to fail before dorny/paths-filter could
-  # set `relevant` (the filter step reports `skipped`, so the output is
-  # genuinely absent, not stale). All sixteen jobs dispatched, the four
-  # matrix jobs reported under their EXPANDED names, and the step-level
-  # guards RAN: `ainb-hooks (ubuntu-latest)` (job 99492659192) concluded
-  # success with all seven of its real steps executed, and both
-  # `fleet send integrity` legs did the same. A missing output resolves to
-  # the empty string, and `'' != 'false'` is true.
-  #
-  # Worth re-measuring if GitHub ever changes that resolution, because the
-  # failure would be SILENT: a job green-with-every-step-skipped is
-  # indistinguishable from a real pass in `gh pr checks` or in any job-level
-  # summary. Only the `steps[]` conclusions from
-  # `/actions/runs/<id>/jobs` tell the two apart.
-  # ────────────────────────────────────────────────────────────────────────────
-  changes:
-    name: Detect relevant changes
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    outputs:
-      relevant: ${{ steps.filter.outputs.relevant }}
-      acp: ${{ steps.filter.outputs.acp }}
-    steps:
-      - uses: dorny/paths-filter@v3
-        if: github.event_name == 'pull_request'
-        id: filter
-        with:
-          filters: |
-            relevant:
-              - 'ainb-tui/**'
-              - 'plugins/ainb-hooks/**'
-              - 'scripts/hangar/**'
-              - 'Cargo.*'
-              - '.github/workflows/ci.yml'
-              # The generated docs live outside ainb-tui/. Without them here, a
-              # PR that hand-edits a generated page skips the very job that
-              # would have caught the edit.
-              - 'docs/man/**'
-              - 'docs/tui/cli.md'
-              - 'docs/tui/keyboard-shortcuts.md'
-            # Coupled lane. A store change (a migration especially) can break
-            # the ACP writer without touching one line of ainb-acp, so the
-            # store fires this lane too; so does the daemon, which hosts the
-            # library from Phase 5 on.
-            acp:
-              - 'ainb-tui/crates/ainb-acp/**'
-              - 'ainb-tui/crates/ainb-hangar-store/**'
-              - 'ainb-tui/crates/ainb-hangar-daemon/**'
-              - 'ainb-tui/Cargo.toml'
-              - 'ainb-tui/Cargo.lock'
-              - '.github/workflows/ci.yml'
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Format check
-  # ────────────────────────────────────────────────────────────────────────────
-  fmt:
-    name: Rustfmt
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
-    timeout-minutes: 10
+  # ──────────────────────────────────────────────────────────────────────────
+  # Everything cheap enough to be worth failing fast on: formatting, the
+  # workflow files themselves, the hook scripts, and the two committed-artifact
+  # sanity checks. Folding the old standalone actionlint workflow in here saves
+  # a workflow file and a checkout.
+  # ──────────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Test and Contracts both refuse to save (see their comments), so this
+          # job and `generated` are the cache writers. Saving only from main also
+          # means a fork PR can restore a cache but never write one.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
-        working-directory: ${{ env.WORKING_DIR }}
       # An abandoned debugging probe reverts real behaviour while every doc
       # comment, test and help string around it still asserts the fix. Cheap
       # grep, runs in the fastest job.
       - name: No leftover debugging probes
         run: bash scripts/check-no-probes.sh
-        working-directory: ${{ env.WORKING_DIR }}
+      # Asserts the hangar-e2e contract in nightly.yml: both runners in its
+      # matrix, and tmux installed before the tripwire script. See
+      # xtask/src/ci_lint.rs.
+      - name: Assert the nightly hangar-e2e contract
+        run: cargo xtask ci-lint
+      # Guards the failure mode that let toolkit-validation.yml sit broken for
+      # six weeks: an unparseable workflow file produces a run with ZERO jobs,
+      # which GitHub reports as neither red nor amber.
+      #
+      # shellcheck is intentionally disabled (-shellcheck=): it flags
+      # pre-existing style and quoting nits in unrelated `run:` blocks that would
+      # fail any PR touching workflow files for reasons unrelated to workflow
+      # validity. Everything actionlint checks on top of shellcheck (YAML syntax,
+      # expression syntax, job and step schema, action input validation,
+      # reachability) stays on, which is what catches the original defect.
+      - name: Download actionlint
+        id: get_actionlint
+        run: bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+        shell: bash
+      - name: Check workflow files
+        run: ${{ steps.get_actionlint.outputs.executable }} -color -shellcheck=
+        shell: bash
+      - name: Hook script parses
+        run: bash -n plugins/ainb-hooks/hooks/notify.sh
+      - name: Stall guard compiles and its self-check passes
+        run: |
+          python3 -m py_compile plugins/ainb-hooks/hooks/stall_guard.py
+          python3 plugins/ainb-hooks/hooks/stall_guard.py --self-test
+      # Nine zero-byte GIFs reached main because a recorder failed silently and
+      # nothing checked that a committed artifact carries bytes. A file existing
+      # is not evidence.
+      - name: Every committed recording carries bytes
+        run: |
+          empty="$(find crates/ainb-core/tests/recordings -type f -empty -print)"
+          if [ -n "$empty" ]; then
+            echo "::error::empty recording artifacts committed:"; echo "$empty"; exit 1
+          fi
+          echo "all recordings non-empty"
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Generated-docs freshness. docs/tui/cli.md AND docs/man/ainb.1 are both
-  # generated from `ainb --help`. Fails if either drifts, so the binary stays
-  # the single source of truth. One job: the build is paid for once.
+  # ──────────────────────────────────────────────────────────────────────────
+  # Generated artifacts freshness. man/cli.md, man/keyboard-shortcuts.md and
+  # man/ainb.1 are all generated from the real `ainb` binary, and
+  # crates/ainb-app/bindings/AppState.ts is generated from the mirror frame's
+  # Rust types by specta. All four are committed, and this job fails if any of
+  # them drifts, so the code stays the single source of truth.
   #
-  # DO NOT RENAME `name:`. It is a required status check in the `main` ruleset,
-  # matched by the literal string below. A renamed job reports under the new
-  # name, the required context stays "Expected" forever, and every PR is
-  # unmergeable until the ruleset is edited to match. Widening what this job
-  # covers is free; renaming it is not.
-  # ────────────────────────────────────────────────────────────────────────────
-  cli-docs:
-    name: CLI reference freshness
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "ainb-tui -> target"
-      - name: Build ainb
-        run: cargo build -p ainb
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Regenerate CLI reference from the binary
-        run: AINB_BIN=target/debug/ainb bash scripts/gen-cli-reference.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Assert docs/tui/cli.md is up to date
-        run: |
-          # Tracked-ness FIRST: `git diff` ignores untracked files, so an
-          # uncommitted generated page would make the diff a silent no-op and
-          # this job would go green having shipped nothing.
-          if ! git ls-files --error-unmatch docs/tui/cli.md > /dev/null 2>&1; then
-            echo "::error::docs/tui/cli.md is not tracked by git: generate it and commit the result." >&2
-            exit 1
-          fi
-          if ! git diff --exit-code -- docs/tui/cli.md; then
-            echo "::error::docs/tui/cli.md is stale: run ainb-tui/scripts/gen-cli-reference.sh and commit the result." >&2
-            exit 1
-          fi
-      - name: Regenerate keyboard shortcuts from the keymap
-        run: AINB_BIN=target/debug/ainb bash scripts/gen-keymap-docs.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Assert docs/tui/keyboard-shortcuts.md is up to date
-        run: |
-          if ! git ls-files --error-unmatch docs/tui/keyboard-shortcuts.md > /dev/null 2>&1; then
-            echo "::error::docs/tui/keyboard-shortcuts.md is not tracked by git: generate it and commit the result." >&2
-            exit 1
-          fi
-          if ! git diff --exit-code -- docs/tui/keyboard-shortcuts.md; then
-            echo "::error::docs/tui/keyboard-shortcuts.md is stale: run ainb-tui/scripts/gen-keymap-docs.sh and commit the result." >&2
-            exit 1
-          fi
-        working-directory: ${{ github.workspace }}
-      - name: Regenerate the man page from the binary
-        run: AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Assert docs/man/ainb.1 is up to date
-        run: |
-          # Same tracked-ness assertion as above: without it a man page that
-          # was never committed passes the freshness gate, and the release
-          # tarball / install.sh ship no man page at all.
-          if ! git ls-files --error-unmatch docs/man/ainb.1 > /dev/null 2>&1; then
-            echo "::error::docs/man/ainb.1 is not tracked by git: generate it with ainb-tui/scripts/gen-man.sh and commit the result." >&2
-            exit 1
-          fi
-          if ! git diff --exit-code -- docs/man/ainb.1; then
-            echo "::error::docs/man/ainb.1 is stale: run ainb-tui/scripts/gen-man.sh and commit the result." >&2
-            exit 1
-          fi
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Mirror fan-out bench (W0-mirror, D15). A SolidJS store at 100 sessions takes
-  # a seeded 2,000-frame burst over 2 s. Per-drain apply must hold the spike 4
-  # ceilings (12,800 computation runs, 32.5 ms apply per 1,000 frames, 2.4 ms
-  # longest unit, exactly 125 apply units) and per-send mode must fail both
-  # numeric gates, so a regression to one write per frame cannot pass. No Rust
-  # build: the bench is the renderer half of the contract.
-  # ────────────────────────────────────────────────────────────────────────────
-  mirror-fanout:
-    name: Mirror fan-out bench
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ainb-tui/bench/mirror-fanout
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: ainb-tui/bench/mirror-fanout/package-lock.json
-      - name: Install the bench's pinned SolidJS
-        run: npm ci --no-audit --no-fund
-      - name: Run the bench and assert the ceilings
-        run: npm run bench
-      - name: Keep the numbers
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mirror-fanout-results
-          path: ainb-tui/bench/mirror-fanout/results.json
-          if-no-files-found: warn
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # TypeScript bindings freshness (W0-mirror, D15). `AppState.ts` is generated
-  # from the mirror frame's Rust types by specta behind the one
-  # `typescript-bindings` feature and committed, like docs/tui/cli.md. This job
-  # builds the feature across the type closure, regenerates the file and fails
-  # on any diff, then type-checks the sample frames' real JSON against it with
-  # `tsc --strict`, so the contract describes what a host sends.
-  # ────────────────────────────────────────────────────────────────────────────
-  bindings:
-    name: TypeScript bindings freshness
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
+  # One job for all four: the cargo build is paid for once.
+  # ──────────────────────────────────────────────────────────────────────────
+  generated:
+    name: Generated artifacts freshness
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: "ainb-tui -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build ainb
+        run: cargo build -p ainb
+      - name: Regenerate the CLI reference from the binary
+        run: AINB_BIN=target/debug/ainb bash scripts/gen-cli-reference.sh
+      - name: Assert man/cli.md is up to date
+        run: |
+          # Tracked-ness FIRST: `git diff` ignores untracked files, so an
+          # uncommitted generated page would make the diff a silent no-op and
+          # this job would go green having shipped nothing.
+          if ! git ls-files --error-unmatch man/cli.md > /dev/null 2>&1; then
+            echo "::error::man/cli.md is not tracked by git: generate it and commit the result." >&2
+            exit 1
+          fi
+          if ! git diff --exit-code -- man/cli.md; then
+            echo "::error::man/cli.md is stale: run scripts/gen-cli-reference.sh and commit the result." >&2
+            exit 1
+          fi
+      - name: Regenerate keyboard shortcuts from the keymap
+        run: AINB_BIN=target/debug/ainb bash scripts/gen-keymap-docs.sh
+      - name: Assert man/keyboard-shortcuts.md is up to date
+        run: |
+          if ! git ls-files --error-unmatch man/keyboard-shortcuts.md > /dev/null 2>&1; then
+            echo "::error::man/keyboard-shortcuts.md is not tracked by git: generate it and commit the result." >&2
+            exit 1
+          fi
+          if ! git diff --exit-code -- man/keyboard-shortcuts.md; then
+            echo "::error::man/keyboard-shortcuts.md is stale: run scripts/gen-keymap-docs.sh and commit the result." >&2
+            exit 1
+          fi
+      - name: Regenerate the man page from the binary
+        run: AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
+      - name: Assert man/ainb.1 is up to date
+        run: |
+          # Same tracked-ness assertion: without it a man page that was never
+          # committed passes the freshness gate, and the release tarball ships
+          # no man page at all.
+          if ! git ls-files --error-unmatch man/ainb.1 > /dev/null 2>&1; then
+            echo "::error::man/ainb.1 is not tracked by git: generate it with scripts/gen-man.sh and commit the result." >&2
+            exit 1
+          fi
+          if ! git diff --exit-code -- man/ainb.1; then
+            echo "::error::man/ainb.1 is stale: run scripts/gen-man.sh and commit the result. Authored prose belongs in the script's heredoc, not in the page." >&2
+            exit 1
+          fi
+      # WRITE_BINDINGS_SAMPLE is load-bearing, not decoration: sample.check.ts is
+      # gitignored and written by this test, and `npm run check` below type-checks
+      # it against AppState.ts. Without it the npm step fails on a missing file.
       - name: Regenerate AppState.ts and write the sample frames
         run: |
           UPDATE_APP_STATE_TS=1 WRITE_BINDINGS_SAMPLE="$PWD/crates/ainb-app/bindings/sample.check.ts" \
             cargo test -p ainb-app --features typescript-bindings --test bindings
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Assert ainb-app/bindings/AppState.ts is up to date
+      - name: Assert crates/ainb-app/bindings/AppState.ts is up to date
         run: |
-          if ! git ls-files --error-unmatch ainb-tui/crates/ainb-app/bindings/AppState.ts > /dev/null 2>&1; then
+          if ! git ls-files --error-unmatch crates/ainb-app/bindings/AppState.ts > /dev/null 2>&1; then
             echo "::error::AppState.ts is not tracked by git: generate it and commit the result." >&2
             exit 1
           fi
-          if ! git diff --exit-code -- ainb-tui/crates/ainb-app/bindings/AppState.ts; then
+          if ! git diff --exit-code -- crates/ainb-app/bindings/AppState.ts; then
             echo "::error::AppState.ts is stale: run UPDATE_APP_STATE_TS=1 cargo test -p ainb-app --features typescript-bindings --test bindings and commit the result." >&2
             exit 1
           fi
@@ -289,67 +184,98 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: ainb-tui/crates/ainb-app/bindings/package-lock.json
+          cache-dependency-path: crates/ainb-app/bindings/package-lock.json
       - name: Type-check the sample frames against AppState.ts
         run: npm ci --no-audit --no-fund && npm run check
-        working-directory: ainb-tui/crates/ainb-app/bindings
+        working-directory: crates/ainb-app/bindings
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Tests — cross-platform with nextest
-  # ────────────────────────────────────────────────────────────────────────────
-  test:
-    name: Test (${{ matrix.os }})
-    needs: changes
-    # Bare `!cancelled()`, with NO relevance clause: it exists so this job is
-    # never SKIPPED. `needs: changes` carries an implicit `success()`, so one
-    # failure in `changes` would skip this job, and GitHub does not expand
-    # `strategy.matrix` for a job it never dispatches: it reports a single
-    # check under the literal unexpanded name. Ruleset 11610771 requires the
-    # EXPANDED names, so that one skip strands every open PR on "Expected".
-    # The relevance clause stays on the steps, where a gated-out PR still
-    # costs no compute and the check still reports under its real name.
-    # MEASURED (run 33393560903): when `changes` FAILS, `relevant` is left
-    # unset, an unset output resolves to '', and `'' != 'false'` is TRUE, so
-    # those step guards RUN rather than skip. See the `changes` job above.
-    if: '!cancelled()'
-    # 40 against a 28.7min p95. A macOS leg once sat here for 97 minutes with
-    # the nextest step never recording a completion, and with no budget set
-    # nothing would have killed it before GitHub's 360min default.
-    timeout-minutes: 40
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  # ──────────────────────────────────────────────────────────────────────────
+  # Contracts: deterministic golden and mutation gates, in their own job.
+  #
+  # Why not just trust `Test` to carry them: in the general pool a contract
+  # failure is one line among thousands and reads as noise. That is exactly how a
+  # real BdLock two-holder race got mistaken for a flake for days. These tests
+  # compare deterministic renderings to committed golden and lock files, so they
+  # cannot legitimately flake.
+  #
+  # POLICY: a red job here is NEVER rerun to green. Fix the code or delete the
+  # contract; do not re-run the workflow.
+  #
+  # The overlap with `Test --workspace` is deliberate and kept. This job exists
+  # for the SIGNAL. Running the same binary twice costs seconds; a filter typo
+  # silently dropping coverage is the failure class these contracts exist to
+  # prevent.
+  # ──────────────────────────────────────────────────────────────────────────
+  contracts:
+    name: Contracts
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      # Linux only: these paths and `df --output` are GNU/Linux, and the macOS
-      # leg of this matrix has never hit the wall.
+      # `--all-features` across the workspace, plus the nested `cargo build` that
+      # `real_plugin_axes` runs per in-tree plugin, outgrew what a stock runner
+      # leaves free. It surfaced as `failed to build archive: No space left on
+      # device` while linking, which the harness could only report as `exit
+      # status: 101`, so it read as a broken contract. The preinstalled Android,
+      # .NET and GHC toolchains are tens of GB and nothing here uses them.
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost
+          df -h /
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Archiving this job's target tree exhausts runner disk during
+          # rust-cache's post-job metadata pass. Registry restore is still
+          # useful; only saving invokes the failing pass.
+          cache-targets: false
+          save-if: false
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
+      # Each binary compares live code to a COMMITTED file:
+      #   argv_golden_matrix           frozen per-provider CLI invocation shape
+      #   migration_upgrade_full_chain forward-chain replay over a seeded db
+      #   ainb-plugin-cts-v2           14-axis protocol conformance plus the
+      #                                wire-surface semver gate
+      #   skew_harness                 the {daemon N, N-1} x {client, web, Swift}
+      #                                matrix, both directions, plus the local leg
+      #   capability_catalogue         the removal-fails gate over the catalogue
+      #   mutation_dedupe              the walk over the committed MUTATING_METHODS
       #
-      # MEASURED, 2026-08-24, run 32785104108: this job's target tree peaks at
-      # 85G and the runner offers 86G free after the image. A ~1G margin, which
-      # is why it failed roughly one run in three rather than every time, and
-      # why it always died on `ainb-plugin-abtop`: that is the LAST of the six
-      # nested plugin builds `real_plugin_axes` runs, so it links at peak
-      # accumulation. At the failure the filesystem was 145G/145G, 8.8M free.
+      # `--workspace` is required: this repo's default-members covers only
+      # ainb-core and ainb-hangar-daemon, and several of these live outside it.
+      - run: >
+          cargo nextest run --workspace --all-features --no-fail-fast
+          -E 'binary(argv_golden_matrix) + binary(migration_upgrade_full_chain) + package(ainb-plugin-cts-v2)
+              + binary(skew_harness) + binary(capability_catalogue) + binary(mutation_dedupe)'
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The workspace test suite on Linux. The macOS leg is nightly: its measured
+  # p95 was 28.7 minutes and macOS bills at 10x, which made it roughly 290 billed
+  # minutes per PR on its own.
+  # ──────────────────────────────────────────────────────────────────────────
+  test-linux:
+    name: Test (ubuntu-latest)
+    timeout-minutes: 40
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # MEASURED, run 32785104108: this job's target tree peaks at 85G and the
+      # runner offers 86G free after the image. A ~1G margin, which is why it
+      # failed roughly one run in three rather than every time, and why it always
+      # died on ainb-plugin-abtop: that is the LAST of the six nested plugin
+      # builds `real_plugin_axes` runs, so it links at peak accumulation.
       #
-      # It does NOT present as a disk error. `rust-lld` sizes the output with
+      # It does NOT present as a disk error. rust-lld sizes the output with
       # ftruncate, mmaps it, and only faults when a page is written to a
       # filesystem that can no longer allocate blocks, so ENOSPC arrives as
       # `ld terminated with signal 7 [Bus error]` under an LLVM crash report.
-      # That cost two days of it being read as a flake, then as infra.
+      # That cost two days of being read first as a flake, then as infra.
       #
-      # The Contracts job hit the same wall and took the same treatment; this
-      # reclaim frees 20G (59G used here against 39G there, same image), taking
-      # the margin from ~1G to ~21G.
+      # This reclaim frees about 20G, taking the margin from ~1G to ~21G.
       - name: Reclaim runner disk
-        if: >-
-          runner.os == 'Linux' && !cancelled() &&
-          (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/.ghcup /usr/local/share/boost
@@ -357,10 +283,6 @@ jobs:
       # Fail FAST and legibly if the headroom ever goes away again, rather than
       # 20 minutes later as a linker crash nobody can attribute.
       - name: Assert disk headroom for the --all-features build
-        if: >-
-          runner.os == 'Linux' && !cancelled() &&
-          (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
         run: |
           avail=$(df --output=avail / | tail -1)
           need=94371840   # 90G in 1K blocks; the tree measured 85G
@@ -369,877 +291,48 @@ jobs:
             exit 1
           fi
           echo "$((avail/1048576))G free, need ~85G"
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: "ainb-tui -> target"
-          # Same wall the Contracts job hit, and the same treatment. This job
-          # also builds `--all-features` across the workspace, and archiving
-          # that target tree exhausts GitHub-hosted runner disk during
-          # rust-cache's post-job pass: observed three consecutive runs where
-          # `cargo nextest` SUCCEEDED and the job was then failed by
-          # `Post Run Swatinem/rust-cache@v2` with "No space left on device".
-          # A green test run must not be reported as a failure by the step that
-          # saves a cache for next time.
+          # Observed three consecutive runs where `cargo nextest` SUCCEEDED and
+          # the job was then failed by `Post Run Swatinem/rust-cache` with "No
+          # space left on device". A green test run must not be reported as a
+          # failure by the step that saves a cache for next time.
           cache-targets: false
-          # Registry restore is still useful; only saving invokes the failing pass.
           save-if: false
-      - uses: taiki-e/install-action@nextest
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
       # `--lib` alone builds ONLY in-source `#[cfg(test)]` modules, so every
-      # integration target under `crates/*/tests/` was invisible here: whole test
-      # files could be added — or stop compiling — without any job noticing.
-      # `--tests` includes them.
+      # integration target under crates/*/tests/ was invisible: whole test files
+      # could be added, or stop compiling, without any job noticing. `--tests`
+      # includes them.
       #
-      # The `tripwire_*` binaries are excluded: they drive a real `ainb tui`
-      # under tmux against staged plugins, which this job deliberately does not
-      # provision (the hangar ones are the `hangar-e2e` job's authoritative
-      # matrix; the `ainb` ones are launched by `ainb-hooks` / their own steps).
-      # Running them here fails on the missing harness, not on the code. Every
-      # other integration target now runs.
+      # `--workspace` is load-bearing for the same class of reason. Without it
+      # nextest honours default-members (ainb-core and ainb-hangar-daemon), so
+      # this job tested 2 of 35 crates and silently skipped the rest, including
+      # the whole database layer.
       #
-      # The former trailing `-- --skip …` args are dropped because the two tests
-      # they muted are FIXED, not because the flag was inert — nextest does
-      # honour it. Both were host-dependent rather than broken:
-      # `test_validate_provider_installed_claude` asserted a real `claude` was
-      # installed on the machine, and `custom_ranges_are_inclusive` hardcoded a
-      # `+01:00` wall clock for a range anchored at LOCAL midnight. They now
-      # drive a stub on a controlled `$PATH` and derive their boundaries from
-      # the host's own zone, so nothing needs muting.
-      #
-      # `--workspace` is load-bearing. Without it nextest honours the
-      # `default-members` in ainb-tui/Cargo.toml (ainb-core and
-      # ainb-hangar-daemon), so this job tested 2 of 29 crates and silently
-      # skipped 27, roughly 160 test files. Everything in ainb-hangar-store
-      # (the database layer, 74 files) and ainb-plugin-hangar (46) had never
-      # run here. `--lib --tests` widened WHICH targets are built; this
-      # widens WHICH crates they are built from.
+      # The tripwire_* binaries are excluded: they drive a real `ainb tui` under
+      # tmux against staged plugins, which this job deliberately does not
+      # provision. Running them here fails on the missing harness, not on the
+      # code. nightly.yml runs every one of them.
       - run: "cargo nextest run --workspace --lib --tests --all-features --no-fail-fast -E 'not binary(/^tripwire_/)'"
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        working-directory: ${{ env.WORKING_DIR }}
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # Contracts: deterministic golden/mutation gates, own job, no rerun-to-green
-  #
-  # Runs the five contract test binaries from the contract-testing-hardening
-  # plan (issue #500, phases 1-4): argv_golden_matrix (frozen per-provider CLI
-  # invocation shape), migration_upgrade_full_chain (forward-chain replay over
-  # a populated, adversarially-seeded db), and the ainb-plugin-cts-v2 package
-  # (axes, real_plugin_axes, wire_surface_gate: 14-axis protocol conformance
-  # against real in-tree plugin binaries plus the wire-surface semver gate).
-  #
-  # Why a separate job instead of trusting `Test` to carry them: in the
-  # general `cargo test` pool a contract failure is one line among thousands
-  # and reads as noise. That is exactly how a real `BdLock` two-holder race
-  # got mistaken for a flake for days this week. These tests compare
-  # deterministic renderings to committed golden/lock files, so they cannot
-  # legitimately flake. POLICY: a red job here is NEVER rerun to green. Fix
-  # the code or delete the contract; do not re-run the workflow. See
-  # ainb-tui/CLAUDE.md for the regeneration commands when a change is
-  # intentional.
-  #
-  # DELIBERATE: `migration_upgrade_full_chain` and the `ainb-plugin-cts-v2`
-  # binaries need `--workspace`, since this repo's `default-members` (see
-  # ainb-tui/Cargo.toml) covers only ainb-core and ainb-hangar-daemon and
-  # both live outside it. `Test` now passes `--workspace` too, so all three
-  # of these binaries double-run: once here, once there.
-  #
-  # DELIBERATE: that overlap is kept, and no exclusion is added to `Test`'s
-  # `-E` filter to remove it. This job exists for the SIGNAL: a contract
-  # failure gets its own red check and its own no-rerun policy instead of
-  # being one line among thousands. Running the same binary twice costs
-  # seconds; a filter typo silently dropping coverage is the exact failure
-  # class this effort exists to prevent.
-  # ────────────────────────────────────────────────────────────────────────────
-  contracts:
-    name: Contracts
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
+  # ──────────────────────────────────────────────────────────────────────────
+  # The one macOS job on the merge path. `cargo check --all-targets` catches the
+  # failure mode that actually recurs, macOS-only compile breakage, in about a
+  # third of the time the full test leg took. macOS-only RUNTIME regressions are
+  # caught by nightly's `Test (macos-latest)`.
+  # ──────────────────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build (macos-latest)
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      # Same disk pressure the `cache-targets: false` below already answers, one
-      # step earlier: it is now the BUILD that runs out, not the post-job archive.
-      # `--all-features` across the workspace, plus the nested `cargo build` that
-      # `real_plugin_axes` runs per in-tree plugin, outgrew what a stock runner
-      # leaves free — surfacing as `failed to build archive …: No space left on
-      # device` while linking ainb-plugin-hangar, which the harness could only
-      # report as `exit status: 101`. It read as a broken contract, and this job's
-      # policy is never to rerun one to green, so it had to be told apart from a
-      # real one: the same run passed at 10:30 and failed at 10:33 on comparable
-      # trees, which is borderline-disk behaviour rather than a frozen guarantee
-      # breaking. The preinstalled Android / .NET / GHC toolchains are tens of GB
-      # and nothing in this job uses them.
-      - name: Reclaim runner disk
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-                      /usr/local/.ghcup /usr/local/share/boost
-          df -h /
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          workspaces: "ainb-tui -> target"
-          # Contract suite builds every feature. Archiving its target tree exhausts
-          # GitHub-hosted runner disk during rust-cache's post-job metadata pass.
-          cache-targets: false
-          # Registry restore is useful; saving invokes the failing post-job pass.
-          save-if: false
-      - uses: taiki-e/install-action@nextest
-      # W0-wire (D17/D18) adds three more frozen-artifact suites, and they
-      # belong here for the same reason the other three do: each compares live
-      # code to a COMMITTED file, so it cannot legitimately flake, and a red one
-      # means the contract moved rather than the runner hiccuped.
-      #
-      #   skew_harness         the {daemon N, N-1} x {hangar-client, ainb-web,
-      #                        Swift fixture} matrix, both directions, plus the
-      #                        local leg (hangar.sock vs hangar-v<N>.sock)
-      #   capability_catalogue the removal-fails gate over capabilities.catalogue
-      #   mutation_dedupe      the walk over the committed MUTATING_METHODS list
-      - run: >
-          cargo nextest run --workspace --all-features --no-fail-fast
-          -E 'binary(argv_golden_matrix) + binary(migration_upgrade_full_chain) + package(ainb-plugin-cts-v2)
-              + binary(skew_harness) + binary(capability_catalogue) + binary(mutation_dedupe)'
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # ainb-hooks daemon + plugin integration tests
-  # ────────────────────────────────────────────────────────────────────────────
-  ainb-hooks:
-    name: ainb-hooks (${{ matrix.os }})
-    needs: changes
-    # Bare `!cancelled()`, with NO relevance clause: it exists so this job is
-    # never SKIPPED. `needs: changes` carries an implicit `success()`, so one
-    # failure in `changes` would skip this job, and GitHub does not expand
-    # `strategy.matrix` for a job it never dispatches: it reports a single
-    # check under the literal unexpanded name. Ruleset 11610771 requires the
-    # EXPANDED names, so that one skip strands every open PR on "Expected".
-    # The relevance clause stays on the steps, where a gated-out PR still
-    # costs no compute and the check still reports under its real name.
-    # MEASURED (run 33393560903): when `changes` FAILS, `relevant` is left
-    # unset, an unset output resolves to '', and `'' != 'false'` is TRUE, so
-    # those step guards RUN rather than skip. See the `changes` job above.
-    if: '!cancelled()'
-    timeout-minutes: 20
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          workspaces: "ainb-tui -> target"
-      # lsof backs the notifyd ownership proof: a pid is only signalled once it is
-      # shown to hold this home's socket. The proof fails closed, so without lsof
-      # nothing is ever proven and reaping silently becomes a no-op, which fails
-      # `reap_signals_a_notifyd_serving_this_home` on Linux while macOS passes.
-      # BOTH legs, and verified rather than assumed. This step used to run on
-      # Linux only, on the belief that "macOS runner ships them"; it does not
-      # ship tmux, so the surface-combo smoke printed `SKIP: tmux is not on
-      # PATH` and exited 0 there while the job reported green. That is the
-      # silently-degrading-to-SKIP trap this file already warns about for
-      # `fleet-send-tmux`, and it is why the verify step below fails closed.
-      - name: Install tmux, jq and lsof
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux jq lsof
-          else
-            brew install tmux jq || true
-          fi
-      - name: Verify the tools the tmux suites need are actually present
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          tmux -V
-          jq --version
-      - name: Verify hook script parses on the runner
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: bash -n plugins/ainb-hooks/hooks/notify.sh
-      - name: Stall guard compiles + self-check passes
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          python3 -m py_compile plugins/ainb-hooks/hooks/stall_guard.py
-          python3 plugins/ainb-hooks/hooks/stall_guard.py --self-test
-      - name: Build + lib tests (ainb-plugin-notifyd)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo test -p ainb-plugin-notifyd --lib --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: End-to-end hook → socket → SQLite
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo test -p ainb-plugin-notifyd --test end_to_end --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      # The Inbox and Fleet-panel tripwires stood here. Both screens are gone
-      # and their claims moved rather than lapsed: a session's notification
-      # history is the sessions screen's `log` tab, asserted by
-      # `tripwire_sessions_tab_strip`, and the ACP provider label belongs to
-      # the hangar plugin's own `F` tab, whose reducer test is exhaustive over
-      # `FleetProvider` so a new variant is a compile error rather than a
-      # silent UNKNOWN.
-      #
-      # The next three steps are LINUX-ONLY at the test level, under #966. All
-      # four of their cases skip loudly on macOS:
-      #
-      #   tripwire_sessions_tab_strip
-      #     the_tab_strip_opens_every_pane_and_enter_stops_meaning_attach
-      #   tripwire_sessions_pal_engine_swap
-      #     the_engine_picker_reads_the_registry_and_a_swap_keeps_the_channel
-      #     with_no_daemon_the_pal_header_names_the_failed_call
-      #   tripwire_sessions_answer_outcome_per_question
-      #     a_failed_answer_stays_on_its_own_question_across_a_navigation
-      #
-      # They had never run on macOS: the runner ships no tmux, so their
-      # `tmux_available()` guard returned early and each counted as a pass.
-      # Installing tmux above is what surfaced them, and all four die the same
-      # way, the TUI renders its home screen, takes `s`, and is gone by the
-      # next key. Root-causing it needs a macOS machine.
-      #
-      # The gate is in the test files, not here, so the step still RUNS on
-      # macOS and reports the skip rather than vanishing from the log.
-      - name: Tripwire — the sessions tab strip, ask pane and log tab
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo test -p ainb --test tripwire_sessions_tab_strip --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Tripwire — the Pal engine picker and guardrail dial
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo test -p ainb --test tripwire_sessions_pal_engine_swap --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      # Named here for the same reason as the two above: the `Test` job filters
-      # `not binary(/^tripwire_/)`, so a tripwire nobody names is a tripwire
-      # nobody runs. Three CI-ungated ones were already red before this branch
-      # noticed, which is the failure mode this line exists to avoid.
-      - name: Tripwire — an answer's outcome stays on its own question
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: >-
-          cargo test -p ainb --test tripwire_sessions_answer_outcome_per_question
-          --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Tripwire — a notice is readable, dismissable, and kept in the log
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: >-
-          cargo test -p ainb --test tripwire_notice_dismiss_and_expiry
-          --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Sandbox script safety guards (rm -rf belts)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo test -p ainb --test sandbox_script_safety_guards --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-      # ──────────────────────────────────────────────────────────────────────
-      # Surface combinations (S-D)
-      #
-      # Runs AFTER the tripwires in this job, and deliberately in it rather
-      # than in one of its own: it needs the same tmux and the same built
-      # `ainb`, and a separate job would pay for both again to assert something
-      # no single surface's test can reach.
-      #
-      # What no unit test covers: two surfaces sharing one $HOME, where the
-      # locks, the connection registry and the config read-modify-write
-      # actually meet. {tui} {web} {tui,web} {tui,tui}, each from a clean home.
-      # ──────────────────────────────────────────────────────────────────────
-      # `REQUIRE=1`: the script's own guards exit 0 when a tool is missing, so
-      # that a developer without tmux is not blocked. In CI that is exactly
-      # wrong, and it is how this ran as a no-op on macOS. Under REQUIRE the
-      # same guards exit 1.
-      - name: Surface combinations start clean and leave nothing behind
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        env:
-          REQUIRE: "1"
-        run: |
-          cargo build -p ainb
-          scripts/surface-combo-smoke.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      # Named explicitly, on both platforms. The `Test` job filters out
-      # `binary(/^tripwire_/)` and `run_all_tripwires.sh` never globs
-      # ainb-core, so a tripwire nobody names here is a tripwire nobody runs.
-      - name: Tripwire, a client resizing while the daemon answers a picker
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: >-
-          cargo test -p ainb --test tripwire_multi_attach_resize --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Fleet send-path integrity against a REAL tmux pane
-  #
-  # `Test` already COMPILES and selects this binary: `--all-features` turns on
-  # ainb-fleet-core's `tmux-tests` feature and `tmux_send_integrity` is not
-  # matched by that job's `not binary(/^tripwire_/)` filter. But neither runner
-  # image ships tmux, so there every test self-skips and the send-path proof is
-  # vacuously green. This job is the lane where it actually executes.
-  #
-  # The trailing grep is the point: an environment that silently degrades to
-  # SKIP is exactly the trap `run_all_tripwires.sh` documents for its macOS
-  # leg, and a skipped suite here would mean the chunked-write / capture-failure
-  # guarantees ship untested while CI stays green.
-  #
-  # Safe to run on a shared machine as well as a runner: the tests clear `TMUX`
-  # and pin `TMUX_TMPDIR` onto a pid-unique socket dir, so their panes live on a
-  # private tmux server and never join the ambient one.
-  # ────────────────────────────────────────────────────────────────────────────
-  fleet-send-tmux:
-    name: fleet send integrity (${{ matrix.os }})
-    needs: changes
-    # Bare `!cancelled()`, with NO relevance clause: it exists so this job is
-    # never SKIPPED. `needs: changes` carries an implicit `success()`, so one
-    # failure in `changes` would skip this job, and GitHub does not expand
-    # `strategy.matrix` for a job it never dispatches: it reports a single
-    # check under the literal unexpanded name. Ruleset 11610771 requires the
-    # EXPANDED names, so that one skip strands every open PR on "Expected".
-    # The relevance clause stays on the steps, where a gated-out PR still
-    # costs no compute and the check still reports under its real name.
-    # MEASURED (run 33393560903): when `changes` FAILS, `relevant` is left
-    # unset, an unset output resolves to '', and `'' != 'false'` is TRUE, so
-    # those step guards RUN rather than skip. See the `changes` job above.
-    if: '!cancelled()'
-    timeout-minutes: 15
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          workspaces: "ainb-tui -> target"
-      # macOS runner images do NOT ship tmux (actions/runner-images macos-15
-      # README), the same reason `hangar-e2e` brew-installs it.
-      - name: Install tmux (apt-get on Linux, brew on macOS)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
-          else
-            brew install tmux
-          fi
-      - name: Send-path integrity against a real tmux pane
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          set -o pipefail
-          cargo test -p ainb-fleet-core --features tmux-tests \
-            --test tmux_send_integrity --no-fail-fast -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/tmux-send-integrity.log"
-          if grep -q '^SKIP:' "$RUNNER_TEMP/tmux-send-integrity.log"; then
-            echo "::error::tmux send-integrity suite SKIPped, so the send path was never exercised on this runner"
-            exit 1
-          fi
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Codex launch-pane behaviour against a REAL tmux server
-  #
-  # Same trap as `fleet-send-tmux` above, same remedy. `Test` compiles and
-  # selects these tests, but neither runner image ships tmux, so `require_tmux!`
-  # self-skips and they pass vacuously. That is not hypothetical here: three
-  # separate defects shipped in this area behind 24-of-24 green CI, including
-  # one that would have failed every Codex launch outright, because nothing in
-  # CI ever started a tmux session.
-  #
-  # The trailing grep is the point: a suite that degrades to SKIP must fail the
-  # job, or the guard is theatre.
-  # ────────────────────────────────────────────────────────────────────────────
-  codex-launch-tmux:
-    name: codex launch pane (${{ matrix.os }})
-    needs: changes
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-        if: >-
-          always() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          always() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          always() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          workspaces: "ainb-tui -> target"
-      # macOS runner images do NOT ship tmux, same as fleet-send-tmux above.
-      - name: Install tmux (apt-get on Linux, brew on macOS)
-        if: >-
-          always() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
-          else
-            brew install tmux
-          fi
-      - name: Launch-pane behaviour against a real tmux pane
-        if: >-
-          always() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          set -o pipefail
-          cargo test -p ainb --test behavioral keeping_dead_pane \
-            --no-fail-fast -- --nocapture \
-            2>&1 | tee "$RUNNER_TEMP/codex-launch-tmux.log"
-          cargo test -p ainb-app --lib capture_failed_launch_pane_reads_a_dead_pane \
-            --no-fail-fast -- --nocapture \
-            2>&1 | tee -a "$RUNNER_TEMP/codex-launch-tmux.log"
-          if grep -q '^SKIP:' "$RUNNER_TEMP/codex-launch-tmux.log"; then
-            echo "::error::codex launch-pane suite SKIPped, so the launch path was never exercised on this runner"
-            exit 1
-          fi
-          if ! grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/codex-launch-tmux.log"; then
-            echo "::error::expected both keeping_dead_pane tests to run; filter may have stopped matching"
-            exit 1
-          fi
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Every ainb-core tripwire, by pattern
-  #
-  # The `Test` job filters `not binary(/^tripwire_/)`, and until this job the
-  # only ainb-core tripwires CI ran were the ones a step named. A tripwire
-  # nobody named was a tripwire nobody ran, and 14 went red that way (#1023,
-  # #1024, #1025). This job inverts the default: every `tripwire_*` binary runs
-  # unless
-  # `crates/ainb-core/tests/tripwire_ci_exclusions.txt` names it, and every
-  # line there carries an issue and a reason, checked by
-  # `crates/ainb-core/tests/ci_tripwire_exclusions.rs` in the `Test` job.
-  #
-  # Linux only: the four macOS deaths gated under #966 would otherwise make it
-  # a macOS triage job. The SKIP guard is the same trap `fleet-send-tmux`
-  # guards against: a lane that is green because every tripwire found no tmux
-  # reads as coverage and is none.
-  # ────────────────────────────────────────────────────────────────────────────
-  core-tripwires:
-    name: ainb-core tripwires (ubuntu-latest)
-    needs: changes
-    if: '!cancelled()'
-    timeout-minutes: 120
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          workspaces: "ainb-tui -> target"
-      - uses: taiki-e/install-action@nextest
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - name: Install tmux, jq and lsof
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: sudo apt-get update && sudo apt-get install -y tmux jq lsof
-      - name: Every tripwire not excluded, serially
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          set -o pipefail
-          cargo build -p ainb-plugin-runtime --bins
-          # Plugin tripwires SKIP without staged plugins, which would pass
-          # them without exercising anything.
-          bash scripts/build-plugins.sh
-          # Real-TUI tripwires time out on a slow runner; a test must fail
-          # three times to fail the job, and each retry is named below.
-          cargo nextest run -p ainb --test-threads 1 --no-fail-fast --retries 2 \
-            --success-output final -E "$(bash scripts/tripwire-ci-filter.sh)" \
-            2>&1 | tee "$RUNNER_TEMP/core-tripwires.log"
-          # A test that SKIPs passes without exercising anything: the set that
-          # SKIPped must be exactly the committed one.
-          bash scripts/tripwire-ci-guard.sh "$RUNNER_TEMP/core-tripwires.log" \
-            crates/ainb-core/tests/tripwire_ci_skips.txt
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Hangar control-plane end-to-end tripwires (P0-P9)
-  #
-  # Mirrors the `ainb-hooks` per-feature pattern: install tmux on Linux, build
-  # the daemon binary + stage the bundled plugins, then run every hangar
-  # `tripwire_*` via scripts/hangar/run_all_tripwires.sh on BOTH target OSes.
-  # No `cargo clippy -D warnings` gate here — the workspace carries pre-existing
-  # clippy debt and CI gates on `cargo fmt --check` only (see `fmt` job).
-  # ────────────────────────────────────────────────────────────────────────────
-  hangar-e2e:
-    name: hangar-e2e (${{ matrix.os }})
-    needs: changes
-    # Bare `!cancelled()`, with NO relevance clause: it exists so this job is
-    # never SKIPPED. `needs: changes` carries an implicit `success()`, so one
-    # failure in `changes` would skip this job, and GitHub does not expand
-    # `strategy.matrix` for a job it never dispatches: it reports a single
-    # check under the literal unexpanded name. Ruleset 11610771 requires the
-    # EXPANDED names, so that one skip strands every open PR on "Expected".
-    # The relevance clause stays on the steps, where a gated-out PR still
-    # costs no compute and the check still reports under its real name.
-    # MEASURED (run 33393560903): when `changes` FAILS, `relevant` is left
-    # unset, an unset output resolves to '', and `'' != 'false'` is TRUE, so
-    # those step guards RUN rather than skip. See the `changes` job above.
-    if: '!cancelled()'
-    timeout-minutes: 45
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v4
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      - uses: dtolnay/rust-toolchain@stable
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          # This action installs with rustup's MINIMAL profile, which omits
-          # clippy. The span-guard gate below needs it, and a missing component
-          # would red the job with `no such command: clippy`.
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        with:
-          workspaces: "ainb-tui -> target"
-      # Both hangar suites below drive nextest (one run per package instead of
-      # one `cargo test` per test file). Unlike the `test` job this one has no
-      # other nextest step, so without this install they fail with
-      # `no such command: nextest`.
-      - uses: taiki-e/install-action@nextest
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-      # macOS runner images do NOT ship tmux (actions/runner-images macos-15
-      # README) — without installing it here the macOS leg is vacuously green:
-      # `can_run_tripwire()` is false and every TUI tripwire SKIPs.
-      - name: Install tmux (apt-get on Linux, brew on macOS)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
-          else
-            brew install tmux
-          fi
-      - name: Build hangar daemon binary
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo build -p ainb-hangar-daemon --bin ainb-hangar-daemon
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Build ainb binary
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo build -p ainb --bin ainb
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Stage bundled plugins (incl. hangar-tui)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: bash scripts/build-plugins.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: CI-lint — assert ci.yml hangar-e2e contract
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: cargo xtask ci-lint
-        working-directory: ${{ env.WORKING_DIR }}
-      # NOT a workspace clippy gate. `xtask/src/ci_lint.rs` documents why one
-      # does not exist: the workspace carries heavy pre-existing clippy debt and
-      # `-D warnings` would red CI for unrelated reasons. This denies exactly ONE
-      # lint and leaves every other finding a warning.
-      #
-      # The lint is `await_holding_invalid_type`, configured in `ainb-tui/
-      # clippy.toml` to reject a `tracing` `Entered` span guard held across an
-      # `.await`. `Entered` is `Send` (unlike `EnteredSpan`), so the mistake
-      # compiles; the guard is then dropped on whichever worker resumed the task,
-      # the entering worker keeps the span id on its stack forever, and the next
-      # contextual span opened there clones a closed span. That returns a slot to
-      # the subscriber registry's pool with a live ref count, and the next
-      # `new_span` ANYWHERE trips its refcount assertion, killing whatever task
-      # opened it. That is what made `rpc_acp` fail intermittently on this job:
-      # the victim was an RPC connection handler, so the test saw a closed socket
-      # thousands of lines away from the cause.
-      - name: No tracing span guard held across an await
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: >
-          cargo clippy -p ainb-hangar-daemon -p ainb-acp --lib
-          -- -D clippy::await_holding_invalid_type
-        working-directory: ${{ env.WORKING_DIR }}
-      - name: Run all hangar tripwires
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        # Hosted runners render the TUI much slower than a dev box, so the
-        # dev-tuned tmux poll budgets time out under the full serial suite (a
-        # runner-speed artifact, not a code fault). Widen every budget that
-        # routes through `budget_scale()` here; single-run rigor is kept (a real
-        # regression still fails at the scaled deadline).
-        #
-        # The Linux leg runs the FULL 68-tripwire matrix (authoritative — the
-        # tmux tripwires exercise OS-agnostic render/protocol/daemon logic). The
-        # macOS hosted runner is too small to finish all 68 heavy serial tmux
-        # tripwires even at 3x budget (~4 random timeouts — runner capacity, not
-        # a code fault), so the macOS leg runs a launch-smoke SUBSET that proves
-        # the macOS-staged binaries actually launch + the basic stack works
-        # (HANGAR_TRIPWIRE_SMOKE; see run_all_tripwires.sh). macOS-specific logic
-        # (Seatbelt sandbox, orphan parent-death) is covered by the `test` +
-        # `ainb-hooks` macOS legs and the macOS-gated crash/reconnect tripwire.
-        env:
-          HANGAR_TRIPWIRE_BUDGET_SCALE: "3"
-          HANGAR_TRIPWIRE_SMOKE: ${{ matrix.os == 'macos-latest' && '1' || '' }}
-        run: bash ../scripts/hangar/run_all_tripwires.sh
-        working-directory: ${{ env.WORKING_DIR }}
-      # The framed-socket + CLI acceptance proofs (rpc_*, migration_*_upgrade,
-      # hangar_cli_integration, …) live in tests/ — neither the `--lib` test job
-      # nor the tripwire suite runs them, so they were CI-ungated. Gate them here.
-      - name: Run hangar acceptance tests (framed-socket + CLI)
-        if: >-
-          !cancelled() && (github.event_name != 'pull_request' ||
-          needs.changes.outputs.relevant != 'false')
-        run: bash ../scripts/hangar/run_acceptance_tests.sh
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # ainb-acp: the ACP client/reducer/writer library, its OWN named lane.
-  #
-  # `Test` already runs `--workspace`, so these tests do execute there. This
-  # job exists for ATTRIBUTION, the same reason `Contracts` exists: an ACP
-  # failure gets its own red check instead of being one line among thousands,
-  # and the plan's verify-by-forced-failure step has a lane to point at.
-  #
-  # COUPLING: it also fires on `ainb-hangar-store/**` (the writer goes through
-  # that crate's repo functions and a migration can break it without touching
-  # a single ainb-acp file) and on `ainb-hangar-daemon/**` (Phase 5 hosts this
-  # library in the daemon's pool).
-  #
-  # The real-adapter probes are `#[ignore]`d and NOT run here: the runners
-  # have no `claude-agent-acp` / `codex-acp` and no credentials. Run them by
-  # hand per the header of `crates/ainb-acp/tests/real_adapter.rs`.
-  # ────────────────────────────────────────────────────────────────────────────
-  acp:
-    name: ainb-acp
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.acp != 'false')
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "ainb-tui -> target"
-      - uses: taiki-e/install-action@nextest
-      - run: cargo nextest run -p ainb-acp --all-features --no-fail-fast
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Recording artifacts — a GATE, unlike the smoke lane below.
-  #
-  # Nine zero-byte GIFs reached main because a recorder failed silently and
-  # nothing checked that a committed artifact carries bytes. A file existing is
-  # not evidence. This is five seconds of CI that would have caught it.
-  # ────────────────────────────────────────────────────────────────────────────
-  recordings:
-    name: Recording artifacts are not empty
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: every committed recording carries bytes
-        run: |
-          empty="$(find explainers/recordings -type f -empty -print)"
-          if [ -n "$empty" ]; then
-            echo "::error::empty recording artifacts committed:"; echo "$empty"; exit 1
-          fi
-          echo "all recordings non-empty"
-      - name: every file the outcomes contract names exists
-        run: |
-          missing=0
-          for doc in $(find explainers/recordings -name EXPECTED-OUTCOMES.md); do
-            dir="$(dirname "$doc")"
-            # Filenames the contract references, as `name.ext` in backticks.
-            for f in $(grep -oE '`[A-Za-z0-9._-]+\.(gif|mp4|png)`' "$doc" | tr -d '`' | sort -u); do
-              [ -f "$dir/$f" ] || { echo "::error::$doc names $f, which does not exist"; missing=1; }
-            done
-          done
-          [ "$missing" -eq 0 ] || exit 1
-          echo "every named artifact exists"
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Live chat-bus smoke — OPT-IN, same posture as the `#[ignore]`d real-adapter
-  # probes.
-  #
-  # It boots a real hangar daemon, a private tmux server and real ACP adapter
-  # processes, which is more than every PR should pay for; and unlike the unit
-  # lanes a red run here can also mean "this runner has no tmux", so it is not
-  # a gate. Ask for it by labelling a PR `chat-bus-smoke`, by setting the repo
-  # variable AINB_CHAT_BUS_SMOKE=1, or by dispatching the workflow.
-  # ────────────────────────────────────────────────────────────────────────────
-  chat-bus-smoke:
-    name: Chat bus live smoke (opt-in)
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      vars.AINB_CHAT_BUS_SMOKE == '1' ||
-      contains(github.event.pull_request.labels.*.name, 'chat-bus-smoke')
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "ainb-tui -> target"
-      - name: Install the harness's tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux jq sqlite3
-      # Journeys print `SMOKE-RESULT <journey> <PASS|FAIL|SKIP> <reason>`; the
-      # script exits non-zero if any journey FAILs. A SKIP (for example the
-      # resume journey against a daemon without Phase 6) keeps the lane green
-      # and says so in the log.
-      - name: Live chat-bus smoke
-        run: bash scripts/chat-bus-smoke.sh
-        working-directory: ${{ env.WORKING_DIR }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Unused dependency detection
-  # ────────────────────────────────────────────────────────────────────────────
-  machete:
-    name: Cargo Machete
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: bnjbvr/cargo-machete@main
-        with:
-          manifest-path: ainb-tui/Cargo.toml
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Web Playwright journey (C2 web leg, CC18). Stands up the converged stack
-  # (real daemon + real tmux last-mile target + ainb web dashboard) and drives
-  # Playwright headless chromium to prove an AskUserQuestion can be answered
-  # end to end from the browser.
-  # ────────────────────────────────────────────────────────────────────────────
-  web-e2e:
-    name: web-e2e
-    permissions:
-      contents: read
-    needs: changes
-    if: >-
-      !cancelled() && (github.event_name != 'pull_request' ||
-      needs.changes.outputs.relevant != 'false')
-    timeout-minutes: 25
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "ainb-tui -> target"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: ainb-tui/crates/ainb-web/e2e/package-lock.json
-      - name: Install system dependencies (tmux, sqlite3)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux sqlite3
-      - name: Cache Playwright Chromium
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('ainb-tui/crates/ainb-web/e2e/package-lock.json') }}
-      - name: Install Playwright Chromium and dependencies
-        working-directory: ainb-tui/crates/ainb-web/e2e
-        run: |
-          npm ci --no-audit --no-fund
-          npx playwright install --with-deps chromium
-      - name: Run Web e2e Playwright journey
-        run: bash scripts/hangar/run_web_e2e.sh
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --workspace --all-features --all-targets

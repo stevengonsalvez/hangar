@@ -24,7 +24,10 @@
 //! cargo test -p ainb --test sandbox_script_safety_guards
 //! ```
 //!
-//! Wired into CI via the `ainb-hooks` job (see `.github/workflows/ci.yml`).
+//! Wired into CI via the `ainb-hooks` job (see `.github/workflows/nightly.yml`).
+//! It also compiles and runs under the required `Test (ubuntu-latest)` job,
+//! which takes `--workspace --lib --tests`; the nightly job gives it a named
+//! lane and a runner with tmux on it.
 //!
 //! Bead `ai-e7t` follow-up — hardening the sandbox teardown path.
 
