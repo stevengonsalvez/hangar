@@ -22,7 +22,7 @@ pub const COMMITTED_KEY_PATHS: &str = include_str!("../../tests/fixtures/section
 
 /// The fixture's path in the repository, for messages an installed binary prints.
 pub const COMMITTED_KEY_PATHS_REPO_PATH: &str =
-    "ainb-tui/crates/ainb-app/tests/fixtures/section_key_paths.txt";
+    "crates/ainb-app/tests/fixtures/section_key_paths.txt";
 
 /// Where [`COMMITTED_KEY_PATHS`] lives in the source tree, for regeneration.
 pub const COMMITTED_KEY_PATHS_FILE: &str = concat!(
