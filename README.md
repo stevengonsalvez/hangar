@@ -382,7 +382,7 @@ ainb install paths.
 
 **One-liner curl install** (any Unix):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/hangar/main/install.sh | bash
 ```
 
 **Cargo** (any platform with a Rust toolchain):
@@ -394,7 +394,7 @@ cargo install --git https://github.com/stevengonsalvez/agents-in-a-box --branch 
 ```powershell
 wsl --install                                                                         # 1. Install WSL2
 # Inside Ubuntu/Debian:
-curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/hangar/main/install.sh | bash
 sudo apt update && sudo apt install -y tmux
 ainb
 ```
