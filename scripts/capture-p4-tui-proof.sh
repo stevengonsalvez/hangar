@@ -12,8 +12,8 @@
 # sessions never touched by wildcard.
 set -euo pipefail
 
-WS="$(cd "$(dirname "$0")/.." && pwd)"            # ainb-tui/
-ROOT="$(cd "$WS/.." && pwd)"                        # worktree root
+WS="$(cd "$(dirname "$0")/.." && pwd)"            # worktree root == workspace root
+ROOT="$WS"
 AINB="$WS/target/debug/ainb"
 DAEMON="$WS/target/debug/ainb-hangar-daemon"
 PLUGIN_ROOT="$WS/dist/plugins"
