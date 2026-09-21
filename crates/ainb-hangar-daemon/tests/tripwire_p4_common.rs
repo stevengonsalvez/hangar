@@ -92,12 +92,12 @@ pub fn staged_plugin() -> Option<PathBuf> {
 
 /// The staged plugin root (`<workspace-root>/dist/plugins`).
 ///
-/// `build-plugins.sh` stages into `ainb-tui/dist/plugins/<id>/<id>` — a path
+/// `build-plugins.sh` stages into `dist/plugins/<id>/<id>` — a path
 /// relative to the *repo workspace root* (`cd "$(dirname "$0")/.."`), NOT under
 /// any `target/` dir. So the anchor MUST be the repo, not the build output dir.
 ///
 /// Primary anchor: `CARGO_MANIFEST_DIR` (compile-time; `<root>/crates/
-/// ainb-hangar-daemon`). Its grandparent is the `ainb-tui` workspace root that
+/// ainb-hangar-daemon`). Its grandparent is the workspace root that
 /// holds `dist/`. This is stable regardless of `CARGO_TARGET_DIR`.
 ///
 /// Why not the test-binary location: under a shared/overridden `CARGO_TARGET_DIR`
@@ -113,7 +113,7 @@ pub fn plugin_root() -> Option<PathBuf> {
     // it always points at the tree `build-plugins.sh` stages into.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // <root>/crates/ainb-hangar-daemon
     if let Some(root) = manifest_dir.parent().and_then(Path::parent) {
-        // crates → ainb-tui workspace root
+        // crates → workspace root
         let p = root.join("dist").join("plugins");
         if p.exists() {
             return Some(p);
@@ -1927,7 +1927,7 @@ fn seed_onboarding(home: &Path) {
 /// workspace root. Falls back to `"1.0.0"` (the current major) if the file can't
 /// be read — only the major is gated by `needs_onboarding`.
 fn workspace_version() -> String {
-    // .../ainb-tui/crates/ainb-hangar-daemon → up two to ainb-tui (workspace root).
+    // .../crates/ainb-hangar-daemon → up two to the workspace root.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root_cargo = manifest_dir.parent().and_then(Path::parent).map(|p| p.join("Cargo.toml"));
     if let Some(path) = root_cargo {
