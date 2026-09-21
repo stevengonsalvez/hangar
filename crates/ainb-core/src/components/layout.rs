@@ -2487,11 +2487,17 @@ mod notification_render_tests {
 mod menu_bar_width_tests {
     use super::*;
     use crate::app::state::AppState;
+    use crate::config::AppConfig;
     use ainb_hangar_proto::snapshots::InboxListResult;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn legend(width: u16, unread: i64) -> Vec<String> {
-        let mut state = AppState::default();
+        // `AppState::default()` loads the user's config from disk, so these
+        // assertions would read whoever's `~/.agents-in-a-box/config.toml` the
+        // run happened to land on: a developer with `show_session_menu_bar =
+        // false` renders the collapsed hint row and every token below is
+        // "missing". Build the state on the shipped defaults instead.
+        let mut state = AppState::with_config(AppConfig::default());
         state.apply_inbox_read(
             InboxListResult {
                 entries: vec![],
