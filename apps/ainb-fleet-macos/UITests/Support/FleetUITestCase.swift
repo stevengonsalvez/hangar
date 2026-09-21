@@ -27,7 +27,7 @@ import XCTest
 /// journeys were being written.
 ///
 /// The fixture daemon binary is resolved as
-/// `<repo>/ainb-tui/target/debug/examples/fleet_fixture_daemon`, so build it
+/// `<repo>/target/debug/examples/fleet_fixture_daemon`, so build it
 /// first. `AINB_FLEET_FIXTURE_DAEMON` is read by the runner process but does
 /// NOT survive being set in the shell that invokes xcodebuild; symlink the
 /// binary into place instead.

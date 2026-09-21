@@ -9,12 +9,12 @@
 #   5. after the last session detaches, the child is reaped post-grace
 #
 # Usage: scripts/validate-mcp-pool.sh [num_sessions]
-# Env:   AINB_BIN=/path/to/ainb   (default: ainb-tui/target/release/ainb)
+# Env:   AINB_BIN=/path/to/ainb   (default: target/release/ainb)
 set -uo pipefail
 
 N=${1:-3}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-AINB_BIN=${AINB_BIN:-"$ROOT/ainb-tui/target/release/ainb"}
+AINB_BIN=${AINB_BIN:-"$ROOT/target/release/ainb"}
 GRACE=15
 RUN_ID="mcpval-$$"
 WORKDIR="$(mktemp -d "/tmp/${RUN_ID}-XXXX")"

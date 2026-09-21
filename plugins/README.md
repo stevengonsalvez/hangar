@@ -13,13 +13,13 @@ They are installable through the `agents-in-a-box` plugin marketplace
 
 ## What these are NOT
 
-These are **not** ainb-tui plugins. For the canonical "two systems, same word"
+These are **not** TUI plugins. For the canonical "two systems, same word"
 explainer, see [`docs/plugins/README.md`](../docs/plugins/README.md); the short
 version:
 
 ```
 ┌──────────────────────────────┐        ┌──────────────────────────────┐
-│  HARNESS plugins (this dir)   │        │  TUI plugins (ainb-tui/)      │
+│  HARNESS plugins (this dir)   │        │  TUI plugins (crates/)        │
 │  extend the coding AGENT      │   vs   │  extend the ainb TUI itself   │
 │  Claude / Codex / Copilot     │        │  ratatui screens + commands   │
 │  skills · hooks · notifs      │        │  JSON-RPC subprocess, ABI v2  │
@@ -27,16 +27,16 @@ version:
 └──────────────────────────────┘        └──────────────────────────────┘
 ```
 
-TUI plugins live in `ainb-tui/crates/ainb-plugin-*` (burndown,
+TUI plugins live in `crates/ainb-plugin-*` (burndown,
 session-reader, …) and are loaded by the TUI's plugin runtime, not by any
-agent harness. See `ainb-tui/CLAUDE.md` for that system.
+agent harness. See `CLAUDE.md` for that system.
 
 ### ⚠️ `hangar-tui/` is the exception in this folder
 
 `plugins/hangar-tui/` is a **TUI plugin**, not a harness plugin. It is a Rust
 crate (`Cargo.toml` + `manifest.toml`, ABI v2, JSON-RPC over a Unix socket)
-and a member of the `ainb-tui` Cargo workspace
-(`ainb-tui/Cargo.toml` → `"../plugins/hangar-tui"`). It builds as its own
+and a member of the root Cargo workspace
+(`Cargo.toml` → `"plugins/hangar-tui"`). It builds as its own
 executable (`[[bin]] ainb-plugin-hangar`) that the host **spawns as a JSON-RPC
 subprocess** — it is *not* linked into the `ainb` binary, and there is nothing
 to "install" from the marketplace. It sits here only because that's where its
@@ -91,7 +91,7 @@ ainb init --script # print the install script instead of running it
 ```
 
 The catalog the wizard drives lives in
-`ainb-tui/crates/ainb-app/src/setup/catalog.rs` (single source of truth for
+`crates/ainb-app/src/setup/catalog.rs` (single source of truth for
 TUI onboarding **and** the `ainb init` CLI).
 
 ## Cross-harness support
@@ -145,4 +145,4 @@ Legend: ✅ first-class · ◑ works with one documented gap · ➜ supported vi
    `codex/hooks.json` and `copilot/hooks.json` (see `ainb-hooks/` for the
    reference layout).
 4. Add it to the setup catalog
-   (`ainb-tui/crates/ainb-app/src/setup/catalog.rs`) so `ainb init` offers it.
+   (`crates/ainb-app/src/setup/catalog.rs`) so `ainb init` offers it.

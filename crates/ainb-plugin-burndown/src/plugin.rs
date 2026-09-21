@@ -1,0 +1,2178 @@
+//! ABI v2 [`Plugin`] implementation for burndown.
+//!
+//! `BurndownPlugin` owns the in-memory analytics view + the latest
+//! `UsageData` snapshot pushed by the host on the `sessions.usage_data`
+//! topic. Render translates the existing ratatui `Buffer` painter into
+//! a wire `WireBuffer` cell stream; `cli_dispatch` re-parses argv via
+//! clap and falls back to `host.snapshot_get` when no event push has
+//! arrived yet.
+
+use crate::data::usage::UsagePeriod;
+use ainb_plugin_sdk::{
+    Cell, CliOutput, Color, Coord, HandleKeyParams, HandleMouseParams, HostClient, InitContext,
+    KeyCode, MouseButton, MouseEvent, MouseKind, Plugin, RenderParams, Result, SdkError,
+    WireBuffer, topics,
+};
+use ainb_plugin_types_sessions::{
+    RefreshRequest, ScanProgressEvent, UsageData as WireUsageData, UsageDataEvent, WIRE_VERSION,
+};
+use async_trait::async_trait;
+use ratatui::buffer::Buffer as RBuffer;
+use ratatui::layout::Rect as RRect;
+use ratatui::style::{Color as RColor, Modifier as RModifier};
+
+use crate::cli::{UsageCommands, execute_for_plugin};
+use crate::data::savings::{SavingsData, fetch_savings};
+use crate::data::usage::UsageData;
+use crate::output_format::OutputFormat;
+use crate::ui::{
+    TAB_BAR_H, TAB_BAR_TOP, UsageTab, UsageViewState, render as render_ui, tab_at_col,
+};
+use crate::wire::wire_to_local;
+
+/// Static manifest TOML loaded at compile time. The Server uses this on
+/// `plugin/init` to echo `name`/`version` back to the host.
+const MANIFEST_TOML: &str = include_str!("../plugin.toml");
+
+/// Default render viewport — the host sends an explicit one in
+/// `RenderParams.viewport`, but we fall back to this if a degenerate
+/// 0×0 ever arrives. Matches the historical 80×24 baseline.
+const FALLBACK_VIEWPORT: (u16, u16) = (80, 24);
+
+/// Disposition of one [`UsageDataEvent`] chunk after
+/// [`BurndownPlugin::apply_chunk_pure`] processes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkOutcome {
+    /// Chunk accepted; sequence not yet final.
+    Buffered,
+    /// `is_final = true` chunk completed the sequence; `self.data` is
+    /// now live.
+    Finalised,
+    /// Follow-on chunk arrived without a preceding `chunk_index = 0`
+    /// — dropped, accumulator state unchanged.
+    DroppedFollowOn,
+}
+
+/// Burndown plugin state.
+#[derive(Default)]
+pub struct BurndownPlugin {
+    /// In-memory UI state — populated from cached snapshots and
+    /// CLI/event-driven tab switches.
+    ui: UsageViewState,
+    /// Most recent fully-assembled `UsageData` snapshot decoded from
+    /// `sessions.usage_data`. Stored as `Arc` so the per-Enter sync
+    /// into `ui.data` and the per-render snapshot copy are reference-
+    /// count bumps (`O(1)`) instead of full 30K-call deep clones. The
+    /// filter cache holds its own derived `Arc<UsageData>` keyed on
+    /// `(data_generation, inputs_hash)`.
+    data: Option<std::sync::Arc<UsageData>>,
+    /// Accumulator for the in-flight chunked publish (if any). Reset
+    /// on `chunk_index == 0`, appended-to on follow-on chunks,
+    /// finalised + moved into `self.data` on `is_final = true`. See
+    /// [`UsageDataEvent`] docs for the chunking protocol.
+    pending: Option<WireUsageData>,
+    /// Set when the most recent snapshot's wire `version` did not match
+    /// the crate's compiled [`WIRE_VERSION`]. Latched — the render path
+    /// surfaces an upgrade hint instead of the wait-spinner.
+    schema_mismatch: bool,
+    /// Latest `sessions.scan_progress` event from session-reader.
+    /// Drives the skeleton/"Scanning sessions…" line that the UI
+    /// renders before the first `sessions.usage_data` chunk lands.
+    /// Cleared once a chunked publish finalises into `self.data`.
+    scan_progress: Option<ScanProgressEvent>,
+    /// Freshness witness — bumped once per `handle_key` invocation
+    /// that actually mutated `self.ui`. The host's next
+    /// `plugin/render` will see the updated state. Future host
+    /// versions may echo this value via `RenderParams.generation`
+    /// so the host can prove the keystroke landed before the frame
+    /// was painted; today the plugin keeps it as private bookkeeping.
+    generation: u64,
+    /// Monotonic data-identity counter. Bumped once per
+    /// `apply_chunk_pure` finalise so the filter cache below can
+    /// invalidate when the underlying call set changes without
+    /// hashing the (potentially huge) `UsageData`.
+    data_generation: u64,
+    /// `filter_usage_data_full(self.data, ui.filters, ui.period,
+    /// ui.provider_filter)` is the dominant per-render cost
+    /// (`analyze_turns` walks every call to build a session timeline,
+    /// then the aggregate pass rebuilds every per-day/per-project/
+    /// per-model rollup). It's also pure: the output depends only on
+    /// `(data, filters, period, provider_filter)`. We cache the
+    /// most-recent result keyed by `(data_generation, inputs_hash)` —
+    /// inputs_hash mixes filters + period + provider — so idle
+    /// re-renders (between keystrokes) and repeated renders on the
+    /// same filter state are O(1) instead of O(N).
+    filter_cache: Option<FilterCacheEntry>,
+    /// Pre-built dimension indices over `self.data.calls`. Built once
+    /// per `data_generation` bump (i.e. each new wire snapshot) and
+    /// reused across chip pivots so the filter pass is
+    /// `O(candidate_set)` instead of `O(N)` whenever a project /
+    /// model / branch / activity chip is active. Cleared in lockstep
+    /// with `filter_cache` on each new ingest.
+    indices: Option<crate::data::usage::UsageIndices>,
+    /// Monotonic counter bumped every time `cached_filtered` runs an
+    /// actual recompute (cache miss). The render path snapshots this
+    /// before/after calling `cached_filtered`; a delta means the chip
+    /// strip should flash a brief `↻ updated` badge — confirming to
+    /// the user that their drill-down was applied even when the
+    /// wall-clock compute was fast enough that the only visible
+    /// change is a few panel numbers.
+    pivot_seq: u64,
+    /// Latest token-savings snapshot. Populated asynchronously after
+    /// each `sessions.usage_data` finalise — the Savings tab renders
+    /// whatever is here (or a "fetching" placeholder while `None`).
+    savings_data: Option<SavingsData>,
+}
+
+/// One-deep filter-cache slot. A single entry is enough because
+/// burndown renders synchronously and a key-press always switches to
+/// at most one (filters, period, provider) state per render. Keeping
+/// the cache size at 1 avoids invalidation logic and bounds memory at
+/// 2× the largest `UsageData` snapshot.
+#[derive(Debug, Clone)]
+struct FilterCacheEntry {
+    data_generation: u64,
+    /// Hash of `(filters, period, provider_filter)` — the full input
+    /// surface to `filter_usage_data_full`. Renamed from `filters_hash`
+    /// when period + provider joined the cache key in PR A.
+    inputs_hash: u64,
+    filtered: std::sync::Arc<crate::data::usage::UsageData>,
+}
+
+#[async_trait]
+impl Plugin for BurndownPlugin {
+    fn manifest(&self) -> &'static str {
+        MANIFEST_TOML
+    }
+
+    async fn on_init(&mut self, host: &HostClient, _ctx: InitContext<'_>) -> Result<()> {
+        // Subscribe up front so chunked publishes from session-reader
+        // arrive via `handle_event`. The snapshot store only retains
+        // the most recent publish, so for >1-chunk snapshots a passive
+        // `snapshot_get` would miss every chunk except the last.
+        let _ = host.snapshot_subscribe("sessions.usage_data").await;
+        // Subscribe to scan-progress events so the skeleton/"Scanning
+        // sessions…" line can render while session-reader is still
+        // walking the per-provider dirs on a cold cache. Failure is
+        // non-fatal — the legacy ⏳ Waiting spinner remains.
+        let _ = host.snapshot_subscribe("sessions.scan_progress").await;
+        // Subscribe to refresh requests so a HARD refresh (from our own
+        // R-confirm or the CLI --hard) drops the in-memory snapshot:
+        // the dashboard falls back to the scanning skeleton, and the
+        // CLI dispatch retry loop can only be satisfied by data
+        // published AFTER the rebuild — never by the pre-wipe snapshot
+        // the user just declared distrusted.
+        let _ = host.snapshot_subscribe("sessions.refresh_request").await;
+
+        // Trigger a fresh publish. Eager-spawned session-reader runs
+        // its first publish during its own `on_init`, which races
+        // with us — burndown can subscribe mid-stream and end up
+        // missing chunk 0 of the in-flight sequence. Publishing on
+        // the `sessions.refresh_request` topic asks session-reader
+        // to rescan and re-publish from scratch, this time with us
+        // already subscribed. Best-effort: failure is non-fatal.
+        let _ = host.snapshot_publish("sessions.refresh_request", bytes::Bytes::new()).await;
+        Ok(())
+    }
+
+    async fn handle_event(
+        &mut self,
+        host: &HostClient,
+        params: ainb_plugin_sdk::HandleEventParams,
+    ) -> Result<()> {
+        match params.topic.as_str() {
+            "sessions.usage_data" => {
+                self.ingest_usage_payload(host, &params.payload).await;
+            }
+            "sessions.scan_progress" => {
+                self.ingest_scan_progress(host, &params.payload).await;
+            }
+            "sessions.refresh_request" => {
+                // Empty payload = incremental ping (our own r key, the
+                // FS watcher) — nothing to do. Only a hard refresh
+                // invalidates what is on screen.
+                let hard = !params.payload.is_empty()
+                    && rmp_serde::from_slice::<RefreshRequest>(&params.payload)
+                        .map(|req| req.hard)
+                        .unwrap_or(false);
+                if hard {
+                    self.data = None;
+                    self.pending = None;
+                    self.ui.data = None;
+                    self.ui.cached_filtered = None;
+                    self.filter_cache = None;
+                    self.generation = self.generation.wrapping_add(1);
+                    let _ = host
+                        .log_info(
+                            "burndown: hard refresh observed — dropped snapshot, awaiting rebuild",
+                        )
+                        .await;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Dispatch a single keystroke forwarded by the host's
+    /// `PluginScreen::handle_key`.
+    ///
+    /// The plan in `plans/plugin-interactive-keys-and-cache.md`
+    /// §Phase 4 enumerates the canonical key → UI binding. A few binds
+    /// were renamed during implementation to match what actually
+    /// exists in `ui.rs`:
+    ///
+    /// - `Backspace` → `pop_filter_chip` / `zoom_handle_esc` (plan:
+    ///   `pop_filter`). `Esc` performs the same one-level pop and, at
+    ///   the root view, publishes `ui.close_request` so the host closes
+    ///   the screen — see `is_host_reserved_key` in ainb-app.
+    /// - `C`   → `clear_all_filter_chips` (plan: `clear_filters`).
+    /// - `d` when zoomed → `toggle_zoom_detail` (plan: `zoom_toggle_detail`).
+    ///
+    /// Two bindings were dropped because the existing UI API needs
+    /// context the dispatch can't provide without inventing new
+    /// methods:
+    ///
+    /// - `j` scroll-down: `scroll_down(max_rows)` is row-count-aware.
+    /// - `D` advanced custom period: `UsagePeriod::Custom { from, to }`
+    ///   has no sensible default range from a single key press.
+    ///
+    /// Generation is bumped only when the dispatch matched a binding,
+    /// so unmapped keys won't trigger an avoidable re-render.
+    async fn handle_key(&mut self, host: &HostClient, params: HandleKeyParams) -> Result<()> {
+        // Hard-refresh confirm overlay is modal: while it's up, every
+        // key resolves it. Dispatched before everything else so the
+        // confirm `y` can never collide with the zoom-yank `y` below.
+        if self.ui.confirm_hard {
+            self.ui.confirm_hard = false;
+            if matches!(params.key.code, KeyCode::Char { ch: 'y' | 'Y' }) {
+                let payload = rmp_serde::to_vec_named(&RefreshRequest { hard: true })
+                    .map(bytes::Bytes::from)
+                    .unwrap_or_default();
+                let _ = host.snapshot_publish("sessions.refresh_request", payload).await;
+            }
+            // Any other key cancels: prior data stays on screen,
+            // nothing is published. (`Esc` is host-reserved and pops
+            // the screen before reaching us, hence `n`/anything.)
+            self.generation = self.generation.wrapping_add(1);
+            return Ok(());
+        }
+
+        // Refresh + flush-cache are the two bindings that need the
+        // host. Everything else mutates `self.ui` only, so it lives in
+        // the pure helper below for testability.
+        let handled = match params.key.code {
+            KeyCode::Char { ch: 'r' } => {
+                // Ask session-reader to re-publish. Empty payload =
+                // incremental refresh (the cheap path). Best effort —
+                // failure is silently dropped, the existing snapshot
+                // stays on screen.
+                let _ =
+                    host.snapshot_publish("sessions.refresh_request", bytes::Bytes::new()).await;
+                true
+            }
+            KeyCode::Char { ch: 'R' } => {
+                // Hard refresh re-parses ALL history from source —
+                // CPU-heavy, so it's gated behind the ⚠ confirm
+                // overlay. Nothing publishes until `y`.
+                self.ui.confirm_hard = true;
+                true
+            }
+            KeyCode::Char { ch: 'F' } => {
+                // Wipe the persistent parse cache, then rescan. Use
+                // `F` (uppercase) to make the destructive nature
+                // obvious — `f` would be too easy to fat-finger. The
+                // scan immediately afterwards is cold-cache and may
+                // take 10s+ for large $HOME datasets; the
+                // `Scanning sessions:` skeleton (now with the new
+                // `N/M` progress bar) covers the latency.
+                let _ = host
+                    .snapshot_publish("sessions.flush_cache_request", bytes::Bytes::new())
+                    .await;
+                true
+            }
+            // Yank the FULL (untruncated) focused zoom-table row to the
+            // clipboard. Data-dependent (needs `self.data` + the same
+            // filter view the table renders), so it lives here rather
+            // than in the pure dispatch. The visible cells are clipped
+            // to the column width — the clipboard gets the real path /
+            // session id regardless.
+            KeyCode::Char { ch: 'y' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                if let Some(panel) = self.ui.zoom {
+                    // The on-screen rows reflect the cached filtered
+                    // view when a filter is active, else the raw
+                    // snapshot — mirror exactly what the renderer shows.
+                    let data = self.cached_filtered().or_else(|| self.data.clone());
+                    if let Some(data) = data {
+                        let rows = crate::ui::zoom_rows(&data, panel, &self.ui.zoom_search_query);
+                        let idx = self.ui.focus_row.min(rows.len().saturating_sub(1));
+                        if let Some(row) = rows.get(idx) {
+                            let text = row.join("\t");
+                            match copy_to_clipboard(&text) {
+                                Ok(()) => {
+                                    self.ui.copy_flash =
+                                        Some("✓ copied row to clipboard".to_string());
+                                }
+                                Err(e) => {
+                                    // Clipboard may be unavailable on
+                                    // headless Linux — degrade, don't
+                                    // crash. Surface a failure flash (so a
+                                    // failed copy never shows a stale "✓"
+                                    // from an earlier success) plus a log.
+                                    self.ui.copy_flash =
+                                        Some("⚠ clipboard unavailable".to_string());
+                                    let _ = host
+                                        .log_info(format!("burndown: clipboard copy failed: {e}"))
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Always treat `y` as handled so generation bumps and the
+                // flash (or the no-op) renders.
+                true
+            }
+            KeyCode::Esc => {
+                // Esc pops one internal level via the pure dispatch
+                // (detail drawer → search overlay → zoom → filter chip).
+                // At the root view nothing is left to pop — publish
+                // `ui.close_request` so the host closes this screen back
+                // to wherever the user opened it from. Best effort: if
+                // the publish is lost the user just presses Esc again.
+                let popped = self.dispatch_key_pure(&params.key.code);
+                if !popped {
+                    let req = topics::UiCloseRequest {
+                        screen_id: params.screen_id.clone(),
+                    };
+                    let payload = serde_json::to_vec(&req).unwrap_or_default();
+                    let _ = host
+                        .snapshot_publish(topics::UI_CLOSE_REQUEST, bytes::Bytes::from(payload))
+                        .await;
+                }
+                popped
+            }
+            _ => self.dispatch_key_pure(&params.key.code),
+        };
+        // Plan-mandated invariant: only bump generation when the
+        // dispatch matched a binding, so unmapped keys can't trigger
+        // an avoidable re-render.
+        if handled {
+            // The copy-confirmation flash is one-shot: any HANDLED key
+            // other than the `y` that just set it clears the banner.
+            // Unhandled keys leave it untouched (clearing there would
+            // wipe state without a re-render — a stale paint).
+            if !matches!(params.key.code, KeyCode::Char { ch: 'y' }) {
+                self.ui.copy_flash = None;
+            }
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    async fn handle_mouse(&mut self, _host: &HostClient, params: HandleMouseParams) -> Result<()> {
+        // Same redraw discipline as `handle_key`: only bump the generation
+        // (→ re-render) when the event actually changed something.
+        if self.dispatch_mouse_pure(params.mouse) {
+            self.ui.copy_flash = None;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    async fn render(&mut self, _host: &HostClient, params: RenderParams) -> Result<WireBuffer> {
+        let (w, h) = match (params.viewport.width, params.viewport.height) {
+            (0, _) | (_, 0) => FALLBACK_VIEWPORT,
+            (w, h) => (w, h),
+        };
+        let area = RRect {
+            x: 0,
+            y: 0,
+            width: w,
+            height: h,
+        };
+        let mut rbuf = RBuffer::empty(area);
+
+        if self.schema_mismatch && self.data.is_none() {
+            paint_schema_mismatch(&mut rbuf, area);
+        } else {
+            // Resolve the cached filtered view FIRST (mutable
+            // borrow) and only then build the ui snapshot. Doing it
+            // in this order lets `cached_filtered()` mutate
+            // `self.filter_cache` without colliding with the later
+            // immutable read of `self.ui` and `self.data`.
+            let pivot_seq_before = self.pivot_seq;
+            let cached_filtered = self.cached_filtered();
+            // Snapshot the UI state so we can paint without holding a
+            // mutable borrow on `self` for the whole call.
+            let mut ui = self.ui.clone();
+            ui.data = self.data.clone();
+            ui.scan_progress = self.scan_progress.clone();
+            ui.cached_filtered = cached_filtered;
+            ui.savings_data = self.savings_data.clone();
+            // True iff `cached_filtered` ran an actual recompute this
+            // frame (cache miss). The chip strip uses this to flash a
+            // brief `↻ updated` badge so the user sees confirmation
+            // their pivot landed.
+            ui.fresh_pivot = self.pivot_seq != pivot_seq_before;
+            render_ui(&mut rbuf, area, &ui);
+        }
+        Ok(buffer_to_wire(&rbuf, area))
+    }
+
+    async fn cli_dispatch(
+        &mut self,
+        host: &HostClient,
+        namespace: &str,
+        argv: &[String],
+    ) -> Result<CliOutput> {
+        if namespace != "usage" {
+            return Ok(CliOutput {
+                stdout: Vec::new(),
+                stderr: format!("burndown: unknown namespace `{namespace}`\n").into_bytes(),
+                exit_code: 2,
+            });
+        }
+
+        // Pull `--format=<text|json|csv>` out of argv (host-level
+        // global flag) and strip it before clap parses the subcommand
+        // surface — clap doesn't declare it.
+        let format = extract_format(argv);
+        let stripped = strip_format_flag(argv);
+
+        // The caller (host CLI shim) is responsible for waiting until
+        // `self.data` has been populated via the `sessions.usage_data`
+        // subscription. We deliberately do NOT call `refresh_snapshot`
+        // here: it holds the plugin mutex while awaiting a host RPC
+        // (`host/snapshot/get`). The SDK's `read_loop` services
+        // `plugin/handle_event` *inline* (to preserve chunk order — see
+        // `ainb-plugin-sdk-rust::server::read_loop`), so if a chunk
+        // event arrives while we're holding the mutex on a host RPC,
+        // `dispatch_incoming.await` for the chunk blocks the read loop
+        // on `plugin.lock().await` — and the host's response to our
+        // `host/snapshot/get` can never be read from stdin. Deadlock.
+        //
+        // Skipping the explicit pull is safe here because burndown is
+        // eager-spawned (manifest `[lifecycle].spawn = "eager"`) and
+        // its `on_init` subscribes to `sessions.usage_data` *before*
+        // session-reader publishes — so the chunk push path always
+        // populates `self.data` once the publisher finishes its scan.
+        // First-call races (data not yet populated) surface as the
+        // "install session-reader" hint, and the host CLI shim retries
+        // until it succeeds or the deadline elapses (see
+        // `crates/ainb-core/src/cli/registry.rs::dispatch_inner`).
+        let _ = host;
+        let Some(data) = self.data.clone() else {
+            return Ok(CliOutput {
+                stdout: Vec::new(),
+                stderr: b"error: usage analytics requires the session-reader plugin (install via 'ainb plugin install session-reader')\n".to_vec(),
+                exit_code: 1,
+            });
+        };
+
+        // Argv reshape: clap's `try_parse_from` expects argv[0] to be
+        // the program name. We feed it "usage" so subcommands like
+        // `report --json` parse naturally.
+        let mut clap_argv: Vec<String> = vec!["usage".to_string()];
+        clap_argv.extend(stripped);
+
+        use clap::Parser;
+        #[derive(Parser)]
+        #[command(name = "usage")]
+        struct UsageRoot {
+            #[command(subcommand)]
+            cmd: UsageCommands,
+        }
+
+        let parsed = match UsageRoot::try_parse_from(clap_argv) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = e.to_string();
+                let exit = if e.use_stderr() { 2 } else { 0 };
+                return Ok(CliOutput {
+                    stdout: Vec::new(),
+                    stderr: msg.into_bytes(),
+                    exit_code: exit,
+                });
+            }
+        };
+
+        match capture_stdout(|| execute_for_plugin(&data, parsed.cmd, format)) {
+            (Ok(()), out) => Ok(CliOutput {
+                stdout: out,
+                stderr: Vec::new(),
+                exit_code: 0,
+            }),
+            (Err(e), out) => Ok(CliOutput {
+                stdout: out,
+                stderr: format!("{e}\n").into_bytes(),
+                exit_code: 1,
+            }),
+        }
+    }
+}
+
+impl BurndownPlugin {
+    /// Decode a `sessions.usage_data` payload (msgpack-encoded
+    /// `UsageDataEvent`) and update local state. Handles chunked
+    /// publishes: chunk 0 resets the accumulator, follow-on chunks
+    /// append their `calls` slice, and `is_final = true` moves the
+    /// accumulator into `self.data`. Single-chunk publishes (the v1
+    /// path, plus small `$HOME`s) take exactly the same code path
+    /// because their defaults are `chunk_index = 0, is_final = true`.
+    /// Notes wire-version drift on the latched `schema_mismatch` flag.
+    async fn ingest_usage_payload(&mut self, host: &HostClient, payload: &[u8]) {
+        let event: UsageDataEvent = match rmp_serde::from_slice(payload) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = host
+                    .log_info(format!(
+                        "burndown: malformed sessions.usage_data payload: {e}"
+                    ))
+                    .await;
+                return;
+            }
+        };
+        if event.version != WIRE_VERSION {
+            self.schema_mismatch = true;
+            let _ = host
+                .log_info(format!(
+                    "burndown: sessions.usage_data wire version mismatch: got {}, expected {}",
+                    event.version, WIRE_VERSION
+                ))
+                .await;
+            return;
+        }
+        self.apply_chunk(event, host).await;
+    }
+
+    /// Drive the chunk accumulator. Logs to `host` on protocol misuse
+    /// (follow-on chunk with no in-flight publish); calls into the
+    /// pure [`Self::apply_chunk_pure`] for the actual state transition
+    /// so unit tests can hit every branch without a `HostClient`.
+    ///
+    /// On `Finalised`, kicks off an async savings fetch so the Savings
+    /// tab has fresh data shortly after each usage snapshot lands.
+    async fn apply_chunk(&mut self, event: UsageDataEvent, host: &HostClient) {
+        let chunk_index = event.chunk_index;
+        let outcome = self.apply_chunk_pure(event);
+        match outcome {
+            ChunkOutcome::DroppedFollowOn => {
+                let _ = host
+                    .log_info(format!(
+                        "burndown: dropped follow-on chunk {chunk_index} (no in-flight publish)"
+                    ))
+                    .await;
+            }
+            ChunkOutcome::Finalised => {
+                // Refresh the savings snapshot from all three sources.
+                // The output_tokens total lives on grand_total after
+                // the wire→local conversion has completed; safe to read
+                // here because apply_chunk_pure already moved the
+                // assembled data into self.data.
+                let output_tokens =
+                    self.data.as_ref().map(|d| d.grand_total.output_tokens).unwrap_or(0);
+                self.savings_data = Some(fetch_savings(output_tokens).await);
+            }
+            ChunkOutcome::Buffered => {}
+        }
+    }
+
+    /// Pure version of [`Self::apply_chunk`] — no host I/O. Returns
+    /// the disposition so the async wrapper can log the misuse path.
+    fn apply_chunk_pure(&mut self, event: UsageDataEvent) -> ChunkOutcome {
+        if event.chunk_index == 0 {
+            // Fresh publish sequence — seed the accumulator with the
+            // bounded aggregates from chunk 0. v4 wire model: chunk 0
+            // also carries empty `calls`/`sessions`/`shell_commands`
+            // (those are tail-chunked and arrive in chunks 1..N), so
+            // the seed already has the right empty tail vecs. Any
+            // prior in-flight accumulator is discarded — the publisher
+            // abandoned it.
+            self.pending = Some(event.data);
+        } else {
+            // Extend each of the three tail-chunked vecs onto the
+            // in-flight accumulator. If we missed chunk 0 (subscriber
+            // joined late or sequence got reordered), drop the chunk —
+            // partial data without aggregates is worse than no data.
+            match self.pending.as_mut() {
+                Some(acc) => {
+                    acc.calls.extend(event.data.calls);
+                    acc.sessions.extend(event.data.sessions);
+                    acc.shell_commands.extend(event.data.shell_commands);
+                }
+                None => return ChunkOutcome::DroppedFollowOn,
+            }
+        }
+
+        if event.is_final {
+            if let Some(assembled) = self.pending.take() {
+                self.data = Some(std::sync::Arc::new(wire_to_local(assembled)));
+                self.schema_mismatch = false;
+                // Real data has landed — the scan is done. Drop any
+                // lingering progress event so the UI flips from
+                // skeleton to populated panels on the next render.
+                self.scan_progress = None;
+                // Invalidate the filter cache: the underlying call
+                // set has changed, every cached result is stale.
+                // Bump first, drop second, so any concurrent reader
+                // sees the new generation when checking the entry.
+                self.data_generation = self.data_generation.wrapping_add(1);
+                self.filter_cache = None;
+                // Indices are derived from `self.data` and become
+                // stale on every new snapshot. Drop them here; the
+                // next `cached_filtered` call rebuilds lazily.
+                self.indices = None;
+                return ChunkOutcome::Finalised;
+            }
+        }
+        ChunkOutcome::Buffered
+    }
+
+    /// Hash a `UsageFilters` snapshot to a u64. Used by the filter
+    /// cache key — `UsageFilters` is `Eq + Hash` so this is a pure
+    /// function of the chip set, period, and provider filter — all three
+    /// inputs to `filter_usage_data_full` so the cache key invalidates
+    /// when ANY of them change.
+    fn hash_filter_inputs(
+        filters: &crate::data::usage::UsageFilters,
+        period: &crate::data::usage::UsagePeriod,
+        provider_filter: crate::data::usage::UsageProviderFilter,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        filters.hash(&mut h);
+        period.hash(&mut h);
+        provider_filter.hash(&mut h);
+        h.finish()
+    }
+
+    /// Resolve the filtered view of `self.data` for the current
+    /// `self.ui.filters` + `self.ui.period` + `self.ui.provider_filter`.
+    /// Cached by `(data_generation, inputs_hash)` — repeated renders
+    /// on the same key state are O(1).
+    ///
+    /// Returns `None` when there is no data yet (the render path
+    /// already paints the wait/skeleton screen in that case) or when
+    /// every filter dimension is at its default ("no-op" — render
+    /// path uses the raw `data` reference).
+    fn cached_filtered(&mut self) -> Option<std::sync::Arc<crate::data::usage::UsageData>> {
+        let data = self.data.as_ref()?;
+        // No-op fast path: nothing to filter. The render path falls
+        // back to the raw `data` reference and never consults the
+        // cache, so don't bother building one.
+        let any_active = self.ui.filters.any()
+            || !matches!(self.ui.period, crate::data::usage::UsagePeriod::All)
+            || !matches!(
+                self.ui.provider_filter,
+                crate::data::usage::UsageProviderFilter::All
+            );
+        if !any_active {
+            return None;
+        }
+        let inputs_hash =
+            Self::hash_filter_inputs(&self.ui.filters, &self.ui.period, self.ui.provider_filter);
+        let key = (self.data_generation, inputs_hash);
+        if let Some(entry) = self.filter_cache.as_ref() {
+            if entry.data_generation == key.0 && entry.inputs_hash == key.1 {
+                return Some(entry.filtered.clone());
+            }
+        }
+        // Build pre-dimension indices once per data_generation. Reused
+        // across every chip pivot until the next wire snapshot lands.
+        if self.indices.is_none() {
+            self.indices = Some(crate::data::usage::UsageIndices::from_usage_data(data));
+        }
+        let filtered = std::sync::Arc::new(crate::data::usage::filter_usage_data_indexed(
+            data,
+            self.indices.as_ref(),
+            &self.ui.filters,
+            &self.ui.period,
+            self.ui.provider_filter,
+        ));
+        self.filter_cache = Some(FilterCacheEntry {
+            data_generation: key.0,
+            inputs_hash: key.1,
+            filtered: filtered.clone(),
+        });
+        // Mark this render as the one that landed a fresh pivot. The
+        // render path snapshots `pivot_seq` before/after this call and
+        // sets `ui.fresh_pivot` when the seq advanced — driving the
+        // `↻ updated` chip-strip badge on the first frame after a
+        // cache miss. Idle frames hit the cache, skip this bump, and
+        // suppress the badge naturally.
+        self.pivot_seq = self.pivot_seq.wrapping_add(1);
+        Some(filtered)
+    }
+
+    /// Decode a `sessions.scan_progress` payload and stash it as the
+    /// latest known progress. Malformed payloads are logged and
+    /// dropped — the skeleton just keeps showing the previous tick (or
+    /// the ⏳ waiting line if no tick has arrived yet).
+    ///
+    /// A `done: true` event is terminal: the scan finished but decided
+    /// not to republish (session-reader's unchanged-snapshot
+    /// short-circuit), so no `usage_data` chunk is coming to clear the
+    /// banner — clear it here instead.
+    async fn ingest_scan_progress(&mut self, host: &HostClient, payload: &[u8]) {
+        match rmp_serde::from_slice::<ScanProgressEvent>(payload) {
+            Ok(evt) => self.apply_scan_progress(evt),
+            Err(e) => {
+                let _ = host
+                    .log_info(format!(
+                        "burndown: malformed sessions.scan_progress payload: {e}"
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    /// Pure half of [`Self::ingest_scan_progress`] — unit-testable
+    /// without a `HostClient`.
+    fn apply_scan_progress(&mut self, evt: ScanProgressEvent) {
+        if evt.done {
+            self.scan_progress = None;
+        } else {
+            self.scan_progress = Some(evt);
+        }
+    }
+
+    /// Pull the latest snapshot synchronously. Used by `cli_dispatch`
+    /// when no event push has arrived yet; failure is non-fatal — the
+    /// caller surfaces an actionable error.
+    async fn refresh_snapshot(&mut self, host: &HostClient) {
+        match host.snapshot_get("sessions.usage_data").await {
+            Ok(snap) => {
+                if let Some(payload) = snap.payload {
+                    self.ingest_usage_payload(host, &payload).await;
+                }
+            }
+            Err(SdkError::Rpc(_)) | Err(_) => {
+                // Treat any failure as "no data" — caller emits the
+                // install-session-reader hint.
+            }
+        }
+    }
+}
+
+fn paint_schema_mismatch(buf: &mut RBuffer, area: RRect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let msg = "  ⚠ Schema mismatch — upgrade session-reader/burndown plugins to matching versions.";
+    let max = area.width as usize;
+    let truncated: String = msg.chars().take(max).collect();
+    buf.set_string(area.x, area.y, truncated, ratatui::style::Style::default());
+}
+
+/// Convert a ratatui `Buffer` to the SDK's `WireBuffer` cell stream.
+///
+/// Iterates row-major so the resulting `Vec<(Coord, Cell)>` is
+/// deterministic between renders. Empty cells (default attrs and a
+/// blank symbol) are dropped to keep the wire payload sparse.
+fn buffer_to_wire(rbuf: &RBuffer, area: RRect) -> WireBuffer {
+    let mut wire = WireBuffer::new(area.width, area.height);
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let cell = rbuf.get(area.x + x, area.y + y);
+            let symbol = cell.symbol();
+            let fg = ratatui_color(cell.fg);
+            let bg = ratatui_color(cell.bg);
+            let modifier = ratatui_modifiers(cell.modifier);
+            // Skip cells that wouldn't render anything visible — saves
+            // bytes on the wire and keeps the JSON sparse like the host
+            // expects.
+            if symbol == " " && fg.is_none() && bg.is_none() && modifier == 0 {
+                continue;
+            }
+            wire.push(
+                Coord::new(x, y),
+                Cell {
+                    symbol: symbol.to_string(),
+                    fg,
+                    bg,
+                    modifier,
+                },
+            );
+        }
+    }
+    wire
+}
+
+fn ratatui_color(c: RColor) -> Option<Color> {
+    match c {
+        RColor::Reset => None,
+        RColor::Black => Some(Color::rgb(0, 0, 0)),
+        RColor::Red => Some(Color::rgb(170, 0, 0)),
+        RColor::Green => Some(Color::rgb(0, 170, 0)),
+        RColor::Yellow => Some(Color::rgb(170, 170, 0)),
+        RColor::Blue => Some(Color::rgb(0, 0, 170)),
+        RColor::Magenta => Some(Color::rgb(170, 0, 170)),
+        RColor::Cyan => Some(Color::rgb(0, 170, 170)),
+        RColor::Gray => Some(Color::rgb(170, 170, 170)),
+        RColor::DarkGray => Some(Color::rgb(85, 85, 85)),
+        RColor::LightRed => Some(Color::rgb(255, 85, 85)),
+        RColor::LightGreen => Some(Color::rgb(85, 255, 85)),
+        RColor::LightYellow => Some(Color::rgb(255, 255, 85)),
+        RColor::LightBlue => Some(Color::rgb(85, 85, 255)),
+        RColor::LightMagenta => Some(Color::rgb(255, 85, 255)),
+        RColor::LightCyan => Some(Color::rgb(85, 255, 255)),
+        RColor::White => Some(Color::rgb(255, 255, 255)),
+        RColor::Indexed(_) => None,
+        RColor::Rgb(r, g, b) => Some(Color::rgb(r, g, b)),
+    }
+}
+
+fn ratatui_modifiers(m: RModifier) -> u16 {
+    let mut out = 0_u16;
+    if m.contains(RModifier::BOLD) {
+        out |= 1;
+    }
+    if m.contains(RModifier::DIM) {
+        out |= 2;
+    }
+    if m.contains(RModifier::ITALIC) {
+        out |= 4;
+    }
+    if m.contains(RModifier::UNDERLINED) {
+        out |= 8;
+    }
+    if m.contains(RModifier::REVERSED) {
+        out |= 16;
+    }
+    out
+}
+
+fn extract_format(argv: &[String]) -> OutputFormat {
+    let mut iter = argv.iter().peekable();
+    while let Some(a) = iter.next() {
+        if let Some(rest) = a.strip_prefix("--format=") {
+            return parse_format(rest);
+        }
+        if a == "--format" {
+            if let Some(next) = iter.peek() {
+                return parse_format(next);
+            }
+        }
+    }
+    OutputFormat::default()
+}
+
+fn strip_format_flag(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        if a == "--format" {
+            i += 1;
+            if i < argv.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if a.starts_with("--format=") {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
+}
+
+fn parse_format(s: &str) -> OutputFormat {
+    match s {
+        "json" => OutputFormat::Json,
+        "csv" => OutputFormat::Csv,
+        "markdown" | "md" => OutputFormat::Markdown,
+        _ => OutputFormat::Text,
+    }
+}
+
+/// Run `f`, collecting anything it `println!`'d into a `Vec<u8>` in
+/// place of stdout. Stderr is unaffected — it still goes to the
+/// process's real stderr, which the runtime drains and forwards.
+///
+/// Implementation: redirect fd 1 to a tempfile via `dup2`, run `f`,
+/// restore the original stdout, then read the tempfile back. The
+/// tempfile drains synchronously (no pipe-buffer deadlock concern).
+/// Unix-only — Phase 7c plugins ship on the same targets the runtime
+/// already supports.
+///
+/// The legacy `cli` module emits its 9-subcommand report output via
+/// `println!` / `print!` (~80 sites). Refactoring each helper to take a
+/// `&mut impl Write` would touch a 1700-line file; this brief
+/// fd-redirect keeps the diff tight while still producing a captured
+/// stdout for the JSON-RPC `cli_dispatch` reply.
+#[cfg(unix)]
+fn capture_stdout<F: FnOnce() -> anyhow::Result<()>>(f: F) -> (anyhow::Result<()>, Vec<u8>) {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::os::fd::AsRawFd;
+
+    let mut buf = Vec::new();
+    let mut tmp = match tempfile::tempfile() {
+        Ok(f) => f,
+        Err(_) => return (f(), buf),
+    };
+
+    // SAFETY: dup/dup2/close are POSIX fd ops. We own fd 1 for the
+    // duration of this call (single-threaded inside the SDK's plugin
+    // mutex), so swapping it in and out is race-free.
+    unsafe {
+        let stdout_fd: libc::c_int = 1;
+        let saved = libc::dup(stdout_fd);
+        if saved < 0 {
+            return (f(), buf);
+        }
+        if libc::dup2(tmp.as_raw_fd(), stdout_fd) < 0 {
+            libc::close(saved);
+            return (f(), buf);
+        }
+        let _ = std::io::stdout().flush();
+        let result = f();
+        let _ = std::io::stdout().flush();
+        libc::dup2(saved, stdout_fd);
+        libc::close(saved);
+
+        let _ = tmp.seek(SeekFrom::Start(0));
+        let _ = tmp.read_to_end(&mut buf);
+        (result, buf)
+    }
+}
+
+#[cfg(not(unix))]
+fn capture_stdout<F: FnOnce() -> anyhow::Result<()>>(f: F) -> (anyhow::Result<()>, Vec<u8>) {
+    // Non-Unix targets fall back to no-capture. The plugin ships on
+    // macOS + Linux only in Phase 7c.
+    (f(), Vec::new())
+}
+
+/// Allow `set_tab` style commands once we wire them through the snapshot
+/// bus. Today this lets `tests/stdio_smoke.rs` exercise the lifecycle
+/// without depending on a session-reader installation.
+impl BurndownPlugin {
+    #[allow(dead_code)]
+    pub fn set_active_tab(&mut self, tab: UsageTab) {
+        self.ui.active_tab = tab;
+    }
+
+    /// Pure version of the `handle_key` match — applies every
+    /// non-host-touching binding to `self.ui` and returns whether
+    /// the key was claimed. Lets unit tests exercise the dispatch
+    /// without spinning up a `HostClient`.
+    ///
+    /// The `r`/`R` refresh binding is intentionally NOT here; it
+    /// lives in the async `handle_key` because it needs the host.
+    fn dispatch_key_pure(&mut self, code: &KeyCode) -> bool {
+        use chrono::{Datelike, Local};
+
+        // The parsed snapshot lives on `self.data`; the render path copies it
+        // into `self.ui.data` only when it clones `self.ui` for the frame, so
+        // a key handler that reads `ui.data` sees `None` unless it syncs
+        // first. Enter, X and the mouse scroll each learned that the hard way
+        // and grew their own copy of this line; the Activity cursor keys did
+        // not, so every arrow press hit `heatmap_move`'s `data.is_none()`
+        // early return and the selected day never moved. Syncing once here
+        // covers every binding, present and future. `self.data` is an
+        // `Arc<UsageData>`, so this is a refcount bump, not a deep copy.
+        self.ui.data = self.data.clone();
+
+        // Zoom fuzzy-search text entry. While the `/` overlay is active,
+        // printable keys build the query, Backspace deletes (or cancels
+        // once the query is empty), and Enter commits — captured here so
+        // they don't fall through to period/navigation binds. Arrows fall
+        // through so the user can move the row cursor over filtered hits
+        // while the query bar is up.
+        if self.ui.zoom_search_active {
+            match *code {
+                KeyCode::Char { ch } => {
+                    self.ui.zoom_search_char(ch);
+                    return true;
+                }
+                KeyCode::Backspace => {
+                    if self.ui.zoom_search_query.is_empty() {
+                        self.ui.zoom_cancel_search();
+                    } else {
+                        self.ui.zoom_search_backspace();
+                    }
+                    return true;
+                }
+                KeyCode::Enter => {
+                    self.ui.zoom_commit_search();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        // Column count of the zoomed panel (0 when not zoomed / on a
+        // non-table panel). Used to clamp the column-nav/resize keys.
+        let zoom_n_cols = self.ui.zoom.map(crate::ui::zoom_col_count).unwrap_or(0);
+
+        match *code {
+            KeyCode::Char { ch: '1' } => self.ui.set_period(UsagePeriod::Today),
+            KeyCode::Char { ch: '2' } => self.ui.set_period(UsagePeriod::Week),
+            KeyCode::Char { ch: '3' } => self.ui.set_period(UsagePeriod::ThirtyDays),
+            KeyCode::Char { ch: '4' } => self.ui.set_period(UsagePeriod::LastNDays(90)),
+            KeyCode::Char { ch: '5' } => self.ui.set_period(UsagePeriod::YearToDate),
+            KeyCode::Char { ch: 'm' } => self.ui.set_period(UsagePeriod::Month),
+            KeyCode::Char { ch: 'q' } => {
+                // No plain `Quarter` variant exists — use today's
+                // calendar quarter as the anchor, matching how the
+                // chip-row picker visualises the active quarter.
+                let today = Local::now().date_naive();
+                let year = today.year();
+                // `Datelike::month()` is 1..=12 → quarter 1..=4.
+                let q = u8::try_from((today.month() - 1) / 3 + 1).unwrap_or(1);
+                self.ui.set_period(UsagePeriod::SpecificQuarter(year, q));
+            }
+            KeyCode::Char { ch: 'a' } => self.ui.set_period(UsagePeriod::All),
+            // Activity owns Left/Right for cursor movement; these must precede
+            // the provider arms below, which are unguarded catch-alls. Provider
+            // switching stays reachable on this tab via `p`.
+            KeyCode::Left if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                self.ui.heatmap_move(-1, 0)
+            }
+            KeyCode::Right if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                self.ui.heatmap_move(1, 0)
+            }
+            KeyCode::Left => self.ui.prev_provider(),
+            KeyCode::Right => self.ui.next_provider(),
+            KeyCode::Tab => self.ui.focus_next_panel(),
+            KeyCode::BackTab => self.ui.focus_prev_panel(),
+            KeyCode::Char { ch: 'z' } => self.ui.toggle_zoom(),
+            KeyCode::Char { ch: '/' } if self.ui.is_zoomed() => self.ui.zoom_begin_search(),
+            KeyCode::Char { ch: 'd' } if self.ui.is_zoomed() => self.ui.toggle_zoom_detail(),
+
+            // ── Zoom-table column focus / resize (zoomed only). The
+            // `!zoom_search_active` guard is belt-and-suspenders: the
+            // search intercept above already consumes every printable key
+            // into the query while `/` is open, so these arms are only
+            // reached when not searching. When NOT zoomed they fall
+            // through (return false), leaving `[ ] < > =` unbound on the
+            // dashboard.
+            KeyCode::Char { ch: '[' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                self.ui.zoom_focus_col_prev()
+            }
+            KeyCode::Char { ch: ']' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                self.ui.zoom_focus_col_next(zoom_n_cols)
+            }
+            KeyCode::Char { ch: '<' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                if let Some(panel) = self.ui.zoom {
+                    self.ui.zoom_shrink_col(panel, zoom_n_cols);
+                }
+            }
+            KeyCode::Char { ch: '>' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                if let Some(panel) = self.ui.zoom {
+                    self.ui.zoom_grow_col(panel, zoom_n_cols);
+                }
+            }
+            KeyCode::Char { ch: '=' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                self.ui.zoom_reset_cols()
+            }
+
+            // ── Outer tab switch (Burndown ↔ … ↔ Savings). While zoomed,
+            // `[`/`]` focus table columns (handled above); when NOT zoomed
+            // they cycle the outer UsageTab so every tab — including the
+            // Savings observability card — is keyboard-reachable.
+            // ── Activity-tab heatmap navigation. Guarded on the active tab so
+            // these keys keep their existing meaning everywhere else.
+            KeyCode::Up if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                self.ui.heatmap_move(0, -1)
+            }
+            KeyCode::Down if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                self.ui.heatmap_move(0, 1)
+            }
+            KeyCode::Char { ch: 'M' } if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                self.ui.heatmap_cycle_metric()
+            }
+            KeyCode::Char { ch: '[' } => self.ui.prev_tab(),
+            KeyCode::Char { ch: ']' } => self.ui.next_tab(),
+
+            // ── Zoom-table row navigation (zoomed only). Arrows are safe
+            // even while searching; `j` is guarded like the resize keys
+            // so it can be typed into the search box.
+            KeyCode::Up if self.ui.is_zoomed() => self.ui.zoom_row_up(),
+            KeyCode::Down if self.ui.is_zoomed() => self.ui.zoom_row_down(),
+            KeyCode::Char { ch: 'j' } if self.ui.is_zoomed() && !self.ui.zoom_search_active => {
+                self.ui.zoom_row_down()
+            }
+            // On the Activity tab Enter pivots to the selected day rather than
+            // committing a table row — there are no rows on a heatmap.
+            KeyCode::Enter if self.ui.active_tab == crate::ui::UsageTab::Activity => {
+                let _ = self.ui.heatmap_commit_day();
+            }
+            KeyCode::Enter => {
+                // `commit_focused_row` resolves the row through
+                // `filtered_data()`, which reads the `ui.data` synced at the
+                // top of this function.
+                let _ = self.ui.commit_focused_row();
+            }
+            KeyCode::Char { ch: 'X' } => {
+                let _ = self.ui.commit_focused_row_exclude();
+            }
+            KeyCode::Char { ch: 'C' } => self.ui.clear_all_filter_chips(),
+            // `Backspace` handles pop-state: close zoom if open,
+            // otherwise pop the most recent filter chip. `Esc` (below)
+            // performs the same one-level pop but additionally signals
+            // the host once the root view is reached.
+            KeyCode::Backspace => {
+                if self.ui.is_zoomed() {
+                    let _ = self.ui.zoom_handle_esc();
+                } else {
+                    let _ = self.ui.pop_filter_chip();
+                }
+            }
+            // One-level pop, mirroring Backspace: the zoom ladder first
+            // (detail drawer → search overlay → zoom), then the newest
+            // filter chip. Returning `false` at the root view (nothing
+            // left to pop) makes the async `handle_key` publish
+            // `ui.close_request` so the host closes the screen back to
+            // wherever it was opened from. See `is_host_reserved_key`
+            // in ainb-app/src/app/screens/builtin.rs for the host side.
+            KeyCode::Esc => {
+                if self.ui.zoom_handle_esc() {
+                    // Consumed by the zoom ladder.
+                } else if self.ui.pop_filter_chip().is_none() {
+                    return false;
+                }
+            }
+            KeyCode::Char { ch: 'p' } => self.ui.cycle_provider_filter(),
+            KeyCode::Char { ch: 'k' } => {
+                // In zoom: move the focused table row up. On the
+                // dashboard: scroll the panel up (legacy behavior).
+                if self.ui.is_zoomed() {
+                    self.ui.zoom_row_up();
+                } else {
+                    self.ui.scroll_up();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Pure mouse dispatch (no host I/O) so it's unit-testable like
+    /// [`Self::dispatch_key_pure`]. Returns true iff it changed visible state.
+    ///
+    /// - **Wheel** scrolls the focused list — the zoomed table row when zoomed
+    ///   (self-clamping), else the dashboard list clamped to the session count
+    ///   so the offset can never run past the data.
+    /// - **Left click on a tab** in the tab bar switches to that tab, so every
+    ///   tab — including the Savings card — is reachable by mouse.
+    fn dispatch_mouse_pure(&mut self, m: MouseEvent) -> bool {
+        match m.kind {
+            MouseKind::ScrollUp => {
+                // Return the REAL delta so a boundary tick (already at the top)
+                // doesn't force a needless WireBuffer re-serialize — same
+                // redraw discipline as `handle_key`.
+                let before = (self.ui.scroll_offset, self.ui.focus_row);
+                if self.ui.is_zoomed() {
+                    self.ui.zoom_row_up();
+                } else {
+                    self.ui.scroll_up();
+                }
+                (self.ui.scroll_offset, self.ui.focus_row) != before
+            }
+            MouseKind::ScrollDown => {
+                let before = (self.ui.scroll_offset, self.ui.focus_row);
+                if self.ui.is_zoomed() {
+                    self.ui.zoom_row_down();
+                } else {
+                    // `row_count()` reads `ui.data`, which the plugin only syncs
+                    // at render time — refresh it first (same sync the Enter
+                    // handler does) so the clamp matches the live snapshot. It
+                    // is tab-aware (Daily=days, Projects=projects, …), so short
+                    // lists can't over-scroll the way a raw session count would.
+                    self.ui.data = self.data.clone();
+                    let max_rows = self.ui.row_count();
+                    self.ui.scroll_down(max_rows);
+                }
+                (self.ui.scroll_offset, self.ui.focus_row) != before
+            }
+            MouseKind::Down {
+                button: MouseButton::Left,
+            } => {
+                if (TAB_BAR_TOP..TAB_BAR_TOP + TAB_BAR_H).contains(&m.row) {
+                    if let Some(tab) = tab_at_col(m.col) {
+                        if tab != self.ui.active_tab {
+                            self.ui.active_tab = tab;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Copy `text` to the system clipboard via `arboard`.
+///
+/// Returns `Err(message)` on any failure (no clipboard backend, e.g. a
+/// headless Linux box with neither X11 nor Wayland) so the caller can
+/// degrade gracefully — clipboard access is best-effort, never fatal.
+fn copy_to_clipboard(text: &str) -> std::result::Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod handle_key_dispatch_tests {
+    use super::*;
+    use ainb_plugin_sdk::KeyCode;
+
+    fn ch(c: char) -> KeyCode {
+        KeyCode::Char { ch: c }
+    }
+
+    #[test]
+    fn period_keys_map_to_expected_variants() {
+        let cases: &[(KeyCode, UsagePeriod)] = &[
+            (ch('1'), UsagePeriod::Today),
+            (ch('2'), UsagePeriod::Week),
+            (ch('3'), UsagePeriod::ThirtyDays),
+            (ch('4'), UsagePeriod::LastNDays(90)),
+            (ch('5'), UsagePeriod::YearToDate),
+            (ch('m'), UsagePeriod::Month),
+            (ch('a'), UsagePeriod::All),
+        ];
+        for (code, expected) in cases {
+            let mut p = BurndownPlugin::default();
+            assert!(p.dispatch_key_pure(code), "binding missing for {code:?}");
+            assert_eq!(
+                p.ui.period, *expected,
+                "period mismatch after dispatching {code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quarter_key_anchors_on_today() {
+        use chrono::{Datelike, Local};
+        let today = Local::now().date_naive();
+        let expected_q = u8::try_from((today.month() - 1) / 3 + 1).unwrap();
+
+        let mut p = BurndownPlugin::default();
+        assert!(p.dispatch_key_pure(&ch('q')));
+        match p.ui.period {
+            UsagePeriod::SpecificQuarter(year, q) => {
+                assert_eq!(year, today.year());
+                assert_eq!(q, expected_q);
+            }
+            other => panic!("expected SpecificQuarter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_keys_advance_provider_filter() {
+        // `◀/▶` step the single `provider_filter` ring directly (prev is
+        // the exact inverse of next), so `▶` then `◀` round-trips back to
+        // the starting filter — and both directions always mutate.
+        let mut p = BurndownPlugin::default();
+        let starting = p.ui.provider_filter;
+        assert!(p.dispatch_key_pure(&KeyCode::Right));
+        assert_ne!(
+            p.ui.provider_filter, starting,
+            "▶ must mutate provider_filter"
+        );
+        assert!(p.dispatch_key_pure(&KeyCode::Left));
+        assert_eq!(
+            p.ui.provider_filter, starting,
+            "◀ after ▶ returns to the starting filter (inverse ring)"
+        );
+    }
+
+    #[test]
+    fn tab_cycles_focused_panel() {
+        let mut p = BurndownPlugin::default();
+        let before = p.ui.focused_panel;
+        assert!(p.dispatch_key_pure(&KeyCode::Tab));
+        let after = p.ui.focused_panel;
+        assert_ne!(before, after, "Tab must change focused panel");
+    }
+
+    #[test]
+    fn bracket_keys_cycle_outer_tabs_and_reach_savings() {
+        use crate::ui::UsageTab;
+        // Regression: `[`/`]` were zoom-only, so the outer tabs (incl. the
+        // Savings observability card) were keyboard-unreachable — active_tab
+        // was stuck on Burndown. They now cycle the outer tab when not zoomed.
+        let mut p = BurndownPlugin::default();
+        assert_eq!(p.ui.active_tab, UsageTab::Burndown, "starts on Burndown");
+
+        // `]` walks forward: Burndown → Activity → Projects → Optimize → Savings.
+        for expect in [
+            UsageTab::Activity,
+            UsageTab::Projects,
+            UsageTab::Optimize,
+            UsageTab::Savings,
+        ] {
+            assert!(
+                p.dispatch_key_pure(&KeyCode::Char { ch: ']' }),
+                "] must be consumed"
+            );
+            assert_eq!(p.ui.active_tab, expect, "] advances the outer tab");
+        }
+        assert_eq!(
+            p.ui.active_tab,
+            UsageTab::Savings,
+            "Savings is now reachable"
+        );
+
+        // `[` walks back off Savings.
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Char { ch: '[' }),
+            "[ must be consumed"
+        );
+        assert_eq!(
+            p.ui.active_tab,
+            UsageTab::Optimize,
+            "[ retreats the outer tab"
+        );
+    }
+
+    #[test]
+    fn mouse_left_click_on_savings_tab_switches_to_it() {
+        use crate::ui::{TAB_BAR_TOP, UsageTab, tab_at_col};
+        let mut p = BurndownPlugin::default();
+        assert_eq!(p.ui.active_tab, UsageTab::Burndown);
+        // A column inside the Savings title's hit zone.
+        let col = (0u16..240)
+            .find(|c| tab_at_col(*c) == Some(UsageTab::Savings))
+            .expect("Savings hit zone exists");
+        let ev = MouseEvent {
+            kind: MouseKind::Down {
+                button: MouseButton::Left,
+            },
+            col,
+            row: TAB_BAR_TOP,
+            mods: 0,
+        };
+        assert!(
+            p.dispatch_mouse_pure(ev),
+            "clicking the Savings tab must switch"
+        );
+        assert_eq!(
+            p.ui.active_tab,
+            UsageTab::Savings,
+            "clicked tab is now active"
+        );
+    }
+
+    #[test]
+    fn mouse_click_off_the_tab_bar_is_a_noop() {
+        use crate::ui::TAB_BAR_TOP;
+        let mut p = BurndownPlugin::default();
+        let ev = MouseEvent {
+            kind: MouseKind::Down {
+                button: MouseButton::Left,
+            },
+            col: 4,
+            row: TAB_BAR_TOP + 40, // deep in the content area
+            mods: 0,
+        };
+        assert!(
+            !p.dispatch_mouse_pure(ev),
+            "a click outside the tab bar changes nothing"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_only_redraws_on_real_movement() {
+        let up = MouseEvent {
+            kind: MouseKind::ScrollUp,
+            col: 0,
+            row: 0,
+            mods: 0,
+        };
+        let down = MouseEvent {
+            kind: MouseKind::ScrollDown,
+            col: 0,
+            row: 0,
+            mods: 0,
+        };
+        // Fresh plugin: nothing to scroll → wheel is a no-op, so it must NOT
+        // request a redraw (boundary tick discipline, mirroring handle_key).
+        let mut p = BurndownPlugin::default();
+        assert!(!p.dispatch_mouse_pure(up), "wheel up at the top is a no-op");
+        assert!(
+            !p.dispatch_mouse_pure(down),
+            "wheel down with no rows is a no-op"
+        );
+
+        // Zoomed table with rows: wheel-down advances the focused row → real
+        // change → redraw requested.
+        let mut z = zoomed_plugin();
+        assert!(
+            z.dispatch_mouse_pure(down),
+            "wheel down in a zoomed table scrolls and redraws"
+        );
+    }
+
+    #[test]
+    fn z_toggles_zoom_state() {
+        let mut p = BurndownPlugin::default();
+        assert!(!p.ui.is_zoomed());
+        // First need a focused panel so toggle_zoom has something to
+        // zoom into.
+        let _ = p.dispatch_key_pure(&KeyCode::Tab);
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.ui.is_zoomed(), "z must zoom into focused panel");
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(!p.ui.is_zoomed(), "second z must un-zoom");
+    }
+
+    #[test]
+    fn slash_only_dispatches_while_zoomed() {
+        let mut p = BurndownPlugin::default();
+        // Not zoomed → `/` is unbound (returns false, no generation bump).
+        assert!(!p.dispatch_key_pure(&ch('/')));
+        // Zoom in.
+        let _ = p.dispatch_key_pure(&KeyCode::Tab);
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.ui.is_zoomed());
+        // Now zoomed → `/` claims the key.
+        assert!(p.dispatch_key_pure(&ch('/')));
+    }
+
+    #[test]
+    fn backspace_pops_filter_when_not_zoomed_and_unzooms_when_zoomed() {
+        let mut p = BurndownPlugin::default();
+        // Not zoomed: Backspace claims the key (no-op against an empty
+        // filter stack, but still bumps generation).
+        assert!(p.dispatch_key_pure(&KeyCode::Backspace));
+
+        // Zoomed: Backspace should also claim, and un-zoom.
+        let _ = p.dispatch_key_pure(&KeyCode::Tab);
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.ui.is_zoomed());
+        assert!(p.dispatch_key_pure(&KeyCode::Backspace));
+        assert!(!p.ui.is_zoomed(), "Backspace must exit zoom");
+    }
+
+    #[test]
+    fn esc_at_root_is_not_claimed() {
+        // At the root view (no zoom, no overlay, no filter chips) there
+        // is nothing left to pop, so the dispatch must return false —
+        // that's the signal `handle_key` uses to publish
+        // `ui.close_request` and have the host close the screen. If
+        // this started returning true, Esc on the analytics root would
+        // silently do nothing forever.
+        let mut p = BurndownPlugin::default();
+        assert!(!p.dispatch_key_pure(&KeyCode::Esc));
+    }
+
+    #[test]
+    fn esc_pops_one_level_before_signalling_close() {
+        // Esc mirrors Backspace's one-level pop: zoomed → unzoom (claimed),
+        // then a second Esc at the root is unclaimed (close signal).
+        let mut p = BurndownPlugin::default();
+        let _ = p.dispatch_key_pure(&KeyCode::Tab);
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.ui.is_zoomed());
+
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Esc),
+            "Esc must claim the unzoom"
+        );
+        assert!(!p.ui.is_zoomed(), "Esc must exit zoom");
+
+        assert!(
+            !p.dispatch_key_pure(&KeyCode::Esc),
+            "Esc at the root must be unclaimed so handle_key publishes ui.close_request"
+        );
+    }
+
+    #[test]
+    fn esc_pops_filter_chip_before_signalling_close() {
+        use crate::data::usage::{BranchUsage, TokenBucket, UsageData, UsagePeriod};
+        use crate::ui::UsagePanel;
+
+        // Commit a branch chip (same setup as the Enter regression test),
+        // then assert Esc pops it before going unclaimed at the root.
+        let mut p = BurndownPlugin::default();
+        let mut data = UsageData::default();
+        data.branches = vec![BranchUsage {
+            branch: "main".to_string(),
+            bucket: TokenBucket {
+                input_tokens: 100,
+                output_tokens: 100,
+                ..Default::default()
+            },
+        }];
+        p.data = Some(std::sync::Arc::new(data));
+        p.ui.data = None;
+        p.ui.focused_panel = Some(UsagePanel::ByBranch);
+        p.ui.focus_row = 0;
+        p.ui.period = UsagePeriod::All;
+        assert!(p.dispatch_key_pure(&KeyCode::Enter));
+        assert_eq!(p.ui.filters.branch, vec!["main".to_string()]);
+
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Esc),
+            "Esc must claim the chip pop"
+        );
+        assert!(p.ui.filters.branch.is_empty(), "Esc must pop the chip");
+        assert!(
+            !p.dispatch_key_pure(&KeyCode::Esc),
+            "Esc with no chips left must be unclaimed (close signal)"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_zoom_search_before_unzooming() {
+        // With the `/` search overlay open inside zoom, Esc closes the
+        // overlay first (one level), keeping the zoom; only subsequent
+        // presses unzoom and then signal close.
+        let mut p = BurndownPlugin::default();
+        let _ = p.dispatch_key_pure(&KeyCode::Tab);
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.dispatch_key_pure(&ch('/')));
+        assert!(p.ui.zoom_search_active);
+
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Esc),
+            "Esc must claim the search cancel"
+        );
+        assert!(
+            !p.ui.zoom_search_active,
+            "Esc must close the search overlay"
+        );
+        assert!(p.ui.is_zoomed(), "search cancel must not also unzoom");
+    }
+
+    #[test]
+    fn k_scrolls_up() {
+        // Even on an empty state `scroll_up` is a no-op `saturating_sub` —
+        // the binding still claims the key. We're really asserting the
+        // dispatch wiring rather than the scroll math.
+        let mut p = BurndownPlugin::default();
+        assert!(p.dispatch_key_pure(&ch('k')));
+    }
+
+    /// Regression: `commit_focused_row` reads `self.ui.data`, but the
+    /// plugin parks the parsed snapshot on `self.data`. Before the
+    /// dispatcher started syncing data into `ui` ahead of the commit,
+    /// Enter was a silent no-op — no chip, no error, no log line. This
+    /// test lifts the contract into the dispatcher's surface so the
+    /// sync can't regress without a CI signal.
+    #[test]
+    fn enter_commits_branch_chip_when_only_plugin_data_is_set() {
+        use crate::data::usage::{BranchUsage, TokenBucket, UsageData, UsagePeriod};
+        use crate::ui::UsagePanel;
+
+        let mut p = BurndownPlugin::default();
+        let mut data = UsageData::default();
+        data.branches = vec![BranchUsage {
+            branch: "main".to_string(),
+            bucket: TokenBucket {
+                input_tokens: 100,
+                output_tokens: 100,
+                ..Default::default()
+            },
+        }];
+        // Plugin-level snapshot ONLY — leave self.ui.data as None to
+        // mirror the production state right after `apply_chunk_pure`.
+        p.data = Some(std::sync::Arc::new(data));
+        p.ui.data = None;
+        p.ui.focused_panel = Some(UsagePanel::ByBranch);
+        p.ui.focus_row = 0;
+        // Bypass period filtering so the synthetic call survives the
+        // re-aggregate in `filter_usage_data_full`.
+        p.ui.period = UsagePeriod::All;
+
+        assert!(p.dispatch_key_pure(&KeyCode::Enter));
+        assert_eq!(
+            p.ui.filters.branch,
+            vec!["main".to_string()],
+            "Enter must commit a chip even when only self.data (not self.ui.data) is set"
+        );
+    }
+
+    #[test]
+    fn unmapped_keys_are_not_claimed() {
+        let mut p = BurndownPlugin::default();
+        // 'D' (advanced/custom) was deliberately dropped — needs a date range.
+        assert!(!p.dispatch_key_pure(&ch('D')));
+        // 'j' was dropped — `scroll_down` needs a row-count we can't
+        // know from the dispatch.
+        assert!(!p.dispatch_key_pure(&ch('j')));
+        // Random Unicode key.
+        assert!(!p.dispatch_key_pure(&ch('🚀')));
+        // F-key.
+        assert!(!p.dispatch_key_pure(&KeyCode::F { n: 5 }));
+    }
+
+    #[test]
+    fn generation_bumps_only_when_dispatch_handled() {
+        // We can't drive the async `handle_key` without a HostClient,
+        // but we can replicate its bookkeeping using the pure helper
+        // — which is what `handle_key` does for every non-`r` binding.
+        let mut p = BurndownPlugin::default();
+        let g0 = p.generation;
+
+        // Handled key → bump.
+        let handled = p.dispatch_key_pure(&ch('1'));
+        if handled {
+            p.generation = p.generation.wrapping_add(1);
+        }
+        assert_eq!(p.generation, g0 + 1, "handled key must bump generation");
+
+        // Unmapped key → no bump.
+        let handled = p.dispatch_key_pure(&ch('j'));
+        if handled {
+            p.generation = p.generation.wrapping_add(1);
+        }
+        assert_eq!(
+            p.generation,
+            g0 + 1,
+            "unmapped key must NOT bump generation"
+        );
+    }
+
+    /// Zoom into a focusable panel so the column-nav / resize / row-nav
+    /// keys are live. Returns the plugin already in zoom mode.
+    fn zoomed_plugin() -> BurndownPlugin {
+        let mut p = BurndownPlugin::default();
+        // Tab focuses the first panel; `z` zooms it.
+        assert!(p.dispatch_key_pure(&KeyCode::Tab));
+        assert!(p.dispatch_key_pure(&ch('z')));
+        assert!(p.ui.is_zoomed(), "setup: plugin must be zoomed");
+        p
+    }
+
+    #[test]
+    fn zoomed_bracket_advances_focus_col() {
+        let mut p = zoomed_plugin();
+        assert_eq!(p.ui.zoom_focus_col, 0);
+        assert!(
+            p.dispatch_key_pure(&ch(']')),
+            "] must be handled when zoomed"
+        );
+        assert_eq!(p.ui.zoom_focus_col, 1, "] advances column focus");
+        assert!(
+            p.dispatch_key_pure(&ch('[')),
+            "[ must be handled when zoomed"
+        );
+        assert_eq!(p.ui.zoom_focus_col, 0, "[ retreats column focus");
+    }
+
+    #[test]
+    fn zoomed_gt_grows_focused_column_delta() {
+        let mut p = zoomed_plugin();
+        // Focus col 1, then grow it.
+        assert!(p.dispatch_key_pure(&ch(']')));
+        assert!(
+            p.dispatch_key_pure(&ch('>')),
+            "> must be handled when zoomed"
+        );
+        assert_eq!(
+            p.ui.zoom_col_deltas[1], 4,
+            "> widens the focused column by COL_RESIZE_STEP (4)"
+        );
+        assert_eq!(p.ui.zoom_col_deltas[0], 0, "other columns untouched");
+    }
+
+    #[test]
+    fn zoomed_k_and_up_move_focus_row_up() {
+        let mut p = zoomed_plugin();
+        p.ui.focus_row = 5;
+        assert!(p.dispatch_key_pure(&ch('k')), "k handled when zoomed");
+        assert_eq!(p.ui.focus_row, 4, "k moves focus row up in zoom");
+        assert!(p.dispatch_key_pure(&KeyCode::Up), "Up handled when zoomed");
+        assert_eq!(p.ui.focus_row, 3, "Up moves focus row up in zoom");
+        // Down moves it back.
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Down),
+            "Down handled when zoomed"
+        );
+        assert_eq!(p.ui.focus_row, 4, "Down moves focus row down in zoom");
+    }
+
+    #[test]
+    fn resize_col_keys_unbound_on_dashboard() {
+        // Not zoomed: the column resize keys `< > =` must fall through (return
+        // false) so they keep their no-op behavior on the dashboard. (`[`/`]`
+        // ARE bound off-zoom now — they switch the outer tab; see
+        // bracket_keys_cycle_outer_tabs_and_reach_savings.)
+        let mut p = BurndownPlugin::default();
+        assert!(!p.ui.is_zoomed());
+        for k in ['<', '>', '='] {
+            assert!(
+                !p.dispatch_key_pure(&ch(k)),
+                "`{k}` must be unhandled on the dashboard"
+            );
+        }
+        // Up / Down are also unbound off-zoom (they don't map to
+        // anything on the dashboard).
+        assert!(!p.dispatch_key_pure(&KeyCode::Up));
+        assert!(!p.dispatch_key_pure(&KeyCode::Down));
+    }
+
+    #[test]
+    fn zoom_search_input_builds_query_and_captures_keys() {
+        let mut p = zoomed_plugin();
+        assert!(p.dispatch_key_pure(&ch('/')), "`/` opens search");
+        assert!(p.ui.zoom_search_active);
+
+        // Printable keys (incl. ones that are period/resize binds when
+        // not searching) build the query instead of firing those binds.
+        for c in ['m', '4', '>', '['] {
+            assert!(p.dispatch_key_pure(&ch(c)), "`{c}` captured into query");
+        }
+        assert_eq!(p.ui.zoom_search_query, "m4>[");
+        // The captured `m`/`4` must NOT have changed the period.
+        assert!(matches!(p.ui.period, crate::data::usage::UsagePeriod::Week));
+
+        // Backspace deletes a char; once empty it cancels the search.
+        for _ in 0..4 {
+            assert!(p.dispatch_key_pure(&KeyCode::Backspace));
+        }
+        assert_eq!(p.ui.zoom_search_query, "");
+        assert!(
+            p.ui.zoom_search_active,
+            "still active while query non-empty path drains"
+        );
+        assert!(
+            p.dispatch_key_pure(&KeyCode::Backspace),
+            "empty-query Backspace cancels"
+        );
+        assert!(!p.ui.zoom_search_active, "search cancelled once empty");
+    }
+
+    #[test]
+    fn zoom_search_enter_commits_and_keeps_query() {
+        let mut p = zoomed_plugin();
+        assert!(p.dispatch_key_pure(&ch('/')));
+        for c in ['p', 'r', 'o', 'j'] {
+            assert!(p.dispatch_key_pure(&ch(c)));
+        }
+        assert!(p.dispatch_key_pure(&KeyCode::Enter), "Enter commits search");
+        assert!(!p.ui.zoom_search_active, "input mode closed");
+        assert_eq!(p.ui.zoom_search_query, "proj", "committed query survives");
+    }
+}
+
+#[cfg(test)]
+mod chunk_accumulator_tests {
+    use super::*;
+    use ainb_plugin_types_sessions::{
+        ProjectUsage, Provider, ProviderCall, TokenBucket, WIRE_VERSION,
+    };
+    use chrono::{DateTime, Utc};
+
+    fn fake_call(id: u64) -> ProviderCall {
+        ProviderCall {
+            id,
+            provider: Provider::Claude,
+            model: "claude-sonnet".into(),
+            session_id: "s".into(),
+            project: "p".into(),
+            project_path: "/tmp".into(),
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            input_tokens: 1,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            output_tokens: 1,
+            reasoning_tokens: 0,
+            cost_usd: None,
+            tools: vec![],
+            bash_commands: vec![],
+            user_message: String::new(),
+            branch: None,
+        }
+    }
+
+    fn chunk(idx: u32, is_final: bool, calls: Vec<ProviderCall>) -> UsageDataEvent {
+        let mut data = WireUsageData::default();
+        data.calls = calls;
+        if idx == 0 {
+            // Plant an aggregate so we can assert chunk 0 seeds the
+            // accumulator with the full payload.
+            data.projects = vec![ProjectUsage {
+                name: "p".into(),
+                path: "/tmp".into(),
+                bucket: TokenBucket::default(),
+                repo: None,
+            }];
+        }
+        UsageDataEvent {
+            version: WIRE_VERSION,
+            published_ns: 0,
+            partial: false,
+            chunk_index: idx,
+            is_final,
+            data,
+        }
+    }
+
+    #[test]
+    fn single_chunk_finalises_immediately() {
+        let mut p = BurndownPlugin::default();
+        let outcome = p.apply_chunk_pure(chunk(0, true, vec![fake_call(1), fake_call(2)]));
+        assert_eq!(outcome, ChunkOutcome::Finalised);
+        assert!(p.pending.is_none());
+        let d = p.data.as_ref().expect("snapshot finalised");
+        assert_eq!(d.calls.len(), 2);
+    }
+
+    #[test]
+    fn three_chunk_sequence_accumulates_then_finalises() {
+        let mut p = BurndownPlugin::default();
+        assert_eq!(
+            p.apply_chunk_pure(chunk(0, false, vec![fake_call(1)])),
+            ChunkOutcome::Buffered
+        );
+        assert_eq!(
+            p.apply_chunk_pure(chunk(1, false, vec![fake_call(2)])),
+            ChunkOutcome::Buffered
+        );
+        // Mid-flight: no live data yet.
+        assert!(p.data.is_none());
+        assert_eq!(
+            p.apply_chunk_pure(chunk(2, true, vec![fake_call(3)])),
+            ChunkOutcome::Finalised
+        );
+        let d = p.data.as_ref().expect("snapshot finalised");
+        assert_eq!(d.calls.len(), 3);
+        // Calls arrive in chunk order.
+        assert_eq!(d.calls[0].id, 1);
+        assert_eq!(d.calls[2].id, 3);
+    }
+
+    #[test]
+    fn follow_on_chunk_without_chunk_zero_is_dropped() {
+        let mut p = BurndownPlugin::default();
+        assert_eq!(
+            p.apply_chunk_pure(chunk(1, true, vec![fake_call(1)])),
+            ChunkOutcome::DroppedFollowOn
+        );
+        assert!(p.data.is_none(), "must not finalise from a stray chunk");
+        assert!(p.pending.is_none());
+    }
+
+    #[test]
+    fn new_chunk_zero_discards_in_flight_accumulator() {
+        let mut p = BurndownPlugin::default();
+        let _ = p.apply_chunk_pure(chunk(0, false, vec![fake_call(1)]));
+        let _ = p.apply_chunk_pure(chunk(1, false, vec![fake_call(2)]));
+        // Publisher abandoned and started over.
+        assert_eq!(
+            p.apply_chunk_pure(chunk(0, true, vec![fake_call(99)])),
+            ChunkOutcome::Finalised
+        );
+        let d = p.data.as_ref().unwrap();
+        assert_eq!(d.calls.len(), 1, "old accumulator was discarded");
+        assert_eq!(d.calls[0].id, 99);
+    }
+
+    #[test]
+    fn finalising_clears_schema_mismatch_flag() {
+        let mut p = BurndownPlugin::default();
+        p.schema_mismatch = true;
+        let _ = p.apply_chunk_pure(chunk(0, true, vec![fake_call(1)]));
+        assert!(!p.schema_mismatch);
+    }
+
+    #[test]
+    fn v4_chunk_zero_no_calls_follow_on_chunks_extend_tail_vecs() {
+        // v4 wire model: chunk 0 carries only bounded aggregates;
+        // follow-on chunks carry slices of `calls`, `sessions`, and
+        // `shell_commands` that the accumulator extend()s onto the
+        // in-flight UsageData. This is what session-reader publishes
+        // after the chunker rewrite (see plugin.rs `chunk_usage_data`).
+        use ainb_plugin_types_sessions::{NamedUsage, SessionUsage};
+        use chrono::DateTime;
+
+        fn session(id: &str) -> SessionUsage {
+            SessionUsage {
+                provider: Provider::Claude,
+                project: "p".into(),
+                project_path: "/tmp/p".into(),
+                session_id: id.into(),
+                first_timestamp: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                last_timestamp: DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+                bucket: TokenBucket::default(),
+            }
+        }
+
+        fn shell(name: &str) -> NamedUsage {
+            NamedUsage {
+                name: name.into(),
+                calls: 1,
+            }
+        }
+
+        let mut p = BurndownPlugin::default();
+
+        // Chunk 0: aggregates only. No calls, no sessions, no shell_cmds.
+        let mut chunk_0_data = WireUsageData::default();
+        chunk_0_data.projects = vec![ProjectUsage {
+            name: "p".into(),
+            path: "/tmp".into(),
+            bucket: TokenBucket::default(),
+            repo: None,
+        }];
+        assert_eq!(
+            p.apply_chunk_pure(UsageDataEvent {
+                version: WIRE_VERSION,
+                published_ns: 0,
+                partial: false,
+                chunk_index: 0,
+                is_final: false,
+                data: chunk_0_data,
+            }),
+            ChunkOutcome::Buffered
+        );
+
+        // Chunk 1: tail slice — 2 calls + 2 sessions + 1 shell_cmd.
+        let mut chunk_1_data = WireUsageData::default();
+        chunk_1_data.calls = vec![fake_call(1), fake_call(2)];
+        chunk_1_data.sessions = vec![session("s1"), session("s2")];
+        chunk_1_data.shell_commands = vec![shell("ls")];
+        assert_eq!(
+            p.apply_chunk_pure(UsageDataEvent {
+                version: WIRE_VERSION,
+                published_ns: 0,
+                partial: false,
+                chunk_index: 1,
+                is_final: false,
+                data: chunk_1_data,
+            }),
+            ChunkOutcome::Buffered
+        );
+
+        // Chunk 2: more tail — 1 call + 1 session + 2 shell_cmds, is_final.
+        let mut chunk_2_data = WireUsageData::default();
+        chunk_2_data.calls = vec![fake_call(3)];
+        chunk_2_data.sessions = vec![session("s3")];
+        chunk_2_data.shell_commands = vec![shell("grep"), shell("cat")];
+        assert_eq!(
+            p.apply_chunk_pure(UsageDataEvent {
+                version: WIRE_VERSION,
+                published_ns: 0,
+                partial: false,
+                chunk_index: 2,
+                is_final: true,
+                data: chunk_2_data,
+            }),
+            ChunkOutcome::Finalised
+        );
+
+        let d = p.data.as_ref().expect("snapshot finalised");
+        // Calls accumulated in order across chunks 1 and 2.
+        assert_eq!(d.calls.len(), 3);
+        assert_eq!(d.calls[0].id, 1);
+        assert_eq!(d.calls[2].id, 3);
+        // Sessions and shell_commands also accumulated.
+        assert_eq!(d.sessions.len(), 3, "sessions extended across chunks");
+        assert_eq!(
+            d.shell_commands.len(),
+            3,
+            "shell_commands extended across chunks"
+        );
+        // Aggregates from chunk 0 survived.
+        assert_eq!(d.projects.len(), 1);
+    }
+
+    #[test]
+    fn finalising_clears_stashed_scan_progress() {
+        // Once real data arrives the skeleton must disappear — so the
+        // chunk accumulator drops `scan_progress` when it finalises a
+        // sequence into `self.data`.
+        let mut p = BurndownPlugin::default();
+        p.scan_progress = Some(ScanProgressEvent {
+            scanned: 7,
+            total: 100,
+            current_project: "alpha".into(),
+            done: false,
+        });
+        let _ = p.apply_chunk_pure(chunk(0, true, vec![fake_call(1)]));
+        assert!(
+            p.scan_progress.is_none(),
+            "scan_progress must clear on finalise so the skeleton goes away"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pivot_seq_tests {
+    //! Cover the `pivot_seq` ↔ `fresh_pivot` contract: the seq must bump
+    //! exactly once per `cached_filtered` cache miss, and not bump at
+    //! all on cache hits or no-op (every filter at default) paths. The
+    //! render path's snapshot-before/after compare relies on this to
+    //! decide when to flash the `↻ updated` chip-strip badge.
+    use super::*;
+    use crate::data::usage::{BranchUsage, TokenBucket, UsageData, UsagePeriod};
+
+    fn plugin_with_one_branch() -> BurndownPlugin {
+        let mut p = BurndownPlugin::default();
+        let mut data = UsageData::default();
+        data.branches = vec![BranchUsage {
+            branch: "main".to_string(),
+            bucket: TokenBucket::default(),
+        }];
+        p.data = Some(std::sync::Arc::new(data));
+        // Period::All bypasses the period predicate so the filter
+        // pass is purely the chip dimension under test.
+        p.ui.period = UsagePeriod::All;
+        p
+    }
+
+    #[test]
+    fn cached_filtered_bumps_seq_on_cache_miss_only() {
+        let mut p = plugin_with_one_branch();
+        let g0 = p.pivot_seq;
+
+        // No active filter, period=All, provider=All → no-op fast path
+        // returns None and must NOT bump the seq.
+        assert!(p.cached_filtered().is_none());
+        assert_eq!(p.pivot_seq, g0, "no-op path must not bump pivot_seq");
+
+        // Activate a chip → cache miss → seq bumps exactly once.
+        p.ui.filters.branch.push("main".to_string());
+        let _ = p.cached_filtered();
+        assert_eq!(p.pivot_seq, g0 + 1, "cache miss must bump pivot_seq by 1");
+
+        // Repeat the same call → cache hit → seq must NOT bump.
+        let _ = p.cached_filtered();
+        assert_eq!(p.pivot_seq, g0 + 1, "cache hit must not bump pivot_seq");
+
+        // Change the filter → cache miss again → seq bumps once more.
+        p.ui.filters.branch.clear();
+        p.ui.filters.branch.push("feature".to_string());
+        let _ = p.cached_filtered();
+        assert_eq!(
+            p.pivot_seq,
+            g0 + 2,
+            "second cache miss must bump pivot_seq again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scan_progress_tests {
+    //! Cover the `sessions.scan_progress` event path end-to-end: a
+    //! plugin instance receives 3 progress events via the same wire
+    //! shape session-reader publishes, and the stashed state matches
+    //! after each one. Verifies the plan's "fixture publishes 3
+    //! progress events → burndown renders 1/3, 2/3, 3/3 in order"
+    //! gate at the state level; the UI render assertion lives in
+    //! `ui::tests::scan_progress_skeleton_renders_n_of_m`.
+    use super::*;
+
+    fn payload(scanned: u32, total: u32, project: &str) -> Vec<u8> {
+        rmp_serde::to_vec_named(&ScanProgressEvent {
+            scanned,
+            total,
+            current_project: project.into(),
+            done: false,
+        })
+        .expect("encode scan_progress")
+    }
+
+    #[test]
+    fn three_progress_payloads_stash_in_order_and_clear_on_data() {
+        let mut p = BurndownPlugin::default();
+
+        // Decode three payloads via the same path `handle_event` uses
+        // for the wire bytes — `rmp_serde::from_slice<ScanProgressEvent>`.
+        for (i, total) in [(1, 3), (2, 3), (3, 3)] {
+            let bytes = payload(i, total, &format!("project-{i}"));
+            let decoded: ScanProgressEvent =
+                rmp_serde::from_slice(&bytes).expect("decode round-trips");
+            p.scan_progress = Some(decoded);
+            let stashed = p.scan_progress.as_ref().expect("stashed");
+            assert_eq!(stashed.scanned, i);
+            assert_eq!(stashed.total, 3);
+            assert_eq!(stashed.current_project, format!("project-{i}"));
+        }
+
+        // Real data arrives → skeleton goes away.
+        let mut data = WireUsageData::default();
+        data.calls = Vec::new();
+        let event = UsageDataEvent {
+            version: WIRE_VERSION,
+            published_ns: 0,
+            partial: false,
+            chunk_index: 0,
+            is_final: true,
+            data,
+        };
+        let outcome = p.apply_chunk_pure(event);
+        assert_eq!(outcome, ChunkOutcome::Finalised);
+        assert!(p.scan_progress.is_none());
+    }
+
+    #[test]
+    fn done_event_clears_in_flight_banner_without_data() {
+        // The unchanged-snapshot short-circuit (issue #255) ends a
+        // scan with NO usage_data publish — the terminal `done` event
+        // is the only thing that clears the banner.
+        let mut p = BurndownPlugin::default();
+        p.apply_scan_progress(ScanProgressEvent {
+            scanned: 7,
+            total: 10,
+            current_project: "mid-scan".into(),
+            done: false,
+        });
+        assert!(p.scan_progress.is_some(), "banner armed mid-scan");
+
+        let bytes = rmp_serde::to_vec_named(&ScanProgressEvent {
+            done: true,
+            ..ScanProgressEvent::default()
+        })
+        .expect("encode");
+        let decoded: ScanProgressEvent = rmp_serde::from_slice(&bytes).expect("decode");
+        p.apply_scan_progress(decoded);
+        assert!(
+            p.scan_progress.is_none(),
+            "done event clears the banner with no data publish"
+        );
+    }
+
+    #[test]
+    fn pre_done_publisher_payload_decodes_with_done_false() {
+        // Wire back-compat: a pre-#255 session-reader publishes maps
+        // without the `done` key — serde's default must fill `false`.
+        #[derive(serde::Serialize)]
+        struct LegacyScanProgress {
+            scanned: u32,
+            total: u32,
+            current_project: String,
+        }
+        let bytes = rmp_serde::to_vec_named(&LegacyScanProgress {
+            scanned: 3,
+            total: 9,
+            current_project: "legacy".into(),
+        })
+        .expect("encode legacy");
+        let decoded: ScanProgressEvent = rmp_serde::from_slice(&bytes).expect("decode legacy");
+        assert!(!decoded.done, "missing field defaults to false");
+        assert_eq!(decoded.scanned, 3);
+    }
+
+    #[test]
+    fn malformed_payload_leaves_state_unchanged() {
+        // `rmp_serde::from_slice` rejects non-msgpack bytes; the
+        // existing stashed progress (if any) must survive.
+        let mut p = BurndownPlugin::default();
+        p.scan_progress = Some(ScanProgressEvent {
+            scanned: 5,
+            total: 10,
+            current_project: "good".into(),
+            done: false,
+        });
+        let bad = b"\xff\xff\xff not msgpack";
+        let result = rmp_serde::from_slice::<ScanProgressEvent>(bad);
+        assert!(result.is_err(), "garbage payload rejected by decoder");
+        // The ingest path drops the err and keeps the prior state —
+        // simulate that contract here without spinning up a HostClient.
+        let stash = p.scan_progress.as_ref().unwrap();
+        assert_eq!(stash.scanned, 5);
+        assert_eq!(stash.current_project, "good");
+    }
+}

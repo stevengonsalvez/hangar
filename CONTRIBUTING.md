@@ -9,15 +9,15 @@ git clone https://github.com/stevengonsalvez/agents-in-a-box.git
 cd agents-in-a-box
 
 # Build the ainb binary (Rust) — replaces the legacy bootstrap.js
-cd ainb-tui && cargo build --release
+cargo build --release
 ```
 
 ## How this repo is organized
 
 | Path | Purpose |
 |------|---------|
-| `ainb-tui/` | The `ainb` binary (Rust) — TUI plus `source`, `skill`, `doctor`, `usage` CLI subcommands. This is the canonical deploy / update / sync surface. |
-| `ainb-tui/plans/skill-manager/spec.md` | Full design + acceptance criteria for the unit manager. |
+| `crates/` | The `ainb` binary (Rust): TUI plus `source`, `skill`, `doctor`, `usage` CLI subcommands. This is the canonical deploy / update / sync surface. |
+| `plans/skill-manager/spec.md` | Full design + acceptance criteria for the unit manager. |
 | `.claude-plugin/marketplace.json` | This repo's Claude plugin marketplace manifest |
 
 The `reflect` long-term-memory system (engine + plugin) was extracted from
@@ -26,7 +26,7 @@ this monorepo into its own public repo,
 The engine installs via
 `uv tool install --upgrade 'git+https://github.com/stevengonsalvez/ainb-reflect-memory.git[graph]'`
 and its Claude plugin ships from that repo's `plugin/` dir. `ainb reflect
-bootstrap` (in `ainb-tui/`) installs the engine from that URL.
+bootstrap` installs the engine from that URL.
 
 The portable skills, agents, workflows, utilities, per-tool rule layouts
 (`cursor/cline/roo/copilot/amazonq/…`), the `bootstrap.js` installer, the

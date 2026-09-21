@@ -1,0 +1,400 @@
+//! End-to-end integration test for the notifyd pipeline.
+//!
+//! Spins up the real `ainb-notifyd` accept loop in a temporary
+//! directory, fires the real `plugins/ainb-hooks/hooks/notify.sh`
+//! bash script against the socket with a Claude-shaped (stdin
+//! JSON) payload and Codex-shaped (argv JSON) payloads, and asserts
+//! that rows with the correct `agent` + `raw_event` end up in
+//! `notifications.db`.
+//!
+//! This is the wiring proof referenced in the spec's success
+//! criteria #1: "real claude / codex session produces a row in
+//! notifications.db".
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use std::{fs, os::unix::fs::PermissionsExt};
+
+use ainb_plugin_notifyd::{Paths, RetentionPolicy, RunConfig, Store, run_daemon};
+
+fn hook_script() -> PathBuf {
+    // The test runs from `crates/ainb-plugin-notifyd`.
+    // The hook script lives at the repository root under
+    // `plugins/ainb-hooks/hooks/notify.sh`.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let manifest = Path::new(&manifest);
+    let monorepo = manifest.ancestors().nth(2).expect("walking up from manifest");
+    monorepo.join("plugins/ainb-hooks/hooks/notify.sh")
+}
+
+async fn wait_for_socket(path: &Path) {
+    for _ in 0..200 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("socket did not appear: {}", path.display());
+}
+
+fn fire_claude_hook(script: &Path, home: &Path, json: &str) {
+    let out = Command::new("bash")
+        .arg(script)
+        .env("HOME", home)
+        .env("AINB_AGENT", "claude")
+        .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(json.as_bytes()).unwrap();
+            }
+            child.wait_with_output()
+        })
+        .expect("running claude hook");
+    assert!(
+        out.status.success(),
+        "claude hook failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn fire_codex_hook(script: &Path, home: &Path, json: &str) {
+    let out = Command::new("bash")
+        .arg(script)
+        .arg(json)
+        .env("HOME", home)
+        .env("AINB_AGENT", "codex")
+        .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("running codex hook");
+    assert!(
+        out.status.success(),
+        "codex hook failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn fire_copilot_hook(script: &Path, home: &Path, json: &str) {
+    let out = Command::new("bash")
+        .arg(script)
+        .env("HOME", home)
+        .env("AINB_AGENT", "copilot")
+        .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(json.as_bytes()).unwrap();
+            }
+            child.wait_with_output()
+        })
+        .expect("running copilot hook");
+    assert!(
+        out.status.success(),
+        "copilot hook failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn fire_antigravity_hook(script: &Path, home: &Path, json: &str) {
+    let out = Command::new("bash")
+        .arg(script)
+        .env("HOME", home)
+        .env("AINB_AGENT", "antigravity")
+        .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(json.as_bytes()).unwrap();
+            }
+            child.wait_with_output()
+        })
+        .expect("running antigravity hook");
+    assert!(
+        out.status.success(),
+        "antigravity hook failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn atc_hook_prefers_ainb_bin_over_path() {
+    let script = hook_script();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let explicit_bin = dir.path().join("source-ainb");
+    let path_dir = dir.path().join("path-bin");
+    let path_bin = path_dir.join("ainb");
+    let capture = dir.path().join("captured-bin");
+    fs::create_dir(&home).unwrap();
+    fs::create_dir(&path_dir).unwrap();
+
+    for (bin, marker) in [(&explicit_bin, "explicit"), (&path_bin, "path")] {
+        fs::write(
+            bin,
+            format!(
+                "#!/usr/bin/env bash\nprintf '%s %s\\n' '{marker}' \"$*\" >> \"$AINB_HOOK_CAPTURE\"\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(bin).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(bin, permissions).unwrap();
+    }
+
+    let original_path = std::env::var("PATH").unwrap();
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("HOME", &home)
+        .env("AINB_AGENT", "claude")
+        .env("AINB_MANAGED", "atc")
+        .env("AINB_BIN", &explicit_bin)
+        .env("AINB_HOOK_CAPTURE", &capture)
+        .env("PATH", format!("{}:{original_path}", path_dir.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(
+                br#"{"hook_event_name":"Stop","session_id":"sess-hook-bin","cwd":"/tmp"}"#,
+            )?;
+            child.wait()
+        })
+        .expect("running hook");
+
+    assert!(out.success(), "hook failed: {out}");
+    let calls = fs::read_to_string(capture).unwrap();
+    assert!(calls.contains("explicit notifyd"), "calls: {calls}");
+    assert!(calls.contains("explicit fleet atc hook"), "calls: {calls}");
+    assert!(!calls.contains("path "), "calls: {calls}");
+}
+
+#[test]
+fn atc_hook_falls_back_to_path_when_installed_binary_is_missing() {
+    let script = hook_script();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let ainb_home = home.join(".agents-in-a-box");
+    let hooks = ainb_home.join("hooks");
+    let missing_bin = dir.path().join("removed-worktree/target/debug/ainb");
+    let path_dir = dir.path().join("path-bin");
+    let path_bin = path_dir.join("ainb");
+    let capture = dir.path().join("captured-bin");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::create_dir(&path_dir).unwrap();
+    fs::write(
+        hooks.join("ainb-bin"),
+        format!("{}\\n", missing_bin.display()),
+    )
+    .unwrap();
+    fs::write(
+        &path_bin,
+        "#!/usr/bin/env bash\nprintf 'path %s\\n' \"$*\" >> \"$AINB_HOOK_CAPTURE\"\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path_bin).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path_bin, permissions).unwrap();
+
+    let original_path = std::env::var("PATH").unwrap();
+    let out = Command::new("bash")
+        .arg(&script)
+        .env("HOME", &home)
+        .env("AINB_HANGAR_HOME", &ainb_home)
+        .env("AINB_AGENT", "claude")
+        .env("AINB_MANAGED", "atc")
+        .env("AINB_HOOK_CAPTURE", &capture)
+        .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
+        .env("PATH", format!("{}:{original_path}", path_dir.display()))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(
+                br#"{"hook_event_name":"Stop","session_id":"sess-stale-bin","cwd":"/tmp"}"#,
+            )?;
+            child.wait()
+        })
+        .expect("running hook");
+
+    assert!(out.success(), "hook failed: {out}");
+    let calls = fs::read_to_string(capture).unwrap();
+    assert!(calls.contains("path fleet atc hook"), "calls: {calls}");
+}
+
+#[tokio::test]
+async fn hook_script_into_real_daemon_persists_supported_agents() {
+    // Skip if the bash script is missing — useful when running from
+    // a CI matrix entry that hasn't checked out the plugin tree
+    // (defensive, not expected).
+    let script = hook_script();
+    if !script.exists() {
+        eprintln!(
+            "skipping: hook script not found at {} (CARGO_MANIFEST_DIR={:?})",
+            script.display(),
+            std::env::var("CARGO_MANIFEST_DIR").ok(),
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    let paths = Paths::under(home.join(".agents-in-a-box"));
+    paths.ensure_base().unwrap();
+
+    let config = RunConfig {
+        paths: paths.clone(),
+        retention: RetentionPolicy {
+            retention_days: 0,
+            max_rows: 0,
+        },
+        os_notifications: false,
+        ingest_interval: std::time::Duration::from_millis(20),
+        materialize_interval: std::time::Duration::from_millis(20),
+    };
+    let daemon = tokio::spawn(async move { run_daemon(config).await });
+
+    wait_for_socket(&paths.socket).await;
+
+    // Claude path: JSON on stdin, hook_event_name field, agent=claude.
+    let claude_json = r#"{"hook_event_name":"Stop","session_id":"sess-claude-1","cwd":"/Users/example/proj","payload":{"k":"v"}}"#;
+    fire_claude_hook(&script, &home, claude_json);
+
+    // Codex path: JSON on argv[1], type field, agent=codex.
+    let codex_json = r#"{"type":"agent-turn-complete","session_id":"sess-codex-1","cwd":"/Users/example/codex-proj"}"#;
+    fire_codex_hook(&script, &home, codex_json);
+
+    // Codex approval path: PermissionRequest is the native Codex event
+    // that ainb-hooks registers for blocked approval prompts.
+    let codex_permission_json = r#"{"hook_event_name":"PermissionRequest","session_id":"sess-codex-2","cwd":"/Users/example/codex-proj"}"#;
+    fire_codex_hook(&script, &home, codex_permission_json);
+
+    // Copilot path: JSON on stdin, camelCase/native event names.
+    let copilot_notification_json = r#"{"type":"notification","sessionId":"sess-copilot-1","working_directory":"/Users/example/copilot-proj"}"#;
+    fire_copilot_hook(&script, &home, copilot_notification_json);
+    let copilot_stop_json = r#"{"type":"agentStop","sessionId":"sess-copilot-2","working_directory":"/Users/example/copilot-proj"}"#;
+    fire_copilot_hook(&script, &home, copilot_stop_json);
+
+    // Antigravity path: JSON on stdin, hook_event_name/type, agent=antigravity.
+    let antigravity_notification_json = r#"{"hook_event_name":"Notification","session_id":"sess-agy-1","cwd":"/Users/example/agy-proj"}"#;
+    fire_antigravity_hook(&script, &home, antigravity_notification_json);
+    let antigravity_stop_json =
+        r#"{"hook_event_name":"Stop","session_id":"sess-agy-2","cwd":"/Users/example/agy-proj"}"#;
+    fire_antigravity_hook(&script, &home, antigravity_stop_json);
+
+    // Give the daemon a tick to drain the writes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Open the same DB the daemon wrote.
+    let store = Store::open(&paths.db).unwrap();
+    let rows = store.list(false, None, None, 100).unwrap();
+    assert_eq!(rows.len(), 7, "expected 7 rows, got {:?}", rows);
+
+    let mut by_agent: std::collections::HashMap<String, _> = std::collections::HashMap::new();
+    for row in &rows {
+        by_agent.insert(row.agent.clone(), row.clone());
+    }
+
+    let claude_row = by_agent.get("claude").expect("claude row missing");
+    assert_eq!(claude_row.raw_event, "Stop");
+    assert_eq!(claude_row.session_id, "sess-claude-1");
+    assert!(claude_row.project.contains("proj"));
+
+    let codex_events: std::collections::HashMap<_, _> = rows
+        .iter()
+        .filter(|row| row.agent == "codex")
+        .map(|row| (row.raw_event.as_str(), row.session_id.as_str()))
+        .collect();
+    assert_eq!(
+        codex_events.get("agent-turn-complete"),
+        Some(&"sess-codex-1")
+    );
+    assert_eq!(codex_events.get("PermissionRequest"), Some(&"sess-codex-2"));
+
+    let copilot_events: std::collections::HashMap<_, _> = rows
+        .iter()
+        .filter(|row| row.agent == "copilot")
+        .map(|row| (row.raw_event.as_str(), row.session_id.as_str()))
+        .collect();
+    assert_eq!(copilot_events.get("notification"), Some(&"sess-copilot-1"));
+    assert_eq!(copilot_events.get("agentStop"), Some(&"sess-copilot-2"));
+
+    let antigravity_events: std::collections::HashMap<_, _> = rows
+        .iter()
+        .filter(|row| row.agent == "antigravity")
+        .map(|row| (row.raw_event.as_str(), row.session_id.as_str()))
+        .collect();
+    assert_eq!(antigravity_events.get("Notification"), Some(&"sess-agy-1"));
+    assert_eq!(antigravity_events.get("Stop"), Some(&"sess-agy-2"));
+
+    daemon.abort();
+}
+
+#[tokio::test]
+async fn hook_falls_back_when_daemon_down_then_daemon_replays() {
+    let script = hook_script();
+    if !script.exists() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().to_path_buf();
+    let paths = Paths::under(home.join(".agents-in-a-box"));
+    paths.ensure_base().unwrap();
+
+    // Fire the hook BEFORE the daemon starts. The script should
+    // detect no socket, skip lazy spawn via the test env, and write to
+    // the fallback file.
+    let claude_json = r#"{"hook_event_name":"Stop","session_id":"sess-fallback","cwd":"/Users/example/proj","payload":{}}"#;
+    fire_claude_hook(&script, &home, claude_json);
+
+    assert!(
+        paths.fallback.exists(),
+        "expected fallback file at {}",
+        paths.fallback.display()
+    );
+
+    // Now start the daemon. It should replay the fallback and remove
+    // the file.
+    let config = RunConfig {
+        paths: paths.clone(),
+        retention: RetentionPolicy {
+            retention_days: 0,
+            max_rows: 0,
+        },
+        os_notifications: false,
+        ingest_interval: std::time::Duration::from_millis(20),
+        materialize_interval: std::time::Duration::from_millis(20),
+    };
+    let daemon = tokio::spawn(async move { run_daemon(config).await });
+    wait_for_socket(&paths.socket).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let store = Store::open(&paths.db).unwrap();
+    let rows = store.list(false, None, None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].agent, "claude");
+    assert_eq!(rows[0].raw_event, "Stop");
+    assert!(!paths.fallback.exists(), "fallback file should be cleared");
+
+    daemon.abort();
+}

@@ -42,12 +42,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Release when it is there, debug otherwise. The tape's sleeps are sized for a
 # cold debug start, so either produces the same recording.
 if [[ -z ${AINB_BIN:-} ]]; then
-  for candidate in "$ROOT/ainb-tui/target/release/ainb" "$ROOT/ainb-tui/target/debug/ainb"; do
+  for candidate in "$ROOT/target/release/ainb" "$ROOT/target/debug/ainb"; do
     [[ -x $candidate ]] && AINB_BIN=$candidate && break
   done
 fi
 if [[ -z ${AINB_BIN:-} || ! -x $AINB_BIN ]]; then
-  echo "no ainb binary — build one in ainb-tui/ first (debug is enough)" >&2
+  echo "no ainb binary: build one first (debug is enough)" >&2
   exit 1
 fi
 

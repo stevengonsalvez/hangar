@@ -8,7 +8,7 @@
 #                                                   + P8 kanban/health/otel
 #                                                   + P9 pr_capture/pr_badge + …
 #   crates/ainb-hangar-store/tests/tripwire_*.rs    P0 sqlx migration determinism
-#   ainb-tui/crates/ainb-plugin-hangar/tests/tripwire_*.rs          P3.8/P4.10 plugin↔daemon roundtrip
+#   crates/ainb-plugin-hangar/tests/tripwire_*.rs                   P3.8/P4.10 plugin↔daemon roundtrip
 #
 # Conventions (deliberately mirroring the repo, NOT the stale P9 plan):
 #
@@ -46,17 +46,17 @@
 #   * `bash scripts/build-plugins.sh`  (stages dist/plugins/hangar-tui/)
 # The plugin↔daemon roundtrip tripwire needs the staged plugin + daemon binary.
 #
-# Run from the repo root OR anywhere — the script cd's to the ainb-tui
+# Run from the repo root OR anywhere: the script cd's to the
 # workspace itself.
 #
 #   bash scripts/hangar/run_all_tripwires.sh
 set -o pipefail
 set -u
 
-# Resolve the ainb-tui workspace relative to this script (repo_root/scripts/hangar/..).
+# Resolve the workspace relative to this script (repo_root/scripts/hangar/..).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE="$REPO_ROOT/ainb-tui"
+WORKSPACE="$REPO_ROOT"
 cd "$WORKSPACE"
 
 failures=0
@@ -233,7 +233,7 @@ fi
 
 # ── ainb-plugin-hangar: plugin↔daemon roundtrip (needs staged plugin + daemon).
 sel=()
-for f in "$REPO_ROOT"/ainb-tui/crates/ainb-plugin-hangar/tests/tripwire_*.rs; do
+for f in "$REPO_ROOT"/crates/ainb-plugin-hangar/tests/tripwire_*.rs; do
     [ -e "$f" ] || continue
     name="$(basename "$f" .rs)"
     case "$name" in *_common) continue ;; esac
