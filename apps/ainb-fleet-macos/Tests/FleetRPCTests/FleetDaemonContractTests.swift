@@ -184,7 +184,7 @@ final class FleetDaemonContractTests: XCTestCase {
     // MARK: - Shared chat fixtures (buzz-port part 2)
     //
     // The SAME files the Rust `chat_fixtures` test round-trips
-    // (ainb-tui/crates/ainb-hangar-proto/fixtures/chat). One fixture set, two
+    // (crates/ainb-hangar-proto/fixtures/chat). One fixture set, two
     // suites: a field that drifts on one side goes red on the other instead of
     // being found by an operator. Read from the repo, never copied here — a
     // copy is how two suites agree with each other and disagree with the wire.
@@ -207,7 +207,7 @@ final class FleetDaemonContractTests: XCTestCase {
     private static func chatFixturesDirectory() -> URL {
         var repository = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { repository.deleteLastPathComponent() }
-        return repository.appendingPathComponent("ainb-tui/crates/ainb-hangar-proto/fixtures/chat")
+        return repository.appendingPathComponent("crates/ainb-hangar-proto/fixtures/chat")
     }
 
     private static func chatFixture(named name: String) throws -> Data {
@@ -1086,7 +1086,7 @@ private final class FixtureDaemon {
         }
         var repository = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { repository.deleteLastPathComponent() }
-        let built = repository.appendingPathComponent("ainb-tui/target/debug/examples/fleet_fixture_daemon")
+        let built = repository.appendingPathComponent("target/debug/examples/fleet_fixture_daemon")
         guard FileManager.default.isExecutableFile(atPath: built.path) else {
             throw XCTSkip("build fleet_fixture_daemon before real daemon contract tests")
         }

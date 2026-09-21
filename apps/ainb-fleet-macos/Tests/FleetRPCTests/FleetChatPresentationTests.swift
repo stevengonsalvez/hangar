@@ -5,7 +5,7 @@ import XCTest
 /// The macOS chat pane's display contract.
 ///
 /// Reads the SAME fixtures the Rust round-trips and the Swift daemon-contract
-/// suite read (`ainb-tui/crates/ainb-hangar-proto/fixtures/chat`), never copies
+/// suite read (`crates/ainb-hangar-proto/fixtures/chat`), never copies
 /// of them: a copy is how two suites agree with each other and disagree with
 /// the wire.
 ///
@@ -1178,7 +1178,7 @@ final class FleetChatPresentationTests: XCTestCase {
     /// (`ainb-hangar-proto::fleet::FleetMessage`). There is no shared fixture
     /// for a chat MESSAGE: part 2 ships fixtures for the channel, confirm and
     /// activity frames only, and this suite may not add files under
-    /// `ainb-tui/`. Built from JSON rather than a Swift initialiser anyway, so
+    /// `crates/`. Built from JSON rather than a Swift initialiser anyway, so
     /// a renamed wire key fails here instead of being renamed on both sides.
     private static func message(sender: String, body: String) throws -> FleetMessage {
         try FleetWire.decoder().decode(FleetMessage.self, from: Data("""
@@ -1202,7 +1202,7 @@ final class FleetChatPresentationTests: XCTestCase {
         var repository = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { repository.deleteLastPathComponent() }
         return try Data(contentsOf: repository
-            .appendingPathComponent("ainb-tui/crates/ainb-hangar-proto/fixtures/chat")
+            .appendingPathComponent("crates/ainb-hangar-proto/fixtures/chat")
             .appendingPathComponent(name))
     }
 }

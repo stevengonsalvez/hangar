@@ -4,7 +4,7 @@ import Foundation
 // tests can hold it without a window.
 //
 // This is a PORT of `AcpClassifier` in
-// `ainb-tui/crates/ainb-hangar-proto/src/transcript.rs`, arm for arm, and the
+// `crates/ainb-hangar-proto/src/transcript.rs`, arm for arm, and the
 // point of the port is that the notch and the terminal client read one
 // transcript the same way. An operator watching both surfaces must not have to
 // learn two vocabularies for one tool call, so every string this file emits is
