@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate the full multi-hierarchy CLI reference (docs/tui/cli.md) from the
+# Generate the full multi-hierarchy CLI reference (man/cli.md) from the
 # real `ainb` binary's recursive `--help` output. The binary is the single
 # source of truth — every command's about, flags, and EXAMPLES come straight
 # from `--help`, so this page can never drift from the actual CLI.
@@ -14,10 +14,10 @@
 #
 # CI freshness gate (see .github/workflows/ci.yml):
 #   AINB_BIN=target/debug/ainb scripts/gen-cli-reference.sh
-#   git diff --exit-code -- docs/tui/cli.md
+#   git diff --exit-code -- man/cli.md
 #
 # Output is deterministic (registry order, no timestamps/versions) so the gate
-# only fires on real CLI-surface changes. DO NOT edit docs/tui/cli.md by hand.
+# only fires on real CLI-surface changes. DO NOT edit man/cli.md by hand.
 #
 # NB: pipefail is intentionally OFF — the parse helpers below early-exit their
 # `awk`, which SIGPIPEs the producing `ainb --help`; with pipefail+`set -e` that
@@ -25,11 +25,11 @@
 # unpiped, so we don't lose its failure signal.
 set -eu
 
-# Repo paths: script lives in scripts/, docs live at repo-root docs/, and
-# the repo root is the cargo workspace root.
+# Repo paths: script lives in scripts/, the generated references at
+# repo-root man/, and the repo root is the cargo workspace root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT="$REPO_ROOT/docs/tui/cli.md"
+OUT="$REPO_ROOT/man/cli.md"
 
 # Resolve the binary: explicit AINB_BIN, else build release.
 if [[ -n "${AINB_BIN:-}" ]]; then
