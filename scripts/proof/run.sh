@@ -5,7 +5,7 @@
 #
 #   --build        rebuild ainb, ainb-hangar-daemon and the plugins first
 #   --only <node>  run one scenario (repeatable); default is every scenario
-#   --out <dir>    where results go; default ainb-tui/proof-out
+#   --out <dir>    where results go; default <repo root>/proof-out
 #
 # Each scenario under scenarios/<node>.sh sets EXPECT (one line) and defines
 # `scenario`, which drives the real TUI and CLI through tmux in a private

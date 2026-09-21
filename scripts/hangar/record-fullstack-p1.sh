@@ -14,9 +14,9 @@ set -euo pipefail
 
 ISO="${ISO:-/home/claude/ainb-e2e-home}"
 WT="${WT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-BIN="$WT/ainb-tui/target/debug/ainb"
-DAEMON="$WT/ainb-tui/target/debug/ainb-hangar-daemon"
-PLUGINS="$WT/ainb-tui/dist/plugins"
+BIN="$WT/target/debug/ainb"
+DAEMON="$WT/target/debug/ainb-hangar-daemon"
+PLUGINS="$WT/dist/plugins"
 OUT="$WT/docs/hangar/proofs/fullstack"
 SUFFIX="${1:-}"
 # vhs 0.11 has no `Set Env`; the launch line carries the whole env contract.

@@ -292,7 +292,7 @@ SCHEMA_VERSION = {SCHEMA_VERSION}.
 
 def main() -> None:
     here = Path(__file__).resolve()
-    # scripts/ lives at ainb-tui/scripts/. Repo root is the ainb-tui dir.
+    # scripts/ lives at the repository root, which is the workspace root.
     repo_root = here.parents[1]
     write_fixture(repo_root)
     plans = build_plans()

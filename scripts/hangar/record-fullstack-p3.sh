@@ -16,9 +16,9 @@ set -euo pipefail
 
 ISO="${ISO:-/home/claude/ainb-e2e-home}"
 WT="${WT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-BIN="$WT/ainb-tui/target/debug/ainb"
-DAEMON="$WT/ainb-tui/target/debug/ainb-hangar-daemon"
-PLUGINS="$WT/ainb-tui/dist/plugins"
+BIN="$WT/target/debug/ainb"
+DAEMON="$WT/target/debug/ainb-hangar-daemon"
+PLUGINS="$WT/dist/plugins"
 OUT="$WT/docs/hangar/proofs/fullstack"
 # No `exec` here: the shell must survive `q` so the proof commands can run after.
 LAUNCH="HOME='$ISO' TMUX_TMPDIR='$ISO/tmux' AINB_PLUGIN_ROOT='$PLUGINS' AINB_BIN='$BIN' AINB_HANGAR_DAEMON_BIN='$DAEMON' env -u AINB_HANGAR_HOME -u AINB_HOME -u TMUX -u TMUX_PANE '$BIN' tui"
