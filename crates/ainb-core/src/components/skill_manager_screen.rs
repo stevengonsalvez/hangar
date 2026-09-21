@@ -22,9 +22,9 @@ use ratatui::{
 
 use ainb_skill_core::drift::DriftStatus;
 
-// Style guide constants — match the rest of ainb-tui's components
+// Style guide constants — match the rest of the TUI's components
 // (cornflower borders, gold titles, soft white text, muted gray for
-// helper text). These mirror crates/ainb-tui/src/components/home_screen_v2.rs.
+// helper text). These mirror the sibling home_screen_v2.rs.
 const CORNFLOWER_BLUE: Color = Color::Rgb(100, 149, 237);
 const GOLD: Color = Color::Rgb(255, 215, 0);
 const SOFT_WHITE: Color = Color::Rgb(220, 220, 230);
