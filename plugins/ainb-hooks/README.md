@@ -3,7 +3,7 @@
 Plugin that emits Claude Code, Codex CLI, and GitHub Copilot CLI lifecycle
 events to the **ainb notification inbox** via a Unix socket. Powers session-state
 badges, the dedicated Inbox screen, and optional OS notifications in
-`ainb-tui`.
+`ainb`.
 
 ## How it works
 
@@ -21,7 +21,7 @@ badges, the dedicated Inbox screen, and optional OS notifications in
                                     │
                        ┌────────────┴───────────────┐
                        ▼                              ▼
-            notifications.db (SQLite)       broadcast → ainb-tui
+            notifications.db (SQLite)       broadcast → ainb
 ```
 
 If the socket is unreachable (daemon not running), `notify.sh` writes
