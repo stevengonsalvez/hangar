@@ -2,8 +2,11 @@
 //! end-to-end job.
 //!
 //! This deliberately mirrors the conventions ACTUALLY in
-//! `.github/workflows/ci.yml` (the `ainb-hooks` per-feature job), NOT the stale
-//! P9 plan. In particular it does **not** require a `cargo clippy -D warnings`
+//! `.github/workflows/nightly.yml`, NOT the stale P9 plan. The `hangar-e2e` job
+//! lives there rather than in `ci.yml`: it is far too slow for the merge path,
+//! and this linter runs from `ci.yml`'s required `Lint` job, so the contract is
+//! still checked on every PR. In particular it does **not** require a
+//! `cargo clippy -D warnings`
 //! step — the workspace carries heavy pre-existing clippy debt and CI gates on
 //! `cargo fmt --check` only. Adding a workspace-clippy gate would red the whole
 //! repo's CI for unrelated reasons, so this linter forbids assuming it exists.
@@ -26,20 +29,21 @@ use serde_yaml::Value;
 /// Entry point for the `ci-lint` subcommand. Resolves the workflow file from the
 /// repository root (the cargo workspace root) and validates the Hangar contract.
 pub fn run() -> Result<()> {
-    let ci_yml = ci_yml_path()?;
-    let text = fs::read_to_string(&ci_yml).with_context(|| format!("read {}", ci_yml.display()))?;
-    lint_ci_yaml(&text).with_context(|| format!("ci-lint {}", ci_yml.display()))?;
-    println!("[xtask] ci-lint OK — hangar-e2e job satisfies the real CI contract");
+    let workflow = workflow_path()?;
+    let text =
+        fs::read_to_string(&workflow).with_context(|| format!("read {}", workflow.display()))?;
+    lint_ci_yaml(&text).with_context(|| format!("ci-lint {}", workflow.display()))?;
+    println!("[xtask] ci-lint OK: hangar-e2e job satisfies the real CI contract");
     Ok(())
 }
 
-/// `<repo_root>/xtask` → `<repo_root>/.github/workflows/ci.yml`. The cargo
+/// `<repo_root>/xtask` → `<repo_root>/.github/workflows/nightly.yml`. The cargo
 /// workspace root IS the repository root, so `.github` is its direct child.
-fn ci_yml_path() -> Result<PathBuf> {
+fn workflow_path() -> Result<PathBuf> {
     let xtask_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root =
         xtask_dir.parent().ok_or_else(|| anyhow!("xtask manifest dir has no parent"))?;
-    Ok(repo_root.join(".github/workflows/ci.yml"))
+    Ok(repo_root.join(".github/workflows/nightly.yml"))
 }
 
 /// Pure validator over the YAML text so it is unit-testable without touching the

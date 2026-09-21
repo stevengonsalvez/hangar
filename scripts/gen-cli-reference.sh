@@ -12,7 +12,8 @@
 #   scripts/gen-cli-reference.sh            # builds ainb (release), regenerates
 #   AINB_BIN=target/debug/ainb scripts/gen-cli-reference.sh   # reuse a built bin
 #
-# CI freshness gate (see .github/workflows/ci.yml):
+# CI freshness gate (see .github/workflows/ci.yml, job `Generated artifacts
+# freshness`):
 #   AINB_BIN=target/debug/ainb scripts/gen-cli-reference.sh
 #   git diff --exit-code -- man/cli.md
 #
