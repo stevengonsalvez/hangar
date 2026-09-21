@@ -26,8 +26,15 @@ logs/
 .idea/
 .code/
 
-# Claude local state
-.claude/
+# Claude local state. Everything under .claude/ is a personal setting except
+# skills/, which is checked-in tooling the verification tripwires depend on.
+#
+# `.claude/*` rather than `.claude/`: git cannot re-include a path whose parent
+# directory is excluded, so the directory itself has to stay un-excluded for the
+# negation below to be reachable at all. `.claude/*` matches only the direct
+# children, so nothing deeper than skills/ needs naming.
+.claude/*
+!.claude/skills/
 
 # Agent tool local state (npx skills add artifacts)
 .agents/
