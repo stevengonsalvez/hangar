@@ -614,20 +614,22 @@ The `/reflect` skill captures learnings. The `/research` and `/prime` skills ret
 ```
 agents-in-a-box/
 │
-├── crates/                     # Rust Cargo workspace members
-│   ├── crates/
-│   │   ├── ainb-core/          #   TUI application (app, components, tmux, git, claude, config)
-│   │   ├── ainb-plugin-runtime/        #   Plugin host runtime
-│   │   ├── ainb-plugin-protocol/       #   Plugin JSON-RPC protocol
-│   │   ├── ainb-plugin-sdk-rust/       #   Rust plugin SDK
-│   │   ├── ainb-plugin-types-sessions/ #   Shared session types
-│   │   ├── ainb-plugin-burndown/       #   v2 analytics plugin
-│   │   ├── ainb-plugin-notifyd/        #   v2 notifications plugin
-│   │   ├── ainb-plugin-session-reader/ #   v2 data-backend plugin
-│   │   ├── ainb-plugin-cts-v2/         #   Conformance test suite (21 axes)
-│   │   └── ainb-plugin-testkit/        #   Plugin author test harness
-│   ├── config/                 #   Homebrew formula & packaging
-│   └── install.sh              #   One-liner installer
+├── Cargo.toml                  # Cargo workspace root (the repository root)
+├── crates/                     # Workspace members
+│   ├── ainb-core/              #   TUI application (app, components, tmux, git, claude, config)
+│   ├── ainb-plugin-runtime/            #   Plugin host runtime
+│   ├── ainb-plugin-protocol/           #   Plugin JSON-RPC protocol
+│   ├── ainb-plugin-sdk-rust/           #   Rust plugin SDK
+│   ├── ainb-plugin-types-sessions/     #   Shared session types
+│   ├── ainb-plugin-burndown/           #   v2 analytics plugin
+│   ├── ainb-plugin-notifyd/            #   v2 notifications plugin
+│   ├── ainb-plugin-session-reader/     #   v2 data-backend plugin
+│   ├── ainb-plugin-cts-v2/             #   Conformance test suite (21 axes)
+│   └── ainb-plugin-testkit/            #   Plugin author test harness
+├── xtask/                      # Workspace task runner
+├── scripts/                    # Build, proof harness and journey scripts
+├── config/                     # Homebrew formula & packaging
+├── install.sh                  # One-liner installer
 │
 # reflect (the `reflect` CLI + GraphRAG/QMD engine and its Claude Code plugin)
 # now lives in a SEPARATE repo: github.com/stevengonsalvez/ainb-reflect-memory
@@ -643,16 +645,15 @@ agents-in-a-box/
 # its repo root. `ainb` consumes it as a pinned external source.
 #
 ├── crates/                     # `ainb` binary (Rust) — TUI + skill-manager CLI
-│   ├── crates/
-│   │   ├── ainb-cli/           #   ainb source/skill/doctor subcommands
-│   │   ├── ainb-core/          #   ratatui app + manifest/lockfile/URI types
-│   │   ├── ainb-fetch/         #   git2 / http / local fetchers
-│   │   ├── ainb-adapters-source/  # marketplace / manifest / raw / single
-│   │   ├── ainb-adapters-tool/    # 9 tool adapters (claude/codex/copilot/…)
-│   │   ├── ainb-diff/          #   Diff render + pager driver
-│   │   ├── ainb-skill-core/    #   Manifest/lockfile/URI/paths/error
-│   │   └── ainb-usage/         #   JSONL invocation parser + cache
-│   └── plans/skill-manager/spec.md   # v1 design + acceptance criteria
+│   ├── ainb-cli/               #   ainb source/skill/doctor subcommands
+│   ├── ainb-core/              #   ratatui app + manifest/lockfile/URI types
+│   ├── ainb-fetch/             #   git2 / http / local fetchers
+│   ├── ainb-adapters-source/   #   marketplace / manifest / raw / single
+│   ├── ainb-adapters-tool/     #   9 tool adapters (claude/codex/copilot/…)
+│   ├── ainb-diff/              #   Diff render + pager driver
+│   ├── ainb-skill-core/        #   Manifest/lockfile/URI/paths/error
+│   └── ainb-usage/             #   JSONL invocation parser + cache
+├── plans/skill-manager/spec.md # v1 design + acceptance criteria
 │
 ├── docs/                       # Documentation hub (Markdown source of truth)
 │   ├── README.md               #   Docs TOC
