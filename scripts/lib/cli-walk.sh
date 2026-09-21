@@ -2,8 +2,8 @@
 # Shared CLI-tree walk helpers for the generated docs. Sourced, never executed,
 # so it has no shebang.
 #
-# Sourced by BOTH scripts/gen-cli-reference.sh (docs/tui/cli.md) and
-# scripts/gen-man.sh (docs/man/ainb.1). They live here so the two generators
+# Sourced by BOTH scripts/gen-cli-reference.sh (man/cli.md) and
+# scripts/gen-man.sh (man/ainb.1). They live here so the two generators
 # can never disagree about what counts as a subcommand or as a command's
 # "about" line. A divergence there would show up as a permanent, unfixable diff
 # between the two CI freshness gates.
