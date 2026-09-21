@@ -35,7 +35,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE="$REPO_ROOT/ainb-tui"
+WORKSPACE="$REPO_ROOT"
 cd "$WORKSPACE"
 
 failures=0
