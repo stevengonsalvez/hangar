@@ -14,7 +14,7 @@
 # Convention: mark any deliberately-reverted / scaffolded code with one of the
 # markers below. The gate then guarantees it cannot reach a commit.
 #
-# Usage: bash scripts/check-no-probes.sh   (run from the ainb-tui workspace root)
+# Usage: bash scripts/check-no-probes.sh   (run from the workspace root)
 
 set -euo pipefail
 
