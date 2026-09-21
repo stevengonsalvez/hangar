@@ -19,12 +19,12 @@ use std::{fs, os::unix::fs::PermissionsExt};
 use ainb_plugin_notifyd::{Paths, RetentionPolicy, RunConfig, Store, run_daemon};
 
 fn hook_script() -> PathBuf {
-    // The test runs from `ainb-tui/crates/ainb-plugin-notifyd`.
-    // The hook script lives at the monorepo root under
+    // The test runs from `crates/ainb-plugin-notifyd`.
+    // The hook script lives at the repository root under
     // `plugins/ainb-hooks/hooks/notify.sh`.
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let manifest = Path::new(&manifest);
-    let monorepo = manifest.ancestors().nth(3).expect("walking up from manifest");
+    let monorepo = manifest.ancestors().nth(2).expect("walking up from manifest");
     monorepo.join("plugins/ainb-hooks/hooks/notify.sh")
 }
 
