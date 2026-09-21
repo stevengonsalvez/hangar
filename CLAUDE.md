@@ -1,12 +1,11 @@
-# ainb-tui
+# ainb
 
 Terminal-based development environment manager for Claude Code agents. Built with Rust + ratatui.
 
 ## Quick Reference
 
 ```bash
-# From monorepo root
-cd ainb-tui
+# From the repository root
 
 # Build & Run
 cargo build                    # Debug build
@@ -28,7 +27,7 @@ just fix                       # Auto-fix formatting & lint
 ## Architecture
 
 ```
-ainb-tui/                       # Cargo workspace root
+<repo root>/                    # Cargo workspace root
 ├── Cargo.toml                  # [workspace] members + default-members = ainb-core
 ├── xtask/                      # Workspace task runner crate
 └── crates/
@@ -291,7 +290,7 @@ backend processes as Claude.
   (`~/.agents-in-a-box/hangar.db`, `~/.agents-in-a-box/hangar.sock`,
   `~/.agents-in-a-box/hangar/…`). **Never `~/.ainb/`.** New persistence resolves
   from `dirs::home_dir()?.join(".agents-in-a-box")` (or `$AINB_HANGAR_HOME`).
-- **TUI plugins live in `ainb-tui/crates/ainb-plugin-<name>/`** as workspace
+- **TUI plugins live in `crates/ainb-plugin-<name>/`** as workspace
   members — folder name == package name (`ainb-plugin-hangar`, `ainb-plugin-witr`,
   …). The repo-root `plugins/` directory is **only** for Claude Code harness
   plugins (`ainb-fleet`, `ainb-hooks`, `reflect`); never put a TUI/subprocess
