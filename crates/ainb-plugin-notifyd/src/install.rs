@@ -64,8 +64,7 @@ const HOOK_SCRIPT: &str = include_str!("../../../plugins/ainb-hooks/hooks/notify
 /// The Stop-hook stall guard, baked into the binary. Claude reaches it through
 /// the plugin directory; Codex has no plugin runtime, so it needs the same
 /// extract-and-point treatment as `notify.sh`.
-const STALL_GUARD_SCRIPT: &str =
-    include_str!("../../../plugins/ainb-hooks/hooks/stall_guard.py");
+const STALL_GUARD_SCRIPT: &str = include_str!("../../../plugins/ainb-hooks/hooks/stall_guard.py");
 
 /// The Claude plugin manifest, baked into the binary.
 const CLAUDE_PLUGIN_JSON: &str =
@@ -79,8 +78,7 @@ const CODEX_HOOKS_TEMPLATE: &str = include_str!("../../../plugins/ainb-hooks/cod
 /// placeholder substituted at install time). Unlike Codex, this is
 /// written verbatim as a standalone file — Copilot loads + combines
 /// every `*.json` in `~/.copilot/hooks/`, so ainb owns one file.
-const COPILOT_HOOKS_TEMPLATE: &str =
-    include_str!("../../../plugins/ainb-hooks/copilot/hooks.json");
+const COPILOT_HOOKS_TEMPLATE: &str = include_str!("../../../plugins/ainb-hooks/copilot/hooks.json");
 
 /// The Antigravity drop-in template (with the `__AINB_HOOK_SCRIPT__`
 /// placeholder substituted at install time).
