@@ -382,7 +382,7 @@ ainb install paths.
 
 **One-liner curl install** (any Unix):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/ainb-tui/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/install.sh | bash
 ```
 
 **Cargo** (any platform with a Rust toolchain):
@@ -394,7 +394,7 @@ cargo install --git https://github.com/stevengonsalvez/agents-in-a-box --branch 
 ```powershell
 wsl --install                                                                         # 1. Install WSL2
 # Inside Ubuntu/Debian:
-curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/ainb-tui/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/agents-in-a-box/main/install.sh | bash
 sudo apt update && sudo apt install -y tmux
 ainb
 ```
@@ -445,7 +445,7 @@ There are four ways to filter plugins, with the following precedence (most speci
 
 Resolution order: `AINB_DISABLE_PLUGINS` → `AINB_ONLY_PLUGINS` → `AINB_DISABLE_PLUGIN` → config `enabled` → config `disabled` → default all-on. **Env always beats config**, and an allowlist always beats a denylist.
 
-Config lives at `~/.agents-in-a-box/config/config.toml` under a `[plugins]` table — see [`example.config.toml`](ainb-tui/config/example.config.toml) for the annotated block. When a screen's plugin is disabled, the TUI shows a placeholder naming the exact variable that turned it off, rather than hanging.
+Config lives at `~/.agents-in-a-box/config/config.toml` under a `[plugins]` table — see [`example.config.toml`](config/example.config.toml) for the annotated block. When a screen's plugin is disabled, the TUI shows a placeholder naming the exact variable that turned it off, rather than hanging.
 
 ### Keyboard Shortcuts
 
@@ -486,7 +486,7 @@ Config lives at `~/.agents-in-a-box/config/config.toml` under a `[plugins]` tabl
 | Codex | ✓ | — | ✓ | — | local JSONL fallback |
 | Other agents | — | — | — | — | not supported |
 
-**Why the asymmetry**: only Anthropic publishes rate-limit windows over OAuth, and only the Claude Code CLI exposes them to statusline hooks. Wiring `ainb claudecode statusline` brings the OAuth-grade signal into ainb-tui's Burndown panel and session-window top bar.
+**Why the asymmetry**: only Anthropic publishes rate-limit windows over OAuth, and only the Claude Code CLI exposes them to statusline hooks. Wiring `ainb claudecode statusline` brings the OAuth-grade signal into the TUI's Burndown panel and session-window top bar.
 
 ---
 
@@ -614,20 +614,22 @@ The `/reflect` skill captures learnings. The `/research` and `/prime` skills ret
 ```
 agents-in-a-box/
 │
-├── ainb-tui/                   # Rust Cargo workspace
-│   ├── crates/
-│   │   ├── ainb-core/          #   TUI application (app, components, tmux, git, claude, config)
-│   │   ├── ainb-plugin-runtime/        #   Plugin host runtime
-│   │   ├── ainb-plugin-protocol/       #   Plugin JSON-RPC protocol
-│   │   ├── ainb-plugin-sdk-rust/       #   Rust plugin SDK
-│   │   ├── ainb-plugin-types-sessions/ #   Shared session types
-│   │   ├── ainb-plugin-burndown/       #   v2 analytics plugin
-│   │   ├── ainb-plugin-notifyd/        #   v2 notifications plugin
-│   │   ├── ainb-plugin-session-reader/ #   v2 data-backend plugin
-│   │   ├── ainb-plugin-cts-v2/         #   Conformance test suite (21 axes)
-│   │   └── ainb-plugin-testkit/        #   Plugin author test harness
-│   ├── config/                 #   Homebrew formula & packaging
-│   └── install.sh              #   One-liner installer
+├── Cargo.toml                  # Cargo workspace root (the repository root)
+├── crates/                     # Workspace members
+│   ├── ainb-core/              #   TUI application (app, components, tmux, git, claude, config)
+│   ├── ainb-plugin-runtime/            #   Plugin host runtime
+│   ├── ainb-plugin-protocol/           #   Plugin JSON-RPC protocol
+│   ├── ainb-plugin-sdk-rust/           #   Rust plugin SDK
+│   ├── ainb-plugin-types-sessions/     #   Shared session types
+│   ├── ainb-plugin-burndown/           #   v2 analytics plugin
+│   ├── ainb-plugin-notifyd/            #   v2 notifications plugin
+│   ├── ainb-plugin-session-reader/     #   v2 data-backend plugin
+│   ├── ainb-plugin-cts-v2/             #   Conformance test suite (21 axes)
+│   └── ainb-plugin-testkit/            #   Plugin author test harness
+├── xtask/                      # Workspace task runner
+├── scripts/                    # Build, proof harness and journey scripts
+├── config/                     # Homebrew formula & packaging
+├── install.sh                  # One-liner installer
 │
 # reflect (the `reflect` CLI + GraphRAG/QMD engine and its Claude Code plugin)
 # now lives in a SEPARATE repo: github.com/stevengonsalvez/ainb-reflect-memory
@@ -642,17 +644,16 @@ agents-in-a-box/
 # SEPARATE repo: github.com/stevengonsalvez/ainb-toolkit — flattened at
 # its repo root. `ainb` consumes it as a pinned external source.
 #
-├── ainb-tui/                   # `ainb` binary (Rust) — TUI + skill-manager CLI
-│   ├── crates/
-│   │   ├── ainb-cli/           #   ainb source/skill/doctor subcommands
-│   │   ├── ainb-core/          #   ratatui app + manifest/lockfile/URI types
-│   │   ├── ainb-fetch/         #   git2 / http / local fetchers
-│   │   ├── ainb-adapters-source/  # marketplace / manifest / raw / single
-│   │   ├── ainb-adapters-tool/    # 9 tool adapters (claude/codex/copilot/…)
-│   │   ├── ainb-diff/          #   Diff render + pager driver
-│   │   ├── ainb-skill-core/    #   Manifest/lockfile/URI/paths/error
-│   │   └── ainb-usage/         #   JSONL invocation parser + cache
-│   └── plans/skill-manager/spec.md   # v1 design + acceptance criteria
+├── crates/                     # `ainb` binary (Rust) — TUI + skill-manager CLI
+│   ├── ainb-cli/               #   ainb source/skill/doctor subcommands
+│   ├── ainb-core/              #   ratatui app + manifest/lockfile/URI types
+│   ├── ainb-fetch/             #   git2 / http / local fetchers
+│   ├── ainb-adapters-source/   #   marketplace / manifest / raw / single
+│   ├── ainb-adapters-tool/     #   9 tool adapters (claude/codex/copilot/…)
+│   ├── ainb-diff/              #   Diff render + pager driver
+│   ├── ainb-skill-core/        #   Manifest/lockfile/URI/paths/error
+│   └── ainb-usage/             #   JSONL invocation parser + cache
+├── plans/skill-manager/spec.md # v1 design + acceptance criteria
 │
 ├── docs/                       # Documentation hub (Markdown source of truth)
 │   ├── README.md               #   Docs TOC
@@ -697,7 +698,6 @@ The Rust codebase enforces `unsafe_code = "forbid"` and runs clippy with `pedant
 ### Building from source
 
 ```bash
-cd ainb-tui
 cargo build --release
 ./target/release/ainb
 ```
@@ -705,7 +705,6 @@ cargo build --release
 ### Running tests
 
 ```bash
-cd ainb-tui
 cargo test                              # Unit tests
 cargo test --features visual-debug      # With terminal output
 cargo test --features vt100-tests       # VT100 screen verification
@@ -715,7 +714,6 @@ cargo nextest run                       # With nextest (parallel)
 ### Linting & checks
 
 ```bash
-cd ainb-tui
 cargo fmt --check                       # Format check
 cargo clippy --all-targets              # Lint
 cargo deny check                        # Security + licenses
@@ -746,7 +744,7 @@ ainb doctor                                   # health-check the deployment
 > Prefer the TUI? Press `m` for the Skill Manager to browse + install units
 > with `[i]` and remove them with `[r]` — no manual URIs.
 
-See `ainb-tui/plans/skill-manager/spec.md` for the full §8 CLI
+See `plans/skill-manager/spec.md` for the full §8 CLI
 surface (`source`, `skill`, `doctor`, `usage`).
 
 #### v1.1 — Discovery + adoption + promote
