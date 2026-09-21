@@ -18,7 +18,7 @@ run.sh ──▶ for each node: ( source lib.sh + scenarios/<node>.sh )
 
 ## Run it
 
-From `ainb-tui/`:
+From the repository root:
 
 ```
 scripts/proof/run.sh --build                  # build ainb, the daemon and plugins, then every node
@@ -93,11 +93,11 @@ Decisions that are easy to get wrong:
 
 | variable | set by | meaning |
 |---|---|---|
-| `PROOF_OUT` | `run.sh` (`--out`) | results directory, default `ainb-tui/proof-out` |
+| `PROOF_OUT` | `run.sh` (`--out`) | results directory, default `proof-out` |
 | `PROOF_BASE_PATH` | `run.sh` | system PATH a world starts from (`/usr/local/bin:/usr/bin:/bin`) |
 | `AINB_BIN`, `BINARY_LINE` | `run.sh` | binary under test and its version line |
 | `AINB_HEADROOM_PORT` | `lib.sh` | free port the headroom stub serves `/health` on |
-| `AINB_PLUGIN_ROOT` | `lib.sh` | `ainb-tui/dist/plugins`, staged by `build-plugins.sh` |
+| `AINB_PLUGIN_ROOT` | `lib.sh` | `dist/plugins`, staged by `build-plugins.sh` |
 
 ## Adding a scenario
 
