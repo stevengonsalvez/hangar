@@ -1,0 +1,560 @@
+name: Nightly
+
+# Everything slow, network-dependent, or flaky-by-construction. None of it is a
+# merge gate: ci.yml carries the five required checks and finishes in about half
+# an hour, while the jobs below add up to several hours and include lanes that
+# drive real tmux servers, real browsers and a cloned external repository.
+#
+# A red nightly gets triaged, not merged around. When a tripwire here is
+# genuinely unstable, add its line to
+# crates/ainb-core/tests/tripwire_ci_exclusions.txt with an issue and a reason;
+# `excluded-tripwires` below then runs it and reds the day it starts passing, so
+# an exclusion cannot outlive the fix.
+#
+# No `ref:` on any checkout, deliberately. `schedule` only ever runs on the
+# default branch, and `workflow_dispatch` checks out whatever ref it was
+# dispatched from, which is what you want when testing a branch by hand.
+# Hardcoding `ref: main` would take that away and buy nothing.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned ainb-toolkit ref this build of ainb consumes.
+  AINB_TOOLKIT_REF: v1.6.0
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────────────
+  # Every ainb-core tripwire, by pattern.
+  #
+  # The required `Test` job filters `not binary(/^tripwire_/)`, so a tripwire
+  # nobody names is a tripwire nobody runs; 14 went red that way (#1023, #1024,
+  # #1025). This job inverts the default: every `tripwire_*` binary runs unless
+  # crates/ainb-core/tests/tripwire_ci_exclusions.txt names it.
+  #
+  # Linux only: the four macOS deaths gated under #966 would otherwise make it a
+  # macOS triage job. The SKIP guard matters as much as the run, because a lane
+  # that is green only because every tripwire found no tmux reads as coverage
+  # and is none.
+  # ──────────────────────────────────────────────────────────────────────────
+  core-tripwires:
+    name: ainb-core tripwires (ubuntu-latest)
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
+      - name: Install tmux, jq and lsof
+        run: sudo apt-get update && sudo apt-get install -y tmux jq lsof
+      - name: Every tripwire not excluded, serially
+        run: |
+          set -o pipefail
+          cargo build -p ainb-plugin-runtime --bins
+          # Plugin tripwires SKIP without staged plugins, which would pass them
+          # without exercising anything.
+          bash scripts/build-plugins.sh
+          # Real-TUI tripwires time out on a slow runner; a test must fail three
+          # times to fail the job, and each retry is named in the log.
+          cargo nextest run -p ainb --test-threads 1 --no-fail-fast --retries 2 \
+            --success-output final -E "$(bash scripts/tripwire-ci-filter.sh)" \
+            2>&1 | tee "$RUNNER_TEMP/core-tripwires.log"
+          # A test that SKIPs passes without exercising anything: the set that
+          # SKIPped must be exactly the committed one.
+          bash scripts/tripwire-ci-guard.sh "$RUNNER_TEMP/core-tripwires.log" \
+            crates/ainb-core/tests/tripwire_ci_skips.txt
+      # Rescued from the deleted visual-tests.yml. That file ran these two at a
+      # repository root which carried no Cargo.toml under the old layout, so
+      # neither had ever executed; `-p ainb` is what makes them real.
+      - name: PTY end-to-end tests (ignored by default)
+        run: cargo test -p ainb --test e2e_pty_tests -- --ignored --test-threads=1
+      - name: vt100 tests (ignored by default)
+        run: cargo test -p ainb --features vt100-tests -- --ignored --test-threads=1
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The inverse lane: only the tripwires `core-tripwires` skips. Red tests are
+  # the EXPECTED state here, and a run in which nothing ran fails too.
+  # ──────────────────────────────────────────────────────────────────────────
+  excluded-tripwires:
+    name: Excluded ainb-core tripwires
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
+      - name: Install tmux, jq and lsof
+        run: sudo apt-get update && sudo apt-get install -y tmux jq lsof
+      - name: Every excluded tripwire test, serially
+        run: |
+          cargo build -p ainb-plugin-runtime --bins
+          bash scripts/build-plugins.sh
+          filter=$(bash scripts/tripwire-ci-filter.sh --excluded)
+          # Retried like core-tripwires, so a test counts as green here only
+          # when it would pass there.
+          cargo nextest run -p ainb --test-threads 1 --no-fail-fast --retries 2 \
+            -E "$filter" 2>&1 | tee "$RUNNER_TEMP/excluded.log" || true
+          plain=$(sed 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/excluded.log")
+          summary=$(grep -oE '[0-9]+ tests run: [0-9]+ passed' <<<"$plain" | tail -1 || true)
+          if [ -z "$summary" ]; then
+            echo "::error::no excluded tripwire test ran"
+            exit 1
+          fi
+          passed=$(grep -oE '[0-9]+ passed' <<<"$summary" | cut -d' ' -f1)
+          echo "excluded run: $summary"
+          if [ "$passed" -gt 0 ]; then
+            grep -oE '^\s*(PASS|FLAKY [0-9/]+) \[[^]]*\] +\([^)]*\) ainb::[^ ]+ [^ ]+' <<<"$plain" \
+              | sed -E 's/.*ainb::([^ ]+) ([^ ]+)$/::error::\1::\2 passes; remove its line from tripwire_ci_exclusions.txt/' \
+              | sort -u || true
+            echo "::error::$passed excluded tripwire test(s) pass"
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Hangar control-plane end-to-end tripwires.
+  #
+  # `cargo xtask ci-lint` reads THIS job out of THIS file and asserts its shape:
+  # both runners in the matrix, and a tmux install before the step that runs
+  # run_all_tripwires.sh. Changing either breaks the required `Lint` check, which
+  # is the point: the contract is what keeps the lane from going vacuously green.
+  # ──────────────────────────────────────────────────────────────────────────
+  hangar-e2e:
+    name: hangar-e2e (${{ matrix.os }})
+    timeout-minutes: 45
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+        with:
+          # This action installs with rustup's MINIMAL profile, which omits
+          # clippy. The span-guard gate below needs it, and a missing component
+          # would red the job with `no such command: clippy`.
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
+      # macOS runner images do NOT ship tmux, so without installing it here the
+      # macOS leg is vacuously green: `can_run_tripwire()` is false and every TUI
+      # tripwire SKIPs.
+      - name: Install tmux (apt-get on Linux, brew on macOS)
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y tmux
+          else
+            brew install tmux
+          fi
+      - name: Build hangar daemon binary
+        run: cargo build -p ainb-hangar-daemon --bin ainb-hangar-daemon
+      - name: Build ainb binary
+        run: cargo build -p ainb --bin ainb
+      - name: Stage bundled plugins (incl. hangar-tui)
+        run: bash scripts/build-plugins.sh
+      # NOT a workspace clippy gate. xtask/src/ci_lint.rs documents why one does
+      # not exist: the workspace carries heavy pre-existing clippy debt and
+      # `-D warnings` would red CI for unrelated reasons. This denies exactly ONE
+      # lint and leaves every other finding a warning.
+      #
+      # The lint is `await_holding_invalid_type`, configured in clippy.toml to
+      # reject a `tracing` `Entered` span guard held across an `.await`.
+      # `Entered` is `Send` (unlike `EnteredSpan`), so the mistake compiles; the
+      # guard is then dropped on whichever worker resumed the task, the entering
+      # worker keeps the span id on its stack forever, and the next contextual
+      # span opened there clones a closed span. That returns a slot to the
+      # subscriber registry's pool with a live ref count, and the next `new_span`
+      # ANYWHERE trips its refcount assertion, killing whatever task opened it.
+      # That is what made `rpc_acp` fail intermittently: the victim was an RPC
+      # connection handler, so the test saw a closed socket thousands of lines
+      # away from the cause.
+      - name: No tracing span guard held across an await
+        run: >
+          cargo clippy -p ainb-hangar-daemon -p ainb-acp --lib
+          -- -D clippy::await_holding_invalid_type
+      # Hosted runners render the TUI much slower than a dev box, so the
+      # dev-tuned tmux poll budgets time out under the full serial suite (a
+      # runner-speed artifact, not a code fault). Widen every budget that routes
+      # through `budget_scale()`; single-run rigor is kept, because a real
+      # regression still fails at the scaled deadline.
+      #
+      # The Linux leg runs the FULL tripwire matrix and is authoritative (the
+      # tmux tripwires exercise OS-agnostic render/protocol/daemon logic). The
+      # macOS hosted runner is too small to finish all of them even at 3x budget,
+      # so the macOS leg runs a launch-smoke SUBSET that proves the macOS-staged
+      # binaries launch and the basic stack works (HANGAR_TRIPWIRE_SMOKE; see
+      # run_all_tripwires.sh).
+      - name: Run all hangar tripwires
+        env:
+          HANGAR_TRIPWIRE_BUDGET_SCALE: "3"
+          HANGAR_TRIPWIRE_SMOKE: ${{ matrix.os == 'macos-latest' && '1' || '' }}
+        run: bash scripts/hangar/run_all_tripwires.sh
+      # The framed-socket and CLI acceptance proofs (rpc_*, migration_*_upgrade,
+      # hangar_cli_integration) live in tests/ and are not reached by the
+      # tripwire suite, so they are gated here.
+      - name: Run hangar acceptance tests (framed-socket + CLI)
+        run: bash scripts/hangar/run_acceptance_tests.sh
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The two lanes that need a REAL tmux server, merged into one job: same
+  # toolchain, same tmux install, and neither is worth its own runner.
+  #
+  # The required `Test` job compiles and selects both suites, but a runner image
+  # without tmux makes them self-skip, so the proofs ship vacuously green. Three
+  # separate defects shipped in the launch-pane area behind 24-of-24 green CI for
+  # exactly that reason. The trailing SKIP greps are the point: a suite that
+  # degrades to SKIP must fail the job, or the guard is theatre.
+  # ──────────────────────────────────────────────────────────────────────────
+  tmux-lanes:
+    name: tmux lanes (ubuntu-latest)
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Send-path integrity against a real tmux pane
+        run: |
+          set -o pipefail
+          cargo test -p ainb-fleet-core --features tmux-tests \
+            --test tmux_send_integrity --no-fail-fast -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/tmux-send-integrity.log"
+          if grep -q '^SKIP:' "$RUNNER_TEMP/tmux-send-integrity.log"; then
+            echo "::error::tmux send-integrity suite SKIPped, so the send path was never exercised on this runner"
+            exit 1
+          fi
+      - name: Launch-pane behaviour against a real tmux pane
+        run: |
+          set -o pipefail
+          cargo test -p ainb --test behavioral keeping_dead_pane \
+            --no-fail-fast -- --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/codex-launch-tmux.log"
+          cargo test -p ainb-app --lib capture_failed_launch_pane_reads_a_dead_pane \
+            --no-fail-fast -- --nocapture \
+            2>&1 | tee -a "$RUNNER_TEMP/codex-launch-tmux.log"
+          if grep -q '^SKIP:' "$RUNNER_TEMP/codex-launch-tmux.log"; then
+            echo "::error::codex launch-pane suite SKIPped, so the launch path was never exercised on this runner"
+            exit 1
+          fi
+          if ! grep -q 'test result: ok. 2 passed' "$RUNNER_TEMP/codex-launch-tmux.log"; then
+            echo "::error::expected both keeping_dead_pane tests to run; filter may have stopped matching"
+            exit 1
+          fi
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The full macOS nextest leg, dropped from the required set because its
+  # measured p95 was 28.7 minutes and macOS bills at 10x. `Build (macos-latest)`
+  # in ci.yml catches macOS-only COMPILE breakage, which is the failure that
+  # actually recurs; this catches macOS-only RUNTIME breakage a day later.
+  # Promote it back into ci.yml if regressions start reaching main.
+  # ──────────────────────────────────────────────────────────────────────────
+  test-macos-full:
+    name: Test (macos-latest)
+    timeout-minutes: 40
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: nextest
+      - run: "cargo nextest run --workspace --lib --tests --all-features --no-fail-fast -E 'not binary(/^tripwire_/)'"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The named ainb tripwires and the surface-combination smoke.
+  #
+  # `Test` filters out `binary(/^tripwire_/)`, so a tripwire nobody names here is
+  # a tripwire nobody runs. Linux only: all four cases in the first three steps
+  # are gated to skip loudly on macOS under #966, where the TUI renders its home
+  # screen, takes `s`, and is gone by the next key.
+  # ──────────────────────────────────────────────────────────────────────────
+  hooks:
+    name: ainb-hooks (ubuntu-latest)
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # lsof backs the notifyd ownership proof: a pid is only signalled once it
+      # is shown to hold this home's socket. The proof fails closed, so without
+      # lsof nothing is ever proven and reaping silently becomes a no-op.
+      - name: Install tmux, jq and lsof
+        run: sudo apt-get update && sudo apt-get install -y tmux jq lsof
+      - name: Verify the tools the tmux suites need are actually present
+        run: |
+          tmux -V
+          jq --version
+      - name: Tripwire, the sessions tab strip, ask pane and log tab
+        run: cargo test -p ainb --test tripwire_sessions_tab_strip --no-fail-fast
+      - name: Tripwire, the Pal engine picker and guardrail dial
+        run: cargo test -p ainb --test tripwire_sessions_pal_engine_swap --no-fail-fast
+      - name: Tripwire, an answer's outcome stays on its own question
+        run: >-
+          cargo test -p ainb --test tripwire_sessions_answer_outcome_per_question
+          --no-fail-fast
+      - name: Tripwire, a notice is readable, dismissable, and kept in the log
+        run: >-
+          cargo test -p ainb --test tripwire_notice_dismiss_and_expiry
+          --no-fail-fast
+      - name: Sandbox script safety guards (rm -rf belts)
+        run: cargo test -p ainb --test sandbox_script_safety_guards --no-fail-fast
+      # What no unit test covers: two surfaces sharing one $HOME, where the
+      # locks, the connection registry and the config read-modify-write actually
+      # meet. {tui} {web} {tui,web} {tui,tui}, each from a clean home.
+      #
+      # `REQUIRE=1`: the script's own guards exit 0 when a tool is missing, so a
+      # developer without tmux is not blocked. In CI that is exactly wrong, and
+      # it is how this once ran as a no-op. Under REQUIRE the same guards exit 1.
+      - name: Surface combinations start clean and leave nothing behind
+        env:
+          REQUIRE: "1"
+        run: |
+          cargo build -p ainb
+          scripts/surface-combo-smoke.sh
+      - name: Tripwire, a client resizing while the daemon answers a picker
+        run: cargo test -p ainb --test tripwire_multi_attach_resize --no-fail-fast
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Web Playwright journey. Stands up the converged stack (real daemon, real
+  # tmux last-mile target, real ainb web dashboard) and drives headless chromium
+  # to prove an AskUserQuestion can be answered end to end from the browser.
+  # ──────────────────────────────────────────────────────────────────────────
+  web-e2e:
+    name: web-e2e
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: crates/ainb-web/e2e/package-lock.json
+      - name: Install system dependencies (tmux, sqlite3)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux sqlite3
+      - name: Cache Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('crates/ainb-web/e2e/package-lock.json') }}
+      - name: Install Playwright Chromium and dependencies
+        working-directory: crates/ainb-web/e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Run Web e2e Playwright journey
+        run: bash scripts/hangar/run_web_e2e.sh
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Mirror fan-out bench. A SolidJS store at 100 sessions takes a seeded
+  # 2,000-frame burst over 2s. Per-drain apply must hold the spike ceilings and
+  # per-send mode must fail both numeric gates, so a regression to one write per
+  # frame cannot pass. No Rust build: the bench is the renderer half.
+  # ──────────────────────────────────────────────────────────────────────────
+  mirror-fanout:
+    name: Mirror fan-out bench
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bench/mirror-fanout
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: bench/mirror-fanout/package-lock.json
+      - name: Install the bench's pinned SolidJS
+        run: npm ci --no-audit --no-fund
+      - name: Run the bench and assert the ceilings
+        run: npm run bench
+      - name: Keep the numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirror-fanout-results
+          path: bench/mirror-fanout/results.json
+          if-no-files-found: warn
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The Swift Fleet app against a real fixture daemon. macOS plus xcodebuild, so
+  # far too costly to sit on the merge path.
+  # ──────────────────────────────────────────────────────────────────────────
+  fleet-macos:
+    name: Fleet macOS contract
+    timeout-minutes: 45
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build Fleet fixture daemon
+        run: cargo build -p ainb-hangar-daemon --example fleet_fixture_daemon
+      - name: Run Fleet RPC contract tests
+        run: |
+          xcodebuild test \
+            -project apps/ainb-fleet-macos/AINBFleet.xcodeproj \
+            -scheme AINBFleet \
+            -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/ainb-fleet-macos-contract" \
+            CODE_SIGNING_ALLOWED=NO
+      - name: Build Release Fleet app
+        run: bash apps/ainb-fleet-macos/ci/check-release-diagnostics.sh "$RUNNER_TEMP/ainb-fleet-macos-release"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The desktop shell. This is the ONLY lane that compiles crates/ainb-desktop:
+  # the root Cargo.toml excludes it from the workspace, so `Test --workspace`
+  # never touches it and nothing in the required set would notice it breaking.
+  # ──────────────────────────────────────────────────────────────────────────
+  desktop:
+    name: Desktop shell (ubuntu-latest)
+    timeout-minutes: 90
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            .
+            crates/ainb-desktop
+      - name: Install the Tauri system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf tmux
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: crates/ainb-desktop/ui/package-lock.json
+      # The window build embeds `ui/dist`, and `tsc --noEmit --strict` runs first.
+      - name: Build the shell frontend
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: crates/ainb-desktop/ui
+      - name: Frontend store tests
+        run: npm test
+        working-directory: crates/ainb-desktop/ui
+      # Builds the daemon the sidecar tests run and stages it for
+      # `bundle.externalBin`, which the window build checks for.
+      - name: Stage the hangar daemon sidecar
+        run: cargo xtask stage-desktop-sidecar
+      - name: Format
+        run: cargo fmt -- --check
+        working-directory: crates/ainb-desktop
+      - name: Clippy (library, tests and the window build)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: crates/ainb-desktop
+      - name: Host contract and sidecar tests
+        run: cargo test
+        working-directory: crates/ainb-desktop
+        env:
+          AINB_CODEX_MANAGED: "0"
+      # The two shapes that cross the IPC seam are generated, not hand-written,
+      # so renaming a variant or a field in Rust cannot leave the window
+      # compiling and wrong (#1158).
+      - name: Assert bindings/Desktop.ts is up to date
+        run: cargo test --features typescript-bindings --test bindings
+        working-directory: crates/ainb-desktop
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # The ainb-toolkit contract. Clones an external repository at a pinned tag, so
+  # it is network-dependent by construction and can never be a merge gate: a
+  # GitHub outage would block every PR.
+  # ──────────────────────────────────────────────────────────────────────────
+  toolkit-contract:
+    name: Toolkit contract
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install tmux (required by TUI tripwires)
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Clone pinned ainb-toolkit
+        env:
+          TOOLKIT_DIR: ${{ github.workspace }}/ainb-toolkit
+        run: |
+          git clone --depth 1 --branch "${AINB_TOOLKIT_REF}" \
+            https://github.com/stevengonsalvez/ainb-toolkit.git \
+            "${TOOLKIT_DIR}"
+      - name: Enforce every embedded template skill resolves in ainb-toolkit
+        env:
+          # The runtime mirror test enforces existence (instead of skipping)
+          # when this points at a real ainb-toolkit skills/ dir.
+          AINB_TOOLKIT_SKILLS_DIR: ${{ github.workspace }}/ainb-toolkit/skills
+        run: cargo test -p ainb-hangar-core --test template_registry_tests -- --nocapture
+      - name: Generate catalog index from the pinned ainb-toolkit (sanity)
+        env:
+          TOOLKIT_DIR: ${{ github.workspace }}/ainb-toolkit
+        run: |
+          cargo run -p xtask -- gen-catalog-index \
+            --toolkit-root "${TOOLKIT_DIR}" \
+            --release-tag "${AINB_TOOLKIT_REF}" \
+            --out "${RUNNER_TEMP}/catalog-index.json"
+          # Owned URIs must pin the cloned ainb-toolkit ref.
+          grep -q "gh:stevengonsalvez/ainb-toolkit@${AINB_TOOLKIT_REF}/skills/" \
+            "${RUNNER_TEMP}/catalog-index.json" \
+            || (echo "ERROR: owned install_uris do not pin ainb-toolkit@${AINB_TOOLKIT_REF}"; exit 1)
+          echo "catalog-index owned URIs pin ainb-toolkit@${AINB_TOOLKIT_REF}"
+      - name: Smoke test, AINB_USE_REAL_HOMES wiring with a tempdir HOME
+        run: |
+          # Build with release-fast (no LTO, parallel codegen) so the binary is
+          # fast to spawn without paying full release-profile LTO.
+          cargo build --profile release-fast -p ainb
+          BIN="$PWD/target/release-fast/ainb"
+
+          # Pretend HOME is a clean tempdir so the real-home tier writes into it
+          # instead of the runner's actual home.
+          HOME="$RUNNER_TEMP/fake-home"
+          export HOME
+          export AINB_HOME="$RUNNER_TEMP/ainb-home"
+          export AINB_USE_REAL_HOMES=1
+          mkdir -p "$HOME" "$AINB_HOME"
+
+          # Build a local fixture source.
+          mkdir -p "$RUNNER_TEMP/fixture/skills/commit"
+          cat > "$RUNNER_TEMP/fixture/skills/commit/SKILL.md" <<'SKILL'
+          ---
+          name: commit
+          description: commit-message skill (CI fixture)
+          ---
+          body
+          SKILL
+
+          "$BIN" source add "local:$RUNNER_TEMP/fixture" --name fixture
+          "$BIN" skill install "local:$RUNNER_TEMP/fixture@main/skills/commit" \
+              --targets claude --yes
+
+          # Verify the file landed in the real-home path.
+          test -f "$HOME/.claude/skills/commit/SKILL.md" \
+              || (echo "ERROR: missing deployed file"; exit 1)
+          echo "ainb skill install reaches HOME/.claude when AINB_USE_REAL_HOMES=1"
+
+          # Doctor against the just-installed state.
+          "$BIN" doctor --offline

@@ -173,7 +173,7 @@ stdin-closed (`cargo test ... < /dev/null`). Diagnose wedges with
 
 **Stale plugin under a shared CARGO_TARGET_DIR**: daemon tripwires resolve
 `plugin_root()` relative to the target dir, but `scripts/build-plugins.sh`
-stages into `ainb-tui/dist/plugins`. With `CARGO_TARGET_DIR` overridden you
+stages into `dist/plugins` at the repository root. With `CARGO_TARGET_DIR` overridden you
 can test a stale binary for hours. Restage after every build (the script now
 also stages into the shared-target dist) and re-check when a "fixed" behaviour
 doesn't appear.

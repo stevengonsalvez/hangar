@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Generate docs/tui/keyboard-shortcuts.md from the effective built-in keymap.
+# Generate man/keyboard-shortcuts.md from the effective built-in keymap.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT="$REPO_ROOT/docs/tui/keyboard-shortcuts.md"
+OUT="$REPO_ROOT/man/keyboard-shortcuts.md"
 
 if [[ -n "${AINB_BIN:-}" ]]; then
   if [[ "$AINB_BIN" = /* ]]; then
