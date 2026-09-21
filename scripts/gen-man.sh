@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Generate the ainb(1) man page (docs/man/ainb.1) from the real `ainb` binary.
+# Generate the ainb(1) man page (man/ainb.1) from the real `ainb` binary.
 #
 # The COMMANDS section is generated: every top-level command's one-line "about"
 # and its immediate subcommand names come straight from the binary's recursive
@@ -23,13 +23,13 @@
 #
 # CI freshness gate (see .github/workflows/ci.yml, job `cli-docs`):
 #   AINB_BIN=target/debug/ainb bash scripts/gen-man.sh
-#   git diff --exit-code -- docs/man/ainb.1
+#   git diff --exit-code -- man/ainb.1
 #
 # Output is deterministic: registry order, and NO version string, NO build date,
 # NO timestamp anywhere (including `.TH`). A version in the header would make
 # every Cargo.toml bump turn the gate red for a page whose content did not
 # change, so the gate only fires on real CLI-surface changes.
-# DO NOT edit docs/man/ainb.1 by hand.
+# DO NOT edit man/ainb.1 by hand.
 #
 # NB: pipefail is intentionally OFF, for the same reason as
 # gen-cli-reference.sh: the shared walk helpers early-exit their `awk`, which
@@ -38,11 +38,11 @@
 # failure signal is not lost.
 set -eu
 
-# Repo paths. The script lives in scripts/, the docs at repo-root docs/, and
-# the repo root is the cargo workspace root.
+# Repo paths. The script lives in scripts/, the generated references at
+# repo-root man/, and the repo root is the cargo workspace root.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-OUT="$REPO_ROOT/docs/man/ainb.1"
+OUT="$REPO_ROOT/man/ainb.1"
 
 # Resolve the binary: explicit AINB_BIN, else build release. Same three-form
 # resolution as gen-cli-reference.sh so a wrong cwd cannot silently pick up a
@@ -110,7 +110,7 @@ roff_text() {
 
 # One COMMANDS entry: `.TP` tag + the about line + (for groups) the immediate
 # subcommand names. One line each, by design: this section is a navigable index,
-# the exhaustive per-flag reference is docs/tui/cli.md and `ainb <cmd> --help`.
+# the exhaustive per-flag reference is man/cli.md and `ainb <cmd> --help`.
 emit_command() {
   local cmd="$1"
   local about; about="$(about_of "$cmd" | roff_text)"
@@ -202,8 +202,8 @@ One line per command, generated from the binary. Run
 .RI "ainb " COMMAND " \-\-help"
 for the full flag list and per\-command examples, or see the complete reference
 at
-.UR https://github.com/stevengonsalvez/agents\-in\-a\-box/blob/main/docs/tui/cli.md
-docs/tui/cli.md
+.UR https://github.com/stevengonsalvez/hangar/blob/main/man/cli.md
+man/cli.md
 .UE .
 CMDHEAD
 
@@ -558,8 +558,8 @@ with nothing staged under
 .BR jq (1).
 .PP
 Full CLI reference:
-.UR https://github.com/stevengonsalvez/agents\-in\-a\-box/blob/main/docs/tui/cli.md
-docs/tui/cli.md
+.UR https://github.com/stevengonsalvez/hangar/blob/main/man/cli.md
+man/cli.md
 .UE
 .SH BUGS
 Report issues at
