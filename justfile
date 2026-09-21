@@ -1,22 +1,17 @@
-# Worktree-level just dispatch plus the Rust workspace recipes.
+# The Rust workspace's recipes.
 #
-# Domain-specific recipes live in sibling `.just` modules so other surfaces
-# (hangar, swarm, ...) can slot in later without recipe-name collisions; the
-# workspace recipes below came from ainb-tui/justfile when the Cargo workspace
-# moved to the repository root.
+# Domain-specific recipes can live in sibling `.just` modules, added back with
+# `mod <name> '<name>.just'`, so other surfaces can slot in without
+# recipe-name collisions.
 #
 # Usage:
-#   just --list-submodules           # see every domain
-#   just skill-manager --list        # see skill-manager's recipes
-#   just skill-manager up --tier full
+#   just --list                      # see every recipe
 #
 # Install: `brew install just` (or your platform's equivalent).
 
 set shell := ["bash", "-cu"]
 
-mod skill-manager 'skill-manager.just'
-
-# Default - list everything (top-level + submodules).
+# Default - list everything.
 default:
     @just --list
 
