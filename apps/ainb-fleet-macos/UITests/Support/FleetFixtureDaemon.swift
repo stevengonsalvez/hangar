@@ -130,15 +130,15 @@ final class FleetFixtureDaemon: @unchecked Sendable {
         }
         var root = URL(fileURLWithPath: sourceFilePath).deletingLastPathComponent()
         while root.path != "/" {
-            let daemonWorkspace = root.appendingPathComponent("ainb-tui", isDirectory: true)
-            if FileManager.default.fileExists(atPath: daemonWorkspace.path) {
-                return daemonWorkspace.appendingPathComponent("target/debug/examples/fleet_fixture_daemon")
+            let crates = root.appendingPathComponent("crates", isDirectory: true)
+            if FileManager.default.fileExists(atPath: crates.path) {
+                return root.appendingPathComponent("target/debug/examples/fleet_fixture_daemon")
             }
             root.deleteLastPathComponent()
         }
         return URL(fileURLWithPath: sourceFilePath)
             .deletingLastPathComponent()
-            .appendingPathComponent("ainb-tui/target/debug/examples/fleet_fixture_daemon")
+            .appendingPathComponent("target/debug/examples/fleet_fixture_daemon")
     }
 
     private func waitForDaemonFiles() throws {
