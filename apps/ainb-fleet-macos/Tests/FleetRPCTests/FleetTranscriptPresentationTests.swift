@@ -3,7 +3,7 @@ import XCTest
 @testable import AINBFleet
 
 /// The Swift half of the ACP transcript taxonomy, held against the Rust it was
-/// ported from (`ainb-tui/crates/ainb-hangar-proto/src/transcript.rs`).
+/// ported from (`crates/ainb-hangar-proto/src/transcript.rs`).
 ///
 /// These assert on the EXACT strings, double spaces included, because that is
 /// the whole contract: the notch and the terminal client render one transcript,
