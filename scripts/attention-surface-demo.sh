@@ -47,7 +47,7 @@ if [[ -z ${AINB_BIN:-} ]]; then
   done
 fi
 if [[ -z ${AINB_BIN:-} || ! -x $AINB_BIN ]]; then
-  echo "no ainb binary — build one first (debug is enough)" >&2
+  echo "no ainb binary: build one first (debug is enough)" >&2
   exit 1
 fi
 
