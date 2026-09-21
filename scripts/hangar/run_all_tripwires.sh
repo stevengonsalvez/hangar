@@ -46,7 +46,7 @@
 #   * `bash scripts/build-plugins.sh`  (stages dist/plugins/hangar-tui/)
 # The plugin↔daemon roundtrip tripwire needs the staged plugin + daemon binary.
 #
-# Run from the repo root OR anywhere — the script cd's to the
+# Run from the repo root OR anywhere: the script cd's to the
 # workspace itself.
 #
 #   bash scripts/hangar/run_all_tripwires.sh
