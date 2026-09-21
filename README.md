@@ -739,7 +739,7 @@ ainb doctor                                   # health-check the deployment
 > Prefer the TUI? Press `m` for the Skill Manager to browse + install units
 > with `[i]` and remove them with `[r]` — no manual URIs.
 
-See [`plans/skill-manager/spec.md`](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/plans/skill-manager/spec.md) for the full §8 CLI
+See [the skill-manager guide](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/skill-manager/guide.mdx) for the full §8 CLI
 surface (`source`, `skill`, `doctor`, `usage`).
 
 #### v1.1 — Discovery + adoption + promote
