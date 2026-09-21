@@ -25,10 +25,10 @@ set -euo pipefail
 
 # Point at the locally-built ainb (with `fleet` subcommand) by default.
 # Override via env: AINB=/path/to/other/ainb scripts/fleet-test.sh dod2
-AINB="${AINB:-$(git rev-parse --show-toplevel)/ainb-tui/target/debug/ainb}"
+AINB="${AINB:-$(git rev-parse --show-toplevel)/target/debug/ainb}"
 if [ ! -x "$AINB" ]; then
   echo "ERROR: ainb binary not executable at $AINB" >&2
-  echo "Build first: (cd ainb-tui && cargo build --bin ainb)" >&2
+  echo "Build first: cargo build --bin ainb" >&2
   exit 2
 fi
 
