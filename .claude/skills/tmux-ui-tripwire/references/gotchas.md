@@ -1,0 +1,191 @@
+# gotchas.md — silent traps that cost hours
+
+Each item burned at least one debugging session. Reading this file before
+writing a new tripwire prevents re-learning these the hard way.
+
+## 1. macOS AMFI silent SIGKILL
+
+See `amfi.md`. Exit 137 in <1ms, no stderr, host reports `Broken pipe`.
+Fix: `just stage-plugins` re-signs after `cp`.
+
+## 2. `version.workspace = true` literal
+
+Workspace member `Cargo.toml` files have `version.workspace = true` —
+that string is what `grep '^version' Cargo.toml` returns. Don't use shell
+greps for the version in test seeds. Use `env!("CARGO_PKG_VERSION")` in
+Rust or read `[workspace.package].version` from the root `Cargo.toml`.
+
+## 3. EnvFilter default crate-name drift
+
+`crates/ainb-core/src/main.rs::setup_logging()` used to default to
+`agents_box=info` — a crate name that no longer exists after the Phase 7
+rename. Anything the plugin runtime emitted was silently dropped. Now
+defaults to `info,ainb_plugin_runtime=debug,...`. If logs are missing
+when debugging, check the EnvFilter default matches the current crate
+names. Override via `RUST_LOG=...`.
+
+## 4. `drain_stderr` was debug-level
+
+The host's stderr drain logged plugin output at `debug!`, which the
+default filter excluded. Bumped to `info!` — plugin `eprintln!` now
+appears by default. If you add a new diagnostic `eprintln!` and don't
+see it in the JSONL, check this hasn't regressed.
+
+## 5. Substring-OR assertion theater
+
+The original 7f.3 asserted on `c.contains("ainb") || c.contains("session") || c.contains("Container")`.
+All three appear in the sidebar regardless of feature state. Test passed
+for 4+ commits while burndown was broken. **Always pair a POSITIVE marker
+with a NEGATIVE placeholder check** AND **assert pre-press state is NOT
+already the post-press state** (catches stale-state leaks).
+
+## 6. First-run wizard intercepts keystrokes
+
+The setup wizard eats every keystroke until completed. If your test
+sends `i` and the capture still shows "Welcome to AINB", the wizard is
+in the way. Fix: pre-seed `$HOME/.agents-in-a-box/config/onboarding.toml`
+BEFORE launch. See `helpers.md::seed_isolated_home`.
+
+## 7. `send-keys` Enter pitfall
+
+```
+tmux send-keys -t S "iEnter"      # wrong — sends literal "iEnter"
+tmux send-keys -t S "i" Enter     # wrong for nav — sends i then Enter
+tmux send-keys -t S "i"           # right — single-char nav
+tmux send-keys -t S "cmd" Enter   # right — shell line + commit
+```
+
+Enter is a SEPARATE argument, only for committing shell command lines.
+Single-character TUI keybindings should NEVER have it appended.
+
+## 8. Bare `sleep` before capture
+
+TUI render rate is 4–30 Hz. A bare `sleep 2` after `send-keys` may catch
+a transient state. Always poll:
+
+```rust
+let post = poll_capture(&session, Instant::now() + Duration::from_secs(30),
+    |c| /* predicate */).unwrap_or_else(|| capture_pane(&session));
+```
+
+Predicate runs against each capture every 500 ms until deadline. Faster
+when the state appears, deterministic when it doesn't.
+
+## 9. Multi-plugin registration ordering
+
+Plugins are registered in discovery order. If your test only watches one
+plugin's lifecycle, you may miss that ANOTHER plugin failed (e.g.
+session-reader is eager so it spawns immediately; burndown is lazy so
+its failure surfaces later only when the user presses `i`). Check JSONL
+for BOTH `registered plugin` lines AND each plugin's subsequent
+lifecycle events.
+
+## 10. Hardlink vs re-sign
+
+A hardlink (`ln`) shares the inode and therefore the original signature
+path-binding, but the *path* used to launch the binary is what AMFI
+checks at `exec()` time. Hardlinking from `dist/plugins/<id>/<id>` to
+`target/debug/<crate>` does NOT bypass the kill — the dist path is still
+the one the host execs. Re-sign is the only reliable fix on macOS.
+
+## 11. tmux geometry default varies
+
+Without explicit `-x 180 -y 50`, tmux uses the calling terminal's
+geometry (or 80×24 in `-d` mode). Width-sensitive renders (burndown
+bars, multi-column layouts) shift between hosts. ALWAYS set explicit
+geometry. 180×50 is the agreed default for ainb tripwires.
+
+## 12. `exec` vs no-`exec` in launch command
+
+```rust
+let cmd = format!("HOME={} exec {} tui", ...);
+```
+
+`exec` replaces the shell with the ainb binary. Without `exec`, the
+shell stays as PID 1 in the tmux pane and any future `send-keys`
+goes to the shell, not ainb. Always include `exec`.
+
+## 13. `kill_on_drop` on host's Child
+
+The host runtime's `Command::new(...).kill_on_drop(true)` means if the
+host's plugin task panics or returns Err early, the child process gets
+SIGKILLed. That's correct behaviour, but it means an unrelated panic in
+the host can mask the real symptom (plugin appears killed, but the
+killer was the host's own teardown). Read the JSONL chronologically.
+
+## 14. `tempfile::tempdir()` cleanup races
+
+`tempdir()` is cleaned up when its handle drops. If a test panics, the
+dir may stay around (Rust's panic unwinding may or may not run the
+drop). If tripwires leave `/var/folders/.../tmp.*` orphans, that's why.
+Periodic `rm -rf /var/folders/*/T/tmp.*` is fine (or `mktemp -d` from
+shell wrappers — manual cleanup).
+
+## 15. `AppState::new()` restores the developer's persisted UI prefs
+
+`AppState::new()` loads the real user config (`~/.agents-in-a-box/...`),
+so any UI preference that lives there — sidebar width, collapsed flag,
+session filter — comes back as whatever the machine running the test has
+saved, NOT a fixed default. A width tripwire that asserts exact cell
+counts (e.g. "embed gets 78 cols beside a 40-col sidebar") will pass on
+CI and on a fresh checkout but FAIL on the developer's box if they once
+dragged the sidebar to 58 cols — and the failure looks like a real
+regression while the feature is working perfectly.
+
+Fix: pin every persisted UI field the test's math depends on, right
+after `AppState::new()`, before asserting:
+
+```rust
+let mut state = AppState::new();
+state.sessions_pane_state.restore(Some(40), false); // width=40, not collapsed
+```
+
+Field-discovered on the embed width tripwire: first run read a 58-col
+saved sidebar and asserted 60 != 78. The same trap applies to any
+config-backed state — snapshot/pin it, don't trust the constructor's
+"default" to be the documented default on every machine.
+
+## Traps from the ccc/tcp campaign (2026-07)
+
+**notifyd consent dialog eats the first keypress** on a fresh isolated HOME —
+the tripwire times out ~20s waiting for a screen the swallowed key never
+opened. Seed the dismissed install record before launching:
+
+```rust
+let install_record = r#"{"agents":[],"hook_script":"","prompt_dismissed":true}"#;
+fs::write(home.join(".agents-in-a-box").join("install.json"), install_record)?;
+```
+
+(`tripwire_new_session_common.rs::seed_isolated_home` does this for the whole
+new-session family.)
+
+**gh-auth wall**: pressing Enter on a GitHub favorite runs
+`gh auth status --hostname github.com`; an isolated HOME on a keychain-authed
+box fails closed and an auth modal blocks the flow. Stub a signed-in `gh` on
+PATH — `launch_cmd_gh_authed` in `tripwire_new_session_common.rs`.
+
+**TTY stdin wedge**: a test driving a real hook/CLI that `read_to_string`s
+stdin blocks FOREVER under a terminal (tmux gives a tty) but passes under
+`/dev/null` (CI, tool shells) — the suite "hangs in full runs" but every test
+passes solo. Guard product stdin reads with `IsTerminal`; run suites
+stdin-closed (`cargo test ... < /dev/null`). Diagnose wedges with
+`sample <pid>` — the blocked frame names the read.
+
+**Stale plugin under a shared CARGO_TARGET_DIR**: daemon tripwires resolve
+`plugin_root()` relative to the target dir, but `scripts/build-plugins.sh`
+stages into `ainb-tui/dist/plugins`. With `CARGO_TARGET_DIR` overridden you
+can test a stale binary for hours. Restage after every build (the script now
+also stages into the shared-target dist) and re-check when a "fixed" behaviour
+doesn't appear.
+
+**macOS CI runs a smoke subset**: the mac hangar-e2e leg sets
+`HANGAR_TRIPWIRE_SMOKE=1` (3 tests). "Mac CI green" ≠ full-suite green — only
+the ubuntu leg runs all 56. Ubuntu-only reds are real; two documented causes:
+SQLite WAL `synchronous=FULL` write-lock contention swallowing best-effort
+writes (fix: `synchronous=NORMAL` + `busy_timeout(10s)`), and Linux Landlock
+denying exec of target-dir binaries that macOS Seatbelt permits (disable the
+sandbox for that fixture).
+
+**Unix socket 104-char path limit (macOS)**: a deep fixture HOME makes the
+daemon silently fail to bind `hangar.sock` — everything then times out with
+no error. Seed fixture HOMEs under a short `mktemp -d /tmp/xx.XXXXXX`.
