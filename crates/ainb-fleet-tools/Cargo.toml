@@ -24,7 +24,7 @@ path = "src/main.rs"
 # `default-features = false` drops the `#[tool]` macro layer — the tool table is
 # hand-written data here, because the guardrail class is part of the table and a
 # derive would hide it.
-rmcp = { version = "=3.1.2", default-features = false, features = [
+rmcp = { version = "=3.4.0", default-features = false, features = [
     "server",
     "transport-io",
 ] }
