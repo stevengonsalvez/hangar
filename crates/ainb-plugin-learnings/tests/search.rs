@@ -296,6 +296,37 @@ async fn render_until(
     }
 }
 
+/// Re-render in a bounded poll loop until the two-stage search has SETTLED on
+/// `token`: the token is painted AND the `refining…` indicator has cleared.
+///
+/// [`render_until`] is NOT enough before a key that moves the result selection.
+/// It returns on the BM25 fast paint, which leaves the semantic rerank still in
+/// flight; that stage lands at the top of a LATER render (`poll_search` runs
+/// before every frame) and applies `self.selected = 0`, silently undoing the
+/// key. Once the indicator has cleared the phase is `Done`, the worker's channel
+/// is dropped, and no further stage can reset the selection.
+///
+/// Polling for the POST-key state instead would not help: after the reset the
+/// selection stays where the swap put it, so the poll would burn the deadline
+/// and fail anyway. The wait has to happen BEFORE the key.
+async fn render_until_settled(
+    h: &mut ainb_plugin_testkit::Harness,
+    token: &str,
+    deadline: Duration,
+) -> String {
+    let start = std::time::Instant::now();
+    loop {
+        let text = buffer_text(&h.render(VIEWPORT).await.expect("render poll"));
+        if text.contains(token) && !text.contains(REFINING_TOKEN) {
+            return text;
+        }
+        if start.elapsed() >= deadline {
+            panic!("search did not settle on {token:?} within {deadline:?}; last frame:\n{text}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Re-render in a bounded poll loop until `token` DISAPPEARS, returning the first
 /// frame without it. The dual of [`render_until`] — used to settle a transient
 /// indicator (e.g. `refining…`) clearing once the semantic stage resolves.
@@ -546,9 +577,11 @@ async fn down_moves_result_selection_before_open() {
         .await
         .expect("submit query");
 
-    // Initially the first result (#114073) is selected (▶ precedes it). Poll the
-    // off-thread worker to completion first.
-    let first = render_until(&mut h, RESULT_ID_TOKEN, SETTLE).await;
+    // Initially the first result (#114073) is selected (▶ precedes it). Wait for
+    // the search to SETTLE, not merely to paint: the semantic stage resets the
+    // selection to 0, so a ↓ sent during the refining window is undone by the
+    // very next render and this test reds with the selection back on row 1.
+    let first = render_until_settled(&mut h, RESULT_ID_TOKEN, SETTLE).await;
     let top_line = first
         .lines()
         .find(|l| l.contains(RESULT_ID_TOKEN))
