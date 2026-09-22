@@ -594,9 +594,11 @@ jobs:
             '.version == $v and .next_root == $r and (has("desktop") | not)' bridge/release-manifest.json
           test -s bridge/release-manifest.sig
           grep -q "github.com/stevengonsalvez/agents-in-a-box/releases/download/v$V/AINBFleet-$V.dmg" bridge/appcast.xml
+      # A dry run's bridge is signed with throwaway keys, so it never takes the
+      # name the publish-day runbook downloads.
       - uses: actions/upload-artifact@v7
         with:
-          name: bridge-v${{ inputs.version }}
+          name: ${{ needs.guard.outputs.publish == 'true' && 'bridge' || 'bridge-dryrun' }}-v${{ inputs.version }}
           path: bridge/
           if-no-files-found: error
 
