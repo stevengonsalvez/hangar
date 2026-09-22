@@ -26,6 +26,13 @@ out="${4:?usage: appcast.sh <dmg> <generate_appcast> <version> <out-dir>}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the publishing repository}"
 bridge_repo="stevengonsalvez/agents-in-a-box"
 
+# macOS ships LibreSSL as /usr/bin/openssl, which lacks `pkeyutl -rawin`.
+# Prefer Homebrew's OpenSSL 3 when it is installed, and fail early otherwise.
+if command -v brew >/dev/null 2>&1 && [ -x "$(brew --prefix openssl@3 2>/dev/null)/bin/openssl" ]; then
+  PATH="$(brew --prefix openssl@3)/bin:$PATH"
+fi
+openssl version | grep -q '^OpenSSL 3' || { echo "OpenSSL 3 is required, found: $(openssl version)" >&2; exit 1; }
+
 test -f "$dmg" || { echo "no DMG at $dmg" >&2; exit 1; }
 test -x "$tool" || { echo "generate_appcast is not executable at $tool" >&2; exit 1; }
 
