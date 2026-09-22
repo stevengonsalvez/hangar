@@ -112,6 +112,14 @@ jobs:
             if git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null; then
               echo "v$V is already tagged"; exit 1
             fi
+            # manifest.sh checks the signing key against the pinned key in THIS
+            # ref's update.rs. Changing both together on a release branch would
+            # pass that check and strand every installed client, so the pin
+            # must be the one main ships.
+            pin='^const RELEASE_SIGNING_PUBLIC_KEY_B64: &str = '
+            git fetch -q --depth 1 origin main
+            [ "$(grep "$pin" crates/ainb-app/src/cli/update.rs)" = "$(git show FETCH_HEAD:crates/ainb-app/src/cli/update.rs | grep "$pin")" ] \
+              || { echo "RELEASE_SIGNING_PUBLIC_KEY_B64 on this ref differs from main"; exit 1; }
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "PUBLISH: v$V from $GITHUB_REF" >> "$GITHUB_STEP_SUMMARY"
           else
