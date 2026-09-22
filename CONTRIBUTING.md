@@ -5,8 +5,8 @@ Thanks for your interest in contributing to **agents-in-a-box**.
 ## Quick start
 
 ```bash
-git clone https://github.com/stevengonsalvez/agents-in-a-box.git
-cd agents-in-a-box
+git clone https://github.com/stevengonsalvez/hangar.git
+cd hangar
 
 # Build the ainb binary (Rust) — replaces the legacy bootstrap.js
 cargo build --release
