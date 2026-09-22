@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Generate and sign the Fleet Sparkle feed for one release, then prove the DMG's
+# signature verifies under the public key Fleet builds pin.
+#
+#   bash scripts/release/appcast.sh <dmg> <generate_appcast> <version> <out-dir>
+#
+# Writes <out-dir>/appcast.xml with enclosures under this repository's release,
+# and with BRIDGE=true also <out-dir>/bridge/appcast.xml with enclosures under
+# the old repository's release of the same version, so the bridge is
+# self-hosted.
+#
+# Environment:
+#   PUB      true: KEY and PUBLIC are required, and the feed is refused unless
+#            the DMG's signature verifies under PUBLIC. false: both are ignored
+#            and a throwaway key signs, so the signing path still runs.
+#   KEY      Sparkle EdDSA private key, base64 (SPARKLE_PRIVATE_ED_KEY).
+#   PUBLIC   Sparkle EdDSA public key, base64 (SPARKLE_PUBLIC_ED_KEY).
+#   BRIDGE   true: also write the bridge feed.
+#   GITHUB_REPOSITORY  owner/name of the repository publishing the release.
+set -euo pipefail
+
+dmg="${1:?usage: appcast.sh <dmg> <generate_appcast> <version> <out-dir>}"
+tool="${2:?usage: appcast.sh <dmg> <generate_appcast> <version> <out-dir>}"
+version="${3:?usage: appcast.sh <dmg> <generate_appcast> <version> <out-dir>}"
+out="${4:?usage: appcast.sh <dmg> <generate_appcast> <version> <out-dir>}"
+: "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must name the publishing repository}"
+bridge_repo="stevengonsalvez/agents-in-a-box"
+
+test -f "$dmg" || { echo "no DMG at $dmg" >&2; exit 1; }
+test -x "$tool" || { echo "generate_appcast is not executable at $tool" >&2; exit 1; }
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+if [ "${PUB:-false}" = true ]; then
+  test -n "${KEY:-}" || { echo "SPARKLE_PRIVATE_ED_KEY is required to publish" >&2; exit 1; }
+  test -n "${PUBLIC:-}" || { echo "SPARKLE_PUBLIC_ED_KEY is required to publish" >&2; exit 1; }
+  private="$KEY"
+  public="$PUBLIC"
+else
+  # A PKCS#8 Ed25519 key ends with its 32-byte seed, which is the form
+  # generate_appcast reads from --ed-key-file.
+  openssl genpkey -algorithm ed25519 -out "$work/key.pem"
+  private="$(openssl pkey -in "$work/key.pem" -outform DER | tail -c 32 | base64)"
+  public="$(openssl pkey -in "$work/key.pem" -pubout -outform DER | tail -c 32 | base64)"
+  echo "dry run: signing the feed with a throwaway key"
+fi
+(printf '302a300506032b6570032100' | xxd -r -p; printf '%s' "$public" | base64 -d) \
+  | openssl pkey -pubin -inform DER -out "$work/pub.pem"
+
+feed() {
+  # feed <repo> <dest>: generate the appcast for <repo>'s release into <dest>.
+  local repo="$1" dest="$2" url sig
+  url="https://github.com/${repo}/releases/download/v${version}/"
+  mkdir -p "$work/$repo" "$dest"
+  cp "$dmg" "$work/$repo/"
+  printf '%s' "$private" | "$tool" --ed-key-file - --download-url-prefix "$url" "$work/$repo"
+  test -s "$work/$repo/appcast.xml"
+  grep -q "url=\"${url}$(basename "$dmg")\"" "$work/$repo/appcast.xml" \
+    || { echo "appcast has no enclosure under $url" >&2; cat "$work/$repo/appcast.xml" >&2; exit 1; }
+  sig="$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' "$work/$repo/appcast.xml" | head -1)"
+  test -n "$sig" || { echo "appcast carries no sparkle:edSignature" >&2; exit 1; }
+  printf '%s' "$sig" | base64 -d > "$work/dmg.sig"
+  # Every installed Fleet pins the public key, so a feed signed by any other key
+  # would be rejected in the field. Refuse it here instead.
+  openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin -in "$dmg" -sigfile "$work/dmg.sig" \
+    || { echo "the DMG signature does not verify under $public; refusing the feed" >&2; exit 1; }
+  cp "$work/$repo/appcast.xml" "$dest/appcast.xml"
+}
+
+feed "$GITHUB_REPOSITORY" "$out"
+if [ "${BRIDGE:-false}" = true ]; then
+  feed "$bridge_repo" "$out/bridge"
+fi
