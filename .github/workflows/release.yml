@@ -592,25 +592,22 @@ jobs:
           path: bridge/
           if-no-files-found: error
 
-  publish:
-    name: Publish
-    needs: [guard, build, desktop, desktop_gate, sign, sign_fleet]
-    # `!cancelled()` rather than `always()`: a cancelled run must not publish.
-    # Every leg must have passed; the first hangar release exists to ship the
-    # desktop, so a failed bundle leg no longer lets the CLI publish alone.
+  # Everything the publish job writes from, built in every run: the release
+  # notes, and the formula and cask written into a scratch tap. A dry run
+  # therefore exercises them too, and `publish` only uploads and pushes.
+  notes:
+    name: Release notes and tap files
+    needs: [guard, build, fleet_macos]
     if: >-
-      ${{ !cancelled() && needs.guard.outputs.publish == 'true' && needs.sign.result == 'success'
-      && (needs.sign_fleet.result == 'success' || (inputs.prerelease && needs.sign_fleet.result == 'skipped')) }}
-    timeout-minutes: 20
+      ${{ !cancelled() && needs.build.result == 'success'
+      && (needs.fleet_macos.result == 'success' || (inputs.prerelease && needs.fleet_macos.result == 'skipped')) }}
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-    environment: release
+      contents: read
     env:
       V: ${{ inputs.version }}
-      PRERELEASE: ${{ inputs.prerelease }}
       DESKTOP_SIGNED: ${{ inputs.desktop_signed }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -673,6 +670,59 @@ jobs:
           - Windows: use WSL2 and the Linux binary
           EOF
           cat notes.md
+      - name: Write the tap files into a scratch tap
+        if: ${{ !inputs.prerelease }}
+        run: bash scripts/release/homebrew.sh "$RUNNER_TEMP/scratch-tap" "$V" artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [guard, build, desktop, desktop_gate, sign, sign_fleet, notes]
+    # `!cancelled()` rather than `always()`: a cancelled run must not publish.
+    # Every leg must have passed; the first hangar release exists to ship the
+    # desktop, so a failed bundle leg no longer lets the CLI publish alone.
+    if: >-
+      ${{ !cancelled() && needs.guard.outputs.publish == 'true' && needs.sign.result == 'success' && needs.notes.result == 'success'
+      && (needs.sign_fleet.result == 'success' || (inputs.prerelease && needs.sign_fleet.result == 'skipped')) }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release
+    env:
+      V: ${{ inputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      # Stable only: the tap follows the release. It is written and committed
+      # BEFORE the release is created, so a bad token or a failing script stops
+      # the job while nothing is public yet; it is pushed after. The token can
+      # push only to the tap repository.
+      - name: Check out the tap
+        if: ${{ !inputs.prerelease }}
+        uses: actions/checkout@v7
+        with:
+          repository: stevengonsalvez/homebrew-agents-in-a-box
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Write and commit the formula and the Fleet cask
+        if: ${{ !inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/homebrew.sh tap "$V" artifacts
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ainb.rb Casks/ainb-fleet.rb
+          git commit -m "chore: update ainb releases to v${V}" || echo "No changes to commit"
       - name: Create the release
         run: |
           set -euo pipefail
@@ -687,24 +737,13 @@ jobs:
             flags=(--latest)
           fi
           for f in "${files[@]}"; do test -f "$f" || { echo "missing $f"; exit 1; }; done
-          gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file notes.md "${flags[@]}" "${files[@]}"
-      # Stable only: the tap follows the release. The token can push only to
-      # the tap repository.
-      - name: Check out the tap
+          # Idempotent, so "Re-run failed jobs" after a failed tap push does not
+          # fail here on the release the first attempt created.
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V already exists; not creating it again"
+          else
+            gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file artifacts/release-notes/notes.md "${flags[@]}" "${files[@]}"
+          fi
+      - name: Push the tap
         if: ${{ !inputs.prerelease }}
-        uses: actions/checkout@v7
-        with:
-          repository: stevengonsalvez/homebrew-agents-in-a-box
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-      - name: Update the formula and the Fleet cask
-        if: ${{ !inputs.prerelease }}
-        run: |
-          set -euo pipefail
-          bash scripts/release/homebrew.sh tap "$V" artifacts
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/ainb.rb Casks/ainb-fleet.rb
-          git commit -m "chore: update ainb releases to v${V}" || echo "No changes to commit"
-          git push
+        run: git -C tap push
