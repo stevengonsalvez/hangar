@@ -619,12 +619,13 @@ jobs:
       - name: Write the release notes
         run: |
           set -euo pipefail
-          awk -v v="$V" '
+          # An rc's notes are its version's section: 1.29.0-rc1 reads ## [1.29.0].
+          awk -v v="${V%%-*}" '
             index($0, "## [" v "]") == 1 { on = 1; next }
             on && /^## \[/ { exit }
             on { print }
           ' CHANGELOG.md > notes.md
-          test -s notes.md || { echo "CHANGELOG.md has no ## [$V] section"; exit 1; }
+          test -s notes.md || { echo "CHANGELOG.md has no ## [${V%%-*}] section"; exit 1; }
           if [ "$DESKTOP_SIGNED" = true ]; then
             sign_note="The macOS bundles are signed with the Developer ID and notarised (signed: true in the manifest)."
           else
