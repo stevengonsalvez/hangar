@@ -438,7 +438,7 @@
         "fetch_timeout_secs": 120,
         "headroom_port": 8787
       },
-      "version": "1.28.2",
+      "version": "<version>",
       "web": {
         "insecure_bind": false,
         "listen": "127.0.0.1:8420",
