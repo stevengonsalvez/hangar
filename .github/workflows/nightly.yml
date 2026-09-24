@@ -76,8 +76,11 @@ jobs:
       # neither had ever executed; `-p ainb` is what makes them real.
       - name: PTY end-to-end tests (ignored by default)
         run: cargo test -p ainb --test e2e_pty_tests -- --ignored --test-threads=1
+      # Named binary and module: a bare `--ignored` across the package also runs
+      # interactive_mode_tests (stale, and kills every `tmux_*` session on the
+      # box) and on-demand journey scaffolding that needs AINB_JOURNEY_DIR.
       - name: vt100 tests (ignored by default)
-        run: cargo test -p ainb --features vt100-tests -- --ignored --test-threads=1
+        run: cargo test -p ainb --features vt100-tests --test e2e_pty_tests -- --ignored --test-threads=1 vt100_tests
 
   # ──────────────────────────────────────────────────────────────────────────
   # The inverse lane: only the tripwires `core-tripwires` skips. Red tests are
