@@ -12,9 +12,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use ainb_desktop::updater::{
-    Channel, Check, Install, Phase, Settings, Source, Updater, clear_previous,
-    repair_at_startup_from, repair_interrupted_swap, rollback, swap, validate_tag,
+    Channel, Check, Install, Settings, Source, Updater, clear_previous, repair_at_startup_from,
+    repair_interrupted_swap, rollback, swap, validate_tag,
 };
+// Only the disk-image test reads the phases, and it runs on macOS alone.
+#[cfg(target_os = "macos")]
+use ainb_desktop::updater::Phase;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
