@@ -155,3 +155,66 @@ fn a_worker_that_is_gone_is_replaced_rather_than_failing_every_write() {
         "the write after the loss was reported as failed"
     );
 }
+
+/// P6e: a write that fails once the shell has stopped taking reports, before
+/// the exit path flushes, is counted as not written. Nothing will show its
+/// report, so the flush's count is the only place it can surface.
+#[test]
+fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    use ainb_app::app::Persist;
+    use ainb_app::interactive::session_manager::{SessionMetadata, SessionStore};
+
+    let home = scratch_home();
+    let tmux = "tmux_desktop-p6e-unread-failure".to_string();
+    let mut store = SessionStore::load();
+    store.upsert(SessionMetadata {
+        session_id: uuid::Uuid::new_v4(),
+        tmux_session_name: tmux.clone(),
+        worktree_path: home.join("work"),
+        workspace_name: "ws".to_string(),
+        created_at: serde_json::from_str("\"2026-09-19T00:00:00Z\"").expect("a timestamp"),
+        agent_type: ainb_app::models::session::SessionAgentType::default(),
+        headroom_enabled: true,
+        rtk_enabled: false,
+        skip_permissions: None,
+        model: None,
+        model_source: ainb_app::interactive::session_manager::ModelSource::default(),
+        codex_model: None,
+        codex_thread_id: None,
+    });
+    store.save().expect("seed sessions.json");
+
+    let mut executor = ainb_desktop::executor::DesktopExecutor::new(None);
+    // Refused: the switch is on and this write expects it off.
+    let refused = executor.execute(Effect::Persist(Persist::SessionHeadroom {
+        tmux_session: tmux.clone(),
+        expected: false,
+        enabled: true,
+    }));
+    // Lands, and only once the refused write is done: the queue runs in order.
+    let lands = executor.execute(Effect::Persist(Persist::SessionHeadroom {
+        tmux_session: tmux.clone(),
+        expected: true,
+        enabled: false,
+    }));
+    assert!(
+        refused.is_empty() && lands.is_empty(),
+        "a write reported on the tick"
+    );
+    let deadline = Instant::now() + ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND;
+    while SessionStore::load().sessions[&tmux].headroom_enabled {
+        assert!(Instant::now() < deadline, "the second write never landed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Both writes are done, one failed, and the shell took no reports since.
+    assert_eq!(
+        executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
+        1,
+        "a write whose failure no screen reported was counted as written"
+    );
+    // Counted, not consumed: the report is still there for the next tick.
+    let reports = executor.take_deferred();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+}
