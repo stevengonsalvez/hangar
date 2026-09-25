@@ -203,7 +203,16 @@ fn a_write_that_failed_before_the_quit_waited_is_counted_as_not_written() {
         dropped, 1,
         "a write whose failure no screen reported was counted as written"
     );
-    // Counted, not consumed: the report is still there for whoever reads next.
+    // Counted once: the quit took the report, so a second finish (the desktop
+    // flushes on several exit paths) does not count the same write again.
+    assert_eq!(
+        effect_host::finish_session_store_writes(SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a second finish counted the same failed write again"
+    );
     let reports = effect_host::take_deferred_reports();
-    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports.is_empty(),
+        "the counted report was left on the queue: {reports:?}"
+    );
 }

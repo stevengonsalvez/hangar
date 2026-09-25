@@ -127,9 +127,10 @@ impl SessionStoreWorker {
     ///
     /// A host calls this on its way out, once its loop has stopped reading
     /// reports, so an unread failure is a change the operator never heard
-    /// about. The reports are counted, logged and put back, not consumed.
-    /// Safe to call when no write ever ran; a later write starts the worker
-    /// again.
+    /// about. Each one is counted and logged here and then taken off the
+    /// queue, so a second finish does not count it again; every other report
+    /// is put back. Writes left queued past the bound are logged too. Safe to
+    /// call when no write ever ran; a later write starts the worker again.
     pub fn finish(&mut self, within: Duration, inbox: &mpsc::Receiver<Intent>) -> usize {
         let Some(Live {
             work,
@@ -151,11 +152,19 @@ impl SessionStoreWorker {
         // Counted under the lock, so a write failing right now is counted
         // once: still queued, or reported.
         let pending = lock(&queued);
+        if *pending > 0 {
+            tracing::warn!(
+                pending = *pending,
+                ?within,
+                "session-store writes were still queued when the bound ran out"
+            );
+        }
         *pending + self.count_unread_failures(inbox)
     }
 
     /// The `persist_failed` reports waiting on `inbox`, each logged with its
-    /// error. Every report goes back on the channel, in order.
+    /// error and consumed. Every other report goes back on the channel, in
+    /// order.
     fn count_unread_failures(&self, inbox: &mpsc::Receiver<Intent>) -> usize {
         let unread: Vec<Intent> = inbox.try_iter().collect();
         let mut failed = 0;
@@ -168,6 +177,7 @@ impl SessionStoreWorker {
                         error = %args["error"],
                         "a session-store write failed and no screen was left to say so"
                     );
+                    continue;
                 }
             }
             let _ = self.reports.send(report);
