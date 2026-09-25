@@ -13,14 +13,12 @@
 //                                    ▼ tmux send-keys
 //                              agent pane: "agent read: prod"
 //
-// Two hook lines, not one, and the reason is a product gap rather than the
-// harness (#1049): a Claude session row never learns its provider session id,
-// so the sidebar takes only a question raised with no session id (matched by
-// its unique worktree), while the board's waiting card needs one raised with
-// the id its Fleet session carries. One line per half, same question, same
-// worktree. The row with the id is never answered, so its card is still
-// waiting when the journey ends; it is asserted that way, not as answered,
-// and #1049 is what lets one question do both.
+// One hook line, carrying the provider session id the real hook always
+// carries. A Claude session row never learns that id (#1049), so the row
+// takes the question through its worktree, which names one session; the
+// board's waiting card is keyed by the id. Until #48 the row refused every
+// id-bearing request and only a line raised with no id reached the banner,
+// which no real hook writes.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -111,8 +109,7 @@ describe("answering from the window", () => {
     await $(`.session-row[data-session="${target.id}"]`).waitForExist({ timeout: 60_000 });
 
     // Raised while the window is open, by a process that is not the window.
-    hook(askLine(`e2e-ask-board-${stamp}`, provider, target.cwd));
-    hook(askLine(`e2e-ask-row-${stamp}`, "", target.cwd));
+    hook(askLine(`e2e-ask-${stamp}`, provider, target.cwd));
 
     // The board: the agent the id names sits in the waiting column.
     await click(".board-tab .tab-title");
@@ -220,15 +217,15 @@ describe("answering from the window", () => {
     // `<surface>@<host>`: the surface is what the person sat at.
     assert.match(second.by, /^desktop@/, `the desktop answered, not the terminal: ${JSON.stringify(second)}`);
 
-    // The board's card is the row raised with the provider id, which no one
-    // answered, so it is still waiting. With #1049 closed, one question would
-    // be both the banner's and the card's, and this would read answered.
-    // Selecting the row opened its terminal tab, so the board is brought back
-    // to be read.
+    // The board's card is the daemon's view of the agent, which stays waiting
+    // until the agent's next hook event; the fixture agent fires none, so the
+    // card is still there. The request itself reads answered, as the second
+    // surface just found. Selecting the row opened its terminal tab, so the
+    // board is brought back to be read.
     await click(".board-tab .tab-title");
     await $(card).waitForExist({
       timeout: 30_000,
-      timeoutMsg: "the card for the unanswered row left the waiting column (#1049 keeps it there)",
+      timeoutMsg: "the agent's card left the board",
     });
   });
 });
