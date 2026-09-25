@@ -23,8 +23,8 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use ainb_hangar_proto::devices::{
-    BaseScope, CallParams, DeviceScope, EVENT_TABLE, EventFamily, SCOPE_TABLE, ScopeColumn,
-    Verdict, column_allows, column_receives, method_allowed,
+    BaseScope, CallParams, DeviceScope, EVENT_TABLE, EventFamily, Grantor, SCOPE_TABLE,
+    ScopeColumn, Verdict, column_allows, column_receives, method_allowed, scope_row,
 };
 use ainb_hangar_proto::fleet::ControlAction;
 use ainb_hangar_proto::methods::{self as m, ALL_METHODS};
@@ -118,6 +118,135 @@ fn every_method_is_classified_exactly_once() {
     );
     let order: Vec<&str> = SCOPE_TABLE.iter().map(|r| r.method).collect();
     assert_eq!(order, ALL_METHODS.to_vec(), "rows follow ALL_METHODS order");
+}
+
+/// Every `pub const NAME: &str = "value"` in `methods.rs`, parsed from source.
+///
+/// Read from the SOURCE, not from `ALL_METHODS`, so a const the daemon
+/// dispatches but nobody appended to the registry is still found.
+fn declared_method_consts(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("pub const ") {
+        rest = &rest[at + "pub const ".len()..];
+        let Some(colon) = rest.find(':') else { break };
+        let name = rest[..colon].trim().to_string();
+        let after = rest[colon + 1..].trim_start();
+        let Some(after) = after.strip_prefix("&str") else {
+            continue;
+        };
+        let Some(after) = after.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let Some(after) = after.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = after.find('"') else { break };
+        out.push((name, after[..end].to_string()));
+    }
+    out
+}
+
+/// No default, enforced from the source: every method-name const in
+/// `methods.rs`, other than a notification, is in `ALL_METHODS` and has a
+/// scope row. `hangar/issue_create` and `hangar/issue_run` slipped past the
+/// registry this way before the freeze.
+#[test]
+fn every_declared_method_const_is_classified() {
+    let consts = declared_method_consts(include_str!("../src/methods.rs"));
+    assert!(
+        consts.len() > ALL_METHODS.len(),
+        "the source parse found too little"
+    );
+    let notifications: HashSet<&str> = m::FLEET_PROTOCOL_NOTIFICATION_METHODS
+        .iter()
+        .chain(m::TERMINAL_NOTIFICATION_METHODS)
+        .copied()
+        .collect();
+    let mut missing = Vec::new();
+    for (name, value) in &consts {
+        if notifications.contains(value.as_str()) {
+            continue;
+        }
+        if !ALL_METHODS.contains(&value.as_str()) || scope_row(value).is_none() {
+            missing.push(format!("{name} = {value:?}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "method consts with no scope verdict: {missing:?}. Append each to \
+         ALL_METHODS and give it a SCOPE_TABLE row; there is no default."
+    );
+}
+
+/// A read method and the events it reads agree: a scope that cannot call
+/// the read is not sent its events, and the other way round.
+#[test]
+fn event_families_match_their_read_methods() {
+    for (family, method) in [
+        (EventFamily::Connections, m::HANGAR_CONNECTIONS_LIST),
+        (EventFamily::Devices, m::DEVICE_LIST),
+    ] {
+        for column in ScopeColumn::ALL {
+            assert_eq!(
+                column_receives(column, family),
+                column_allows(column, method, &CallParams::Untyped),
+                "{family:?} vs {method} in {}",
+                column.as_str()
+            );
+        }
+    }
+}
+
+/// DV5 and S1 for grants: the operator grants any known scope; a device grants
+/// only the two phone scopes, never above its own; an unknown base is granted
+/// by nobody and grants nothing.
+#[test]
+fn only_the_operator_grants_desktop_or_admin() {
+    let all = [
+        DeviceScope::MOBILE,
+        DeviceScope::MOBILE_TYPE,
+        DeviceScope::DESKTOP,
+        DeviceScope::DESKTOP_ADMIN,
+    ];
+    for target in all {
+        assert!(Grantor::Operator.may_grant(target), "{target:?}");
+    }
+    let admin = Grantor::Device(DeviceScope::DESKTOP_ADMIN);
+    assert!(admin.may_grant(DeviceScope::MOBILE));
+    assert!(admin.may_grant(DeviceScope::MOBILE_TYPE));
+    assert!(!admin.may_grant(DeviceScope::DESKTOP));
+    assert!(!admin.may_grant(DeviceScope::DESKTOP_ADMIN));
+    let phone = Grantor::Device(DeviceScope::MOBILE);
+    assert!(phone.may_grant(DeviceScope::MOBILE));
+    assert!(
+        !phone.may_grant(DeviceScope::MOBILE_TYPE),
+        "never above its own"
+    );
+    let unknown = DeviceScope::new(BaseScope::Unknown, false).unwrap();
+    assert!(!Grantor::Operator.may_grant(unknown));
+    assert!(!Grantor::Device(unknown).may_grant(DeviceScope::MOBILE));
+}
+
+/// A base this build does not know is refused every method and event.
+#[test]
+fn an_unknown_base_is_refused_everything() {
+    let unknown: DeviceScope =
+        serde_json::from_value(serde_json::json!({"base": "watch"})).unwrap();
+    assert_eq!(unknown.base(), BaseScope::Unknown);
+    for method in ALL_METHODS {
+        assert!(
+            !method_allowed(&unknown, method, &CallParams::Untyped),
+            "{method}"
+        );
+    }
+    for family in EventFamily::ALL {
+        assert!(!ainb_hangar_proto::devices::event_allowed(&unknown, family));
+    }
+    assert!(!ainb_hangar_proto::devices::event_allowed(
+        &DeviceScope::DESKTOP_ADMIN,
+        EventFamily::Unknown
+    ));
 }
 
 /// A params rule is meaningful only on the method whose params it reads.
