@@ -33,7 +33,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 use ainb_hangar_core::clock::{HangarClock, SystemClock};
 use ainb_hangar_core::token::{TokenKind, mint, sha256_hex};
 use ainb_hangar_proto::auth::{DeviceInfo, HelloParams, HelloResult, UNAUTHORIZED};
-use ainb_hangar_proto::connections::SurfaceInfo;
+use ainb_hangar_proto::connections::{SurfaceHost, SurfaceInfo};
 use ainb_hangar_proto::protocol::{
     PROTOCOL_INCOMPATIBLE, ProtocolRange, catalogue_strings, negotiate,
 };
@@ -349,11 +349,13 @@ pub async fn authenticate_first_frame(
         // able to see, so it cannot opt out of the listing.
         transient: params.transient && matches!(caller, Caller::Operator),
         caller,
-        surface: params.surface.clone(),
+        // `mobile` is a peer-leg identity from a device credential; a local
+        // process that claims it is recorded as `unknown`.
+        surface: params.surface.clone().map(SurfaceInfo::for_local_leg),
         protocol: selected,
         capabilities: params.capabilities.clone(),
         device: params.device.clone(),
-        host: params.host,
+        host: params.host.map(SurfaceHost::for_local_leg),
     };
 
     // The Pal credential FIRST, and it is never the daemon token: a scoped
@@ -663,6 +665,37 @@ mod tests {
         assert!(
             authenticate_first_frame(store.pool(), &hello(&pal)).await.is_err(),
             "a revoked Pal credential still authenticated"
+        );
+    }
+
+    /// A local hello cannot label itself a phone: `mobile`, as the surface or
+    /// as a plugin's host, is recorded as `unknown` on the unix leg.
+    #[tokio::test]
+    async fn a_local_hello_cannot_declare_the_mobile_surface() {
+        use ainb_hangar_proto::connections::SurfaceKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let path = ensure_socket_token(store.pool(), dir.path()).await.unwrap();
+        let daemon = std::fs::read_to_string(&path).unwrap().trim().to_string();
+        let hello = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": methods::AUTH_HELLO,
+            "params": {
+                "token": daemon,
+                "surface": {"kind": "mobile", "pid": 42},
+                "host": {"kind": "mobile", "pid": 7},
+            }
+        }))
+        .unwrap();
+        let (_, authenticated) = authenticate_first_frame(store.pool(), &hello)
+            .await
+            .expect("the operator token authenticates");
+        let surface = authenticated.surface.expect("surface kept");
+        assert_eq!(surface.kind, SurfaceKind::Unknown);
+        assert_eq!(surface.pid, 42);
+        assert_eq!(
+            authenticated.host.map(|h| h.kind),
+            Some(SurfaceKind::Unknown)
         );
     }
 
