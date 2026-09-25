@@ -1265,6 +1265,7 @@ const fn app_event_writes_outside_ainb(event: &AppEvent) -> bool {
         | AppEvent::DetachTmuxSession
         | AppEvent::ToggleExpandAll
         | AppEvent::ToggleSessionMenuBar
+        | AppEvent::ToggleSessionMetadata
         | AppEvent::OtherTmuxStartRename
         | AppEvent::OtherTmuxRenameChar(..)
         | AppEvent::OtherTmuxRenameBackspace
