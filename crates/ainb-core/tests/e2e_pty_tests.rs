@@ -44,7 +44,8 @@ struct App {
     root: IsolatedRoot,
 }
 
-/// The directory an app runs under, whose `tmux/` holds its own tmux server.
+/// The directory an app runs under, whose `tmux/` holds its own tmux server
+/// (and `tmux-visual/` the visual-debug copy's).
 ///
 /// Dropping it kills every session on that server, each by its exact name,
 /// while the socket directory still exists, and only then deletes the
@@ -62,19 +63,22 @@ impl IsolatedRoot {
 
 impl Drop for IsolatedRoot {
     fn drop(&mut self) {
-        let dir = self.path().join("tmux");
-        let tmux = |args: &[&str]| {
-            Command::new("tmux")
-                .args(args)
-                .env("TMUX_TMPDIR", &dir)
-                .env_remove("TMUX")
-                .output()
-        };
-        let Ok(listed) = tmux(&["list-sessions", "-F", "#{session_name}"]) else {
-            return;
-        };
-        for name in String::from_utf8_lossy(&listed.stdout).lines() {
-            let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
+        // `tmux-visual` is the visual-debug Terminal.app copy's own server.
+        for server in ["tmux", "tmux-visual"] {
+            let dir = self.path().join(server);
+            let tmux = |args: &[&str]| {
+                Command::new("tmux")
+                    .args(args)
+                    .env("TMUX_TMPDIR", &dir)
+                    .env_remove("TMUX")
+                    .output()
+            };
+            let Ok(listed) = tmux(&["list-sessions", "-F", "#{session_name}"]) else {
+                continue;
+            };
+            for name in String::from_utf8_lossy(&listed.stdout).lines() {
+                let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
+            }
         }
     }
 }
