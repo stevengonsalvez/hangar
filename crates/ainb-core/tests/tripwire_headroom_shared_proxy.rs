@@ -130,13 +130,29 @@ fn start_tui(home: &Path, session: &str) -> TmuxGuard {
     guard
 }
 
+/// Ctrl+C until the TUI goes. The event loop drops every key for its first
+/// 100 ms (`STARTUP_GUARD_MS` in main.rs), and the first frame `start_tui`
+/// waits for can land inside that window, so one press can be lost and the
+/// TUI never quits. A press is repeated only while the TUI is still on its
+/// screen, and no sooner than two seconds after the last: once it has left
+/// the alternate screen it is exiting, and another Ctrl+C there would be a
+/// SIGINT in the middle of the exit work this test is about.
 fn quit_tui(session: &str) {
-    Command::new("tmux")
-        .args(["send-keys", "-t", session, "C-c"])
-        .status()
-        .expect("send ctrl+c");
+    let end = Instant::now() + Duration::from_secs(30);
+    let mut last_press: Option<Instant> = None;
+    while Instant::now() < end && session_exists(session) {
+        let due = last_press.is_none_or(|at| at.elapsed() >= Duration::from_secs(2));
+        if due && capture_pane(session).contains("Agents in a Box") {
+            Command::new("tmux")
+                .args(["send-keys", "-t", session, "C-c"])
+                .status()
+                .expect("send ctrl+c");
+            last_press = Some(Instant::now());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
     assert!(
-        wait_until(Duration::from_secs(30), || !session_exists(session)),
+        !session_exists(session),
         "TUI in {session} did not exit on ctrl+c:\n{}",
         capture_pane(session)
     );
