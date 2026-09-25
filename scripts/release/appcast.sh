@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Generate and sign the Fleet Sparkle feed for one release, then prove the DMG's
-# signature verifies under the public key Fleet builds pin.
+# Generate and sign the Fleet Sparkle feed for one release, then prove both
+# signatures in it, the DMG's and the feed's own, verify under the public key
+# Fleet builds pin.
 #
 #   bash scripts/release/appcast.sh <dmg> <generate_appcast> <version> <out-dir>
 #
@@ -11,8 +12,10 @@
 #
 # Environment:
 #   PUB      true: KEY and PUBLIC are required, and the feed is refused unless
-#            the DMG's signature verifies under PUBLIC. false: both are ignored
-#            and a throwaway key signs, so the signing path still runs.
+#            both of its signatures verify under PUBLIC. false: KEY and PUBLIC
+#            are the throwaway pair the dry run's Fleet build pinned (Sparkle
+#            signs only under the key the app pins); without them a fresh
+#            throwaway key is made, which only a Fleet pinning no key accepts.
 #   KEY      Sparkle EdDSA private key, base64 (SPARKLE_PRIVATE_ED_KEY).
 #   PUBLIC   Sparkle EdDSA public key, base64 (SPARKLE_PUBLIC_ED_KEY).
 #   BRIDGE   true: also write the bridge feed.
@@ -43,6 +46,10 @@ if [ "${PUB:-false}" = true ]; then
   test -n "${PUBLIC:-}" || { echo "SPARKLE_PUBLIC_ED_KEY is required to publish" >&2; exit 1; }
   private="$KEY"
   public="$PUBLIC"
+elif [ -n "${KEY:-}" ] && [ -n "${PUBLIC:-}" ]; then
+  private="$KEY"
+  public="$PUBLIC"
+  echo "dry run: signing the feed with the throwaway key the build pinned"
 else
   # A PKCS#8 Ed25519 key ends with its 32-byte seed, which is the form
   # generate_appcast reads from --ed-key-file.
@@ -71,7 +78,26 @@ feed() {
   # would be rejected in the field. Refuse it here instead.
   openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin -in "$dmg" -sigfile "$work/dmg.sig" \
     || { echo "the DMG signature does not verify under $public; refusing the feed" >&2; exit 1; }
+  verify_feed "$work/$repo/appcast.xml"
   cp "$work/$repo/appcast.xml" "$dest/appcast.xml"
+}
+
+verify_feed() {
+  # Fleet sets SURequireSignedFeed, so an installed Fleet also rejects a feed
+  # whose own signature is missing or wrong. Sparkle signs every byte before
+  # the trailing `<!-- sparkle-signatures:` comment, and records that count.
+  local xml="$1" at block fsig flen
+  at="$(perl -0777 -ne 'my $i = rindex($_, "<!-- sparkle-signatures:\n"); print $i if $i >= 0' "$xml")"
+  test -n "$at" || { echo "appcast carries no feed signature (sparkle-signatures)" >&2; exit 1; }
+  head -c "$at" "$xml" > "$work/feed.signed"
+  block="$(tail -c +"$((at + 1))" "$xml")"
+  fsig="$(sed -n 's/^edSignature: *//p' <<<"$block" | head -1)"
+  flen="$(sed -n 's/^length: *//p' <<<"$block" | head -1)"
+  test -n "$fsig" || { echo "the feed signature block has no edSignature" >&2; exit 1; }
+  [ "$flen" = "$at" ] || { echo "the feed signature covers ${flen:-no} bytes, the feed has $at" >&2; exit 1; }
+  printf '%s' "$fsig" | base64 -d > "$work/feed.sig"
+  openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin -in "$work/feed.signed" -sigfile "$work/feed.sig" \
+    || { echo "the feed signature does not verify under $public; refusing the feed" >&2; exit 1; }
 }
 
 feed "$GITHUB_REPOSITORY" "$out"

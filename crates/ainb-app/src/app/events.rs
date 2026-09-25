@@ -395,11 +395,12 @@ pub enum AppEvent {
     GitReviewExpandAllFolders, // e — expand all folders
     GitReviewCollapseAllFolders, // E — collapse all folders
     // Tmux integration events
-    AttachTmuxSession,    // Attach to tmux session (full-screen)
-    EnterInteractivePane, // Attach in-place: interactive embedded tmux pane
-    DetachTmuxSession,    // Detach from tmux session
-    ToggleExpandAll,      // Toggle expand/collapse all workspaces
-    ToggleSessionMenuBar, // Hide/show the Sessions bottom keymap legend (⇧M)
+    AttachTmuxSession,     // Attach to tmux session (full-screen)
+    EnterInteractivePane,  // Attach in-place: interactive embedded tmux pane
+    DetachTmuxSession,     // Detach from tmux session
+    ToggleExpandAll,       // Toggle expand/collapse all workspaces
+    ToggleSessionMenuBar,  // Hide/show the Sessions bottom keymap legend (⇧M)
+    ToggleSessionMetadata, // Toggle compact model/effort titles (v)
     // Other tmux rename events
     OtherTmuxStartRename, // Start rename mode for selected "Other tmux" session
     OtherTmuxRenameChar(char), // Character input for rename
@@ -2686,6 +2687,7 @@ impl EventHandler {
             AppEvent::ToggleClaudeChat => state.toggle_claude_chat(),
             AppEvent::ToggleExpandAll => state.toggle_expand_all_workspaces(),
             AppEvent::ToggleSessionMenuBar => state.toggle_session_menu_bar(),
+            AppEvent::ToggleSessionMetadata => state.toggle_session_metadata(),
             // Applied in the main loop: the sidebar's collapsed flag is
             // renderer state (`UiState::sessions_pane`), which the reducer does
             // not hold. Same path the [-]/[+] mouse glyph takes.
@@ -7970,6 +7972,19 @@ mod session_list_key_tests {
 
     fn ctrl_x(state: &mut AppState) -> Option<AppEvent> {
         EventHandler::handle_key_event(Chord::new(Char('x'), Mods::CTRL), state)
+    }
+
+    /// `m` and ⇧M are occupied. A persistent toggle works in terminals that
+    /// cannot report a held key's release event.
+    #[test]
+    fn session_list_v_key_toggles_compact_model_metadata() {
+        let mut state = session_list_state();
+        let event = key(&mut state, 'v').expect("v on the session list dispatches metadata toggle");
+        assert!(matches!(event, AppEvent::ToggleSessionMetadata));
+        EventHandler::process_event(event, &mut state);
+        assert!(state.sessions.show_session_metadata);
+        EventHandler::process_event(AppEvent::ToggleSessionMetadata, &mut state);
+        assert!(!state.sessions.show_session_metadata);
     }
 
     /// The chord is claimed only while a notice is showing; an empty corner
