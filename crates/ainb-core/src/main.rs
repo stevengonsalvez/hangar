@@ -502,9 +502,9 @@ async fn run_tui(
     let dropped =
         ainb::effect_host::finish_session_store_writes(ainb::cli::util::SESSION_STORE_FLUSH_BOUND);
     if dropped > 0 {
-        tracing::warn!(dropped, "session-store writes were still queued at exit");
+        tracing::warn!(dropped, "session-store writes were not written at exit");
         eprintln!(
-            "Warning: {dropped} session change(s) were not written: the session store did not answer in time."
+            "Warning: {dropped} session change(s) were not written to the session store; the log says why."
         );
     }
 

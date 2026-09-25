@@ -274,6 +274,11 @@ jobs:
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: nextest
+      # The runner image ships no tmux, and tests that seed their own tmux
+      # server (tui_with_a_hung_daemon) fail to spawn it, while the ones that
+      # check first skip and prove nothing on macOS.
+      - name: Install tmux
+        run: brew install tmux
       - run: "cargo nextest run --workspace --lib --tests --all-features --no-fail-fast -E 'not binary(/^tripwire_/)'"
 
   # ──────────────────────────────────────────────────────────────────────────
