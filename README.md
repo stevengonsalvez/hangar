@@ -30,8 +30,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/stevengonsalvez/agents-in-a-box/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/stevengonsalvez/agents-in-a-box/ci.yml?branch=main&style=flat-square&label=CI&logo=github" alt="CI"></a>
-  <a href="https://github.com/stevengonsalvez/agents-in-a-box/actions/workflows/toolkit-validation.yml"><img src="https://img.shields.io/github/actions/workflow/status/stevengonsalvez/agents-in-a-box/toolkit-validation.yml?branch=main&style=flat-square&label=Toolkit&logo=github" alt="Toolkit Validation"></a>
+  <a href="https://github.com/stevengonsalvez/hangar/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/stevengonsalvez/hangar/ci.yml?branch=main&style=flat-square&label=CI&logo=github" alt="CI"></a>
   <a href="https://github.com/stevengonsalvez/agents-in-a-box/releases"><img src="https://img.shields.io/github/v/release/stevengonsalvez/agents-in-a-box?style=flat-square&logo=github" alt="Release"></a>
   <img src="https://img.shields.io/badge/rust-2021_edition-orange?style=flat-square&logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-blue?style=flat-square" alt="Platform">
@@ -53,7 +52,7 @@ separate, standalone repo — `ainb` consumes it as a pinned external source.
 
 | Repo | What it holds |
 |---|---|
-| **stevengonsalvez/agents-in-a-box** (this repo) | The `ainb` TUI/CLI unit manager (Rust workspace), the v2 plugin system, and the docs. |
+| **stevengonsalvez/hangar** (this repo) | The `ainb` TUI/CLI unit manager (Rust workspace), the v2 plugin system, and the docs. |
 | **[stevengonsalvez/ainb-reflect-memory](https://github.com/stevengonsalvez/ainb-reflect-memory)** | `reflect` — the long-term memory engine (GraphRAG + QMD) + its Claude Code plugin, extracted from this monorepo. Engine install: `uv tool install --upgrade 'git+https://github.com/stevengonsalvez/ainb-reflect-memory.git[graph]'`. |
 | **[stevengonsalvez/ainb-toolkit](https://github.com/stevengonsalvez/ainb-toolkit)** | The canonical home for the 94 curated skills, 16 agents, workflows, utilities, the `external-dependencies.yaml` manifest, the `bootstrap.js` legacy installer, and the generated `catalog.yaml`. `ainb` browses + installs from it; the release CI pins a tag of it to generate the curated `catalog-index.json`. |
 
@@ -387,7 +386,7 @@ curl -fsSL https://raw.githubusercontent.com/stevengonsalvez/hangar/main/install
 
 **Cargo** (any platform with a Rust toolchain):
 ```bash
-cargo install --git https://github.com/stevengonsalvez/agents-in-a-box --branch main ainb
+cargo install --git https://github.com/stevengonsalvez/hangar --branch main ainb
 ```
 
 **Windows via WSL2** — native Windows is not supported (`ainb` uses Unix-only APIs: PTY, POSIX file modes). Use WSL2:
@@ -789,7 +788,7 @@ and `.agents/goals/ainb-skill-manager-v1.2-rollup-plan.md`.
 - [Website](https://ainb.app/)
 - [Releases](https://github.com/stevengonsalvez/agents-in-a-box/releases)
 - [Homebrew Tap](https://github.com/stevengonsalvez/homebrew-agents-in-a-box)
-- [Issues](https://github.com/stevengonsalvez/agents-in-a-box/issues)
+- [Issues](https://github.com/stevengonsalvez/hangar/issues)
 - [Knowledge System Architecture](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/knowledge/overview.md)
 - [Toolkit Repository (ainb-toolkit)](https://github.com/stevengonsalvez/ainb-toolkit)
 

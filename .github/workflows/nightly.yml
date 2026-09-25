@@ -74,10 +74,17 @@ jobs:
       # Rescued from the deleted visual-tests.yml. That file ran these two at a
       # repository root which carried no Cargo.toml under the old layout, so
       # neither had ever executed; `-p ainb` is what makes them real.
+      # `!cancelled()`: a red tripwire above must not skip these, as it has
+      # three times already.
       - name: PTY end-to-end tests (ignored by default)
+        if: ${{ !cancelled() }}
         run: cargo test -p ainb --test e2e_pty_tests -- --ignored --test-threads=1
+      # Named binary and module: a bare `--ignored` across the package also runs
+      # interactive_mode_tests (stale, and kills every `tmux_*` session on the
+      # box) and on-demand journey scaffolding that needs AINB_JOURNEY_DIR.
       - name: vt100 tests (ignored by default)
-        run: cargo test -p ainb --features vt100-tests -- --ignored --test-threads=1
+        if: ${{ !cancelled() }}
+        run: cargo test -p ainb --features vt100-tests --test e2e_pty_tests -- --ignored --test-threads=1 vt100_tests
 
   # ──────────────────────────────────────────────────────────────────────────
   # The inverse lane: only the tripwires `core-tripwires` skips. Red tests are
@@ -274,6 +281,11 @@ jobs:
       - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: nextest
+      # The runner image ships no tmux, and tests that seed their own tmux
+      # server (tui_with_a_hung_daemon) fail to spawn it, while the ones that
+      # check first skip and prove nothing on macOS.
+      - name: Install tmux
+        run: brew install tmux
       - run: "cargo nextest run --workspace --lib --tests --all-features --no-fail-fast -E 'not binary(/^tripwire_/)'"
 
   # ──────────────────────────────────────────────────────────────────────────
