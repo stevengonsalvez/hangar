@@ -402,7 +402,10 @@ name = "ainb-hangar-client"
 version = "0.1.0"
 dependencies = [
  "ainb-hangar-core",
+ "ainb-hangar-noise",
  "ainb-hangar-proto",
+ "ainb-hangar-secrets",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "tempfile",
