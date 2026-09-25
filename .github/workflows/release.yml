@@ -396,7 +396,9 @@ jobs:
               exit 0
             fi
           fi
-          reported="$("${via[@]}" "$BIN" --version)"
+          # The guarded expansion, because an empty array under `set -u` is an
+          # unbound variable on the macOS runner's bash 3.2.
+          reported="$(${via[@]+"${via[@]}"} "$BIN" --version)"
           echo "sidecar reports: $reported"
           case "$reported" in
             *" ${VERSION}") ;;
