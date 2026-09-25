@@ -49,6 +49,46 @@ impl SurfaceKind {
     }
 }
 
+impl SurfaceKind {
+    /// The kind a LOCAL (unix-leg) hello may claim.
+    ///
+    /// [`Self::Mobile`] is a peer-leg identity the daemon derives from a paired
+    /// device's credential, never a label a local process may give itself, so
+    /// a local claim of it is recorded as [`Self::Unknown`]. Every other kind
+    /// passes through.
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        match self {
+            Self::Mobile => Self::Unknown,
+            other => other,
+        }
+    }
+}
+
+impl SurfaceInfo {
+    /// This surface as a local (unix-leg) hello may declare it; see
+    /// [`SurfaceKind::for_local_leg`].
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        Self {
+            kind: self.kind.for_local_leg(),
+            pid: self.pid,
+        }
+    }
+}
+
+impl SurfaceHost {
+    /// This host claim as a local (unix-leg) hello may declare it; see
+    /// [`SurfaceKind::for_local_leg`].
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        Self {
+            kind: self.kind.for_local_leg(),
+            pid: self.pid,
+        }
+    }
+}
+
 impl fmt::Display for SurfaceKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -219,6 +259,40 @@ mod tests {
             serde_json::from_str::<OlderKind>("\"tui\"").unwrap(),
             OlderKind::Unknown
         );
+    }
+
+    /// A local process cannot claim to be a phone: the local leg records the
+    /// claim as `unknown`, and leaves every other kind alone.
+    #[test]
+    fn a_local_hello_cannot_declare_mobile() {
+        assert_eq!(SurfaceKind::Mobile.for_local_leg(), SurfaceKind::Unknown);
+        for kind in [
+            SurfaceKind::Tui,
+            SurfaceKind::Web,
+            SurfaceKind::Desktop,
+            SurfaceKind::Cli,
+            SurfaceKind::Copilot,
+            SurfaceKind::Plugin,
+            SurfaceKind::Unknown,
+        ] {
+            assert_eq!(kind.for_local_leg(), kind);
+        }
+        let info = SurfaceInfo {
+            kind: SurfaceKind::Mobile,
+            pid: 9,
+        };
+        assert_eq!(
+            info.for_local_leg(),
+            SurfaceInfo {
+                kind: SurfaceKind::Unknown,
+                pid: 9
+            }
+        );
+        let host = SurfaceHost {
+            kind: SurfaceKind::Mobile,
+            pid: 4,
+        };
+        assert_eq!(host.for_local_leg().kind, SurfaceKind::Unknown);
     }
 
     #[test]
