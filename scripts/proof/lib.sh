@@ -670,7 +670,18 @@ start_desktop() {
   ptmux new-session -d -s desktop -x "$PROOF_COLS" -y "$PROOF_ROWS" \
     "env -u TMUX -u TMUX_PANE AINB_DESKTOP_DAEMON_BIN='$DESKTOP_DAEMON_BIN' \
        xvfb-run -a '$DESKTOP_BIN' 2>>'$PROOF_WORLD/desktop.stderr'"
-  wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null
+  wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null || return 1
+  # The first batch is applied from the reducer before the window's sidecar
+  # has a daemon: the socket binds and the token is written a few seconds
+  # after that line on a slower box. A scenario whose first daemon read
+  # follows this return would race that boot (d3p-inbox did: its issue_create
+  # found no token file), so the wait lives here, as it does in start_tui, and
+  # every desktop node's first read finds a daemon. A daemon that never comes
+  # is recorded against the boot rather than against the read.
+  if ! wait_for 60 daemon_running \
+    || ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
+    observe "the daemon the window starts had no bound socket and token 90 s after its first batch: $("$AINB_BIN" hangar daemon status 2>&1 | head -1)"
+  fi
 }
 
 # applied_sessions: the session count on the last batch the renderer applied.

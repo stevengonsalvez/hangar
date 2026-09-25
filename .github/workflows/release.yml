@@ -10,8 +10,10 @@ name: Release
 # Nothing here commits. The version bump is a signed commit on the release
 # branch, and `guard` only checks that the source agrees with the input.
 #
-# No cache anywhere in this file, so a release never restores a cache a pull
-# request could have written.
+# No cache in this file's own jobs, so no released byte comes from a cache a
+# pull request could have written. `desktop_gate` calls desktop.yml, which
+# restores the rust and npm caches, but that job only passes or fails: nothing
+# it builds is shipped.
 on:
   workflow_dispatch:
     inputs:
@@ -77,6 +79,7 @@ jobs:
           PRE: ${{ inputs.prerelease }}
           PUB: ${{ inputs.publish }}
           BRIDGE: ${{ inputs.bridge }}
+          DESKTOP_SIGNED: ${{ inputs.desktop_signed }}
         run: |
           set -euo pipefail
           [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+)?$ ]] || { echo "bad version $V"; exit 1; }
@@ -88,6 +91,11 @@ jobs:
           if [ "$BRIDGE" = true ] && [ "$PRE" = true ]; then
             echo "the bridge carries a stable release only"; exit 1
           fi
+          # A dry run's environment holds no Apple secrets, so a signed dry run
+          # could only fail at the bundle, or quietly ship ad-hoc bundles.
+          if [ "$DESKTOP_SIGNED" = true ] && [ "$PUB" != true ]; then
+            echo "desktop_signed needs publish: a dry run has no Apple secrets to sign with"; exit 1
+          fi
           grep -q "^version = \"$V\"$" Cargo.toml || { echo "Cargo.toml is not at $V"; exit 1; }
           grep -q "^version = \"$V\"$" crates/ainb-desktop/Cargo.toml || { echo "crates/ainb-desktop/Cargo.toml is not at $V"; exit 1; }
 
@@ -97,7 +105,9 @@ jobs:
           root_ok=true
           grep -A2 'macro_rules! release_host' crates/ainb-app/src/cli/update.rs | grep -qF "\"$url\"" \
             || { echo "::warning::release_host! does not name $url"; root_ok=false; }
-          grep -qF "\"$url\"," crates/ainb-app/src/cli/update.rs \
+          # Escaped: in -E a bare `.` in the URL would match any character.
+          url_re="$(printf '%s' "$url" | sed 's|[][\\.*^$+?(){}\|]|\\&|g')"
+          grep -A1 '^ *"--git",$' crates/ainb-app/src/cli/update.rs | grep -qxE " *\"$url_re\"," \
             || { echo "::warning::the cargo install --git URL does not name $url"; root_ok=false; }
           grep -qF "pub const CATALOG_INDEX_REPO: &str = \"$GITHUB_REPOSITORY\";" crates/ainb-cli/src/catalog_curated.rs \
             || { echo "::warning::CATALOG_INDEX_REPO does not name $GITHUB_REPOSITORY"; root_ok=false; }
@@ -118,8 +128,22 @@ jobs:
             # must be the one main ships.
             pin='^const RELEASE_SIGNING_PUBLIC_KEY_B64: &str = '
             git fetch -q --depth 1 origin main
-            [ "$(grep "$pin" crates/ainb-app/src/cli/update.rs)" = "$(git show FETCH_HEAD:crates/ainb-app/src/cli/update.rs | grep "$pin")" ] \
+            # Found first: a pin line renamed on both refs would compare equal.
+            ours="$(grep "$pin" crates/ainb-app/src/cli/update.rs)" \
+              || { echo "RELEASE_SIGNING_PUBLIC_KEY_B64 is not in update.rs on this ref"; exit 1; }
+            [ "$ours" = "$(git show FETCH_HEAD:crates/ainb-app/src/cli/update.rs | grep "$pin")" ] \
               || { echo "RELEASE_SIGNING_PUBLIC_KEY_B64 on this ref differs from main"; exit 1; }
+            # The Fleet build pins, and its feed is signed for, the Sparkle key
+            # this ref commits. Every installed Fleet pins the key main
+            # commits, so a release branch that changed its copy would strand
+            # them all.
+            if [ "$PRE" = false ]; then
+              key_file=apps/ainb-fleet-macos/sparkle-public-ed-key
+              sparkle="$(git show "FETCH_HEAD:$key_file" 2>/dev/null || true)"
+              [ -n "$sparkle" ] || { echo "main commits no $key_file"; exit 1; }
+              [ "$(cat "$key_file" 2>/dev/null)" = "$sparkle" ] \
+                || { echo "$key_file on this ref is not the Sparkle key main commits"; exit 1; }
+            fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
             echo "PUBLISH: v$V from $GITHUB_REF" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -213,8 +237,7 @@ jobs:
           if-no-files-found: error
 
   # Builds the universal Fleet app and its DMG. No key: signing the feed is
-  # `sign_fleet`'s, in the environment that holds the key. The Sparkle tools
-  # the build fetched travel with the DMG so `sign_fleet` uses the same ones.
+  # `sign_fleet`'s, in the environment that holds the key.
   fleet_macos:
     name: Build Fleet macOS app
     needs: guard
@@ -225,11 +248,42 @@ jobs:
       contents: read
     env:
       VERSION: ${{ inputs.version }}
-      # Public, a repository variable. Empty in a dry run before the owner sets
-      # it; `sign_fleet` refuses to publish a feed that does not verify under it.
-      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
     steps:
       - uses: actions/checkout@v7
+      # Sparkle signs an update only under the key the app itself pins, so the
+      # build and `sign_fleet` must agree on the pair. A publish pins the key
+      # every installed Fleet has, the committed apps/ainb-fleet-macos/
+      # sparkle-public-ed-key (guard checked it against main's). A dry run has no private half of that key, so it pins
+      # a throwaway pair made here and hands the private half to its own
+      # `sign_fleet`; the committed key is never touched.
+      - name: Choose the Sparkle key
+        env:
+          PUB: ${{ needs.guard.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "$PUB" = true ]; then
+            echo "SPARKLE_PUBLIC_ED_KEY=$(cat apps/ainb-fleet-macos/sparkle-public-ed-key)" >> "$GITHUB_ENV"
+          else
+            # LibreSSL, the system openssl, cannot write Ed25519 keys.
+            PATH="$(brew --prefix openssl@3)/bin:$PATH"
+            dir="$RUNNER_TEMP/dryrun-sparkle"
+            mkdir -p "$dir"
+            openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/dryrun.pem"
+            # generate_appcast reads the 32-byte seed; Info.plist pins the public half.
+            openssl pkey -in "$RUNNER_TEMP/dryrun.pem" -outform DER | tail -c 32 | base64 > "$dir/private"
+            openssl pkey -in "$RUNNER_TEMP/dryrun.pem" -pubout -outform DER | tail -c 32 | base64 > "$dir/public"
+            rm "$RUNNER_TEMP/dryrun.pem"
+            echo "SPARKLE_PUBLIC_ED_KEY=$(cat "$dir/public")" >> "$GITHUB_ENV"
+            echo "dry run: Fleet pins a throwaway Sparkle key" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: needs.guard.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fleet-dryrun-sparkle-key
+          path: ${{ runner.temp }}/dryrun-sparkle/
+          if-no-files-found: error
+          # Throwaway, and only this run's sign_fleet reads it.
+          retention-days: 1
       - name: Archive universal Fleet app
         run: |
           xcodebuild archive \
@@ -250,10 +304,8 @@ jobs:
           set -euo pipefail
           app_path="$RUNNER_TEMP/AINBFleet.xcarchive/Products/Applications/AINBFleet.app"
           staging_path="$RUNNER_TEMP/fleet-dmg"
-          mkdir -p fleet-out/dmg fleet-out/sparkle "$staging_path"
-          appcast_tool=$(find "$RUNNER_TEMP/ainb-fleet-derived-data" -type f -name generate_appcast -perm -u+x -print -quit)
+          mkdir -p fleet-out/dmg "$staging_path"
           test -d "$app_path"
-          test -n "$appcast_tool"
           lipo "$app_path/Contents/MacOS/AINBFleet" -verify_arch arm64 x86_64
           test "$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")" = "$VERSION"
           test "$(plutil -extract CFBundleVersion raw "$app_path/Contents/Info.plist")" = "$VERSION"
@@ -262,18 +314,10 @@ jobs:
           codesign --verify --deep --strict "$app_path"
           ditto "$app_path" "$staging_path/AINBFleet.app"
           hdiutil create -volname 'AINB Fleet' -srcfolder "$staging_path" -ov -format UDZO "fleet-out/dmg/AINBFleet-${VERSION}.dmg"
-          # The whole bin directory, in case generate_appcast is not
-          # self-contained on its own.
-          cp -R "$(dirname "$appcast_tool")/." fleet-out/sparkle/
       - uses: actions/upload-artifact@v7
         with:
           name: fleet-dmg
           path: fleet-out/dmg/AINBFleet-*.dmg
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        with:
-          name: fleet-sparkle-tools
-          path: fleet-out/sparkle/
           if-no-files-found: error
 
   # The desktop shell, bundled with its daemon sidecar, one bundle per target.
@@ -356,7 +400,9 @@ jobs:
               exit 0
             fi
           fi
-          reported="$("${via[@]}" "$BIN" --version)"
+          # The guarded expansion, because an empty array under `set -u` is an
+          # unbound variable on the macOS runner's bash 3.2.
+          reported="$(${via[@]+"${via[@]}"} "$BIN" --version)"
           echo "sidecar reports: $reported"
           case "$reported" in
             *" ${VERSION}") ;;
@@ -395,6 +441,12 @@ jobs:
         if: ${{ runner.os == 'macOS' && !inputs.desktop_signed }}
         run: |
           echo "desktop bundles on ${TARGET}: ad-hoc signed, not notarised (desktop_signed is false; #530)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # The Apple secrets reach only the two steps that name them, but the
+      # steps before those (`npm ci`, cargo build scripts) run in the same job
+      # and can leave files or PATH entries the signed bundle step then runs.
+      # Inherent to bundling with Tauri; the secrets are not provisioned yet
+      # (#530).
+      #
       # Two bundle steps rather than one with conditional variables: the
       # bundler treats a DEFINED but empty APPLE_CERTIFICATE as a certificate
       # to import, so an unsigned run must not have the names in its
@@ -444,8 +496,12 @@ jobs:
           DEB="$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)"
           test -x "$APPIMAGE"
           test -f "$DEB"
-          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-hangar-daemon$'
-          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-desktop$'
+          # Listed once and grepped from the string: `grep -q` quits on the first
+          # match, and under pipefail the listing's tar dying on the closed pipe
+          # fails the step even though the file is there.
+          contents="$(dpkg-deb --contents "$DEB")"
+          grep -q 'usr/bin/ainb-hangar-daemon$' <<<"$contents"
+          grep -q 'usr/bin/ainb-desktop$' <<<"$contents"
           echo "bundles: $APPIMAGE $DEB"
       # Stable, target-named file names: the manifest and the release page
       # name these, not the bundler's spaced product name.
@@ -524,8 +580,8 @@ jobs:
           if-no-files-found: error
 
   # Signs the Fleet feed. Publishing requires SPARKLE_PRIVATE_ED_KEY and refuses
-  # a feed whose DMG signature does not verify under the public key every
-  # installed Fleet pins.
+  # a feed whose signatures do not verify under the public key every installed
+  # Fleet pins.
   sign_fleet:
     name: Sign Fleet feed
     needs: [guard, fleet_macos]
@@ -541,21 +597,46 @@ jobs:
         with:
           name: fleet-dmg
           path: fleet/dmg
-      - uses: actions/download-artifact@v8
+      # The private key is piped into generate_appcast, so the tool comes from
+      # Sparkle's own release at the version the Fleet build resolves, checked
+      # against a pinned digest, not from an artifact an unprivileged job built.
+      - name: Fetch the pinned Sparkle tools
+        env:
+          SPARKLE_VERSION: "2.9.6"
+          SPARKLE_SHA256: 52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192
+        run: |
+          set -euo pipefail
+          resolved=apps/ainb-fleet-macos/AINBFleet.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          [ "$(jq -r '.pins[] | select(.identity == "sparkle") | .state.version' "$resolved")" = "$SPARKLE_VERSION" ] \
+            || { echo "Package.resolved no longer pins Sparkle $SPARKLE_VERSION; move this pin with it"; exit 1; }
+          curl -fsSL -o "$RUNNER_TEMP/sparkle.tar.xz" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          echo "${SPARKLE_SHA256}  $RUNNER_TEMP/sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p fleet/sparkle
+          tar -xJf "$RUNNER_TEMP/sparkle.tar.xz" -C fleet/sparkle
+          test -x fleet/sparkle/bin/generate_appcast
+      - if: needs.guard.outputs.publish != 'true'
+        uses: actions/download-artifact@v8
         with:
-          name: fleet-sparkle-tools
-          path: fleet/sparkle
+          name: fleet-dryrun-sparkle-key
+          path: fleet/dryrun-sparkle
       - name: Generate, sign and verify the appcast
         env:
           KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
-          PUBLIC: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
           PUB: ${{ needs.guard.outputs.publish }}
           BRIDGE: ${{ inputs.bridge }}
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          chmod +x fleet/sparkle/*
-          bash scripts/release/appcast.sh "fleet/dmg/AINBFleet-${VERSION}.dmg" fleet/sparkle/generate_appcast "$VERSION" fleet/feed
+          if [ "$PUB" = true ]; then
+            PUBLIC="$(cat apps/ainb-fleet-macos/sparkle-public-ed-key)"
+          else
+            # The pair the dry run's Fleet build pinned, never a real secret.
+            KEY="$(cat fleet/dryrun-sparkle/private)"
+            PUBLIC="$(cat fleet/dryrun-sparkle/public)"
+          fi
+          export KEY PUBLIC
+          bash scripts/release/appcast.sh "fleet/dmg/AINBFleet-${VERSION}.dmg" fleet/sparkle/bin/generate_appcast "$VERSION" fleet/feed
       - uses: actions/upload-artifact@v7
         with:
           name: fleet-feed
@@ -708,7 +789,11 @@ jobs:
       PRERELEASE: ${{ inputs.prerelease }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # No token left in .git/config: gh reads GH_TOKEN, and only the tap
+      # checkout below pushes.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -747,13 +832,59 @@ jobs:
             flags=(--latest)
           fi
           for f in "${files[@]}"; do test -f "$f" || { echo "missing $f"; exit 1; }; done
+          # The release as the API holds it, draft or not: drafts have no tag
+          # yet, so the tag endpoint cannot find them.
+          fetch() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -s --arg t "v$V" '[add[] | select(.tag_name == $t)] | first' > "$RUNNER_TEMP/release.json"
+          }
+          # An asset holds a file only if its API digest is the file's sha256:
+          # names and sizes alone say nothing about content, and the .sha256
+          # files and the manifest signature are the same size every release.
+          holds() {
+            jq -e --arg n "$(basename "$1")" --arg d "sha256:$(sha256sum "$1" | cut -d' ' -f1)" \
+              'any(.assets[]; .name == $n and .state == "uploaded" and .digest == $d)' \
+              "$RUNNER_TEMP/release.json" >/dev/null
+          }
           # Idempotent, so "Re-run failed jobs" after a failed tap push does not
-          # fail here on the release the first attempt created.
-          if gh release view "v$V" >/dev/null 2>&1; then
-            echo "v$V already exists; not creating it again"
+          # fail here on the release the first attempt created. A first attempt
+          # that died part way can leave a draft, or a release missing assets,
+          # so an existing release is finished rather than trusted, and only
+          # when it was made from this run's commit: publishing a draft tags its
+          # own target, which a later dispatch would not have built.
+          fetch
+          if jq -e '. != null' "$RUNNER_TEMP/release.json" >/dev/null; then
+            target="$(jq -r '.target_commitish' "$RUNNER_TEMP/release.json")"
+            [ "$target" = "$GITHUB_SHA" ] \
+              || { echo "v$V already exists at $target, not at this run's $GITHUB_SHA; delete it and dispatch again"; exit 1; }
+            echo "v$V already exists at this commit; completing it"
+            missing=()
+            for f in "${files[@]}"; do
+              holds "$f" || missing+=("$f")
+            done
+            if [ "${#missing[@]}" -gt 0 ]; then
+              gh release upload "v$V" --clobber "${missing[@]}"
+            fi
           else
-            gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file artifacts/release-notes/notes.md "${flags[@]}" "${files[@]}"
+            # A draft first, so every asset is checked before anyone can see it.
+            gh release create "v$V" --draft --target "$GITHUB_SHA" --title "v$V" --notes-file artifacts/release-notes/notes.md "${files[@]}"
           fi
+          # Every file, byte for byte, before the release goes public. GitHub
+          # can fill an asset's digest a moment after the upload returns, so a
+          # miss is retried with a short backoff before it counts.
+          for attempt in 1 2 3 4 5; do
+            fetch
+            short=()
+            for f in "${files[@]}"; do
+              holds "$f" || short+=("$(basename "$f")")
+            done
+            [ "${#short[@]}" -eq 0 ] && break
+            [ "$attempt" -eq 5 ] && { echo "v$V does not hold as built: ${short[*]}"; exit 1; }
+            sleep $((attempt * 3))
+          done
+          gh release edit "v$V" --draft=false --notes-file artifacts/release-notes/notes.md "${flags[@]}"
+          fetch
+          jq -e '.draft == false' "$RUNNER_TEMP/release.json" >/dev/null || { echo "v$V is still a draft"; exit 1; }
       - name: Push the tap
         if: ${{ !inputs.prerelease }}
         run: git -C tap push
