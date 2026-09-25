@@ -65,6 +65,10 @@ pub enum BaseScope {
     /// A phone that may also type into a terminal.
     #[serde(rename = "mobile+type")]
     MobileType,
+    /// A base a newer daemon defined and this build does not know. It grants
+    /// nothing: every method and event is refused, and it covers no scope.
+    #[serde(rename = "unknown", other)]
+    Unknown,
 }
 
 impl BaseScope {
@@ -75,6 +79,7 @@ impl BaseScope {
             Self::Desktop => "desktop",
             Self::Mobile => "mobile",
             Self::MobileType => "mobile+type",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -167,23 +172,62 @@ impl DeviceScope {
         self.admin
     }
 
-    /// The [`SCOPE_TABLE`] column this scope reads.
+    /// The [`SCOPE_TABLE`] column this scope reads, or `None` for a base this
+    /// build does not know, which reads no column and is refused everything.
     #[must_use]
-    pub const fn column(self) -> ScopeColumn {
+    pub const fn column(self) -> Option<ScopeColumn> {
         match (self.base, self.admin) {
-            (BaseScope::Desktop, true) => ScopeColumn::DesktopAdmin,
-            (BaseScope::Desktop, false) => ScopeColumn::Desktop,
-            (BaseScope::MobileType, _) => ScopeColumn::MobileType,
-            (BaseScope::Mobile, _) => ScopeColumn::Mobile,
+            (BaseScope::Desktop, true) => Some(ScopeColumn::DesktopAdmin),
+            (BaseScope::Desktop, false) => Some(ScopeColumn::Desktop),
+            (BaseScope::MobileType, _) => Some(ScopeColumn::MobileType),
+            (BaseScope::Mobile, _) => Some(ScopeColumn::Mobile),
+            (BaseScope::Unknown, _) => None,
         }
     }
 
-    /// Whether this scope is at least `other` in the lattice.
+    /// Whether this scope is at least `other` in the lattice. An unknown base
+    /// covers nothing and is covered by nothing.
     ///
-    /// A rescope or an invite may never grant more than the caller holds.
+    /// Ordering only: whether a caller may GRANT a scope is
+    /// [`Grantor::may_grant`], which is stricter.
     #[must_use]
     pub const fn covers(self, other: Self) -> bool {
-        self.column().rank() >= other.column().rank()
+        match (self.column(), other.column()) {
+            (Some(mine), Some(theirs)) => mine.rank() >= theirs.rank(),
+            _ => false,
+        }
+    }
+}
+
+/// Who is granting a scope, through an invite or a rescope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grantor {
+    /// The local operator on the unix leg (the CLI).
+    Operator,
+    /// A paired device, by its own scope.
+    Device(DeviceScope),
+}
+
+impl Grantor {
+    /// Whether this grantor may give a device `target`.
+    ///
+    /// DV5 and S1: only the operator grants `desktop` or `admin`. A device may
+    /// grant only `mobile` or `mobile+type`, and never above its own scope, so
+    /// an admin desktop can move a phone between the two phone scopes and no
+    /// further. Nobody grants an unknown base.
+    #[must_use]
+    pub const fn may_grant(self, target: DeviceScope) -> bool {
+        if target.column().is_none() {
+            return false;
+        }
+        match self {
+            Self::Operator => true,
+            Self::Device(own) => {
+                matches!(target.base, BaseScope::Mobile | BaseScope::MobileType)
+                    && !target.admin
+                    && own.covers(target)
+            }
+        }
     }
 }
 
@@ -356,7 +400,8 @@ const W: Verdict = Verdict::WatchOnly;
 ///
 /// Deltas from the spec's D13 table, all recorded in the v2-next contract:
 /// desktop loses `hangar/daemon_config_set` (operator only), admin does not
-/// get `device/invite_create` (operator only in v1), `fleet/transcript_prune`
+/// get `device/invite_create` (operator only in v1), plain desktop does not get
+/// `hangar/connections_list` (its events are admin only), `fleet/transcript_prune`
 /// is refused to every device, and `device/redeem` is refused to everyone
 /// here because it is served before hello on the peer leg only.
 pub static SCOPE_TABLE: &[ScopeRow] = &[
@@ -466,7 +511,7 @@ pub static SCOPE_TABLE: &[ScopeRow] = &[
     row(m::HANGAR_DAEMON_CONFIG_SET, A, D, D, D, D),
     row(m::HANGAR_AGENT_CREATE, A, A, A, D, D),
     row(m::HANGAR_DAEMON_CONFIG_LIST, A, A, A, D, D),
-    row(m::HANGAR_CONNECTIONS_LIST, A, A, A, D, D),
+    row(m::HANGAR_CONNECTIONS_LIST, A, A, D, D, D),
     row(m::HANGAR_ISSUE_DELETE, A, A, A, D, D),
     row(m::HANGAR_ISSUE_CANCEL_ACTIVE, A, A, A, D, D),
     row(m::HANGAR_AGENT_DELETE, A, A, A, D, D),
@@ -534,6 +579,8 @@ pub static SCOPE_TABLE: &[ScopeRow] = &[
     row(m::TERMINAL_INPUT, A, A, A, A, D),
     row(m::TERMINAL_FLOOR, A, A, A, A, D),
     row(m::TERMINAL_RESIZE, A, A, A, A, D),
+    row(m::HANGAR_ISSUE_CREATE, A, A, A, D, D),
+    row(m::HANGAR_ISSUE_RUN, A, A, A, D, D),
 ];
 
 /// The row for `method`, when it is classified.
@@ -549,10 +596,11 @@ pub fn column_allows(column: ScopeColumn, method: &str, params: &CallParams<'_>)
     scope_row(method).is_some_and(|r| r.verdict(column).allows(params))
 }
 
-/// Whether a device with `scope` may call `method` with `params`.
+/// Whether a device with `scope` may call `method` with `params`. An unknown
+/// base is refused every method.
 #[must_use]
 pub fn method_allowed(scope: &DeviceScope, method: &str, params: &CallParams<'_>) -> bool {
-    column_allows(scope.column(), method, params)
+    scope.column().is_some_and(|column| column_allows(column, method, params))
 }
 
 /// The event families a subscription stream carries.
@@ -577,6 +625,10 @@ pub enum EventFamily {
     Notification,
     /// The device registry.
     Devices,
+    /// A family a newer daemon defined and this build does not know. No scope
+    /// receives it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl EventFamily {
@@ -606,6 +658,7 @@ impl EventFamily {
             Self::Transcript => "transcript",
             Self::Notification => "notification",
             Self::Devices => "devices",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -684,10 +737,11 @@ pub fn column_receives(column: ScopeColumn, family: EventFamily) -> bool {
         .is_some_and(|r| matches!(r.verdict(column), Verdict::Allow))
 }
 
-/// Whether a device with `scope` receives `family`.
+/// Whether a device with `scope` receives `family`. An unknown base receives
+/// nothing.
 #[must_use]
 pub fn event_allowed(scope: &DeviceScope, family: EventFamily) -> bool {
-    column_receives(scope.column(), family)
+    scope.column().is_some_and(|column| column_receives(column, family))
 }
 
 /// One paired device, as `device/list` returns it.
@@ -737,7 +791,9 @@ pub struct DeviceRedeemResult {
     pub scope: DeviceScope,
     /// Unix milliseconds the token expires unless a hello slides it.
     pub expires_at_ms: i64,
-    /// The host that paired the device, always minted.
+    /// The host that paired the device, always minted: `local` is refused on
+    /// decode.
+    #[serde(deserialize_with = "crate::hosts::deserialize_minted")]
     pub host_id: HostId,
 }
 
