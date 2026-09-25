@@ -26,13 +26,13 @@
 //! retired opcode and counts it; a sender uses a reserved opcode only after a
 //! capability that names it was advertised.
 
-use serde::{Deserialize, Serialize};
-
 /// Opcodes retired from spike 3 (`Input` 7, `Subscribe` 9). Never reused.
 pub const RETIRED: [u8; 2] = [7, 9];
 
 /// A frame opcode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+// No serde: the wire carries the byte, and `from_u8` is the forward-compatible
+// decoder (a number this build does not know is `None`, dropped and counted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Opcode {
     /// R2: live pane output. Reserved.
