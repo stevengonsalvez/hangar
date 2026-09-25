@@ -281,9 +281,11 @@ fn a_prerelease_is_declined_on_stable_and_accepted_on_prerelease() {
         "",
     );
     source.manifests.insert(ROOT.into(), signed(&key(), &body));
-    let pre_root =
-        "https://github.com/stevengonsalvez/agents-in-a-box/releases/download/v1.29.0-rc2";
-    source.manifests.insert(pre_root.into(), signed(&key(), &body));
+    let pre_root = format!(
+        "{}/releases/download/v1.29.0-rc2",
+        ainb_app::cli::update::release_host()
+    );
+    source.manifests.insert(pre_root, signed(&key(), &body));
     let source = Arc::new(source);
     let u = updater(Arc::clone(&source), Channel::Stable, home.path());
     assert!(matches!(u.check("1.29.0-rc1"), Check::Declined { .. }));
