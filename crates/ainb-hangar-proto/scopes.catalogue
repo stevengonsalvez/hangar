@@ -1,0 +1,198 @@
+# The per-scope method and event table (D13, frozen by the v2-next PR-0).
+#
+# GENERATED from ainb_hangar_proto::devices::{SCOPE_TABLE, EVENT_TABLE}.
+# Every method in ALL_METHODS has one row and an explicit verdict in every
+# column: there is NO default. A changed line here is a changed grant.
+#
+# allow      always
+# deny       never
+# interrupt  fleet/action only as ControlAction::Interrupt (typed check)
+# watch      terminal/attach only without want_input
+#
+# Regenerate: UPDATE_SCOPE_CATALOGUE=1 cargo test -p ainb-hangar-proto --test scope_catalogue
+#
+# method                             operator desktop+admin desktop mobile+type mobile
+workspace/subscribe                  allow    allow         allow   deny        deny
+workspace/list                       allow    allow         allow   deny        deny
+workspace/session_list               allow    allow         allow   deny        deny
+workspace/session_upsert             allow    allow         allow   deny        deny
+workspace/session_delete             allow    allow         allow   deny        deny
+workspace/session_reconcile          allow    allow         allow   deny        deny
+hangar/issues_list                   allow    allow         allow   deny        deny
+hangar/issues_search                 allow    allow         allow   deny        deny
+hangar/search                        allow    allow         allow   deny        deny
+hangar/agents_list                   allow    allow         allow   deny        deny
+hangar/skills_list                   allow    allow         allow   deny        deny
+hangar/skill_get                     allow    allow         allow   deny        deny
+hangar/skills_sync                   allow    allow         allow   deny        deny
+hangar/skill_attach                  allow    allow         allow   deny        deny
+hangar/skill_detach                  allow    allow         allow   deny        deny
+hangar/skill_set_enabled             allow    allow         allow   deny        deny
+hangar/agent_skills_list             allow    allow         allow   deny        deny
+hangar/autopilots_list               allow    allow         allow   deny        deny
+hangar/autopilot_runs                allow    allow         allow   deny        deny
+hangar/autopilot_fire_now            allow    allow         allow   deny        deny
+hangar/autopilot_set_enabled         allow    allow         allow   deny        deny
+hangar/autopilot_trigger_api         allow    allow         allow   deny        deny
+hangar/autopilot_set_api_trigger     allow    allow         allow   deny        deny
+hangar/autopilot_update              allow    allow         allow   deny        deny
+hangar/autopilot_versions            allow    allow         allow   deny        deny
+hangar/autopilot_collaborator_add    allow    allow         allow   deny        deny
+hangar/autopilot_collaborator_remove allow    allow         allow   deny        deny
+hangar/autopilot_collaborators       allow    allow         allow   deny        deny
+hangar/autopilot_subscriber_add      allow    allow         allow   deny        deny
+hangar/autopilot_subscriber_remove   allow    allow         allow   deny        deny
+hangar/autopilot_subscribers         allow    allow         allow   deny        deny
+hangar/autopilot_set_access_mode     allow    allow         allow   deny        deny
+hangar/tasks_list                    allow    allow         allow   deny        deny
+hangar/task_transition               allow    allow         allow   deny        deny
+hangar/task_retry                    allow    allow         allow   deny        deny
+hangar/issue_update                  allow    allow         allow   deny        deny
+hangar/issues_batch_update           allow    allow         allow   deny        deny
+hangar/issue_label_attach            allow    allow         allow   deny        deny
+hangar/issue_label_detach            allow    allow         allow   deny        deny
+hangar/issue_criterion_set           allow    allow         allow   deny        deny
+hangar/comment_add                   allow    allow         allow   deny        deny
+hangar/comment_mention_preview       allow    allow         allow   deny        deny
+hangar/agent_update                  allow    allow         allow   deny        deny
+hangar/agent_archive                 allow    allow         allow   deny        deny
+hangar/members_list                  allow    allow         allow   deny        deny
+hangar/member_set_role               allow    allow         allow   deny        deny
+hangar/member_remove                 allow    allow         allow   deny        deny
+hangar/invite_create                 allow    allow         allow   deny        deny
+hangar/invite_accept                 allow    allow         allow   deny        deny
+hangar/invite_decline                allow    allow         allow   deny        deny
+hangar/invite_revoke                 allow    allow         allow   deny        deny
+hangar/squads_list                   allow    allow         allow   deny        deny
+hangar/squad_create                  allow    allow         allow   deny        deny
+hangar/squad_member_add              allow    allow         allow   deny        deny
+hangar/squad_member_remove           allow    allow         allow   deny        deny
+hangar/squad_assign                  allow    allow         allow   deny        deny
+hangar/squad_archive                 allow    allow         allow   deny        deny
+hangar/squad_member_role_set         allow    allow         allow   deny        deny
+hangar/squad_instructions_set        allow    allow         allow   deny        deny
+hangar/health                        allow    allow         allow   deny        deny
+hangar/daemon_health                 allow    allow         allow   deny        deny
+hangar/usage_rollup                  allow    allow         allow   deny        deny
+hangar/pr_status_refresh             allow    allow         allow   deny        deny
+hangar/inbox_list                    allow    allow         allow   deny        deny
+hangar/inbox_mark_read               allow    allow         allow   deny        deny
+attention/list                       allow    allow         allow   allow       allow
+attention/subscribe                  allow    allow         allow   allow       allow
+attention/answer                     allow    allow         allow   allow       allow
+atc/register                         allow    allow         allow   deny        deny
+atc/list                             allow    allow         allow   deny        deny
+atc/escalate                         allow    allow         allow   deny        deny
+atc/unregister                       allow    allow         allow   deny        deny
+auth/hello                           allow    allow         allow   allow       allow
+ping                                 allow    allow         allow   allow       allow
+hangar/boards_list                   allow    allow         allow   deny        deny
+hangar/board_create                  allow    allow         allow   deny        deny
+hangar/board_update                  allow    allow         allow   deny        deny
+hangar/board_delete                  allow    allow         allow   deny        deny
+hangar/board_column_add              allow    allow         allow   deny        deny
+hangar/board_column_update           allow    allow         allow   deny        deny
+hangar/board_column_delete           allow    allow         allow   deny        deny
+hangar/board_column_reorder          allow    allow         allow   deny        deny
+hangar/board_card_add                allow    allow         allow   deny        deny
+hangar/board_card_move               allow    allow         allow   deny        deny
+hangar/squad_fanout                  allow    allow         allow   deny        deny
+hangar/run_history                   allow    allow         allow   deny        deny
+profile/list                         allow    allow         allow   deny        deny
+profile/get                          allow    allow         allow   deny        deny
+profile/upsert                       allow    allow         allow   deny        deny
+hangar/board_card_create             allow    allow         allow   deny        deny
+hangar/board_card_run                allow    allow         allow   deny        deny
+hangar/repo_list                     allow    allow         allow   deny        deny
+hangar/board_card_cancel             allow    allow         allow   deny        deny
+hangar/board_card_reorder            allow    allow         allow   deny        deny
+hangar/board_card_remove             allow    allow         allow   deny        deny
+hangar/board_card_timeline           allow    allow         allow   deny        deny
+hangar/board_card_assign_squad       allow    allow         allow   deny        deny
+hangar/board_card_dep_add            allow    allow         allow   deny        deny
+hangar/board_card_dep_remove         allow    allow         allow   deny        deny
+hangar/board_card_set_auto_run       allow    allow         allow   deny        deny
+hangar/notify_rules_list             allow    allow         allow   deny        deny
+hangar/notify_rule_set               allow    allow         allow   deny        deny
+hangar/daemon_config_get             allow    allow         allow   deny        deny
+hangar/daemon_config_set             allow    deny          deny    deny        deny
+hangar/agent_create                  allow    allow         allow   deny        deny
+hangar/daemon_config_list            allow    allow         allow   deny        deny
+hangar/connections_list              allow    allow         allow   deny        deny
+hangar/issue_delete                  allow    allow         allow   deny        deny
+hangar/issue_cancel_active           allow    allow         allow   deny        deny
+hangar/agent_delete                  allow    allow         allow   deny        deny
+hangar/issue_link_add                allow    allow         allow   deny        deny
+hangar/issue_link_remove             allow    allow         allow   deny        deny
+hangar/issue_links                   allow    allow         allow   deny        deny
+hangar/issue_subscribe               allow    allow         allow   deny        deny
+hangar/issue_unsubscribe             allow    allow         allow   deny        deny
+hangar/issue_subscribers             allow    allow         allow   deny        deny
+hangar/issue_reaction_add            allow    allow         allow   deny        deny
+hangar/issue_reaction_remove         allow    allow         allow   deny        deny
+fleet/snapshot                       allow    allow         allow   allow       allow
+fleet/status                         allow    allow         allow   allow       allow
+fleet/roster_status                  allow    allow         allow   allow       allow
+fleet/subscribe                      allow    allow         allow   allow       allow
+fleet/action                         allow    allow         allow   interrupt   interrupt
+fleet/broadcast                      allow    allow         allow   deny        deny
+fleet/negotiate                      allow    allow         allow   allow       allow
+fleet/receipt_list                   allow    allow         allow   deny        deny
+fleet/receipt_get                    allow    allow         allow   allow       allow
+fleet/start                          allow    allow         allow   deny        deny
+codex/session_ensure                 allow    allow         allow   deny        deny
+fleet/timeline                       allow    allow         allow   deny        deny
+fleet/usage_summary                  allow    allow         allow   deny        deny
+fleet/usage_dashboard                allow    allow         allow   deny        deny
+fleet/quota_summary                  allow    allow         allow   deny        deny
+fleet/runtime_status                 allow    allow         allow   deny        deny
+fleet/reproject_claude_interview     allow    allow         allow   deny        deny
+hangar/dispatch_attempts_list        allow    allow         allow   deny        deny
+hangar/issue_timeline                allow    allow         allow   deny        deny
+hangar/properties_list               allow    allow         allow   deny        deny
+hangar/property_define               allow    allow         allow   deny        deny
+hangar/property_archive              allow    allow         allow   deny        deny
+hangar/issue_property_set            allow    allow         allow   deny        deny
+hangar/issue_property_clear          allow    allow         allow   deny        deny
+hangar/issue_metadata_get            allow    allow         allow   deny        deny
+hangar/issue_metadata_set            allow    allow         allow   deny        deny
+hangar/issue_metadata_delete         allow    allow         allow   deny        deny
+fleet/acp_session_create             allow    allow         allow   deny        deny
+fleet/message_send                   allow    allow         allow   allow       allow
+fleet/message_list                   allow    allow         allow   deny        deny
+fleet/message_subscribe              allow    allow         allow   deny        deny
+fleet/transcript_list                allow    allow         allow   allow       allow
+fleet/transcript_subscribe           allow    allow         allow   allow       allow
+fleet/transcript_prune               allow    deny          deny    deny        deny
+fleet/channel_create                 allow    allow         allow   deny        deny
+fleet/channel_list                   allow    allow         allow   deny        deny
+fleet/copilot_configure              allow    allow         allow   deny        deny
+fleet/confirm_list                   allow    allow         allow   deny        deny
+fleet/confirm_answer                 allow    allow         allow   deny        deny
+fleet/activity_list                  allow    allow         allow   deny        deny
+fleet/copilot_gate                   allow    allow         allow   deny        deny
+codex/session_discard                allow    allow         allow   deny        deny
+fleet/adapter_list                   allow    allow         allow   deny        deny
+atc/retry_list                       allow    allow         allow   deny        deny
+device/redeem                        deny     deny          deny    deny        deny
+device/invite_create                 allow    deny          deny    deny        deny
+device/list                          allow    allow         deny    deny        deny
+device/revoke                        allow    allow         deny    deny        deny
+device/rescope                       allow    allow         deny    deny        deny
+terminal/attach                      allow    allow         allow   allow       watch
+terminal/detach                      allow    allow         allow   allow       allow
+terminal/ack                         allow    allow         allow   allow       allow
+terminal/scrollback                  allow    allow         allow   allow       allow
+terminal/input                       allow    allow         allow   allow       deny
+terminal/floor                       allow    allow         allow   allow       deny
+terminal/resize                      allow    allow         allow   allow       deny
+#
+event workspace                      allow    allow         allow   deny        deny
+event task_stream                    allow    allow         allow   deny        deny
+event attention                      allow    allow         allow   allow       allow
+event connections                    allow    allow         deny    deny        deny
+event fleet                          allow    allow         allow   allow       allow
+event message                        allow    allow         allow   deny        deny
+event transcript                     allow    allow         allow   allow       allow
+event notification                   allow    allow         allow   deny        deny
+event devices                        allow    allow         deny    deny        deny
