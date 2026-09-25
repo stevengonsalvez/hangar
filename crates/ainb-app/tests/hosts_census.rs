@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use ainb_app::hosts::{
     CarrierKind, HostCoverage, HostId, HostKind, HostListing, HostRegistry, Reachability, fold,
-    read_roster,
+    listing_from_read,
 };
 use ainb_hangar_client::DaemonClient;
 use ainb_hangar_daemon::events::EventBroker;
@@ -115,22 +115,20 @@ async fn two_daemons_fold_into_one_census_and_a_killed_one_turns_unreachable() {
     registry.upsert(b.host_id.clone(), HostKind::Remote, 1_000);
 
     // Both reachable: every row is in, under its own host.
-    let la = read_roster(
+    let la = listing_from_read(
         &mut registry,
         &a.host_id,
-        &a.client,
+        a.client.fleet_roster_status().await,
         CarrierKind::SshL,
         2_000,
-    )
-    .await;
-    let lb = read_roster(
+    );
+    let lb = listing_from_read(
         &mut registry,
         &b.host_id,
-        &b.client,
+        b.client.fleet_roster_status().await,
         CarrierKind::Tailnet,
         2_000,
-    )
-    .await;
+    );
     assert!(
         matches!(&la, HostListing::Fresh { rows, .. } if rows.len() == 3),
         "{la:?}"
@@ -181,41 +179,38 @@ async fn two_daemons_fold_into_one_census_and_a_killed_one_turns_unreachable() {
     // contact (2_000), not since the failed read, and no B row is listed.
     b.serve.abort();
     let _ = b.serve.await;
-    let mut lb = read_roster(
+    let mut lb = listing_from_read(
         &mut registry,
         &b.host_id,
-        &b.client,
+        b.client.fleet_roster_status().await,
         CarrierKind::Tailnet,
         9_000,
-    )
-    .await;
+    );
     for _ in 0..20 {
         if matches!(lb, HostListing::Unreachable { .. }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-        lb = read_roster(
+        lb = listing_from_read(
             &mut registry,
             &b.host_id,
-            &b.client,
+            b.client.fleet_roster_status().await,
             CarrierKind::Tailnet,
             9_000,
-        )
-        .await;
+        );
     }
     assert_eq!(lb, HostListing::Unreachable { since_ms: 2_000 });
     assert_eq!(
         registry.get(&b.host_id).unwrap().reachability,
         Reachability::Unreachable { since_ms: 2_000 }
     );
-    let la = read_roster(
+    let la = listing_from_read(
         &mut registry,
         &a.host_id,
-        &a.client,
+        a.client.fleet_roster_status().await,
         CarrierKind::SshL,
         9_000,
-    )
-    .await;
+    );
     let census = fold(vec![(a.host_id.clone(), la), (b.host_id.clone(), lb)], 50);
     assert_eq!(census.rows.len(), 3);
     assert!(census.rows.iter().all(|r| r.host_id == a.host_id));
@@ -234,7 +229,13 @@ async fn rows_from_another_host_are_never_filed_under_this_one() {
     let expected = HostId::parse("01K5A0000000000000000ZZZZZ").unwrap();
     let mut registry = HostRegistry::new();
     registry.upsert(expected.clone(), HostKind::Remote, 5);
-    let listing = read_roster(&mut registry, &expected, &a.client, CarrierKind::Lan, 10).await;
+    let listing = listing_from_read(
+        &mut registry,
+        &expected,
+        a.client.fleet_roster_status().await,
+        CarrierKind::Lan,
+        10,
+    );
     assert_eq!(listing, HostListing::Unreachable { since_ms: 5 });
     assert!(matches!(
         registry.get(&expected).unwrap().reachability,
