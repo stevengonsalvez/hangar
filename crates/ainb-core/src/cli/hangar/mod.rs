@@ -8544,7 +8544,7 @@ async fn find_default_workspace(store: &Store) -> Result<Option<String>> {
 /// user + member row when none exists.
 ///
 /// The `issue` table's `workspace_id` FK requires a `workspace` row; the
-/// `member:stevie` creator references a `member` row only at the service layer
+/// `member:me` creator references a `member` row only at the service layer
 /// (FK-less by design, per the actor module), so the member row is informational
 /// but kept consistent. Idempotent: a second call returns the existing id.
 async fn ensure_default_workspace(store: &Store) -> Result<String> {
