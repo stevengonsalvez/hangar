@@ -1,0 +1,759 @@
+name: Release
+
+# Builds, signs and (only when asked, from a release branch, with the owner's
+# approval) publishes one release. Three independent locks stand between a
+# dispatch and a published release: the `publish` input, the `release`
+# environment's deployment branch policy (`release/v*`), and the owner's review
+# on that environment. A dry run needs none of them: it builds everything,
+# signs with throwaway keys so the signing path runs, and publishes nothing.
+#
+# Nothing here commits. The version bump is a signed commit on the release
+# branch, and `guard` only checks that the source agrees with the input.
+#
+# No cache anywhere in this file, so a release never restores a cache a pull
+# request could have written.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "x.y.z or x.y.z-rcN, must equal Cargo.toml on this ref"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a prerelease (required for an -rcN version, refused otherwise)"
+        type: boolean
+        default: true
+      publish:
+        description: "false = dry run, nothing leaves the runner"
+        type: boolean
+        default: false
+      bridge:
+        description: "Also emit the old-repo bridge manifest and appcast as a workflow artifact"
+        type: boolean
+        default: false
+      # The desktop bundles are ad-hoc signed unless this is true, in which
+      # case the six Apple secrets must all be present in the `release`
+      # environment (#530) and the bundler signs with the Developer ID,
+      # notarises and staples.
+      desktop_signed:
+        description: "Sign and notarise the desktop bundles with the Apple secrets"
+        type: boolean
+        default: false
+
+permissions: {}
+
+# Two dispatches of one version would race the tag; the second waits for the
+# first rather than cancelling it, because a release half published is worse
+# than one published twice over.
+concurrency:
+  group: release-v${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: ainb
+  TAURI_CLI_VERSION: "2.11.4"
+  # The ainb-toolkit ref the curated catalog index pins (what 1.28.5 shipped).
+  AINB_TOOLKIT_REF: v1.7.0
+
+jobs:
+  # Validates, never writes. `publish` is true only when the input asks for it
+  # AND the ref is the release branch for this version AND every compiled-in
+  # release root names this repository. The last check is what makes it
+  # impossible to publish a build that points clients back at the old root.
+  guard:
+    name: Guard
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.g.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: g
+        env:
+          V: ${{ inputs.version }}
+          PRE: ${{ inputs.prerelease }}
+          PUB: ${{ inputs.publish }}
+          BRIDGE: ${{ inputs.bridge }}
+        run: |
+          set -euo pipefail
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+)?$ ]] || { echo "bad version $V"; exit 1; }
+          if [[ "$V" == *-* ]]; then
+            [ "$PRE" = true ] || { echo "$V is a prerelease version; set prerelease"; exit 1; }
+          else
+            [ "$PRE" = false ] || { echo "$V is a stable version; clear prerelease"; exit 1; }
+          fi
+          if [ "$BRIDGE" = true ] && [ "$PRE" = true ]; then
+            echo "the bridge carries a stable release only"; exit 1
+          fi
+          grep -q "^version = \"$V\"$" Cargo.toml || { echo "Cargo.toml is not at $V"; exit 1; }
+          grep -q "^version = \"$V\"$" crates/ainb-desktop/Cargo.toml || { echo "crates/ainb-desktop/Cargo.toml is not at $V"; exit 1; }
+
+          # Each value a client fetches from, read exactly, not a loose grep a
+          # comment could satisfy.
+          url="https://github.com/$GITHUB_REPOSITORY"
+          root_ok=true
+          grep -A2 'macro_rules! release_host' crates/ainb-app/src/cli/update.rs | grep -qF "\"$url\"" \
+            || { echo "::warning::release_host! does not name $url"; root_ok=false; }
+          grep -qF "\"$url\"," crates/ainb-app/src/cli/update.rs \
+            || { echo "::warning::the cargo install --git URL does not name $url"; root_ok=false; }
+          grep -qF "pub const CATALOG_INDEX_REPO: &str = \"$GITHUB_REPOSITORY\";" crates/ainb-cli/src/catalog_curated.rs \
+            || { echo "::warning::CATALOG_INDEX_REPO does not name $GITHUB_REPOSITORY"; root_ok=false; }
+          grep -qF "<string>$url/releases/latest/download/appcast.xml</string>" apps/ainb-fleet-macos/Resources/Info.plist \
+            || { echo "::warning::SUFeedURL does not name $url"; root_ok=false; }
+          grep -qx "REPO=\"$GITHUB_REPOSITORY\"" install.sh \
+            || { echo "::warning::install.sh REPO does not name $GITHUB_REPOSITORY"; root_ok=false; }
+
+          if [ "$PUB" = true ]; then
+            [ "$GITHUB_REF" = "refs/heads/release/v${V%%-*}" ] || { echo "publish only from release/v${V%%-*}"; exit 1; }
+            [ "$root_ok" = true ] || { echo "a compiled-in release root does not name $GITHUB_REPOSITORY"; exit 1; }
+            if git ls-remote --exit-code --tags origin "refs/tags/v$V" >/dev/null; then
+              echo "v$V is already tagged"; exit 1
+            fi
+            # manifest.sh checks the signing key against the pinned key in THIS
+            # ref's update.rs. Changing both together on a release branch would
+            # pass that check and strand every installed client, so the pin
+            # must be the one main ships.
+            pin='^const RELEASE_SIGNING_PUBLIC_KEY_B64: &str = '
+            git fetch -q --depth 1 origin main
+            [ "$(grep "$pin" crates/ainb-app/src/cli/update.rs)" = "$(git show FETCH_HEAD:crates/ainb-app/src/cli/update.rs | grep "$pin")" ] \
+              || { echo "RELEASE_SIGNING_PUBLIC_KEY_B64 on this ref differs from main"; exit 1; }
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "PUBLISH: v$V from $GITHUB_REF" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "DRY RUN: nothing will be tagged, released or pushed. root_ok=$root_ok" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: guard
+    timeout-minutes: 60
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          # macOS Apple Silicon (native build on ARM runner)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # macOS Intel, cross-compiled on the ARM runner. Dedicated Intel
+          # runners queue indefinitely, and Apple's macOS SDK is universal, so
+          # `--target x86_64-apple-darwin` produces a valid Intel binary.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Linux glibc (works on most distributions)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+        with:
+          targets: ${{ matrix.target }}
+      # rust-toolchain.toml pins the toolchain, not the `stable` installed
+      # above. Add the target's std to the pinned one so the cross-compiled
+      # x86_64-apple-darwin leg finds `core` (a no-op for native targets).
+      - name: Add target std to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # Bundle the first-party plugins into the archive. Without them a
+      # brew-installed ainb has no analytics: the runtime only discovers
+      # plugins via AINB_PLUGIN_ROOT / exe-relative / cwd-relative dist/, none
+      # of which exist on a bare binary install.
+      - name: Build + stage plugins
+        run: ./scripts/build-plugins.sh --release --target=${{ matrix.target }}
+      # share/ is a top-level member of the tarball: install.sh reads
+      # share/man/man1/ainb.1 and the Homebrew formula does man1.install.
+      - name: Package
+        env:
+          VERSION: ${{ inputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="${BINARY_NAME}-${VERSION}-${TARGET}"
+          mkdir -p out/share/man/man1
+          cp "target/${TARGET}/release/${BINARY_NAME}" out/
+          cp -R dist/plugins out/plugins
+          cp "man/${BINARY_NAME}.1" out/share/man/man1/
+          cd out
+          tar -czf "${ARCHIVE}.tar.gz" "${BINARY_NAME}" plugins share
+          shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            out/*.tar.gz
+            out/*.sha256
+          if-no-files-found: error
+      # The curated skill catalog index, a release asset the CLI fetches. The
+      # curated skills live in stevengonsalvez/ainb-toolkit, cloned at the
+      # pinned ref; --release-tag MUST equal that ref so the owned install_uris
+      # pin the same bytes the checkout was cut from. Once, on the Linux leg.
+      - name: Clone pinned ainb-toolkit
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          git clone --depth 1 --branch "${AINB_TOOLKIT_REF}" \
+            https://github.com/stevengonsalvez/ainb-toolkit.git "${RUNNER_TEMP}/ainb-toolkit"
+      - name: Generate curated catalog index
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          mkdir -p catalog
+          cargo run -p xtask -- gen-catalog-index --toolkit-root "${RUNNER_TEMP}/ainb-toolkit" \
+            --release-tag "${AINB_TOOLKIT_REF}" --out catalog/catalog-index.json
+          test -s catalog/catalog-index.json
+      - if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@v7
+        with:
+          name: catalog-index
+          path: catalog/catalog-index.json
+          if-no-files-found: error
+
+  # Builds the universal Fleet app and its DMG. No key: signing the feed is
+  # `sign_fleet`'s, in the environment that holds the key. The Sparkle tools
+  # the build fetched travel with the DMG so `sign_fleet` uses the same ones.
+  fleet_macos:
+    name: Build Fleet macOS app
+    needs: guard
+    if: ${{ !inputs.prerelease }}
+    timeout-minutes: 45
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+      # Public, a repository variable. Empty in a dry run before the owner sets
+      # it; `sign_fleet` refuses to publish a feed that does not verify under it.
+      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Archive universal Fleet app
+        run: |
+          xcodebuild archive \
+            -project apps/ainb-fleet-macos/AINBFleet.xcodeproj \
+            -scheme AINBFleet \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/AINBFleet.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/ainb-fleet-derived-data" \
+            ARCHS='arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$VERSION" \
+            SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
+      - name: Package the DMG
+        run: |
+          set -euo pipefail
+          app_path="$RUNNER_TEMP/AINBFleet.xcarchive/Products/Applications/AINBFleet.app"
+          staging_path="$RUNNER_TEMP/fleet-dmg"
+          mkdir -p fleet-out/dmg fleet-out/sparkle "$staging_path"
+          appcast_tool=$(find "$RUNNER_TEMP/ainb-fleet-derived-data" -type f -name generate_appcast -perm -u+x -print -quit)
+          test -d "$app_path"
+          test -n "$appcast_tool"
+          lipo "$app_path/Contents/MacOS/AINBFleet" -verify_arch arm64 x86_64
+          test "$(plutil -extract CFBundleShortVersionString raw "$app_path/Contents/Info.plist")" = "$VERSION"
+          test "$(plutil -extract CFBundleVersion raw "$app_path/Contents/Info.plist")" = "$VERSION"
+          test "$(plutil -extract SUPublicEDKey raw "$app_path/Contents/Info.plist")" = "$SPARKLE_PUBLIC_ED_KEY"
+          codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict "$app_path"
+          ditto "$app_path" "$staging_path/AINBFleet.app"
+          hdiutil create -volname 'AINB Fleet' -srcfolder "$staging_path" -ov -format UDZO "fleet-out/dmg/AINBFleet-${VERSION}.dmg"
+          # The whole bin directory, in case generate_appcast is not
+          # self-contained on its own.
+          cp -R "$(dirname "$appcast_tool")/." fleet-out/sparkle/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fleet-dmg
+          path: fleet-out/dmg/AINBFleet-*.dmg
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fleet-sparkle-tools
+          path: fleet-out/sparkle/
+          if-no-files-found: error
+
+  # The desktop shell, bundled with its daemon sidecar, one bundle per target.
+  # Per-arch on macOS rather than universal: the sidecar is a
+  # target-triple-named external binary staged one at a time, and the x64 leg is
+  # cross-compiled on the arm64 runner exactly as the CLI's is. Linux builds on
+  # the oldest supported image so the AppImage links the oldest glibc. It takes
+  # the `release` environment only when publishing a Developer ID build, the one
+  # case that reads the Apple secrets.
+  desktop:
+    name: Build desktop ${{ matrix.target }}
+    needs: guard
+    timeout-minutes: 90
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    environment: ${{ (inputs.desktop_signed && needs.guard.outputs.publish == 'true') && 'release' || 'release-dry-run' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `app` declared beside `dmg`: the bundle check reads the .app, so
+          # it is asked for rather than relied on as the dmg's byproduct.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            bundles: app,dmg
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            bundles: app,dmg
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            bundles: appimage,deb
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: ${{ matrix.target }}
+      DESKTOP_SIGNED: ${{ inputs.desktop_signed }}
+      DESKTOP_DIR: crates/ainb-desktop
+      # linuxdeploy is itself an AppImage; without FUSE on the runner it has
+      # to extract and run.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+        with:
+          targets: ${{ matrix.target }}
+      - name: Add target std to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+      - name: Install the Tauri system packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf libfuse2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      # `tsc --noEmit --strict` runs first; the bundler's beforeBuildCommand
+      # builds it again, which is cheap once node_modules is in place.
+      - name: Build the shell frontend
+        run: npm ci --no-audit --no-fund && npm run build
+        working-directory: ${{ env.DESKTOP_DIR }}/ui
+      - name: Stage the hangar daemon sidecar for the target
+        run: cargo xtask stage-desktop-sidecar --release --target ${{ matrix.target }}
+      # The bundle's daemon must report the release version, asserted before
+      # anything is bundled. The cross-compiled x64 sidecar can run on the
+      # arm64 runner only under Rosetta; without it the run is skipped, the
+      # job summary says so, and the binary's architecture is checked instead.
+      - name: Assert the staged sidecar reports the release version
+        run: |
+          set -euo pipefail
+          BIN="${DESKTOP_DIR}/binaries/ainb-hangar-daemon-${TARGET}"
+          test -x "$BIN"
+          via=()
+          if [ "$TARGET" = "x86_64-apple-darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then
+              via=(arch -x86_64)
+            else
+              lipo -archs "$BIN" | grep -qw x86_64
+              echo "sidecar version assert on ${TARGET}: skipped, no Rosetta on this runner; the staged binary is x86_64" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          reported="$("${via[@]}" "$BIN" --version)"
+          echo "sidecar reports: $reported"
+          case "$reported" in
+            *" ${VERSION}") ;;
+            *) echo "sidecar version does not match the release version ${VERSION}" >&2; exit 1 ;;
+          esac
+      - name: Install the Tauri CLI (pinned)
+        run: |
+          if cargo tauri --version 2>/dev/null | grep -q "tauri-cli ${TAURI_CLI_VERSION}"; then
+            echo "tauri-cli ${TAURI_CLI_VERSION} already installed"
+          else
+            cargo install tauri-cli --version "${TAURI_CLI_VERSION}" --locked
+          fi
+          cargo tauri --version
+      - name: Require the Apple signing secrets
+        if: ${{ runner.os == 'macOS' && inputs.desktop_signed }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=()
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              missing+=("${name}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'desktop_signed was requested but these Apple secrets are missing (#530): %s\n' "${missing[*]}"
+            exit 1
+          fi
+          echo "desktop bundles on ${TARGET}: signed with the Developer ID and notarised" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Record ad-hoc signing
+        if: ${{ runner.os == 'macOS' && !inputs.desktop_signed }}
+        run: |
+          echo "desktop bundles on ${TARGET}: ad-hoc signed, not notarised (desktop_signed is false; #530)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # Two bundle steps rather than one with conditional variables: the
+      # bundler treats a DEFINED but empty APPLE_CERTIFICATE as a certificate
+      # to import, so an unsigned run must not have the names in its
+      # environment at all. `--locked` reaches cargo through the CLI.
+      - name: Bundle the desktop shell (ad-hoc signed)
+        if: ${{ !(runner.os == 'macOS' && inputs.desktop_signed) }}
+        working-directory: ${{ env.DESKTOP_DIR }}
+        run: cargo tauri build --target ${{ matrix.target }} --features bundled --bundles ${{ matrix.bundles }} -- --locked
+      - name: Bundle the desktop shell (Developer ID, notarised)
+        if: ${{ runner.os == 'macOS' && inputs.desktop_signed }}
+        working-directory: ${{ env.DESKTOP_DIR }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo tauri build --target ${{ matrix.target }} --features bundled --bundles ${{ matrix.bundles }} -- --locked
+      # What was bundled is read, never launched: a hosted runner is not a GUI
+      # host. The sidecar sits beside the app binary inside the bundle, which
+      # is where the supervisor looks for it.
+      - name: Check the macOS bundle
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          APP="$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/macos" -maxdepth 1 -name '*.app' -print -quit)"
+          test -d "$APP"
+          echo "bundle: $APP"
+          test -x "$APP/Contents/MacOS/ainb-desktop"
+          test -x "$APP/Contents/MacOS/ainb-hangar-daemon"
+          test "$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")" = "${VERSION}"
+          test "$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")" = "dev.agentsinabox.desktop"
+          codesign -v --strict --deep "$APP"
+          # `spctl --assess` reads signatures and the stapled ticket without
+          # executing the app, so it assesses the cross-compiled x64 bundle on
+          # the arm64 runner too.
+          if [ "$DESKTOP_SIGNED" = "true" ]; then
+            spctl --assess --type execute "$APP"
+          fi
+          test -f "$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+      - name: Check the Linux bundles
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          APPIMAGE="$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          DEB="$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)"
+          test -x "$APPIMAGE"
+          test -f "$DEB"
+          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-hangar-daemon$'
+          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-desktop$'
+          echo "bundles: $APPIMAGE $DEB"
+      # Stable, target-named file names: the manifest and the release page
+      # name these, not the bundler's spaced product name.
+      - name: Package
+        run: |
+          set -euo pipefail
+          OUT="${DESKTOP_DIR}/out"
+          mkdir -p "$OUT"
+          BUNDLE_DIR="${DESKTOP_DIR}/target/${TARGET}/release/bundle"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cp "$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -print -quit)" \
+              "$OUT/ainb-desktop-${VERSION}-${TARGET}.dmg"
+          else
+            cp "$(find "$BUNDLE_DIR/appimage" -maxdepth 1 -name '*.AppImage' -print -quit)" \
+              "$OUT/ainb-desktop-${VERSION}-${TARGET}.AppImage"
+            cp "$(find "$BUNDLE_DIR/deb" -maxdepth 1 -name '*.deb' -print -quit)" \
+              "$OUT/ainb-desktop-${VERSION}-${TARGET}.deb"
+          fi
+          cd "$OUT"
+          for f in ainb-desktop-*; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+          ls -la
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.target }}
+          path: ${{ env.DESKTOP_DIR }}/out/ainb-desktop-*
+          if-no-files-found: error
+
+  # The desktop e2e gate on the same commit, before anything is signed.
+  desktop_gate:
+    name: Desktop gate
+    needs: guard
+    permissions:
+      contents: read
+    uses: ./.github/workflows/desktop.yml
+
+  # Signs release-manifest.json. In a dry run the environment has no secrets
+  # and the script signs with a throwaway key; publishing requires the pinned
+  # key, whose public half the script checks against update.rs.
+  sign:
+    name: Sign release manifest
+    needs: [guard, build, desktop, desktop_gate]
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment: ${{ needs.guard.outputs.publish == 'true' && 'release' || 'release-dry-run' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Assemble, sign and verify the manifest
+        env:
+          KEY: ${{ secrets.AINB_RELEASE_SIGNING_KEY }}
+          PUB: ${{ needs.guard.outputs.publish }}
+          BRIDGE: ${{ inputs.bridge }}
+          DESKTOP_SIGNED: ${{ inputs.desktop_signed }}
+          VERSION: ${{ inputs.version }}
+        run: bash scripts/release/manifest.sh artifacts "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: signed-manifest
+          path: |
+            artifacts/release-manifest.json
+            artifacts/release-manifest.sig
+          if-no-files-found: error
+      - if: ${{ inputs.bridge }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bridge-part-manifest
+          path: |
+            artifacts/bridge/release-manifest.json
+            artifacts/bridge/release-manifest.sig
+          if-no-files-found: error
+
+  # Signs the Fleet feed. Publishing requires SPARKLE_PRIVATE_ED_KEY and refuses
+  # a feed whose DMG signature does not verify under the public key every
+  # installed Fleet pins.
+  sign_fleet:
+    name: Sign Fleet feed
+    needs: [guard, fleet_macos]
+    if: ${{ !inputs.prerelease }}
+    timeout-minutes: 15
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    environment: ${{ needs.guard.outputs.publish == 'true' && 'release' || 'release-dry-run' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: fleet-dmg
+          path: fleet/dmg
+      - uses: actions/download-artifact@v8
+        with:
+          name: fleet-sparkle-tools
+          path: fleet/sparkle
+      - name: Generate, sign and verify the appcast
+        env:
+          KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          PUBLIC: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          PUB: ${{ needs.guard.outputs.publish }}
+          BRIDGE: ${{ inputs.bridge }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x fleet/sparkle/*
+          bash scripts/release/appcast.sh "fleet/dmg/AINBFleet-${VERSION}.dmg" fleet/sparkle/generate_appcast "$VERSION" fleet/feed
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fleet-feed
+          path: fleet/feed/appcast.xml
+          if-no-files-found: error
+      - if: ${{ inputs.bridge }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: bridge-part-appcast
+          path: fleet/feed/bridge/appcast.xml
+          if-no-files-found: error
+
+  # The old repository's bridge release, as one workflow artifact. It is never
+  # attached to a release here; the owner publishes it in the old repository.
+  bridge:
+    name: Bridge artifact
+    needs: [guard, sign, sign_fleet]
+    if: ${{ inputs.bridge }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bridge-part-*
+          merge-multiple: true
+          path: bridge
+      - name: Check the bridge
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          ls -la bridge
+          jq -e --arg v "$V" --arg r "https://github.com/$GITHUB_REPOSITORY/releases/latest/download" \
+            '.version == $v and .next_root == $r and (has("desktop") | not)' bridge/release-manifest.json
+          test -s bridge/release-manifest.sig
+          grep -q "github.com/stevengonsalvez/agents-in-a-box/releases/download/v$V/AINBFleet-$V.dmg" bridge/appcast.xml
+      # A dry run's bridge is signed with throwaway keys, so it never takes the
+      # name the publish-day runbook downloads.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ needs.guard.outputs.publish == 'true' && 'bridge' || 'bridge-dryrun' }}-v${{ inputs.version }}
+          path: bridge/
+          if-no-files-found: error
+
+  # Everything the publish job writes from, built in every run: the release
+  # notes, and the formula and cask written into a scratch tap. A dry run
+  # therefore exercises them too, and `publish` only uploads and pushes.
+  notes:
+    name: Release notes and tap files
+    needs: [guard, build, fleet_macos]
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success'
+      && (needs.fleet_macos.result == 'success' || (inputs.prerelease && needs.fleet_macos.result == 'skipped')) }}
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      V: ${{ inputs.version }}
+      DESKTOP_SIGNED: ${{ inputs.desktop_signed }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+          # An rc's notes are its version's section: 1.29.0-rc1 reads ## [1.29.0].
+          awk -v v="${V%%-*}" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no ## [${V%%-*}] section"; exit 1; }
+          if [ "$DESKTOP_SIGNED" = true ]; then
+            sign_note="The macOS bundles are signed with the Developer ID and notarised (signed: true in the manifest)."
+          else
+            sign_note="The macOS bundles are ad-hoc signed and not notarised (signed: false in the manifest), so first launch can require right-click Open, or Open Anyway in System Settings > Privacy & Security."
+          fi
+          cat >> notes.md <<EOF
+
+          ## Installation
+
+          ### One-liner install (recommended)
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | bash
+          \`\`\`
+
+          ### Homebrew (macOS / Linux)
+          \`\`\`bash
+          brew tap stevengonsalvez/agents-in-a-box
+          brew trust stevengonsalvez/agents-in-a-box   # once per machine
+          brew install ainb
+          \`\`\`
+
+          ### Fleet macOS app
+          \`\`\`bash
+          brew install --cask stevengonsalvez/agents-in-a-box/ainb-fleet
+          \`\`\`
+          Fleet checks its signed Sparkle feed automatically; Settings, Check for Updates checks now.
+          Fleet is unsigned, so first launch can require right-click Open.
+
+          ### Desktop app
+          One bundle per platform, each carrying its own \`ainb-hangar-daemon\` sidecar at this
+          version: \`ainb-desktop-${V}-aarch64-apple-darwin.dmg\` (Apple Silicon),
+          \`ainb-desktop-${V}-x86_64-apple-darwin.dmg\` (Intel), and for Linux x86_64 an
+          \`.AppImage\` and a \`.deb\`, all listed under the signed manifest's \`desktop\` key.
+          ${sign_note}
+
+          ### Cargo
+          \`\`\`bash
+          cargo install --git https://github.com/${GITHUB_REPOSITORY} --tag v${V} --locked ainb
+          \`\`\`
+          Source builds omit the bundled analytics plugins.
+
+          ## Supported platforms
+          - macOS Apple Silicon and Intel
+          - Linux x86_64
+          - Windows: use WSL2 and the Linux binary
+          EOF
+          cat notes.md
+      - name: Write the tap files into a scratch tap
+        if: ${{ !inputs.prerelease }}
+        run: bash scripts/release/homebrew.sh "$RUNNER_TEMP/scratch-tap" "$V" artifacts
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: notes.md
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [guard, build, desktop, desktop_gate, sign, sign_fleet, notes]
+    # `!cancelled()` rather than `always()`: a cancelled run must not publish.
+    # Every leg must have passed; the first hangar release exists to ship the
+    # desktop, so a failed bundle leg no longer lets the CLI publish alone.
+    if: >-
+      ${{ !cancelled() && needs.guard.outputs.publish == 'true' && needs.sign.result == 'success' && needs.notes.result == 'success'
+      && (needs.sign_fleet.result == 'success' || (inputs.prerelease && needs.sign_fleet.result == 'skipped')) }}
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    environment: release
+    env:
+      V: ${{ inputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      # Stable only: the tap follows the release. It is written and committed
+      # BEFORE the release is created, so a bad token or a failing script stops
+      # the job while nothing is public yet; it is pushed after. The token can
+      # push only to the tap repository.
+      - name: Check out the tap
+        if: ${{ !inputs.prerelease }}
+        uses: actions/checkout@v7
+        with:
+          repository: stevengonsalvez/homebrew-agents-in-a-box
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Write and commit the formula and the Fleet cask
+        if: ${{ !inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          bash scripts/release/homebrew.sh tap "$V" artifacts
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ainb.rb Casks/ainb-fleet.rb
+          git commit -m "chore: update ainb releases to v${V}" || echo "No changes to commit"
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          files=(artifacts/*-apple-darwin/ainb-"$V"-*.tar.gz* artifacts/x86_64-unknown-linux-gnu/ainb-"$V"-*.tar.gz*
+                 artifacts/desktop-*/ainb-desktop-"$V"-*
+                 artifacts/catalog-index/catalog-index.json
+                 artifacts/signed-manifest/release-manifest.json artifacts/signed-manifest/release-manifest.sig)
+          if [ "$PRERELEASE" = true ]; then
+            flags=(--prerelease --latest=false)
+          else
+            files+=(artifacts/fleet-dmg/AINBFleet-"$V".dmg artifacts/fleet-feed/appcast.xml)
+            flags=(--latest)
+          fi
+          for f in "${files[@]}"; do test -f "$f" || { echo "missing $f"; exit 1; }; done
+          # Idempotent, so "Re-run failed jobs" after a failed tap push does not
+          # fail here on the release the first attempt created.
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V already exists; not creating it again"
+          else
+            gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file artifacts/release-notes/notes.md "${flags[@]}" "${files[@]}"
+          fi
+      - name: Push the tap
+        if: ${{ !inputs.prerelease }}
+        run: git -C tap push
