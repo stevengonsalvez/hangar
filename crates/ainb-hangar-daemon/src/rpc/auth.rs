@@ -442,6 +442,9 @@ fn ack(id: RpcId, selected: u32, host_id: Option<String>) -> RpcResponse {
         capabilities: advertised_capabilities(),
         daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         host_id,
+        // The unix leg is never a device; the peer leg fills these (R1).
+        scope: None,
+        device_expires_at_ms: None,
     };
     RpcResponse {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
@@ -475,6 +478,8 @@ fn incompatible(id: RpcId, client: ProtocolRange) -> RpcResponse {
                 daemon_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 // Never before authentication (#1066).
                 host_id: None,
+                scope: None,
+                device_expires_at_ms: None,
             })
             .ok(),
         }),
