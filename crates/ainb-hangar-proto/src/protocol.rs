@@ -258,6 +258,52 @@ pub const CAP_ATC_REGISTRY: &str = "atc.registry";
 /// Capability: Interactive Codex thread ensure / discard.
 pub const CAP_CODEX_SESSION: &str = "codex.session";
 
+// ── Dark until flipped (the v2-next freeze, PR-0) ────────────────────────
+//
+// Defined so every lane builds against one spelling, and kept OUT of
+// `CAPABILITY_CATALOGUE` until the phase's flip PR (R1-15 for the `hangar.*`
+// six, WP15 for the `terminal.*` two). A v1.29.0 client and a daemon built
+// from this tree therefore negotiate exactly the catalogue they did before.
+// `DARK_CAPABILITIES` lists them, and `the_v2_next_capabilities_are_dark`
+// is the test a flip PR edits, deliberately.
+
+/// Capability (dark until R1-15): the off-box peer WebSocket leg, Noise IK.
+pub const CAP_PEER_WS: &str = "hangar.peer.ws";
+/// Capability (dark until R1-15): pairing by invite, `device/redeem`.
+pub const CAP_PEER_PAIR: &str = "hangar.peer.pair";
+/// Capability (dark until R1-15): peer Ping and Pong opcodes (22, 23).
+pub const CAP_PEER_HEARTBEAT: &str = "hangar.peer.heartbeat";
+/// Capability (dark until R1-15): the device registry, `device/list`,
+/// `device/revoke`, `device/rescope`, `device/invite_create`.
+pub const CAP_DEVICES: &str = "hangar.devices";
+/// Capability (dark until R1-15): per-device scopes, and `HelloResult.scope`
+/// with `device_expires_at_ms`.
+pub const CAP_SCOPES: &str = "hangar.scopes";
+/// Capability (dark until R1-15): `SessionRef` addressing across hosts.
+pub const CAP_SESSION_REF: &str = "hangar.session_ref";
+/// Capability (dark until WP15): terminal streams, `terminal/attach`,
+/// `terminal/detach`, `terminal/ack`, `terminal/scrollback` and the
+/// `terminal/frame` notification.
+pub const CAP_TERMINAL_STREAM: &str = "terminal.stream";
+/// Capability (dark until WP15): terminal input, `terminal/input`,
+/// `terminal/floor`, `terminal/resize`.
+pub const CAP_TERMINAL_INPUT: &str = "terminal.input";
+
+/// Every capability defined by the v2-next freeze and not yet advertised.
+///
+/// A flip PR moves its strings from here into [`CAPABILITY_CATALOGUE`] (and
+/// the committed `capabilities.catalogue`) in one change.
+pub const DARK_CAPABILITIES: &[&str] = &[
+    CAP_PEER_WS,
+    CAP_PEER_PAIR,
+    CAP_PEER_HEARTBEAT,
+    CAP_DEVICES,
+    CAP_SCOPES,
+    CAP_SESSION_REF,
+    CAP_TERMINAL_STREAM,
+    CAP_TERMINAL_INPUT,
+];
+
 /// The ONE capability catalogue: every string this build advertises.
 ///
 /// Ordered and APPEND-ONLY. The Hangar strings come first, then the fleet ids
@@ -371,6 +417,25 @@ mod tests {
     fn the_workspace_sessions_capability_is_advertised() {
         assert!(advertises(CAP_WORKSPACE_SESSIONS));
         assert!(catalogue_strings().iter().any(|c| c == CAP_WORKSPACE_SESSIONS));
+    }
+
+    /// The v2-next freeze ships no behaviour: every capability it defines is
+    /// dark, so the hello a v1.29.0 peer sees is unchanged. A flip PR edits
+    /// this test in the same change that appends its strings.
+    #[test]
+    fn the_v2_next_capabilities_are_dark() {
+        assert_eq!(DARK_CAPABILITIES.len(), 8);
+        for id in DARK_CAPABILITIES {
+            assert!(!advertises(id), "{id:?} is advertised before its flip");
+        }
+        // The terminal family follows the method-prefix pattern of
+        // `atc.registry` and `codex.session`.
+        assert!(CAP_TERMINAL_STREAM.starts_with("terminal."));
+        assert!(CAP_TERMINAL_INPUT.starts_with("terminal."));
+        let mut seen = std::collections::HashSet::new();
+        for id in DARK_CAPABILITIES {
+            assert!(seen.insert(*id), "duplicate dark capability {id:?}");
+        }
     }
 
     /// The catalogue is a SET: a duplicated string means one of the two
