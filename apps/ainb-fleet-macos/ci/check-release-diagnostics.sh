@@ -17,7 +17,7 @@ xcodebuild build \
 
 test -x "$binary"
 lipo "$binary" -verify_arch arm64 x86_64
-test "$(plutil -extract SUFeedURL raw "$plist")" = "https://github.com/stevengonsalvez/agents-in-a-box/releases/latest/download/appcast.xml"
+test "$(plutil -extract SUFeedURL raw "$plist")" = "https://github.com/stevengonsalvez/hangar/releases/latest/download/appcast.xml"
 test "$(plutil -extract SUPublicEDKey raw "$plist")" = "$public_key"
 test "$(plutil -extract SUEnableAutomaticChecks raw "$plist")" = "true"
 test "$(plutil -extract SURequireSignedFeed raw "$plist")" = "true"

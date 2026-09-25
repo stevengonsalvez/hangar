@@ -32,7 +32,7 @@
 <p align="center">
   <a href="https://github.com/stevengonsalvez/agents-in-a-box/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/stevengonsalvez/agents-in-a-box/ci.yml?branch=main&style=flat-square&label=CI&logo=github" alt="CI"></a>
   <a href="https://github.com/stevengonsalvez/agents-in-a-box/actions/workflows/toolkit-validation.yml"><img src="https://img.shields.io/github/actions/workflow/status/stevengonsalvez/agents-in-a-box/toolkit-validation.yml?branch=main&style=flat-square&label=Toolkit&logo=github" alt="Toolkit Validation"></a>
-  <a href="https://github.com/stevengonsalvez/agents-in-a-box/releases"><img src="https://img.shields.io/github/v/release/stevengonsalvez/agents-in-a-box?style=flat-square&logo=github" alt="Release"></a>
+  <a href="https://github.com/stevengonsalvez/hangar/releases"><img src="https://img.shields.io/github/v/release/stevengonsalvez/hangar?style=flat-square&logo=github" alt="Release"></a>
   <img src="https://img.shields.io/badge/rust-2021_edition-orange?style=flat-square&logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-blue?style=flat-square" alt="Platform">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
@@ -787,7 +787,7 @@ and `.agents/goals/ainb-skill-manager-v1.2-rollup-plan.md`.
 ## Links
 
 - [Website](https://ainb.app/)
-- [Releases](https://github.com/stevengonsalvez/agents-in-a-box/releases)
+- [Releases](https://github.com/stevengonsalvez/hangar/releases)
 - [Homebrew Tap](https://github.com/stevengonsalvez/homebrew-agents-in-a-box)
 - [Issues](https://github.com/stevengonsalvez/agents-in-a-box/issues)
 - [Knowledge System Architecture](https://github.com/stevengonsalvez/agents-in-a-box/blob/v2/docs/knowledge/overview.md)

@@ -604,10 +604,15 @@ fn render_table(frame: &mut Frame, area: Rect, snapshot: &Snapshot, state: &Daem
 fn daemon_version_label(daemon: &DaemonStatus) -> (String, Style) {
     match (&daemon.version, daemon.version_current) {
         (Some(version), Some(true)) => (format!("{version} ✓"), Style::default().fg(HEALTHY_GREEN)),
+        // Compared against this build's release core: `release_version_is_older`
+        // refuses a prerelease, so an rc build would otherwise call every
+        // stale daemon "newer".
         (Some(version), Some(false))
             if crate::fleet::daemons::probe::release_version_is_older(
                 version,
-                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_VERSION")
+                    .split_once('-')
+                    .map_or(env!("CARGO_PKG_VERSION"), |(core, _)| core),
             ) =>
         {
             (
