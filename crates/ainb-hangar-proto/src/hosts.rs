@@ -147,6 +147,10 @@ pub enum CarrierKind {
     /// Loopback, reached through `ssh -L`.
     #[serde(rename = "ssh-l")]
     SshL,
+    /// A carrier a newer build defined and this one does not know. Never
+    /// dialed and never written into a prologue.
+    #[serde(rename = "unknown", other)]
+    Unknown,
 }
 
 impl CarrierKind {
@@ -157,6 +161,7 @@ impl CarrierKind {
             Self::Tailnet => "tailnet",
             Self::Lan => "lan",
             Self::SshL => "ssh-l",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -191,6 +196,9 @@ pub enum Reachability {
         /// Unix milliseconds since the stream fell behind.
         since_ms: i64,
     },
+    /// A state a newer build defined and this one does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 /// How completely one host is represented in one census listing.
@@ -216,6 +224,21 @@ pub enum HostCoverage {
         /// Unix milliseconds since the rows fell behind.
         since_ms: i64,
     },
+    /// A state a newer build defined and this one does not know.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Deserialize a [`HostId`] that must be minted, refusing `local`.
+///
+/// For wire members that always name a peer, such as
+/// `DeviceRedeemResult.host_id`: `#[serde(deserialize_with = "…")]`.
+pub fn deserialize_minted<'de, D>(deserializer: D) -> Result<HostId, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    HostId::parse_minted(&value).map_err(serde::de::Error::custom)
 }
 
 #[cfg(test)]
@@ -273,6 +296,38 @@ mod tests {
         let back: HostId = serde_json::from_value(serde_json::json!(MINTED)).unwrap();
         assert_eq!(back, id);
         assert!(serde_json::from_value::<HostId>(serde_json::json!("nope")).is_err());
+    }
+
+    /// Every wire enum here decodes a value a newer build added as `Unknown`
+    /// rather than refusing the whole message.
+    #[test]
+    fn newer_values_decode_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<CarrierKind>(serde_json::json!("relay")).unwrap(),
+            CarrierKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<Reachability>(serde_json::json!({"state": "probing"}))
+                .unwrap(),
+            Reachability::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<HostCoverage>(serde_json::json!({"state": "sampled"}))
+                .unwrap(),
+            HostCoverage::Unknown
+        );
+    }
+
+    #[test]
+    fn a_minted_member_refuses_local() {
+        #[derive(Deserialize)]
+        struct Peer {
+            #[serde(deserialize_with = "deserialize_minted")]
+            host_id: HostId,
+        }
+        let ok: Peer = serde_json::from_value(serde_json::json!({"host_id": MINTED})).unwrap();
+        assert_eq!(ok.host_id.as_str(), MINTED);
+        assert!(serde_json::from_value::<Peer>(serde_json::json!({"host_id": "local"})).is_err());
     }
 
     #[test]
