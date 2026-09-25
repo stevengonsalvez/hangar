@@ -245,11 +245,41 @@ jobs:
       contents: read
     env:
       VERSION: ${{ inputs.version }}
-      # Public, a repository variable. Empty in a dry run before the owner sets
-      # it; `sign_fleet` refuses to publish a feed that does not verify under it.
-      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
     steps:
       - uses: actions/checkout@v7
+      # Sparkle signs an update only under the key the app itself pins, so the
+      # build and `sign_fleet` must agree on the pair. A publish pins the key
+      # every installed Fleet has (guard checked the variable against main's
+      # committed copy). A dry run has no private half of that key, so it pins
+      # a throwaway pair made here and hands the private half to its own
+      # `sign_fleet`; the committed key is never touched.
+      - name: Choose the Sparkle key
+        env:
+          PUB: ${{ needs.guard.outputs.publish }}
+          VAR_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "$PUB" = true ]; then
+            echo "SPARKLE_PUBLIC_ED_KEY=$VAR_KEY" >> "$GITHUB_ENV"
+          else
+            # LibreSSL, the system openssl, cannot write Ed25519 keys.
+            PATH="$(brew --prefix openssl@3)/bin:$PATH"
+            dir="$RUNNER_TEMP/dryrun-sparkle"
+            mkdir -p "$dir"
+            openssl genpkey -algorithm ed25519 -out "$RUNNER_TEMP/dryrun.pem"
+            # generate_appcast reads the 32-byte seed; Info.plist pins the public half.
+            openssl pkey -in "$RUNNER_TEMP/dryrun.pem" -outform DER | tail -c 32 | base64 > "$dir/private"
+            openssl pkey -in "$RUNNER_TEMP/dryrun.pem" -pubout -outform DER | tail -c 32 | base64 > "$dir/public"
+            rm "$RUNNER_TEMP/dryrun.pem"
+            echo "SPARKLE_PUBLIC_ED_KEY=$(cat "$dir/public")" >> "$GITHUB_ENV"
+            echo "dry run: Fleet pins a throwaway Sparkle key" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - if: needs.guard.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: fleet-dryrun-sparkle-key
+          path: ${{ runner.temp }}/dryrun-sparkle/
+          if-no-files-found: error
       - name: Archive universal Fleet app
         run: |
           xcodebuild archive \
@@ -575,6 +605,11 @@ jobs:
           mkdir -p fleet/sparkle
           tar -xJf "$RUNNER_TEMP/sparkle.tar.xz" -C fleet/sparkle
           test -x fleet/sparkle/bin/generate_appcast
+      - if: needs.guard.outputs.publish != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: fleet-dryrun-sparkle-key
+          path: fleet/dryrun-sparkle
       - name: Generate, sign and verify the appcast
         env:
           KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
@@ -583,6 +618,13 @@ jobs:
           BRIDGE: ${{ inputs.bridge }}
           VERSION: ${{ inputs.version }}
         run: |
+          set -euo pipefail
+          if [ "$PUB" != true ]; then
+            # The pair the dry run's Fleet build pinned, never a real secret.
+            KEY="$(cat fleet/dryrun-sparkle/private)"
+            PUBLIC="$(cat fleet/dryrun-sparkle/public)"
+            export KEY PUBLIC
+          fi
           bash scripts/release/appcast.sh "fleet/dmg/AINBFleet-${VERSION}.dmg" fleet/sparkle/bin/generate_appcast "$VERSION" fleet/feed
       - uses: actions/upload-artifact@v7
         with:
@@ -779,32 +821,49 @@ jobs:
             flags=(--latest)
           fi
           for f in "${files[@]}"; do test -f "$f" || { echo "missing $f"; exit 1; }; done
+          # The release as the API holds it, draft or not: drafts have no tag
+          # yet, so the tag endpoint cannot find them.
+          fetch() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -s --arg t "v$V" '[add[] | select(.tag_name == $t)] | first' > "$RUNNER_TEMP/release.json"
+          }
+          # An asset holds a file only if its API digest is the file's sha256:
+          # names and sizes alone say nothing about content, and the .sha256
+          # files and the manifest signature are the same size every release.
+          holds() {
+            jq -e --arg n "$(basename "$1")" --arg d "sha256:$(sha256sum "$1" | cut -d' ' -f1)" \
+              'any(.assets[]; .name == $n and .state == "uploaded" and .digest == $d)' \
+              "$RUNNER_TEMP/release.json" >/dev/null
+          }
           # Idempotent, so "Re-run failed jobs" after a failed tap push does not
           # fail here on the release the first attempt created. A first attempt
           # that died part way can leave a draft, or a release missing assets,
-          # so an existing release is finished rather than trusted.
-          if gh release view "v$V" >/dev/null 2>&1; then
-            echo "v$V already exists; completing it"
-            have="$(gh release view "v$V" --json assets --jq '.assets[] | select(.state == "uploaded") | .name')"
+          # so an existing release is finished rather than trusted, and only
+          # when it was made from this run's commit: publishing a draft tags its
+          # own target, which a later dispatch would not have built.
+          fetch
+          if jq -e '. != null' "$RUNNER_TEMP/release.json" >/dev/null; then
+            target="$(jq -r '.target_commitish' "$RUNNER_TEMP/release.json")"
+            [ "$target" = "$GITHUB_SHA" ] \
+              || { echo "v$V already exists at $target, not at this run's $GITHUB_SHA; delete it and dispatch again"; exit 1; }
+            echo "v$V already exists at this commit; completing it"
             missing=()
             for f in "${files[@]}"; do
-              grep -qxF "$(basename "$f")" <<<"$have" || missing+=("$f")
+              holds "$f" || missing+=("$f")
             done
             if [ "${#missing[@]}" -gt 0 ]; then
               gh release upload "v$V" --clobber "${missing[@]}"
             fi
-            gh release edit "v$V" --draft=false "${flags[@]}"
+            gh release edit "v$V" --draft=false --notes-file artifacts/release-notes/notes.md "${flags[@]}"
           else
             gh release create "v$V" --target "$GITHUB_SHA" --title "v$V" --notes-file artifacts/release-notes/notes.md "${flags[@]}" "${files[@]}"
           fi
           # Either way, before the tap points at it: the release is public and
-          # holds every file, at the size built here.
-          gh release view "v$V" --json isDraft,assets > "$RUNNER_TEMP/release.json"
-          jq -e '.isDraft == false' "$RUNNER_TEMP/release.json" >/dev/null || { echo "v$V is still a draft"; exit 1; }
+          # holds every file, byte for byte.
+          fetch
+          jq -e '.draft == false' "$RUNNER_TEMP/release.json" >/dev/null || { echo "v$V is still a draft"; exit 1; }
           for f in "${files[@]}"; do
-            jq -e --arg n "$(basename "$f")" --argjson s "$(stat -c %s "$f")" \
-              'any(.assets[]; .name == $n and .state == "uploaded" and .size == $s)' "$RUNNER_TEMP/release.json" >/dev/null \
-              || { echo "v$V does not hold $(basename "$f") as built"; exit 1; }
+            holds "$f" || { echo "v$V does not hold $(basename "$f") as built"; exit 1; }
           done
       - name: Push the tap
         if: ${{ !inputs.prerelease }}
