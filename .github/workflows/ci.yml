@@ -49,8 +49,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
         with:
           components: rustfmt
-          # The phone targets `ainb-hangar-noise` must keep compiling for (R1).
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Test and Contracts both refuse to save (see their comments), so this
@@ -61,11 +59,16 @@ jobs:
       # The peer wire is shared with the phone crate, which cannot be rebuilt
       # from here, so a dependency that stops compiling for a phone target has
       # to fail this job, not a mobile build weeks later. `check` needs no
-      # linker, so the ubuntu runner covers the Apple targets too.
+      # linker, so the ubuntu runner covers the Apple targets too. The targets
+      # are added here, not through the toolchain action: `rust-toolchain.toml`
+      # pins the compiler cargo actually runs, and the action's `stable` is a
+      # different toolchain.
       - name: The peer wire compiles for the five phone targets
         run: |
-          for target in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios \
-                        aarch64-linux-android x86_64-linux-android; do
+          targets="aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-linux-android x86_64-linux-android"
+          # shellcheck disable=SC2086
+          rustup target add $targets
+          for target in $targets; do
             cargo check -p ainb-hangar-noise --target "$target"
           done
       # An abandoned debugging probe reverts real behaviour while every doc
