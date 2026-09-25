@@ -13,7 +13,7 @@
 use ainb_hangar_noise::frame::FrameHeader;
 use ainb_hangar_noise::offer::{Endpoint, OfferError, PairingOffer};
 use ainb_hangar_noise::opcode::{Opcode, RETIRED};
-use ainb_hangar_noise::prologue;
+use ainb_hangar_noise::{PrologueError, prologue};
 use ainb_hangar_proto::hosts::{CarrierKind, HostId, HostIdError};
 use serde_json::{Value, json};
 
@@ -175,7 +175,7 @@ fn golden_offer_parses() {
 fn local_is_refused_on_the_peer_wire() {
     assert_eq!(
         prologue(CarrierKind::SshL, &HostId::local()),
-        Err(HostIdError::LocalNotAllowed)
+        Err(PrologueError::Host(HostIdError::LocalNotAllowed))
     );
     let mut value = serde_json::to_value(offer()).unwrap();
     value["host_id"] = json!("local");
