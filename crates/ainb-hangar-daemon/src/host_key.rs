@@ -209,12 +209,15 @@ pub fn load_or_mint(
 /// old one has to pair again (a planned change goes through the rotation in
 /// R1-17 instead, which never reaches this branch).
 ///
+/// `backend` is `Sync` because the borrow lives across the store write, and
+/// the boot future that awaits this must stay `Send`.
+///
 /// # Errors
 ///
 /// [`HostKeyError`] from [`load_or_mint`], or when the row cannot be written.
 pub async fn ensure(
     pool: &SqlitePool,
-    backend: &dyn SecretBackend,
+    backend: &(dyn SecretBackend + Sync),
     hangar_home: &Path,
 ) -> Result<Loaded, HostKeyError> {
     let loaded = load_or_mint(backend, hangar_home)?;
