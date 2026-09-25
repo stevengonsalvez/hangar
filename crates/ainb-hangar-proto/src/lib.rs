@@ -19,19 +19,29 @@ pub mod agent_status;
 pub mod auth;
 pub mod connections;
 pub mod dates;
+/// Paired devices, scopes and the per-scope method table (R1, frozen by PR-0).
+pub mod devices;
 pub mod events;
 pub mod fleet;
+/// Host identity and reachability (spec D11, frozen by PR-0).
+pub mod hosts;
 pub mod lifecycle;
 pub mod methods;
 pub mod mutation;
+/// Close codes of the off-box peer leg (R1, frozen by PR-0).
+pub mod peer_close;
 pub mod pr_status;
 pub mod protocol;
 pub mod reprime;
+/// A session named across hosts (spec D11, frozen by PR-0).
+pub mod session_ref;
 pub mod sessions;
 pub mod settings;
 pub mod snapshots;
 pub mod status_topic;
 pub mod status_view;
+/// Terminal streams (R2, frozen by PR-0).
+pub mod terminal;
 pub mod transcript;
 
 /// Re-export the notification routing vocabulary (tcp T5) so proto-only consumers

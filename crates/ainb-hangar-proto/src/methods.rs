@@ -1724,6 +1724,100 @@ pub const AUTH_HELLO: &str = "auth/hello";
 /// `ping` — bare liveness probe. Params: `{}`. Result: `{}`.
 pub const PING: &str = "ping";
 
+// ── Devices (R1, frozen by PR-0) ─────────────────────────────────────────
+//
+// Declared and classified in the scope table, and dispatched by NOTHING until
+// the handler PR lands: a daemon built from this tree answers every one of
+// them `METHOD_NOT_FOUND`, exactly like a v1.29.0 daemon. Each handler PR
+// appends its method to `MUTATING_METHODS` in the same change.
+
+/// `device/redeem`: exchange a single-use pairing invite for a device token.
+///
+/// Valid ONLY as the first Rpc on the peer WS leg, in place of `auth/hello`;
+/// the unix leg answers [`crate::auth::UNAUTHORIZED`]. Params:
+/// [`crate::devices::DeviceRedeemParams`]. Result:
+/// [`crate::devices::DeviceRedeemResult`]. Not a ledger mutation: it has no
+/// principal before hello, and the single-use invite is its idempotency.
+pub const DEVICE_REDEEM: &str = "device/redeem";
+
+/// `device/invite_create`: mint a pairing invite. Operator only in v1.
+///
+/// Params: [`crate::devices::DeviceInviteCreateParams`]. Result:
+/// [`crate::devices::DeviceInviteCreateResult`].
+pub const DEVICE_INVITE_CREATE: &str = "device/invite_create";
+
+/// `device/list`: the paired device registry. Params: `{}`. Result:
+/// [`crate::devices::DeviceListResult`].
+pub const DEVICE_LIST: &str = "device/list";
+
+/// `device/revoke`: revoke a device; its sockets close 4403.
+///
+/// Params: [`crate::devices::DeviceRevokeParams`], fenced on the registry
+/// version.
+pub const DEVICE_REVOKE: &str = "device/revoke";
+
+/// `device/rescope`: change a device's scope; its sockets close 4503 so it
+/// says hello again under the new scope.
+///
+/// Params: [`crate::devices::DeviceRescopeParams`], fenced on the registry
+/// version.
+pub const DEVICE_RESCOPE: &str = "device/rescope";
+
+// ── Terminal streams (R2, frozen by PR-0) ────────────────────────────────
+//
+// Same rule as the devices block: declared, classified, never dispatched in
+// this tree. With the terminal gate off every `terminal/*` request answers
+// `METHOD_NOT_FOUND (-32601)`, which a client cannot tell from an older daemon.
+
+/// `terminal/attach`: open a stream on one session's pane.
+///
+/// Params: [`crate::terminal::TerminalAttachParams`]. Result:
+/// [`crate::terminal::TerminalAttachResult`]; [`TERMINAL_FRAME`]
+/// notifications follow.
+pub const TERMINAL_ATTACH: &str = "terminal/attach";
+
+/// `terminal/detach`: close a stream. Params:
+/// [`crate::terminal::TerminalDetachParams`]. Result: `{}`.
+pub const TERMINAL_DETACH: &str = "terminal/detach";
+
+/// `terminal/ack`: return flow-control credit. Params:
+/// [`crate::terminal::TerminalAckParams`]. Result: `{}`.
+pub const TERMINAL_ACK: &str = "terminal/ack";
+
+/// `terminal/scrollback`: read rows above the live window. Params:
+/// [`crate::terminal::TerminalScrollbackParams`]. Result:
+/// [`crate::terminal::TerminalScrollbackResult`].
+pub const TERMINAL_SCROLLBACK: &str = "terminal/scrollback";
+
+/// `terminal/input`: type bytes into the pane (receipt tier).
+///
+/// Params: [`crate::terminal::TerminalInputParams`]. Result:
+/// [`crate::terminal::TerminalInputResult`].
+pub const TERMINAL_INPUT: &str = "terminal/input";
+
+/// `terminal/floor`: acquire, release or take the input floor (dedupe tier).
+///
+/// Params: [`crate::terminal::TerminalFloorParams`]. Result:
+/// [`crate::terminal::FloorState`].
+pub const TERMINAL_FLOOR: &str = "terminal/floor";
+
+/// `terminal/resize`: resize the pane as the floor holder. Not a ledger
+/// mutation: it is idempotent by value.
+///
+/// Params: [`crate::terminal::TerminalResizeParams`]. Result:
+/// [`crate::terminal::TerminalResizeResult`].
+pub const TERMINAL_RESIZE: &str = "terminal/resize";
+
+/// Notification carrying one frame of an attached stream.
+///
+/// Params: [`crate::terminal::TerminalFrameParams`]. Scoped to the stream: it
+/// reaches only the connection that attached, so it has no event family. A
+/// notification, never a request method, so it is NOT in [`ALL_METHODS`].
+pub const TERMINAL_FRAME: &str = "terminal/frame";
+
+/// Terminal notifications emitted by the daemon, never JSON-RPC request methods.
+pub const TERMINAL_NOTIFICATION_METHODS: &[&str] = &[TERMINAL_FRAME];
+
 /// Every daemon method name, in declaration order.
 ///
 /// Single source of truth for the registry tests in this module. The
@@ -1942,6 +2036,24 @@ pub const ALL_METHODS: &[&str] = &[
     // ordered and append-only, so a new method goes at the tail.
     FLEET_ADAPTER_LIST,
     ATC_RETRY_LIST,
+    // The v2-next freeze (PR-0): declared and classified, dispatched by nothing
+    // until each handler lands. Appended at the tail, as every method is.
+    DEVICE_REDEEM,
+    DEVICE_INVITE_CREATE,
+    DEVICE_LIST,
+    DEVICE_REVOKE,
+    DEVICE_RESCOPE,
+    TERMINAL_ATTACH,
+    TERMINAL_DETACH,
+    TERMINAL_ACK,
+    TERMINAL_SCROLLBACK,
+    TERMINAL_INPUT,
+    TERMINAL_FLOOR,
+    TERMINAL_RESIZE,
+    // Served by the daemon long before this registry listed them; appended
+    // here so they are classified in the scope table like every method.
+    HANGAR_ISSUE_CREATE,
+    HANGAR_ISSUE_RUN,
 ];
 
 #[cfg(test)]
@@ -2270,6 +2382,20 @@ mod tests {
             CODEX_SESSION_DISCARD,
             FLEET_ADAPTER_LIST,
             ATC_RETRY_LIST,
+            DEVICE_REDEEM,
+            DEVICE_INVITE_CREATE,
+            DEVICE_LIST,
+            DEVICE_REVOKE,
+            DEVICE_RESCOPE,
+            TERMINAL_ATTACH,
+            TERMINAL_DETACH,
+            TERMINAL_ACK,
+            TERMINAL_SCROLLBACK,
+            TERMINAL_INPUT,
+            TERMINAL_FLOOR,
+            TERMINAL_RESIZE,
+            HANGAR_ISSUE_CREATE,
+            HANGAR_ISSUE_RUN,
         ];
         for m in declared {
             assert!(
@@ -2284,5 +2410,36 @@ mod tests {
             ALL_METHODS.len(),
             declared.len()
         );
+    }
+
+    /// The terminal frame is a notification: never a request method, and
+    /// namespaced under `terminal/` beside the requests it answers.
+    #[test]
+    fn terminal_notifications_are_never_request_methods() {
+        for m in TERMINAL_NOTIFICATION_METHODS {
+            assert!(m.starts_with("terminal/"), "{m:?} not under terminal/");
+            assert!(!ALL_METHODS.contains(m), "{m:?} is also a request method");
+            assert!(!FLEET_PROTOCOL_NOTIFICATION_METHODS.contains(m));
+        }
+        for m in [
+            TERMINAL_ATTACH,
+            TERMINAL_DETACH,
+            TERMINAL_ACK,
+            TERMINAL_SCROLLBACK,
+            TERMINAL_INPUT,
+            TERMINAL_FLOOR,
+            TERMINAL_RESIZE,
+        ] {
+            assert!(m.starts_with("terminal/"), "{m:?} not under terminal/");
+        }
+        for m in [
+            DEVICE_REDEEM,
+            DEVICE_INVITE_CREATE,
+            DEVICE_LIST,
+            DEVICE_REVOKE,
+            DEVICE_RESCOPE,
+        ] {
+            assert!(m.starts_with("device/"), "{m:?} not under device/");
+        }
     }
 }
