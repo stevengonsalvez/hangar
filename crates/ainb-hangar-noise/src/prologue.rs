@@ -13,6 +13,26 @@
 
 use ainb_hangar_proto::hosts::{CarrierKind, HostId, HostIdError};
 
+/// Why a prologue cannot be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrologueError {
+    /// The host id is not a minted ULID (`local`, or malformed).
+    Host(HostIdError),
+    /// A carrier this build does not know has no prologue spelling.
+    UnknownCarrier,
+}
+
+impl std::fmt::Display for PrologueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host(e) => write!(f, "prologue host id: {e}"),
+            Self::UnknownCarrier => f.write_str("prologue carrier is unknown"),
+        }
+    }
+}
+
+impl std::error::Error for PrologueError {}
+
 /// The prologue fields before `transport` and `host_id`, in order.
 pub const FIXED_FIELDS: [(&str, &str); 5] = [
     ("protocol", "ainb-peer-ws"),
@@ -30,9 +50,13 @@ fn push(out: &mut Vec<u8>, field: &str) {
 
 /// The prologue bytes for a session to `host_id` over `carrier`.
 ///
-/// `host_id` must be minted: a peer is never `local`.
-pub fn prologue(carrier: CarrierKind, host_id: &HostId) -> Result<Vec<u8>, HostIdError> {
-    let host_id = HostId::parse_minted(host_id.as_str())?;
+/// `host_id` must be minted: a peer is never `local`. The carrier must be one
+/// this build knows.
+pub fn prologue(carrier: CarrierKind, host_id: &HostId) -> Result<Vec<u8>, PrologueError> {
+    if matches!(carrier, CarrierKind::Unknown) {
+        return Err(PrologueError::UnknownCarrier);
+    }
+    let host_id = HostId::parse_minted(host_id.as_str()).map_err(PrologueError::Host)?;
     let mut out = Vec::with_capacity(160);
     for (key, value) in FIXED_FIELDS {
         push(&mut out, key);
@@ -53,7 +77,14 @@ mod tests {
     fn the_prologue_refuses_local_and_names_every_field() {
         assert_eq!(
             prologue(CarrierKind::SshL, &HostId::local()),
-            Err(HostIdError::LocalNotAllowed)
+            Err(PrologueError::Host(HostIdError::LocalNotAllowed))
+        );
+        assert_eq!(
+            prologue(
+                CarrierKind::Unknown,
+                &HostId::parse("01K5A0000000000000000ABCDE").unwrap()
+            ),
+            Err(PrologueError::UnknownCarrier)
         );
         let host = HostId::parse("01K5A0000000000000000ABCDE").unwrap();
         let bytes = prologue(CarrierKind::Tailnet, &host).unwrap();
