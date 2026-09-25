@@ -105,6 +105,12 @@ pub const REASON_NO_TARGET: &str = "no_target";
 /// ambiguous means "do not retry, go and look", while this means "nothing
 /// happened, retrying is safe".
 pub const REASON_NOT_DELIVERED: &str = "not_delivered";
+/// Reason: another stream holds the terminal input floor (R2).
+///
+/// A [`MUTATION_REJECTED`] reason, not a new error code: the spec already
+/// calls it "rejected with `floor_denied`". The error data also carries the
+/// current `holder` and `floor_gen` ([`crate::terminal::FloorDeniedData`]).
+pub const REASON_FLOOR_DENIED: &str = "floor_denied";
 
 /// The reserved key under which the daemon attaches a [`MutationAck`] to an
 /// object-shaped mutation result.
@@ -1425,6 +1431,82 @@ mod tests {
             json,
             serde_json::json!({"status":"unknown","reason":"effects_ambiguous","receipt":"unknown"})
         );
+    }
+
+    /// PR-0 freezes the v2-next params and dispatches none of them, so no new
+    /// method joins the registry yet: `mutation_dedupe` replays every entry
+    /// as the operator, where `device/redeem` is refused by design and the
+    /// rest have no handler. Each handler PR appends its row here.
+    #[test]
+    fn the_v2_next_methods_are_not_registered_yet() {
+        for method in [
+            crate::methods::DEVICE_REDEEM,
+            crate::methods::DEVICE_INVITE_CREATE,
+            crate::methods::DEVICE_LIST,
+            crate::methods::DEVICE_REVOKE,
+            crate::methods::DEVICE_RESCOPE,
+            crate::methods::TERMINAL_ATTACH,
+            crate::methods::TERMINAL_DETACH,
+            crate::methods::TERMINAL_ACK,
+            crate::methods::TERMINAL_SCROLLBACK,
+            crate::methods::TERMINAL_INPUT,
+            crate::methods::TERMINAL_FLOOR,
+            crate::methods::TERMINAL_RESIZE,
+        ] {
+            assert!(
+                !is_mutating(method),
+                "{method} registered before its handler"
+            );
+        }
+    }
+
+    /// The W0 rule for the v2-next mutations: `op_id` and `fence` sit at the
+    /// TOP level of the params object, never under a named `envelope` member.
+    #[test]
+    fn every_v2_next_mutating_params_struct_flattens_the_envelope() {
+        use crate::devices::{
+            DeviceInviteCreateParams, DeviceRescopeParams, DeviceRevokeParams, DeviceScope,
+        };
+        use crate::terminal::{FloorAction, TerminalFloorParams, TerminalInputParams};
+
+        let op = OpId::from_bytes([0xcd; 16]);
+        let envelope = MutationEnvelope::fenced(op.clone(), Fence::RegistryVersion { version: 5 });
+        let encoded = [
+            serde_json::to_value(DeviceInviteCreateParams {
+                scope: DeviceScope::MOBILE,
+                display_name: None,
+                ttl_s: None,
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(DeviceRevokeParams {
+                device_id: "d".to_string(),
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(DeviceRescopeParams {
+                device_id: "d".to_string(),
+                scope: DeviceScope::MOBILE,
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(TerminalInputParams {
+                stream_id: 1,
+                floor_gen: None,
+                data: String::new(),
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(TerminalFloorParams {
+                stream_id: 1,
+                action: FloorAction::Acquire,
+                mutation: envelope,
+            }),
+        ];
+        for value in encoded {
+            let value = value.unwrap();
+            assert_eq!(value["op_id"], op.as_str(), "{value}");
+            assert_eq!(value["fence"]["kind"], "registry_version", "{value}");
+            for nested in ["envelope", "mutation"] {
+                assert!(value.get(nested).is_none(), "{value}");
+            }
+        }
     }
 
     /// The two mutation codes sit in the server-error range and collide with
