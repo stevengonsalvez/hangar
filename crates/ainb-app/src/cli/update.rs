@@ -1129,10 +1129,43 @@ pub fn schedule_is_enabled() -> bool {
 }
 
 /// Install the daily release checker if it is not already installed.
+///
+/// Refused for a home under the system temp dir: the install registers with
+/// the user's service manager (`launchctl`, `systemctl --user`), which a temp
+/// `HOME` does not scope, so a test or scratch home would load a job into the
+/// real user's session, pointing at files that are about to be deleted.
 pub fn ensure_schedule() -> Result<()> {
-    if schedule_is_enabled() {
+    ensure_schedule_with(
+        dirs::home_dir().as_deref(),
+        schedule_is_enabled,
+        install_schedule,
+    )
+}
+
+/// [`ensure_schedule`] with its impure inputs passed in, so the refusal is
+/// proven on the install itself rather than on a predicate: the home, whether
+/// the checker is already installed, and the install.
+pub fn ensure_schedule_with(
+    home: Option<&std::path::Path>,
+    installed: impl FnOnce() -> bool,
+    install: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if let Some(home) = home {
+        if crate::cli::hangar::is_under_temp_dir(home) {
+            anyhow::bail!(
+                "{} is a temporary home; the daily release checker registers with the real \
+                 user's service manager, so it is not installed from here",
+                home.display()
+            );
+        }
+    }
+    if installed() {
         return Ok(());
     }
+    install()
+}
+
+fn install_schedule() -> Result<()> {
     let schedule = UpdateSchedule::daily();
     if cfg!(target_os = "macos") {
         let path = launchd_path().context("resolving LaunchAgents path")?;
@@ -1208,6 +1241,40 @@ pub fn cached_state() -> Option<ReleaseState> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_temp_home_never_reaches_the_service_manager() {
+        let home = tempfile::tempdir().expect("temp home");
+        let mut installed = false;
+        let result = super::ensure_schedule_with(
+            Some(home.path()),
+            || false,
+            || {
+                installed = true;
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a temp home must be refused, not skipped in silence"
+        );
+        assert!(!installed, "the install ran for a temp home");
+    }
+
+    #[test]
+    fn a_real_home_without_the_checker_installs_it() {
+        let mut installed = false;
+        super::ensure_schedule_with(
+            Some(std::path::Path::new("/home/someone")),
+            || false,
+            || {
+                installed = true;
+                Ok(())
+            },
+        )
+        .expect("a real home is not refused");
+        assert!(installed, "the install did not run for a real home");
+    }
+
     use super::*;
 
     #[test]
