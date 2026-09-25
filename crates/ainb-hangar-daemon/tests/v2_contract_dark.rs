@@ -131,3 +131,67 @@ fn the_phase_switches_are_env_only() {
         );
     }
 }
+
+/// Every method the daemon's dispatch matches on has a scope verdict: the
+/// no-default rule, enforced from the daemon's side. Parsed from source so a
+/// handler added without a registry entry fails here, not in production.
+#[test]
+fn every_dispatched_method_is_classified() {
+    let consts = method_consts(include_str!("../../ainb-hangar-proto/src/methods.rs"));
+    let dispatch = include_str!("../src/rpc/mod.rs");
+    let mut arms = std::collections::BTreeSet::new();
+    for line in dispatch.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("methods::") else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        let tail = rest[name.len()..].trim_start();
+        if tail.starts_with("=>") || tail.starts_with('|') {
+            arms.insert(name);
+        }
+    }
+    assert!(
+        arms.len() > 100,
+        "the dispatch parse found {} arms",
+        arms.len()
+    );
+    let mut unclassified = Vec::new();
+    for name in &arms {
+        let Some((_, value)) = consts.iter().find(|(n, _)| n == name) else {
+            unclassified.push(format!("{name} (no const)"));
+            continue;
+        };
+        if ainb_hangar_proto::devices::scope_row(value).is_none() {
+            unclassified.push(format!("{name} = {value:?}"));
+        }
+    }
+    assert!(
+        unclassified.is_empty(),
+        "dispatched methods with no scope verdict: {unclassified:?}"
+    );
+}
+
+/// `pub const NAME: &str = "value"` pairs from `methods.rs` source.
+fn method_consts(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("pub const ") {
+        rest = &rest[at + "pub const ".len()..];
+        let Some(colon) = rest.find(':') else { break };
+        let name = rest[..colon].trim().to_string();
+        let value = rest[colon + 1..]
+            .trim_start()
+            .strip_prefix("&str")
+            .and_then(|r| r.trim_start().strip_prefix('='))
+            .and_then(|r| r.trim_start().strip_prefix('"'))
+            .and_then(|r| r.find('"').map(|end| r[..end].to_string()));
+        if let Some(value) = value {
+            out.push((name, value));
+        }
+    }
+    out
+}
