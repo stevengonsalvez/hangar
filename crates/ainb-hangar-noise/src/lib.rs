@@ -26,7 +26,7 @@ pub mod prologue;
 pub use frame::{FrameHeader, HEADER_LEN, MAGIC, VERSION};
 pub use offer::{Endpoint, OfferError, PairingOffer};
 pub use opcode::Opcode;
-pub use prologue::prologue;
+pub use prologue::{PrologueError, prologue};
 
 /// The WebSocket path of the peer leg.
 pub const PEER_PATH: &str = "/peer";
