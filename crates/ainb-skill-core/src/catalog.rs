@@ -78,7 +78,7 @@ pub struct CatalogHit {
     /// Unit name (the trailing folder / file stem — e.g. `commit`).
     pub name: String,
     /// Source repo in `owner/repo` form (e.g.
-    /// `stevengonsalvez/agents-in-a-box`).
+    /// `stevengonsalvez/hangar`).
     pub repo: String,
     /// GitHub star count, used to rank results (descending).
     pub stars: u64,
