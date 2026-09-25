@@ -2050,6 +2050,10 @@ pub const ALL_METHODS: &[&str] = &[
     TERMINAL_INPUT,
     TERMINAL_FLOOR,
     TERMINAL_RESIZE,
+    // Served by the daemon long before this registry listed them; appended
+    // here so they are classified in the scope table like every method.
+    HANGAR_ISSUE_CREATE,
+    HANGAR_ISSUE_RUN,
 ];
 
 #[cfg(test)]
@@ -2390,6 +2394,8 @@ mod tests {
             TERMINAL_INPUT,
             TERMINAL_FLOOR,
             TERMINAL_RESIZE,
+            HANGAR_ISSUE_CREATE,
+            HANGAR_ISSUE_RUN,
         ];
         for m in declared {
             assert!(
