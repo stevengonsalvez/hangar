@@ -209,9 +209,8 @@ export function seed() {
  * exactly as an agent's hook does: the daemon tails this file and raises what
  * the line announces.
  *
- * Written directly rather than through `ainb fleet atc hook`, because that
- * command refuses a line with no session id, and the sidebar only takes a
- * question raised with none (#1049). The line carries no `raw_payload_ref`:
+ * Written directly rather than through `ainb fleet atc hook`, so the line is
+ * exactly what the spec says it is. The line carries no `raw_payload_ref`:
  * the hook sets one only beside a payload file it wrote, and a ref with no
  * file, or one that is not the line's own event id, holds the daemon's ingest
  * on a retry for good. With none, the daemon reads the inline payload.
