@@ -55,7 +55,7 @@ version = "1.28.2"
 edition = "2021"
 authors = ["Agents-in-a-Box Team"]
 license = "MIT"
-repository = "https://github.com/stevengonsalvez/agents-in-a-box"
+repository = "https://github.com/stevengonsalvez/hangar"
 
 [workspace.dependencies]
 # Core

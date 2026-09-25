@@ -3508,21 +3508,39 @@ mod tests {
                 "-k",
                 "-t",
                 &format!("{target}:"),
-                "sh -c 'echo codex-startup-failed; exit 1'",
+                // Lives a second past its output. On a child's exit tmux 3.4
+                // closes the pane's pty at once (`server_destroy_pane`), and
+                // output its event loop had not read yet is dropped for good;
+                // an instant exit therefore leaves a pane holding nothing but
+                // `Pane is dead (status 1, ...)` now and then on a loaded
+                // runner (#33), however long the capture is polled.
+                "sh -c 'echo codex-startup-failed; sleep 1; exit 1'",
             ])
             .output()
             .await;
-        // Poll, do not sleep a guessed interval. `remain-on-exit` keeps the
-        // pane, but the echo and the death are two separate events and a loaded
-        // runner can put the capture between them: the marker is drawn, the
-        // program's line is not readable yet, and the assertion below reports a
-        // pane holding nothing but `Pane is dead (status 1, ...)`. That is a
-        // race in the TEST, not in `capture_failed_launch_pane`, and it went red
-        // once on ubuntu while macOS passed the same commit.
-        //
+        // Read the pane once it is dead, as a failed launch is read.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let panes = TokioCommand::new("tmux")
+                .args([
+                    "list-panes",
+                    "-t",
+                    &format!("{target}:"),
+                    "-F",
+                    "#{pane_dead}",
+                ])
+                .output()
+                .await
+                .expect("list panes");
+            if String::from_utf8_lossy(&panes.stdout).contains('1')
+                || tokio::time::Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         // On timeout, fall through with the last capture so the assertion still
         // prints what the pane actually held.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         let captured = loop {
             let attempt = super::capture_failed_launch_pane(&target).await;
             if attempt.as_deref().is_some_and(|text| text.contains("codex-startup-failed")) {
