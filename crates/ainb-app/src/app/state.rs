@@ -12911,11 +12911,24 @@ impl AppState {
                     .as_deref()
                     .map(|session_id| daemon.rows_for_session_id(session_id))
                     .unwrap_or_default();
+                // A Claude row never learns its provider session id (#1049):
+                // only Codex sets one, from its app-server thread. The daemon
+                // keys every hook-raised request by that id, so for the one
+                // Claude row in a worktree the id-bearing rows are the only
+                // rows there are; excluding them left every real hook ASK
+                // open and counted as waiting elsewhere, with no banner able
+                // to answer it (#48). The id is still not learned from the
+                // row: the fallback is per refresh, and only while the cwd
+                // names one local session.
                 let daemon_rows = if provider_session_id.is_none()
                     && exact_rows.is_empty()
                     && sessions_per_cwd.get(&cwd).copied() == Some(1)
                 {
-                    daemon.rows_for_unidentified_cwd(&cwd)
+                    if s.agent_type == crate::models::SessionAgentType::Claude {
+                        daemon.rows_for(&cwd)
+                    } else {
+                        daemon.rows_for_unidentified_cwd(&cwd)
+                    }
                 } else {
                     exact_rows
                 };
