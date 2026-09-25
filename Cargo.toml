@@ -32,6 +32,9 @@ members = [
     "crates/ainb-hangar-client",
     "crates/ainb-hangar-sandbox",
     "crates/ainb-hangar-daemon",
+    # The peer wire (R1): pure Rust, builds for the phone targets, small enough
+    # for the required CI's disk budget.
+    "crates/ainb-hangar-noise",
     "crates/ainb-acp",
     "crates/ainb-fleet-tools",
     "crates/ainb-plugin-hangar",
@@ -39,7 +42,11 @@ members = [
 ]
 # The desktop shell is its own workspace with its own lockfile: it builds Tauri
 # and the platform webview, which no job of this workspace should need.
-exclude = ["crates/ainb-desktop"]
+#
+# The phone bridge (M1) is excluded for the same reason: uniffi and the mobile
+# toolchains are outside the required CI's disk budget, so it builds in its own
+# workflow only.
+exclude = ["crates/ainb-desktop", "crates/ainb-wire-mobile"]
 # `ainb hangar daemon start` launches the sibling `ainb-hangar-daemon` binary
 # (built beside `ainb` in the same target dir). It MUST be in default-members so
 # a plain `cargo build` rebuilds it alongside `ainb` — otherwise the sibling
