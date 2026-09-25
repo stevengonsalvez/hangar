@@ -158,7 +158,10 @@ impl TmuxSession {
     }
 
     fn tmux(&self, args: &[&str]) -> std::process::ExitStatus {
+        // `-f /dev/null`: the developer's own tmux.conf and its plugins stay
+        // out of this server (tmux-continuum, for one, runs systemctl).
         Command::new("tmux")
+            .args(["-f", "/dev/null"])
             .args(args)
             .env("TMUX_TMPDIR", &self.tmux_dir)
             .env_remove("TMUX")
