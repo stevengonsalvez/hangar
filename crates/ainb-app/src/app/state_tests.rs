@@ -3290,6 +3290,112 @@ mod tests {
         );
     }
 
+    /// A hook-raised request carries the agent's own session id, which the
+    /// daemon keys the row by, and a Claude row never learns that id (#1049):
+    /// the one Claude row in the worktree still takes the row, so the banner
+    /// can answer it rather than counting it as waiting elsewhere (#48).
+    #[test]
+    fn a_hook_ask_with_a_session_id_lands_on_the_only_claude_row_in_its_cwd() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/claude-hook";
+        let mut state = state_with_session_at(cwd, Some("tmux_claude"));
+        let id = state.sessions.workspaces[0].sessions[0].id;
+        assert_eq!(state.sessions.workspaces[0].sessions[0].provider_session_id, None);
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-hook".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert("claude-session-id".into(), vec![chip.clone()]);
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-hook".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        let chips = &state.find_session(id).unwrap().live_attention;
+        assert_eq!(chips.len(), 1, "the only Claude row in the worktree takes the hook's ASK");
+        assert_eq!(chips[0].kind, AttentionKind::Ask);
+        assert_eq!(
+            state.fleet.attention_elsewhere, 0,
+            "a request the row holds is not waiting elsewhere"
+        );
+        assert_eq!(
+            state.find_session(id).unwrap().provider_session_id,
+            None,
+            "the row does not learn the id from the request"
+        );
+    }
+
+    /// Two rows in one worktree: the id names one of them and nothing says
+    /// which, so neither takes it and it is counted elsewhere, as before.
+    #[test]
+    fn a_hook_ask_with_a_session_id_lands_on_no_row_when_the_cwd_holds_two() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+        use crate::models::Session;
+
+        let cwd = "/work/claude-shared";
+        let mut state = state_with_session_at(cwd, Some("tmux_one"));
+        let mut other = Session::new("two".into(), cwd.into());
+        other.tmux_session_name = Some("tmux_two".into());
+        state.sessions.workspaces[0].add_session(other);
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-hook".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert("claude-session-id".into(), vec![chip.clone()]);
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-hook".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        for session in &state.sessions.workspaces[0].sessions {
+            assert!(session.live_attention.is_empty(), "a shared worktree guesses no row");
+        }
+        assert_eq!(state.fleet.attention_elsewhere, 1);
+    }
+
+    /// A Codex row learns its thread id at launch, so an id-bearing row that
+    /// is not its own belongs to another thread even alone in the worktree.
+    #[test]
+    fn a_codex_row_without_a_thread_still_refuses_an_id_bearing_row_in_its_cwd() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/codex-unbound";
+        let mut state = state_with_session_at(cwd, Some("tmux_codex"));
+        state.sessions.workspaces[0].sessions[0].agent_type =
+            crate::models::SessionAgentType::Codex;
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-thread".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert("some-thread".into(), vec![chip.clone()]);
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-thread".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        assert!(state.sessions.workspaces[0].sessions[0].live_attention.is_empty());
+        assert_eq!(state.fleet.attention_elsewhere, 1);
+    }
+
     #[test]
     fn a_known_provider_id_never_falls_back_to_another_rows_cwd() {
         use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
