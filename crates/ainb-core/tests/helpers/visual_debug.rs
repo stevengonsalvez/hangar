@@ -95,7 +95,12 @@ pub fn spawn_app_silent(root: &Path) -> Pty {
     // XDG_CONFIG_HOME or XDG_CACHE_HOME, through which the app, or a tmux
     // server it starts, would read their real config.
     cmd.env_clear();
-    for key in ["PATH", "LANG", "LC_ALL", "USER", "LOGNAME"] {
+    // TMPDIR too: without it the app takes /tmp as the temp dir, and on macOS,
+    // where the test's home sits under the per-user TMPDIR, its temp-home
+    // guards would not recognise that home.
+    for key in [
+        "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME",
+    ] {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
