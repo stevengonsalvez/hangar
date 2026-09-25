@@ -214,7 +214,16 @@ fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
         1,
         "a write whose failure no screen reported was counted as written"
     );
-    // Counted, not consumed: the report is still there for the next tick.
+    // Counted once: the update, rollback and exit paths each flush, and the
+    // drop flushes again, so a second flush must not count the same write.
+    assert_eq!(
+        executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a second flush counted the same failed write again"
+    );
     let reports = executor.take_deferred();
-    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports.is_empty(),
+        "the counted report was left on the queue: {reports:?}"
+    );
 }

@@ -1,0 +1,44 @@
+[package]
+name = "ainb-hangar-noise"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hangar peer wire, version 1: frame header, opcode registry, Noise prologue and pairing offer. Pure Rust, no IO, builds for the phone targets."
+categories = ["encoding", "network-programming"]
+keywords = ["ainb", "hangar", "noise", "protocol", "wire"]
+
+[lib]
+name = "ainb_hangar_noise"
+path = "src/lib.rs"
+
+# Kept small on purpose: the daemon, the desktop client and the phone crate all
+# link this, and it must `cargo check` for aarch64-apple-ios,
+# aarch64-apple-ios-sim, x86_64-apple-ios, aarch64-linux-android and
+# x86_64-linux-android. No tokio, no std::net, no C. `snow` arrives with the
+# IK handshake (R1-01), not here.
+[dependencies]
+ainb-hangar-proto = { path = "../ainb-hangar-proto" }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Local lint config, mirroring ainb-hangar-proto (the workspace-level lint
+# groups share a priority with specific lints, which rustc rejects).
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_imports = "warn"
+unused_variables = "warn"
+dead_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+similar_names = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

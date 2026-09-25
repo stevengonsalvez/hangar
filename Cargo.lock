@@ -487,6 +487,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ainb-hangar-noise"
+version = "0.1.0"
+dependencies = [
+ "ainb-hangar-proto",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ainb-hangar-proto"
 version = "0.1.0"
 dependencies = [
