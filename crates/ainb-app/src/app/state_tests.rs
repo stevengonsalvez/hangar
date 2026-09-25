@@ -3301,7 +3301,10 @@ mod tests {
         let cwd = "/work/claude-hook";
         let mut state = state_with_session_at(cwd, Some("tmux_claude"));
         let id = state.sessions.workspaces[0].sessions[0].id;
-        assert_eq!(state.sessions.workspaces[0].sessions[0].provider_session_id, None);
+        assert_eq!(
+            state.sessions.workspaces[0].sessions[0].provider_session_id,
+            None
+        );
         let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-hook".into());
         let mut by_session_id = std::collections::HashMap::new();
         by_session_id.insert("claude-session-id".into(), vec![chip.clone()]);
@@ -3319,7 +3322,11 @@ mod tests {
         state.merge_attention(2_000);
 
         let chips = &state.find_session(id).unwrap().live_attention;
-        assert_eq!(chips.len(), 1, "the only Claude row in the worktree takes the hook's ASK");
+        assert_eq!(
+            chips.len(),
+            1,
+            "the only Claude row in the worktree takes the hook's ASK"
+        );
         assert_eq!(chips[0].kind, AttentionKind::Ask);
         assert_eq!(
             state.fleet.attention_elsewhere, 0,
@@ -3361,7 +3368,10 @@ mod tests {
         state.merge_attention(2_000);
 
         for session in &state.sessions.workspaces[0].sessions {
-            assert!(session.live_attention.is_empty(), "a shared worktree guesses no row");
+            assert!(
+                session.live_attention.is_empty(),
+                "a shared worktree guesses no row"
+            );
         }
         assert_eq!(state.fleet.attention_elsewhere, 1);
     }
