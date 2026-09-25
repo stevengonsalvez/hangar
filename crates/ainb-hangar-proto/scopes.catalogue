@@ -118,7 +118,7 @@ hangar/daemon_config_get             allow    allow         allow   deny        
 hangar/daemon_config_set             allow    deny          deny    deny        deny
 hangar/agent_create                  allow    allow         allow   deny        deny
 hangar/daemon_config_list            allow    allow         allow   deny        deny
-hangar/connections_list              allow    allow         allow   deny        deny
+hangar/connections_list              allow    allow         deny    deny        deny
 hangar/issue_delete                  allow    allow         allow   deny        deny
 hangar/issue_cancel_active           allow    allow         allow   deny        deny
 hangar/agent_delete                  allow    allow         allow   deny        deny
@@ -186,6 +186,8 @@ terminal/scrollback                  allow    allow         allow   allow       
 terminal/input                       allow    allow         allow   allow       deny
 terminal/floor                       allow    allow         allow   allow       deny
 terminal/resize                      allow    allow         allow   allow       deny
+hangar/issue_create                  allow    allow         allow   deny        deny
+hangar/issue_run                     allow    allow         allow   deny        deny
 #
 event workspace                      allow    allow         allow   deny        deny
 event task_stream                    allow    allow         allow   deny        deny
