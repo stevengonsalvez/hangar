@@ -23,6 +23,9 @@ pub enum SurfaceKind {
     /// inside a TUI or a desktop shell. Its hello names that host separately,
     /// so its own `pid` stays the plugin's and a host is never misnamed.
     Plugin,
+    /// A paired phone on the off-box peer leg (M1). Additive: an older daemon
+    /// decodes it as [`Self::Unknown`].
+    Mobile,
     /// Legacy or unrecognised client which supplied no surface metadata, or a
     /// kind a newer client sends that this build does not know.
     #[serde(other)]
@@ -40,6 +43,7 @@ impl SurfaceKind {
             Self::Cli => "cli",
             Self::Copilot => "copilot",
             Self::Plugin => "plugin",
+            Self::Mobile => "mobile",
             Self::Unknown => "unknown",
         }
     }
@@ -187,6 +191,33 @@ mod tests {
         assert!(
             wire.get("host_surface").is_none(),
             "absent unless a host was verified"
+        );
+    }
+
+    /// M1: the phone kind has a stable name, and an older decoder that lacks
+    /// it reads `unknown` (the `#[serde(other)]` arm) instead of failing.
+    #[test]
+    fn the_mobile_kind_is_named_and_additive() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderKind {
+            Tui,
+            #[serde(other)]
+            Unknown,
+        }
+
+        assert_eq!(
+            serde_json::to_string(&SurfaceKind::Mobile).unwrap(),
+            "\"mobile\""
+        );
+        assert_eq!(SurfaceKind::Mobile.as_str(), "mobile");
+        let back: SurfaceKind = serde_json::from_str("\"mobile\"").unwrap();
+        assert_eq!(back, SurfaceKind::Mobile);
+        let older: OlderKind = serde_json::from_str("\"mobile\"").unwrap();
+        assert_eq!(older, OlderKind::Unknown);
+        assert_ne!(
+            serde_json::from_str::<OlderKind>("\"tui\"").unwrap(),
+            OlderKind::Unknown
         );
     }
 
