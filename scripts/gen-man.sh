@@ -592,8 +592,8 @@ man/cli.md
 .UE
 .SH BUGS
 Report issues at
-.UR https://github.com/stevengonsalvez/agents\-in\-a\-box/issues
-github.com/stevengonsalvez/agents\-in\-a\-box/issues
+.UR https://github.com/stevengonsalvez/hangar/issues
+github.com/stevengonsalvez/hangar/issues
 .UE .
 TAIL
 } > "$OUT"
