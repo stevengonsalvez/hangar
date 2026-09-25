@@ -1,0 +1,20 @@
+[package]
+name = "ainb-term"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Headless terminal emulation for the Hangar daemon's terminal stream (R2). Pure: no daemon, tmux or IO dependencies."
+
+# Not a default member and not a dependency of any shipped crate yet, so
+# release builds (`cargo build --release`, default-members only) never link it.
+# CI still builds and tests it through `--workspace --all-features`.
+
+[lib]
+name = "ainb_term"
+path = "src/lib.rs"
+
+[dependencies]
+wezterm-term = { workspace = true }

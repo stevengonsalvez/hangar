@@ -75,6 +75,19 @@ export const config = {
   async before() {
     const [window] = await browser.getWindowHandles();
     if (window !== undefined) await browser.switchToWindow(window);
+    // On macOS the window the service launches opens occluded: the page reads
+    // `document.visibilityState === "hidden"`, and an occluded WKWebView never
+    // runs requestAnimationFrame, so anything a spec waits on through a frame
+    // (the review journey's in-page redraw timer, the terminal's repaint) never
+    // arrives and the wait times out. Giving the window a frame brings it on
+    // screen within a second; the wait makes that a fact before the spec runs.
+    if (process.platform === "darwin") {
+      await browser.setWindowRect(0, 30, 1280, 800);
+      await browser.waitUntil(() => browser.execute(() => document.visibilityState === "visible"), {
+        timeout: 10_000,
+        timeoutMsg: "the window stayed occluded after it was placed on screen",
+      });
+    }
   },
   onComplete() {
     down();

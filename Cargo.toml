@@ -32,6 +32,7 @@ members = [
     "crates/ainb-hangar-client",
     "crates/ainb-hangar-sandbox",
     "crates/ainb-hangar-daemon",
+    "crates/ainb-term",
     "crates/ainb-acp",
     "crates/ainb-fleet-tools",
     "crates/ainb-plugin-hangar",
@@ -74,6 +75,11 @@ tar = "0.4"
 # Tmux/PTY support
 portable-pty = "0.9"
 vt100 = "0.16"
+# Headless emulator for the R2 terminal stream (crates/ainb-term). The crates.io
+# fork of wezterm's `term` crate, renamed back so code says `wezterm_term`.
+# Upstream publishes no crate; the fork passed spike 2's width table and
+# fixture matrix with zero differences from the spike's git rev.
+wezterm-term = { package = "tattoy-wezterm-term", version = "=0.1.0-fork.5" }
 tui-term = "0.3.4"
 
 # Git operations (vendored-openssl for cross-compilation support)
