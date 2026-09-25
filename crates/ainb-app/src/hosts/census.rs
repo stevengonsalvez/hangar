@@ -15,9 +15,8 @@
 
 use std::collections::BTreeSet;
 
-use ainb_hangar_client::DaemonClient;
-use ainb_hangar_proto::agent_status::RosterStatusRow;
-use ainb_hangar_proto::hosts::{CarrierKind, HostCoverage, HostId};
+use ainb_hangar_proto::agent_status::{RosterStatusResult, RosterStatusRow};
+use ainb_hangar_proto::hosts::{CarrierKind, HostCoverage, HostId, Reachability};
 
 use super::registry::HostRegistry;
 
@@ -155,26 +154,29 @@ pub fn fold<R>(listings: Vec<(HostId, HostListing<R>)>, cap: usize) -> Census<R>
     Census { rows, coverage }
 }
 
-/// Read `host_id`'s roster through `client`, the connection the caller chose
-/// for that host, and record the outcome in `registry`.
+/// File one `fleet/roster_status` read of `host_id` as that host's listing,
+/// and record the outcome in `registry`.
 ///
-/// A failed read makes the host unreachable. So does a reply whose rows name
-/// another host: rows are never filed under a host that did not produce
-/// them, which is how a remote host could otherwise show local sessions.
-pub async fn read_roster(
+/// The census never reads the roster itself: there is one agent status
+/// reader (#1188), and the caller hands its result here, read through the
+/// connection it chose for that host. A failed read makes the host
+/// unreachable. So does a reply whose rows name another host: rows are never
+/// filed under a host that did not produce them, which is how a remote host
+/// could otherwise show local sessions.
+pub fn listing_from_read<E: std::fmt::Display>(
     registry: &mut HostRegistry,
     host_id: &HostId,
-    client: &DaemonClient,
+    read: Result<RosterStatusResult, E>,
     carrier: CarrierKind,
     now_ms: i64,
 ) -> HostListing<RosterStatusRow> {
     let unreachable = |registry: &HostRegistry| HostListing::Unreachable {
         since_ms: match registry.get(host_id).map(|h| h.reachability) {
-            Some(ainb_hangar_proto::hosts::Reachability::Unreachable { since_ms }) => since_ms,
+            Some(Reachability::Unreachable { since_ms }) => since_ms,
             _ => now_ms,
         },
     };
-    match client.fleet_roster_status().await {
+    match read {
         Ok(read) if read.rows.iter().all(|r| r.status.host_id == host_id.as_str()) => {
             registry.reached(host_id, carrier, now_ms);
             HostListing::Fresh {
