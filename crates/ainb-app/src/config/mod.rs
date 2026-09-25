@@ -24,6 +24,7 @@ pub mod registry;
 pub mod renderer_edit;
 pub mod screen_model;
 pub mod session_defaults;
+pub mod session_store_worker;
 pub mod settings_model;
 pub mod ssh_display_names;
 pub mod tunables;

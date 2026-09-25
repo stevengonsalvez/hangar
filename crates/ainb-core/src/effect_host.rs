@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::app::reports::{self, AttachOutcome, AttachedTo, EditorOutcome, ShellCd, ShellOutcome};
 use crate::app::ui_state::UiState;
 use crate::app::{Effect, Intent, TerminalTarget, ToolTerminal};
+use crate::config::session_store_worker::SessionStoreWorker;
 
 /// Carry out one effect for the terminal host and return the reports to
 /// dispatch, in order.
@@ -256,144 +257,39 @@ fn spawn_inbox_mark_all_read() {
     }
 }
 
-/// The one worker that writes the session store. One thread, not one per
-/// write: the writes are a queue, and two of them running at once would race
-/// for the same `sessions.json` lock and land out of order.
-static SESSION_STORE_WRITER: std::sync::Mutex<Option<SessionStoreWriter>> =
-    std::sync::Mutex::new(None);
+/// The one worker that writes the session store, reporting on the deferred
+/// queue.
+static SESSION_STORE_WORKER: std::sync::LazyLock<std::sync::Mutex<SessionStoreWorker>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(SessionStoreWorker::new(deferred().0.clone()))
+    });
 
-/// The session-store worker, as the host holds it.
-struct SessionStoreWriter {
-    /// Where a queued write goes. Dropping it ends the worker's loop.
-    work: std::sync::mpsc::Sender<ainb_app::app::Persist>,
-    /// The worker sends once here when its queue is empty and it is leaving,
-    /// which is what the quit waits on: a `JoinHandle` has no bounded wait.
-    done: std::sync::mpsc::Receiver<()>,
-    handle: std::thread::JoinHandle<()>,
-    /// Writes queued and not yet written, plus any that failed once the quit
-    /// began: what a quit reports as left behind.
-    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// Set when the quit starts waiting. A failure after that has no screen
-    /// left to report on, so it stays in `queued` instead.
-    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+fn session_store_worker() -> std::sync::MutexGuard<'static, SessionStoreWorker> {
+    SESSION_STORE_WORKER.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Hand one session-store write to the worker, starting it on first use
-/// (P6e). A write can reach the hangar daemon and wait out its deadline, and
-/// the tick must not: this returns as soon as the write is queued, and a
-/// failure comes back through the deferred reports.
+/// Hand one session-store write to the worker (P6e). A write can reach the
+/// hangar daemon and wait out its deadline, and the tick must not: this
+/// returns as soon as the write is queued, and a failure comes back through
+/// the deferred reports.
 fn queue_session_store_write(store: ainb_app::app::Persist) {
-    let tx = deferred().0.clone();
-    let store_id = store.store_id();
-    let mut writer = SESSION_STORE_WRITER.lock().unwrap_or_else(|p| p.into_inner());
-    let mut store = store;
-    // Two turns at most: the first send can find a worker that is gone (a
-    // panic inside a write ends the thread and drops the queue), and a dead
-    // slot left in place would fail this write and every write after it. The
-    // second turn is against a worker started here.
-    for attempt in 0..2 {
-        if writer.is_none() {
-            match start_session_store_worker(&tx) {
-                Some(started) => *writer = Some(started),
-                None => return,
-            }
-        }
-        let Some(live) = writer.as_ref() else { return };
-        // Counted before the send, so the worker never sees a write it cannot
-        // subtract.
-        live.queued.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        match live.work.send(store) {
-            Ok(()) => return,
-            Err(error) => {
-                live.queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                // The worker is gone. Clear the slot so the next turn, and
-                // every later write, starts a new one.
-                *writer = None;
-                if attempt == 1 {
-                    let _ = tx.send(reports::persist_failed(
-                        store_id,
-                        &format!("the session store worker is gone: {error}"),
-                    ));
-                    return;
-                }
-                tracing::warn!("the session store worker was gone; starting another");
-                store = error.0;
-            }
-        }
-    }
-}
-
-/// Start the one session-store worker, or report why it did not start.
-fn start_session_store_worker(
-    reports: &std::sync::mpsc::Sender<Intent>,
-) -> Option<SessionStoreWriter> {
-    let (work_tx, work_rx) = std::sync::mpsc::channel::<ainb_app::app::Persist>();
-    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-    let reports_tx = reports.clone();
-    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = std::sync::Arc::clone(&queued);
-    let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let quitting = std::sync::Arc::clone(&closing);
-    match std::thread::Builder::new()
-        .name("ainb-session-store-write".into())
-        .spawn(move || {
-            // In order, one at a time, until the sender is dropped on exit.
-            for store in work_rx {
-                if let Err(error) = crate::config::persist::write(&store) {
-                    if quitting.load(std::sync::atomic::Ordering::SeqCst) {
-                        continue;
-                    }
-                    let _ = reports_tx.send(reports::persist_failed(store.store_id(), &error));
-                }
-                counted.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            // The queue is empty and the worker is leaving: a quit that is
-            // waiting can stop waiting.
-            let _ = done_tx.send(());
-        }) {
-        Ok(handle) => Some(SessionStoreWriter {
-            work: work_tx,
-            done: done_rx,
-            handle,
-            queued,
-            closing,
-        }),
-        Err(error) => {
-            let _ = reports.send(reports::persist_failed(
-                "session_store",
-                &format!("the worker did not start: {error}"),
-            ));
-            None
-        }
+    if let Some(report) = session_store_worker().queue(store) {
+        let _ = deferred().0.send(report);
     }
 }
 
 /// Leave the session-store worker's slot holding a sender nothing reads, as a
 /// worker that panicked inside a write leaves it. The next queued write has to
 /// notice and start another worker.
-///
-/// The live worker is drained and let go first, so the writes queued before
-/// this and the writes queued after it never run at the same time: the test
-/// reading the store afterwards is reading one order, not a race.
 #[cfg(feature = "test-support")]
 pub fn break_the_session_store_worker_for_tests() {
-    finish_session_store_writes(std::time::Duration::from_secs(5));
-    let (dead_work, unread) = std::sync::mpsc::channel();
-    drop(unread);
-    let (never, done) = std::sync::mpsc::channel();
-    drop(never);
-    *SESSION_STORE_WRITER.lock().unwrap_or_else(|p| p.into_inner()) = Some(SessionStoreWriter {
-        work: dead_work,
-        done,
-        handle: std::thread::spawn(|| {}),
-        queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        closing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    });
+    let inbox = deferred().1.lock().unwrap_or_else(|p| p.into_inner());
+    session_store_worker().break_for_tests(&inbox);
 }
 
 /// Wait for every queued session-store write to land, up to `within` for all
-/// of them together, and answer with the number still unwritten: queued past
-/// the bound, or failed while the quit waited, when no screen is left to say so.
+/// of them together, and answer with the number not written: queued past the
+/// bound, or failed with no loop left to report it.
 ///
 /// The host calls this on its way out, after the terminal is back: a quit
 /// while a write is in flight would otherwise drop it, and the operator's last
@@ -402,27 +298,8 @@ pub fn break_the_session_store_worker_for_tests() {
 /// and a quit that waited that out per write would look like a hang. Safe to
 /// call when no write ever ran.
 pub fn finish_session_store_writes(within: std::time::Duration) -> usize {
-    let taken = SESSION_STORE_WRITER.lock().unwrap_or_else(|p| p.into_inner()).take();
-    let Some(writer) = taken else {
-        return 0;
-    };
-    let SessionStoreWriter {
-        work,
-        done,
-        handle,
-        queued,
-        closing,
-    } = writer;
-    closing.store(true, std::sync::atomic::Ordering::SeqCst);
-    // The worker's loop ends when the last sender goes, and only then does it
-    // say it is done.
-    drop(work);
-    // Past the bound the writes that are left are left: the worker is blocked
-    // on a lock or a daemon, and the quit does not wait on it.
-    if done.recv_timeout(within).is_ok() {
-        let _ = handle.join();
-    }
-    queued.load(std::sync::atomic::Ordering::SeqCst)
+    let inbox = deferred().1.lock().unwrap_or_else(|p| p.into_inner());
+    session_store_worker().finish(within, &inbox)
 }
 
 /// The system clipboard's text as a bracketed paste would deliver it.
