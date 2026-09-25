@@ -34,16 +34,21 @@ pub fn spawn_app_visual(root: &Path) -> Pty {
     #[cfg(feature = "visual-debug")]
     {
         // Open in separate terminal window (macOS), against the same isolated
-        // home as the PTY copy below.
+        // home as the PTY copy below, and on a tmux server of its own: the
+        // Terminal shell's TMUX, TMUX_TMPDIR and XDG_CONFIG_HOME would
+        // otherwise point it at the developer's real server and tmux.conf.
+        let visual_tmux = root.join("tmux-visual");
+        std::fs::create_dir_all(&visual_tmux).expect("create visual tmux dir");
         let script = format!(
             r#"
             tell application "Terminal"
-                do script "env HOME={home} AINB_HOME={home} AINB_HANGAR_HOME={hangar} {bin}"
+                do script "env -u TMUX -u XDG_CONFIG_HOME HOME={home} AINB_HOME={home} AINB_HANGAR_HOME={hangar} TMUX_TMPDIR={tmux} {bin}"
                 activate
             end tell
             "#,
             home = seed_home(root).display(),
             hangar = root.join("hangar").display(),
+            tmux = visual_tmux.display(),
             bin = ainb_bin(),
         );
 
@@ -85,11 +90,20 @@ pub fn spawn_app_silent(root: &Path) -> Pty {
 
     let mut cmd = CommandBuilder::new(ainb_bin());
     cmd.cwd(root);
+    // Only what a terminal session needs from the developer's environment.
+    // Nothing else reaches the app: not their AINB_* settings, and not
+    // XDG_CONFIG_HOME or XDG_CACHE_HOME, through which the app, or a tmux
+    // server it starts, would read their real config.
+    cmd.env_clear();
+    for key in ["PATH", "LANG", "LC_ALL", "USER", "LOGNAME"] {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.env("HOME", &home);
     cmd.env("AINB_HOME", &home);
     cmd.env("AINB_HANGAR_HOME", root.join("hangar"));
     cmd.env("TMUX_TMPDIR", root.join("tmux"));
-    cmd.env_remove("TMUX");
     cmd.env("TERM", "xterm-256color");
     cmd.env("RUST_LOG", "error");
     cmd.env("NO_COLOR", "1");
