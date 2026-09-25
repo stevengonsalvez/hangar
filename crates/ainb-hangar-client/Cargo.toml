@@ -30,10 +30,19 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # Logs a hello whose host id is malformed or changed under one socket (#1066).
 tracing = { workspace = true }
+# The peer wire (R1-09): the pairing offer's `Endpoint`, and later the Noise
+# session. Pure Rust, no IO.
+ainb-hangar-noise = { path = "../ainb-hangar-noise" }
+# Pairing secrets (the device's static key and token) in the OS keychain.
+ainb-hangar-secrets = { path = "../ainb-hangar-secrets" }
+# The `peers.json` key encoding, the same base64url as the pairing offer.
+base64 = "0.22"
 
 [dev-dependencies]
 # The fake-socket tests bind a `UnixListener` in a temporary directory.
 tempfile = { workspace = true }
+# The in-memory keychain double, so pairing tests never touch the real one.
+ainb-hangar-secrets = { path = "../ainb-hangar-secrets", features = ["test-backend"] }
 
 [lints]
 workspace = true
