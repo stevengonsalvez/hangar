@@ -139,6 +139,21 @@ fn seed_home(root: &Path) -> PathBuf {
         r#"{"agents":[],"hook_script":"","prompt_dismissed":true}"#,
     )
     .expect("seed install.json");
+    // The TUI installs the daily release checker on start unless it finds one,
+    // and installing runs `launchctl` or `systemctl --user` against the REAL
+    // user's service manager: a temp HOME scopes neither. These are the files
+    // `update::schedule_is_enabled` looks for, so the install is skipped and
+    // nothing else about the start changes. (`AINB_DISABLE_PLUGINS` would skip
+    // it too, but also the hangar daemon, which slows the New Session dialog
+    // to seconds.)
+    for marker in [
+        "Library/LaunchAgents/com.agentsinabox.release-check.plist",
+        ".config/systemd/user/com.agentsinabox.release-check.timer",
+    ] {
+        let path = home.join(marker);
+        std::fs::create_dir_all(path.parent().expect("marker dir")).expect("create marker dir");
+        std::fs::write(&path, "").expect("seed release-check marker");
+    }
     home
 }
 
