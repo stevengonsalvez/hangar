@@ -270,8 +270,12 @@ struct SessionStoreWriter {
     /// which is what the quit waits on: a `JoinHandle` has no bounded wait.
     done: std::sync::mpsc::Receiver<()>,
     handle: std::thread::JoinHandle<()>,
-    /// Writes queued and not yet written, for a timed-out quit to report.
+    /// Writes queued and not yet written, plus any that failed once the quit
+    /// began: what a quit reports as left behind.
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Set when the quit starts waiting. A failure after that has no screen
+    /// left to report on, so it stays in `queued` instead.
+    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Hand one session-store write to the worker, starting it on first use
@@ -328,12 +332,17 @@ fn start_session_store_worker(
     let reports_tx = reports.clone();
     let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = std::sync::Arc::clone(&queued);
+    let closing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quitting = std::sync::Arc::clone(&closing);
     match std::thread::Builder::new()
         .name("ainb-session-store-write".into())
         .spawn(move || {
             // In order, one at a time, until the sender is dropped on exit.
             for store in work_rx {
                 if let Err(error) = crate::config::persist::write(&store) {
+                    if quitting.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
                     let _ = reports_tx.send(reports::persist_failed(store.store_id(), &error));
                 }
                 counted.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -347,6 +356,7 @@ fn start_session_store_worker(
             done: done_rx,
             handle,
             queued,
+            closing,
         }),
         Err(error) => {
             let _ = reports.send(reports::persist_failed(
@@ -377,11 +387,13 @@ pub fn break_the_session_store_worker_for_tests() {
         done,
         handle: std::thread::spawn(|| {}),
         queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        closing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
 }
 
 /// Wait for every queued session-store write to land, up to `within` for all
-/// of them together, and answer with the number still unwritten.
+/// of them together, and answer with the number still unwritten: queued past
+/// the bound, or failed while the quit waited, when no screen is left to say so.
 ///
 /// The host calls this on its way out, after the terminal is back: a quit
 /// while a write is in flight would otherwise drop it, and the operator's last
@@ -399,19 +411,18 @@ pub fn finish_session_store_writes(within: std::time::Duration) -> usize {
         done,
         handle,
         queued,
+        closing,
     } = writer;
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
     // The worker's loop ends when the last sender goes, and only then does it
     // say it is done.
     drop(work);
-    match done.recv_timeout(within) {
-        Ok(()) => {
-            let _ = handle.join();
-            0
-        }
-        // Past the bound the writes that are left are left: the worker is
-        // blocked on a lock or a daemon, and the quit does not wait on it.
-        Err(_) => queued.load(std::sync::atomic::Ordering::SeqCst),
+    // Past the bound the writes that are left are left: the worker is blocked
+    // on a lock or a daemon, and the quit does not wait on it.
+    if done.recv_timeout(within).is_ok() {
+        let _ = handle.join();
     }
+    queued.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The system clipboard's text as a bracketed paste would deliver it.
