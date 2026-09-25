@@ -8,9 +8,7 @@
 //! back as report intents.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use ainb_app::Intent;
@@ -18,6 +16,7 @@ use ainb_app::app::reports::{
     self, AttachOutcome, AttachedTo, DaemonActionReport, EditorOutcome, ShellOutcome,
 };
 use ainb_app::app::{Effect, TerminalTarget, ToolTerminal};
+use ainb_app::config::session_store_worker::SessionStoreWorker;
 
 use crate::host::Executor;
 use crate::terminal::{TabTarget, Terminals};
@@ -42,22 +41,9 @@ pub struct DesktopExecutor {
     terminals: Option<Terminals>,
     deferred_tx: mpsc::Sender<Intent>,
     deferred_rx: mpsc::Receiver<Intent>,
-    /// The one worker that writes the session store. One thread, not one per
-    /// write: the writes are a queue, and two at once would race for the same
-    /// `sessions.json` lock.
-    session_store_writer: Option<SessionStoreWriter>,
-}
-
-/// The session-store worker, as the executor holds it.
-struct SessionStoreWriter {
-    /// Where a queued write goes. Dropping it ends the worker's loop.
-    work: mpsc::Sender<ainb_app::app::Persist>,
-    /// The worker sends once here when its queue is empty and it is leaving,
-    /// which is what a flush waits on: a `JoinHandle` has no bounded wait.
-    done: mpsc::Receiver<()>,
-    handle: thread::JoinHandle<()>,
-    /// Writes queued and not yet written, for a timed-out flush to report.
-    queued: Arc<AtomicUsize>,
+    /// The one worker that writes the session store, reporting on
+    /// `deferred_tx`.
+    session_store: SessionStoreWorker,
 }
 
 impl DesktopExecutor {
@@ -69,146 +55,37 @@ impl DesktopExecutor {
         Self {
             ainb,
             terminals: None,
+            session_store: SessionStoreWorker::new(deferred_tx.clone()),
             deferred_tx,
             deferred_rx,
-            session_store_writer: None,
         }
     }
 
-    /// Hand one session-store write to the worker, starting it on first use
-    /// (P6e). A write can reach the hangar daemon and wait out its deadline,
-    /// and the tick must not: this returns as soon as the write is queued,
-    /// and a failure comes back through the deferred reports.
+    /// Hand one session-store write to the worker (P6e). A write can reach
+    /// the hangar daemon and wait out its deadline, and the tick must not:
+    /// this returns as soon as the write is queued, and a failure comes back
+    /// through the deferred reports.
     fn queue_session_store_write(&mut self, store: ainb_app::app::Persist) -> Vec<Intent> {
-        let store_id = store.store_id();
-        let mut store = store;
-        // Two turns at most: the first send can find a worker that is gone (a
-        // panic inside a write ends the thread and drops the queue), and a
-        // dead slot left in place would fail this write and every write after
-        // it. The second turn is against a worker started here.
-        for attempt in 0..2 {
-            if let Some(started) = self.start_session_store_writer(store_id) {
-                return started;
-            }
-            let Some(live) = self.session_store_writer.as_ref() else {
-                return Vec::new();
-            };
-            // Counted before the send, so the worker never sees a write it
-            // cannot subtract.
-            live.queued.fetch_add(1, Ordering::SeqCst);
-            match live.work.send(store) {
-                Ok(()) => return Vec::new(),
-                Err(error) => {
-                    live.queued.fetch_sub(1, Ordering::SeqCst);
-                    // The worker is gone. Clear the slot so the next turn, and
-                    // every later write, starts a new one.
-                    self.session_store_writer = None;
-                    if attempt == 1 {
-                        return vec![reports::persist_failed(
-                            store_id,
-                            &format!("the session store worker is gone: {error}"),
-                        )];
-                    }
-                    tracing::warn!("the session store worker was gone; starting another");
-                    store = error.0;
-                }
-            }
-        }
-        Vec::new()
-    }
-
-    /// Start the worker when there is none. `Some(reports)` is the failure to
-    /// hand back: the worker could not start, so this write never will.
-    fn start_session_store_writer(&mut self, store_id: &'static str) -> Option<Vec<Intent>> {
-        if self.session_store_writer.is_none() {
-            let (work_tx, work_rx) = mpsc::channel::<ainb_app::app::Persist>();
-            let (done_tx, done_rx) = mpsc::channel::<()>();
-            let reports_tx = self.deferred_tx.clone();
-            let queued = Arc::new(AtomicUsize::new(0));
-            let counted = Arc::clone(&queued);
-            match thread::Builder::new().name("ainb-desktop-session-store-write".into()).spawn(
-                move || {
-                    // In order, one at a time, until the sender is dropped.
-                    for store in work_rx {
-                        if let Err(error) = ainb_app::config::persist::write(&store) {
-                            let _ =
-                                reports_tx.send(reports::persist_failed(store.store_id(), &error));
-                        }
-                        counted.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    // The queue is empty and the worker is leaving: a flush
-                    // that is waiting can stop waiting.
-                    let _ = done_tx.send(());
-                },
-            ) {
-                Ok(handle) => {
-                    self.session_store_writer = Some(SessionStoreWriter {
-                        work: work_tx,
-                        done: done_rx,
-                        handle,
-                        queued,
-                    });
-                }
-                Err(error) => {
-                    return Some(vec![reports::persist_failed(
-                        store_id,
-                        &format!("the worker did not start: {error}"),
-                    )]);
-                }
-            }
-        }
-        None
+        self.session_store.queue(store).into_iter().collect()
     }
 
     /// Leave the worker's slot holding a sender nothing reads, as a worker
     /// that panicked inside a write leaves it. The next queued write has to
     /// notice and start another worker.
-    ///
-    /// The live worker is drained and let go first, so the writes queued
-    /// before this and the writes queued after it never run at the same time.
     #[doc(hidden)]
     pub fn break_session_store_worker_for_tests(&mut self) {
-        self.flush_session_store_writes(Duration::from_secs(5));
-        let (dead_work, unread) = mpsc::channel();
-        drop(unread);
-        let (never, done) = mpsc::channel();
-        drop(never);
-        self.session_store_writer = Some(SessionStoreWriter {
-            work: dead_work,
-            done,
-            handle: thread::spawn(|| {}),
-            queued: Arc::new(AtomicUsize::new(0)),
-        });
+        self.session_store.break_for_tests(&self.deferred_rx);
     }
 
     /// Wait for every queued session-store write to land, up to `within` for
-    /// all of them together, and answer with the number still unwritten.
+    /// all of them together, and answer with the number not written: queued
+    /// past the bound, or failed with the report not yet taken.
     ///
     /// The desktop calls this on the paths that end the process: this shell
     /// never unwinds, so nothing here can be left to a destructor. A later
     /// write simply starts the worker again.
     pub fn flush_session_store_writes(&mut self, within: Duration) -> usize {
-        let Some(writer) = self.session_store_writer.take() else {
-            return 0;
-        };
-        let SessionStoreWriter {
-            work,
-            done,
-            handle,
-            queued,
-        } = writer;
-        // The worker's loop ends when the last sender goes, and only then does
-        // it say it is done.
-        drop(work);
-        match done.recv_timeout(within) {
-            Ok(()) => {
-                let _ = handle.join();
-                0
-            }
-            // Past the bound the writes that are left are left: the worker is
-            // blocked on a lock or a daemon, and the exit does not wait on it.
-            Err(_) => queued.load(Ordering::SeqCst),
-        }
+        self.session_store.finish(within, &self.deferred_rx)
     }
 
     /// Open terminal tabs on `terminals` for the attaches they can hold.
