@@ -41,7 +41,42 @@ struct App {
     pty: Pty,
     screen: ScreenCapture,
     // Dropped last: the app is gone before its home is deleted.
-    _root: tempfile::TempDir,
+    root: IsolatedRoot,
+}
+
+/// The directory an app runs under, whose `tmux/` holds its own tmux server.
+///
+/// Dropping it kills every session on that server, each by its exact name,
+/// while the socket directory still exists, and only then deletes the
+/// directory: a server whose socket is gone can no longer be reached, and it
+/// and a test's `sleep 600` would linger. The last session takes the server
+/// with it. Held from before the app is spawned, so a failed spawn is covered
+/// too.
+struct IsolatedRoot(tempfile::TempDir);
+
+impl IsolatedRoot {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for IsolatedRoot {
+    fn drop(&mut self) {
+        let dir = self.path().join("tmux");
+        let tmux = |args: &[&str]| {
+            Command::new("tmux")
+                .args(args)
+                .env("TMUX_TMPDIR", &dir)
+                .env_remove("TMUX")
+                .output()
+        };
+        let Ok(listed) = tmux(&["list-sessions", "-F", "#{session_name}"]) else {
+            return;
+        };
+        for name in String::from_utf8_lossy(&listed.stdout).lines() {
+            let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
+        }
+    }
 }
 
 impl App {
@@ -50,10 +85,11 @@ impl App {
     }
 
     fn start_in(root: tempfile::TempDir) -> Self {
+        let root = IsolatedRoot(root);
         let mut app = Self {
             pty: spawn_app(root.path()),
             screen: ScreenCapture::new(ROWS, COLS),
-            _root: root,
+            root,
         };
         app.wait_until("the home screen on the alternate screen", |s| {
             s.screen().alternate_screen() && s.has_text(HOME)
