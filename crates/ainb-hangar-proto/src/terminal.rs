@@ -189,6 +189,9 @@ pub enum FloorAction {
     Release,
     /// Take the floor from its holder.
     Take,
+    /// An action a newer client sent; the daemon refuses it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// `terminal/floor` params (dedupe tier). Result: [`FloorState`].
@@ -231,6 +234,9 @@ pub enum TerminalResizeResult {
         /// The session's `window-size` option.
         window_size: String,
     },
+    /// An outcome a newer daemon added.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a stream skipped bytes.
@@ -245,6 +251,10 @@ pub enum DataGapReason {
     Dropped,
     /// The session ended.
     SessionGone,
+    /// A reason a newer daemon added; treated like any gap: wait for the
+    /// next snapshot.
+    #[serde(other)]
+    Unknown,
 }
 
 /// One frame of an attached stream.
@@ -307,6 +317,9 @@ pub enum TerminalFrame {
         /// A machine-readable reason.
         reason: String,
     },
+    /// A frame kind a newer daemon added; a client skips it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Params of the [`crate::methods::TERMINAL_FRAME`] notification.
@@ -484,7 +497,8 @@ mod tests {
         );
     }
 
-    /// Only the four reasons; R2's early `lagged` is not one of them.
+    /// The daemon emits only the four reasons; R2's early `lagged` is not one
+    /// of them, and a reason this build does not know decodes as `Unknown`.
     #[test]
     fn data_gap_reasons_are_the_four() {
         for (reason, token) in [
@@ -495,7 +509,10 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(reason).unwrap(), token);
         }
-        assert!(serde_json::from_value::<DataGapReason>(json!("lagged")).is_err());
+        assert_eq!(
+            serde_json::from_value::<DataGapReason>(json!("lagged")).unwrap(),
+            DataGapReason::Unknown
+        );
     }
 
     #[test]
@@ -545,5 +562,22 @@ mod tests {
         assert_eq!(wire["reason"], "floor_denied");
         assert_eq!(wire["floor_gen"], 7);
         assert_eq!(crate::mutation::MUTATION_REJECTED, -32008);
+    }
+
+    /// Every wire enum here decodes a value a newer build added as `Unknown`.
+    #[test]
+    fn newer_values_decode_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<TerminalFrame>(json!({"kind": "bell"})).unwrap(),
+            TerminalFrame::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<TerminalResizeResult>(json!({"outcome": "queued"})).unwrap(),
+            TerminalResizeResult::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<FloorAction>(json!("yield")).unwrap(),
+            FloorAction::Unknown
+        );
     }
 }
