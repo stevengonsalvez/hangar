@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthChar;
 const CORNFLOWER_BLUE: Color = Color::Rgb(100, 149, 237);
 const GOLD: Color = Color::Rgb(255, 215, 0);
 const SELECTION_GREEN: Color = Color::Rgb(100, 200, 100);
+const PROGRESS_CYAN: Color = Color::Rgb(100, 200, 230);
 const WARNING_ORANGE: Color = Color::Rgb(255, 165, 0);
 const DARK_BG: Color = Color::Rgb(25, 25, 35);
 const LIST_HIGHLIGHT_BG: Color = Color::Rgb(40, 40, 60);
@@ -30,7 +31,7 @@ const ALERT_WAITING_AMBER: Color = Color::Rgb(230, 180, 80);
 const ALERT_PERMISSION_RED: Color = Color::Rgb(220, 90, 90);
 const ALERT_ERROR_RED: Color = Color::Rgb(230, 100, 100);
 
-// Per-agent brand colours for the compact provider icon on the metadata line.
+// Per-agent brand colours for session metadata elsewhere in this component.
 const BRAND_CLAUDE: Color = Color::Rgb(217, 119, 87); // Anthropic clay-orange
 const BRAND_CODEX: Color = Color::Rgb(236, 236, 241); // OpenAI near-white
 const BRAND_COPILOT: Color = Color::Rgb(46, 160, 67); // GitHub green
@@ -676,8 +677,8 @@ impl SessionListComponent {
                     // Tree line characters with subdued color
                     let tree_prefix = if is_last_session { "└─" } else { "├─" };
 
-                    let status_indicator = session.status.indicator();
-                    let lifecycle_label = session_lifecycle_label(state, session);
+                    let lifecycle_label = session_lifecycle_label(state, session, now_ms);
+                    let status_indicator = session_lifecycle_indicator(lifecycle_label);
 
                     // Git changes (controlled by show_git_status config)
                     let changes_text = if state.config.app_config.ui_preferences.show_git_status
@@ -688,38 +689,65 @@ impl SessionListComponent {
                         String::new()
                     };
 
-                    // Session state drives the row colour so active vs stopped
-                    // reads at a glance: running = green, idle = soft white,
-                    // stopped = muted grey, error = red. The selected row is
-                    // always green (reinforced by the ▶ arrow + highlight bar).
+                    // Agent state drives the row colour. A discoverable tmux
+                    // shell alone is `LIVE` (muted), never green `RUN`.
                     let state_color = if is_selected_session {
                         SELECTION_GREEN
                     } else {
-                        match session.status {
-                            SessionStatus::Running => SELECTION_GREEN,
-                            SessionStatus::Idle => SOFT_WHITE,
-                            SessionStatus::Stopped => MUTED_GRAY,
-                            SessionStatus::Error(_) => Color::Rgb(230, 100, 100),
-                        }
+                        session_lifecycle_color(lifecycle_label)
                     };
                     let branch_color = state_color;
-                    let agent_icon = session.agent_type.icon();
-                    let agent_color = agent_brand_color(&session.agent_type);
                     let is_multi_selected = state.sessions.selected_sessions.contains(&session.id);
-                    let title = session_list_name(session);
+                    let normal_title = session_list_name(session);
+                    let title = if state.sessions.show_session_metadata {
+                        session_model_effort_label(state, session)
+                            .unwrap_or_else(|| normal_title.clone())
+                    } else {
+                        normal_title.clone()
+                    };
                     let collision_id = session_collision_id(
                         session,
-                        title_counts.get(&title).copied().unwrap_or_default() > 1,
+                        title_counts.get(&normal_title).copied().unwrap_or_default() > 1,
                     );
 
                     let checkbox = ballot_checkbox(is_multi_selected);
 
                     // The row's live attention chips, already in precedence
                     // order (ASK, WAIT, APPROVE, ERR, DONE). Recomputed each refresh
-                    // from the hook events and the session's own status; empty
-                    // while the agent is generating, because nothing is waiting
-                    // on a human then.
+                    // from hook events and status. Explicit hook evidence beats
+                    // tmux discovery's coarse "process exists" observation.
                     let session_alert = session.live_attention.as_slice();
+                    // The chip whose answer is still in flight, if it is on
+                    // THIS row. Asked per CHIP, so an answer sent on one
+                    // session cannot render every other session's chip as
+                    // SENT, and this one keeps reading SENT after the operator
+                    // has navigated to a different question. It belongs to the
+                    // full chip list: the primary chip moves into the lifecycle
+                    // cell below, but must still read `SENT` until delivered.
+                    let sending =
+                        session_alert.iter().find(|chip| state.fleet.ask_state.is_sending(chip));
+                    let primary_chip =
+                        session_alert.first().filter(|chip| chip.kind.label() == lifecycle_label);
+                    // A primary attention state replaces the lifecycle word,
+                    // but retains its age in that one gutter cell. `ASK 40s`
+                    // is readable at a glance; dropping the chip entirely
+                    // would turn it into the unhelpful bare `ASK`.
+                    let lifecycle_display = primary_chip
+                        .map(|chip| {
+                            format!(
+                                "{} {}",
+                                chip_label(chip, sending),
+                                format_age(now_ms, chip.since_ms)
+                            )
+                        })
+                        .unwrap_or_else(|| lifecycle_label.to_string());
+                    // The primary attention state is the right-hand status
+                    // itself. Do not render `WAIT  WAIT 3m`; retain any
+                    // secondary state (for example `ASK  APPROVE`) after it.
+                    let gutter_alert = primary_chip
+                        .is_some()
+                        .then(|| &session_alert[1..])
+                        .unwrap_or(session_alert);
 
                     // Line one contains only stable session identity. Status lives
                     // in a fixed right gutter so it is readable as a column while
@@ -735,35 +763,49 @@ impl SessionListComponent {
                     // than searched, so future reordering cannot silently
                     // truncate a tree or status decoration instead.
                     let name_span_index = title_spans.len();
+                    let title_with_collision = collision_id
+                        .as_ref()
+                        // Identity precedes the lossy title budget so two
+                        // same-branch rows remain distinguishable even when a
+                        // narrow sidebar must protect an attention/status gutter.
+                        .map(|identity| format!("{identity} · {title}"))
+                        .unwrap_or_else(|| title.clone());
                     title_spans.push(Span::styled(
-                        title.clone(),
-                        Style::default().fg(branch_color).add_modifier(if is_selected_session {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
+                        title_with_collision.clone(),
+                        Style::default()
+                            .fg(if state.sessions.show_session_metadata {
+                                METADATA_GRAY
+                            } else {
+                                branch_color
+                            })
+                            .add_modifier(if is_selected_session {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ));
                     title_spans.push(Span::styled(
                         changes_text,
                         Style::default().fg(WARNING_ORANGE),
                     ));
                     debug_assert_eq!(
-                        title_spans[name_span_index].content, title,
+                        title_spans[name_span_index].content, title_with_collision,
                         "name_span_index must track the session-name span"
                     );
-                    // The chip whose answer is still in flight, if it is on
-                    // THIS row. Asked per CHIP, so an answer sent on one
-                    // session cannot render every other session's chip as
-                    // SENT, and this one keeps reading SENT after the operator
-                    // has navigated to a different question.
-                    let sending =
-                        session_alert.iter().find(|chip| state.fleet.ask_state.is_sending(chip));
                     push_status_gutter(
                         &mut title_spans,
                         status_indicator,
-                        lifecycle_label,
-                        Style::default().fg(state_color),
-                        session_alert,
+                        &lifecycle_display,
+                        Style::default().fg(
+                            if primary_chip.is_some_and(|chip| {
+                                sending.is_some_and(|target| std::ptr::eq(target, chip))
+                            }) {
+                                GOLD
+                            } else {
+                                session_lifecycle_color(lifecycle_label)
+                            },
+                        ),
+                        gutter_alert,
                         now_ms,
                         row_width,
                         name_span_index,
@@ -771,33 +813,7 @@ impl SessionListComponent {
                     );
                     let title_line = Line::from(title_spans);
 
-                    // Keep model/effort visible for every row without making
-                    // identity compete with provider metadata. It is a separate
-                    // line, aligned underneath the title rather than a pill.
-                    let mut metadata_spans = vec![
-                        empty_badge(),
-                        Span::raw("     "),
-                        Span::styled(agent_icon.to_string(), Style::default().fg(agent_color)),
-                    ];
-                    if let Some(identity) = collision_id {
-                        // Metadata has an independent second-line budget. Put
-                        // collision identity first there so a narrow title can
-                        // still yield to the fixed right status/ASK gutter.
-                        metadata_spans.push(Span::raw(" "));
-                        metadata_spans
-                            .push(Span::styled(identity, Style::default().fg(METADATA_GRAY)));
-                    }
-                    if let Some(metadata) = session_model_effort_label(state, session) {
-                        let prefix_width: usize = metadata_spans.iter().map(Span::width).sum();
-                        metadata_spans.push(Span::raw(" · "));
-                        metadata_spans.push(Span::styled(
-                            truncate_text(&metadata, row_width.saturating_sub(prefix_width + 3)),
-                            Style::default().fg(METADATA_GRAY),
-                        ));
-                    }
-                    let metadata_line = Line::from(metadata_spans);
-
-                    items.push(ListItem::new(vec![title_line, metadata_line]));
+                    items.push(ListItem::new(title_line));
                 }
 
                 // Render workspace shell (single shell per workspace)
@@ -1219,35 +1235,90 @@ fn session_collision_id(session: &Session, has_collision: bool) -> Option<String
     has_collision.then(|| format!("#{}", &session.id.to_string()[..8]))
 }
 
-/// Compact process/turn lifecycle word for the sidebar. Fleet's completed-turn
-/// observation is more precise than local `SessionStatus::Idle`, so it gets a
-/// dedicated `DONE` label rather than being collapsed into normal idle.
-fn session_lifecycle_label(state: &AppState, session: &Session) -> &'static str {
+/// Compact agent-state word for the sidebar.
+///
+/// `SessionStatus::Running` is seeded from tmux discovery, so it means only
+/// that a pane was found. Never paint that as `RUN`: an attachable shell may be
+/// quiet, waiting, or already complete. Explicit hook attention wins, then an
+/// authoritative Fleet lifecycle; a live pane with neither is honestly `LIVE`.
+/// Fleet's completed-turn observation is more precise than local
+/// `SessionStatus::Idle`, so it gets a dedicated `DONE` label while fresh.
+fn session_lifecycle_label(state: &AppState, session: &Session, now_ms: i64) -> &'static str {
+    // A stopped session has no attachable pane. It must never retain an old
+    // chip in its right gutter while refresh is catching up.
+    if matches!(session.status, SessionStatus::Stopped) {
+        return "STOP";
+    }
+    if let Some(chip) = session.live_attention.first() {
+        return chip.kind.label();
+    }
+
+    let fleet_lifecycle = state.fleet.fleet_metadata.get(&session.id);
+    let fleet_is_live = state
+        .fleet
+        .daemon_attention
+        .lock()
+        .map(|daemon| daemon.reachable)
+        .unwrap_or(false);
+    // A daemon heartbeat proves transport only; the lifecycle word must carry
+    // its own fresh transition evidence or it falls back to what is known.
+    let fleet_lifecycle_is_fresh = fleet_lifecycle.is_some_and(|metadata| {
+        AppState::fleet_lifecycle_is_fresh_at(
+            metadata.lifecycle_updated_at,
+            now_ms,
+            state.config.app_config.fleet.healthy_state_stale_ms,
+        )
+    });
+
     if matches!(session.status, SessionStatus::Idle)
         && matches!(
-            state
-                .fleet
-                .fleet_metadata
-                .get(&session.id)
-                .and_then(|metadata| metadata.lifecycle),
+            fleet_lifecycle.and_then(|metadata| metadata.lifecycle),
             Some(ainb_hangar_proto::fleet::LifecycleState::TurnComplete)
         )
-        && state
-            .fleet
-            .daemon_attention
-            .lock()
-            .map(|daemon| daemon.reachable)
-            .unwrap_or(false)
-        && session.live_attention.is_empty()
+        && fleet_is_live
+        && fleet_lifecycle_is_fresh
     {
         return "DONE";
     }
 
     match session.status {
-        SessionStatus::Running => "RUN",
+        SessionStatus::Running => match (fleet_is_live && fleet_lifecycle_is_fresh)
+            .then(|| fleet_lifecycle.and_then(|metadata| metadata.lifecycle))
+            .flatten()
+        {
+            Some(
+                ainb_hangar_proto::fleet::LifecycleState::Starting
+                | ainb_hangar_proto::fleet::LifecycleState::Running,
+            ) => "RUN",
+            _ => "LIVE",
+        },
         SessionStatus::Idle => "IDLE",
         SessionStatus::Stopped => "STOP",
         SessionStatus::Error(_) => "ERR",
+    }
+}
+
+/// One-cell marker for the sidebar's agent state. This is deliberately derived
+/// from the displayed state rather than `SessionStatus::indicator()`: the
+/// latter reports tmux discovery and would paint a green busy dot next to WAIT.
+fn session_lifecycle_indicator(label: &str) -> &'static str {
+    match label {
+        "RUN" => "●",
+        "ERR" => "✗",
+        "STOP" => "\u{ead1}",
+        _ => "○",
+    }
+}
+
+/// Agent-state colour shared by the title and right-hand status word.
+fn session_lifecycle_color(label: &str) -> Color {
+    match label {
+        "RUN" => SELECTION_GREEN,
+        "DONE" => PROGRESS_CYAN,
+        "ASK" | "APPROVE" | "ERR" => ALERT_PERMISSION_RED,
+        "WAIT" => ALERT_WAITING_AMBER,
+        "IDLE" => SOFT_WHITE,
+        _ => MUTED_GRAY,
     }
 }
 
@@ -1467,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_shows_observed_model_and_effort_on_each_session_row() {
+    fn sidebar_toggles_observed_model_and_effort_into_one_line_titles() {
         let mut state = chip_state();
         let first = state.sessions.workspaces[0].sessions[0].id;
         let second = state.sessions.workspaces[0].sessions[1].id;
@@ -1503,17 +1574,23 @@ mod tests {
             "{second_row}"
         );
         assert!(
-            rendered.contains("gpt-5.6-terra / high"),
-            "first row gets a second-line model/effort label: {rendered}"
+            !rendered.contains("gpt-5.6-terra / high"),
+            "normal mode retains session names: {rendered}"
         );
         assert!(
-            rendered.contains("claude-opus-5 / medium"),
-            "second row gets a second-line model/effort label: {rendered}"
+            !rendered.contains("claude-opus-5 / medium"),
+            "normal mode retains session names: {rendered}"
         );
+
+        state.sessions.show_session_metadata = true;
+        let metadata = render_panel(&mut state, 120, 14);
+        assert!(metadata.contains("gpt-5.6-terra / high"), "{metadata}");
+        assert!(metadata.contains("claude-opus-5 / medium"), "{metadata}");
+        assert!(!metadata.contains("ainb/acp-chat"), "{metadata}");
     }
 
     #[test]
-    fn sidebar_keeps_model_effort_on_its_own_line_at_narrow_width() {
+    fn sidebar_metadata_mode_keeps_attention_in_the_fixed_gutter_at_narrow_width() {
         let mut state = chip_state();
         let first = state.sessions.workspaces[0].sessions[0].id;
         state.fleet.fleet_metadata.insert(
@@ -1525,12 +1602,50 @@ mod tests {
             },
         );
 
+        state.sessions.show_session_metadata = true;
         let rendered = render_panel(&mut state, 42, 14);
         assert!(rendered.contains("gpt-5.6-terra / high"), "{rendered}");
         assert!(
             rendered.contains("ASK 40s"),
             "attention survives: {rendered}"
         );
+    }
+
+    #[test]
+    fn selected_ask_keeps_its_red_status_gutter() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let state = chip_state();
+        let mut ui = crate::app::ui_state::UiState::default();
+        ui.sessions_pane.set_layout(Rect::new(0, 0, 100, 16), Rect::new(100, 0, 1, 16));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).expect("terminal");
+        let mut list = SessionListComponent::new();
+        terminal
+            .draw(|frame| list.render(frame, frame.area(), &state, &mut ui))
+            .expect("draw sessions panel");
+        let buffer = terminal.backend().buffer();
+        let ask = (0..buffer.area.height).find_map(|y| {
+            (0..buffer.area.width.saturating_sub(2)).find_map(|x| {
+                (buffer[(x, y)].symbol() == "A"
+                    && buffer[(x + 1, y)].symbol() == "S"
+                    && buffer[(x + 2, y)].symbol() == "K")
+                    .then_some((x, y))
+            })
+        });
+        let (x, y) = ask.expect("selected ASK is painted");
+        assert_eq!(buffer[(x, y)].fg, ALERT_PERMISSION_RED);
+    }
+
+    #[test]
+    fn lifecycle_gutter_uses_distinct_run_and_done_colours() {
+        assert_eq!(session_lifecycle_color("RUN"), SELECTION_GREEN);
+        assert_eq!(session_lifecycle_color("DONE"), PROGRESS_CYAN);
+        assert_ne!(
+            session_lifecycle_color("RUN"),
+            session_lifecycle_color("DONE")
+        );
+        assert_eq!(session_lifecycle_color("WAIT"), ALERT_WAITING_AMBER);
+        assert_eq!(session_lifecycle_color("ASK"), ALERT_PERMISSION_RED);
     }
 
     #[test]
@@ -1541,14 +1656,17 @@ mod tests {
         state.sessions.workspaces[0].sessions[2].status = SessionStatus::Stopped;
         state.sessions.workspaces[0].sessions[3].status =
             SessionStatus::Error("lost transport".into());
+        for session in &mut state.sessions.workspaces[0].sessions {
+            session.live_attention.clear();
+        }
         assert_eq!(
-            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[2]),
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[2], CHIP_NOW),
             "STOP"
         );
 
         let rendered = render_panel(&mut state, 140, 16);
         for (name, lifecycle) in [
-            ("ainb/acp-chat", "RUN"),
+            ("ainb/acp-chat", "LIVE"),
             ("ainb/disk-clean", "IDLE"),
             ("ainb/site-build", "ERR"),
             ("ainb/quiet", "IDLE"),
@@ -1562,6 +1680,35 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_only_calls_a_session_run_with_authoritative_work_evidence() {
+        let mut state = chip_state();
+        let session = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].live_attention.clear();
+        state.sessions.workspaces[0].sessions[0].status = SessionStatus::Running;
+
+        assert_eq!(
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0], CHIP_NOW),
+            "LIVE",
+            "tmux discovery alone is only attachability"
+        );
+
+        state.fleet.fleet_metadata.insert(
+            session,
+            crate::app::state::SessionFleetMetadata {
+                lifecycle: Some(ainb_hangar_proto::fleet::LifecycleState::Running),
+                lifecycle_updated_at: CHIP_NOW,
+                ..Default::default()
+            },
+        );
+        state.fleet.daemon_attention.lock().unwrap().reachable = true;
+        assert_eq!(
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0], CHIP_NOW),
+            "RUN",
+            "authoritative Fleet active-work lifecycle permits RUN"
+        );
+    }
+
+    #[test]
     fn sidebar_uses_fleet_turn_complete_for_done_gutter() {
         let mut state = chip_state();
         let session = state.sessions.workspaces[0].sessions[0].id;
@@ -1571,6 +1718,7 @@ mod tests {
             session,
             crate::app::state::SessionFleetMetadata {
                 lifecycle: Some(ainb_hangar_proto::fleet::LifecycleState::TurnComplete),
+                lifecycle_updated_at: CHIP_NOW,
                 ..Default::default()
             },
         );
@@ -1610,10 +1758,7 @@ mod tests {
             .lines()
             .find(|line| line.contains("ainb/acp-chat"))
             .expect("ask session row");
-        assert!(
-            ask_row.contains("IDLE") && ask_row.contains("ASK"),
-            "{ask_row}"
-        );
+        assert!(ask_row.contains("ASK"), "{ask_row}");
         assert!(!ask_row.contains("DONE"), "{ask_row}");
 
         // A retained snapshot cannot drive lifecycle after daemon reachability
@@ -1627,6 +1772,35 @@ mod tests {
             .expect("unreachable daemon row");
         assert!(row.contains("IDLE"), "{row}");
         assert!(!row.contains("DONE"), "{row}");
+    }
+
+    #[test]
+    fn stale_fleet_running_is_live_not_run_and_stale_completion_is_not_done() {
+        let mut state = chip_state();
+        let session = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].live_attention.clear();
+        state.sessions.workspaces[0].sessions[0].status = SessionStatus::Running;
+        state.fleet.daemon_attention.lock().unwrap().reachable = true;
+        state.fleet.fleet_metadata.insert(
+            session,
+            crate::app::state::SessionFleetMetadata {
+                lifecycle: Some(ainb_hangar_proto::fleet::LifecycleState::Running),
+                lifecycle_updated_at: CHIP_NOW - 5 * 60_000 - 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0], CHIP_NOW),
+            "LIVE"
+        );
+
+        state.sessions.workspaces[0].sessions[0].status = SessionStatus::Idle;
+        state.fleet.fleet_metadata.get_mut(&session).unwrap().lifecycle =
+            Some(ainb_hangar_proto::fleet::LifecycleState::TurnComplete);
+        assert_eq!(
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0], CHIP_NOW),
+            "IDLE"
+        );
     }
 
     #[test]
@@ -1645,13 +1819,13 @@ mod tests {
         );
 
         assert_eq!(
-            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0]),
+            session_lifecycle_label(&state, &state.sessions.workspaces[0].sessions[0], CHIP_NOW),
             "STOP"
         );
     }
 
     #[test]
-    fn metadata_line_click_targets_its_own_session() {
+    fn single_line_session_click_targets_its_own_session() {
         use ratatui::{Terminal, backend::TestBackend};
 
         let state = chip_state();
@@ -1673,16 +1847,20 @@ mod tests {
         );
         assert_eq!(
             state.session_list_row_at_mouse(&ui.sessions_pane, 8, 3),
-            Some(first)
+            Some(SessionListRowTarget::Attachable(
+                AttachableRef::WorkspaceSession {
+                    workspace_idx: 0,
+                    session_idx: 1,
+                }
+            ))
         );
 
-        // When List has scrolled past the one-line workspace header, the two
-        // physical rows of the first session still resolve to the same logical
-        // item before the next session starts.
+        // List row mapping remains one physical row per logical session after
+        // scrolling past the workspace header.
         ui.sessions_pane.set_list_scroll_offset(1);
         assert_eq!(ui.sessions_pane.row_index_at(8, 1), Some(1));
-        assert_eq!(ui.sessions_pane.row_index_at(8, 2), Some(1));
-        assert_eq!(ui.sessions_pane.row_index_at(8, 3), Some(2));
+        assert_eq!(ui.sessions_pane.row_index_at(8, 2), Some(2));
+        assert_eq!(ui.sessions_pane.row_index_at(8, 3), Some(3));
     }
 
     #[test]
@@ -1785,9 +1963,10 @@ mod tests {
     }
 
     /// Chip words are never abbreviated, at any width the panel can be dragged
-    /// to. The session NAME is what gives way.
+    /// to. Removing duplicated lifecycle text keeps ordinary session names
+    /// readable at the narrow default width.
     #[test]
-    fn chip_words_survive_a_width_the_name_does_not() {
+    fn chip_words_and_names_survive_the_narrow_default_width() {
         let mut state = chip_state();
         let rendered = render_panel(&mut state, 42, 16);
         for word in ["ASK 40s", "ERR 9m", "APPROVE 3m", "DONE 1m"] {
@@ -1797,8 +1976,8 @@ mod tests {
             );
         }
         assert!(
-            rendered.contains('\u{2026}'),
-            "the session name is what truncates instead: {rendered}"
+            rendered.contains("ainb/api-stats"),
+            "name stays whole: {rendered}"
         );
     }
 
@@ -1985,6 +2164,7 @@ mod tests {
         let mut state = AppState::new();
         state.sessions.workspaces.clear();
         state.sessions.expand_all_workspaces = true;
+        state.sessions.session_filter = SessionFilter::All;
 
         let mut workspace = Workspace::new("ws".to_string(), "/tmp/ws".into());
         let mut first = Session::new("first".to_string(), "/tmp/ws/first".to_string());
@@ -2000,7 +2180,7 @@ mod tests {
         workspace.add_session(second);
         state.sessions.workspaces.push(workspace);
 
-        let painted = render_panel(&mut state, 24, 8);
+        let painted = render_panel(&mut state, 42, 8);
         assert!(
             painted.contains(&format!("#{first_id}")),
             "painted: {painted}"
