@@ -2580,18 +2580,25 @@ fn issue_link_refuses_a_self_link_and_a_cycle() {
 ///
 /// A real-binary round trip — `issue create` then `issue subscribe` — followed by
 /// a raw `SELECT` on the same `hangar.db` the binary wrote. The row must read
-/// `member|me|manual`, and a SECOND process invocation must still list it, which
+/// `member|bob|manual`, and a SECOND process invocation must still list it, which
 /// is the "persists" half proven across a process boundary rather than asserted.
+///
+/// A second human subscribes, not the local one: the CLI creates as the local
+/// human, who is auto-subscribed as the creator, so a manual subscription has
+/// to come from another actor to be its own row.
 #[test]
 fn issue_subscribe_persists_to_sqlite_and_survives_a_new_process() {
     let tmp = tempfile::tempdir().unwrap();
     let id = create_issue(tmp.path(), "Subscribe proof");
 
-    let (ok, out) = run(tmp.path(), &["hangar", "issue", "subscribe", &id]);
+    let (ok, out) = run(
+        tmp.path(),
+        &["hangar", "issue", "subscribe", &id, "--actor", "member:bob"],
+    );
     assert!(ok, "issue subscribe should exit 0; out={out}");
     assert!(
-        out.contains("member:me") && out.contains("(manual)"),
-        "the refreshed set names the local human with its provenance:\n{out}"
+        out.contains("member:bob") && out.contains("(manual)"),
+        "the refreshed set names the subscriber with its provenance:\n{out}"
     );
 
     // The at-rest proof: read the row the binary wrote, in a FRESH connection.
@@ -2611,7 +2618,11 @@ fn issue_subscribe_persists_to_sqlite_and_survives_a_new_process() {
         .expect("read issue_subscriber")
     });
     assert!(
-        rows.contains(&("member".to_string(), "me".to_string(), "manual".to_string())),
+        rows.contains(&(
+            "member".to_string(),
+            "bob".to_string(),
+            "manual".to_string()
+        )),
         "the manual subscription is at rest in sqlite: {rows:?}"
     );
 
@@ -2619,7 +2630,7 @@ fn issue_subscribe_persists_to_sqlite_and_survives_a_new_process() {
     let (ok, out) = run(tmp.path(), &["hangar", "issue", "subscribers", &id]);
     assert!(ok, "issue subscribers should exit 0; out={out}");
     assert!(
-        out.contains("member:me"),
+        out.contains("member:bob"),
         "still listed after a restart:\n{out}"
     );
 
@@ -2628,20 +2639,40 @@ fn issue_subscribe_persists_to_sqlite_and_survives_a_new_process() {
     assert!(ok, "issue show should exit 0; out={out}");
     assert!(out.contains("Subscribers:"), "the show block:\n{out}");
 
-    // Unsubscribe really removes the row (the CLI's own creator row survives —
-    // it is a DIFFERENT actor, so this also proves the delete is actor-scoped)
+    // Unsubscribe really removes the row (the creator's own row survives — it
+    // is a DIFFERENT actor, so this also proves the delete is actor-scoped)
     // and a second unsubscribe is an idempotent no-op.
-    let (ok, out) = run(tmp.path(), &["hangar", "issue", "unsubscribe", &id]);
+    let (ok, out) = run(
+        tmp.path(),
+        &[
+            "hangar",
+            "issue",
+            "unsubscribe",
+            &id,
+            "--actor",
+            "member:bob",
+        ],
+    );
     assert!(ok, "unsubscribe should exit 0; out={out}");
     assert!(
-        !out.contains("member:me"),
+        !out.contains("member:bob"),
         "the manual subscription is gone:\n{out}"
     );
     assert!(
         out.contains("(creator)"),
         "the creator's own row is untouched:\n{out}"
     );
-    let (ok, _) = run(tmp.path(), &["hangar", "issue", "unsubscribe", &id]);
+    let (ok, _) = run(
+        tmp.path(),
+        &[
+            "hangar",
+            "issue",
+            "unsubscribe",
+            &id,
+            "--actor",
+            "member:bob",
+        ],
+    );
     assert!(ok, "a second unsubscribe is an idempotent no-op");
 }
 
