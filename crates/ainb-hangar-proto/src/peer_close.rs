@@ -4,15 +4,17 @@
 //! condition gets a new code.
 //!
 //! ```text
-//! 1013 over capacity   ──▶ back off retry-after
-//! 4401 unauthenticated ──▶ "host identity changed or wrong route, re-pair"
-//! 4403 revoked/expired ──▶ latch "re-pair", never retry
-//! 4409 incompatible    ──▶ "update one side"
-//! 4429 rate limited    ──▶ back off retry-after
-//! 4503 draining        ──▶ jittered reconnect (also a device rescope)
+//! 1013 over capacity   ──▶ back off retry-after          (retry)
+//! 4401 unauthenticated ──▶ "identity changed, re-pair"    (no retry)
+//! 4403 revoked/expired ──▶ latch "re-pair"                (no retry)
+//! 4409 incompatible    ──▶ "update one side"              (no retry)
+//! 4429 rate limited    ──▶ back off retry-after          (retry)
+//! 4503 draining        ──▶ jittered reconnect, also rescope (retry)
 //! ```
-
-use serde::{Deserialize, Serialize};
+//!
+//! The wire carries only the number. A code this build does not know maps to
+//! `None` in [`PeerClose::from_code`], and a client treats it as not retryable
+//! until a person looks.
 
 /// Over capacity; the close reason carries `retry-after=<s>`.
 pub const OVER_CAPACITY: u16 = 1013;
@@ -36,8 +38,7 @@ pub const DRAINING: u16 = 4503;
 pub const RETRY_AFTER_PREFIX: &str = "retry-after=";
 
 /// A peer close, by meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerClose {
     /// [`OVER_CAPACITY`].
     OverCapacity,
@@ -93,10 +94,16 @@ impl PeerClose {
 
     /// Whether a client may reconnect on its own after this close.
     ///
-    /// Only [`Self::Revoked`] latches: the device must pair again.
+    /// Only load and lifecycle closes retry: over capacity, rate limited and
+    /// draining. An identity close (4401), a revoke (4403) and a protocol
+    /// conflict (4409) never fix themselves by redialing, so the client stops
+    /// and tells the person what to do.
     #[must_use]
     pub const fn may_retry(self) -> bool {
-        !matches!(self, Self::Revoked)
+        matches!(
+            self,
+            Self::OverCapacity | Self::RateLimited | Self::Draining
+        )
     }
 }
 
@@ -121,9 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn only_a_revoke_latches() {
-        for close in PeerClose::ALL {
-            assert_eq!(close.may_retry(), close != PeerClose::Revoked, "{close:?}");
+    fn identity_revoke_and_conflict_closes_never_retry() {
+        let retry: Vec<u16> =
+            PeerClose::ALL.iter().filter(|c| c.may_retry()).map(|c| c.code()).collect();
+        assert_eq!(retry, vec![1013, 4429, 4503]);
+        for code in [4401, 4403, 4409] {
+            assert!(!PeerClose::from_code(code).unwrap().may_retry(), "{code}");
         }
     }
 
