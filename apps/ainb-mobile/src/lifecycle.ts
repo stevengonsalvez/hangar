@@ -17,7 +17,7 @@ import { useEffect } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import { reconcile } from "./attention/store";
-import type { FleetCursor, HostId, WireClient } from "./wire/types";
+import { PeerCloseError, type FleetCursor, type HostId, type WireClient } from "./wire/types";
 
 interface Live {
   cursor?: number;
@@ -39,6 +39,12 @@ let foreground = true;
 
 /** Close codes worth redialing through (T9). Undefined is a plain network drop. */
 const RETRYABLE = new Set([1013, 4429, 4503]);
+
+/** Whether a dial failure may be redialled: a network error yes, a peer close only for the three retryable codes. */
+function mayRedial(e: unknown): boolean {
+  if (e instanceof PeerCloseError) return e.code === undefined || RETRYABLE.has(e.code);
+  return true;
+}
 const HOOK_BUDGET_MS = 500;
 const RETRY_AFTER_PREFIX = "retry-after=";
 
@@ -121,7 +127,9 @@ function scheduleRedial(wire: WireClient, hostId: HostId) {
   l.timer = setTimeout(() => {
     l.timer = undefined;
     if (!foreground) return;
-    connectHost(wire, hostId).catch(() => {
+    connectHost(wire, hostId).catch((e: unknown) => {
+      if (!mayRedial(e)) return; // 4401, 4403, 4409 or an unknown code: the row shows the latch, no more dials
+      if (e instanceof PeerCloseError) l.retryAfter = retryAfterSecs(e.reason) ?? l.retryAfter;
       l.attempts += 1;
       scheduleRedial(wire, hostId); // the host's retry-after still applies
     });
@@ -135,8 +143,8 @@ export async function connectAll(wire: WireClient) {
     hosts
       .filter((h) => !h.repair && !h.notice)
       .map((h) =>
-        connectHost(wire, h.hostId).catch(() => {
-          if (foreground) scheduleRedial(wire, h.hostId);
+        connectHost(wire, h.hostId).catch((e: unknown) => {
+          if (foreground && mayRedial(e)) scheduleRedial(wire, h.hostId);
         }),
       ),
   );

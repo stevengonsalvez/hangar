@@ -145,7 +145,7 @@ test("frames that arrive before the attach reply is recorded are replayed, not l
 
 test("an early-frame overflow discards the buffer and re-attaches once for a fresh snapshot", async () => {
   fake.snapshotBeforeReply = true;
-  fake.floodBytesAfterSnapshot = 300 * 1024; // past the 256 KiB early cap, all before the attach reply lands
+  fake.floodBytesAfterSnapshot = 2 * 1024 * 1024 + 1024; // past the 2 MiB window, all before the attach reply lands
   const screen = await openTerminal();
   // both attaches overflow: one retry, then the terminal says why instead of spinning
   await waitFor(() => expect(fake.attaches).toBe(2), { timeout: 5000 });
@@ -169,4 +169,20 @@ test("an attach that throws leaves nothing buffered and the next attach starts c
   await act(() => onAppState(fake, "background"));
   await act(() => onAppState(fake, "active")); // afterForeground re-attaches
   await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT), { timeout: 5000 });
+});
+
+test("early frames of another stream never count against ours", async () => {
+  fake.snapshotBeforeReply = true;
+  const screen = await openTerminal();
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT));
+  // a stray stream's frames while a fresh attach is pending
+  await act(() => onAppState(fake, "background"));
+  const off = fake.onEvent(() => undefined);
+  await act(async () => {
+    fake.frame(99, { kind: "output", data: new Uint8Array(3 * 1024 * 1024) }); // unknown stream, huge
+  });
+  off();
+  await act(() => onAppState(fake, "active"));
+  await waitFor(() => expect(sinkCalls().slice(-3)).toEqual(SNAPSHOT), { timeout: 5000 });
+  expect(screen.queryByText(/snapshot too large/)).toBeNull();
 });

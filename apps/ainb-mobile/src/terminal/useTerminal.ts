@@ -25,8 +25,8 @@ export interface TerminalState {
 
 /** Keystrokes inside one frame go out as one receipt-tier mutation (M1-plan R8). */
 const INPUT_BATCH_MS = 16;
-/** Early frames held before the attach reply: one snapshot window's worth (T15 chunks are 48 KiB). */
-const EARLY_BUFFER_BYTES = 256 * 1024;
+/** Early frames held before the attach reply: the flow-control window (T15 `WINDOW_BYTES`, 2 MiB). */
+const EARLY_BUFFER_BYTES = 2 * 1024 * 1024;
 
 function frameBytes(frame: TerminalFrame): number {
   return frame.kind === "snapshot_chunk" || frame.kind === "output" ? frame.data.length : 0;
@@ -46,11 +46,7 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
    * would lose the snapshot head, so an overflow discards the lot and asks for
    * a fresh snapshot by re-attaching once the pending attach settles.
    */
-  const early = useRef<{ frames: { streamId: number; seq: number; frame: TerminalFrame }[]; bytes: number; overflowed: boolean }>({
-    frames: [],
-    bytes: 0,
-    overflowed: false,
-  });
+  const early = useRef<Map<number, { frames: { seq: number; frame: TerminalFrame }[]; bytes: number; overflowed: boolean }>>(new Map());
   const inputTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [state, setState] = useState<TerminalState>({ canType: false, typing: false, floor: { floorGen: 0 }, nativeClients: 0 });
   const stateRef = useRef(state);
@@ -119,7 +115,7 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
   );
 
   const resetEarly = () => {
-    early.current = { frames: [], bytes: 0, overflowed: false };
+    early.current = new Map();
   };
   /** One fresh snapshot per overflow; a second overflow in a row is reported, not retried forever. */
   const overflowRetried = useRef(false);
@@ -141,7 +137,8 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
       resetEarly(); // nothing held for a stream that never came
       throw e;
     }
-    const held = early.current;
+    // Only this stream's frames count; another stream's early frames are dropped with the map.
+    const held = early.current.get(at.streamId) ?? { frames: [], bytes: 0, overflowed: false };
     resetEarly();
     if (held.overflowed) {
       // The head of the snapshot is gone: start over with a fresh one, once.
@@ -154,7 +151,7 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
       return attach();
     }
     overflowRetried.current = false;
-    for (const q of held.frames) if (q.streamId === at.streamId) onFrame(q.seq, q.frame);
+    for (const q of held.frames) onFrame(q.seq, q.frame);
     await resizeIfHolder(at.floor);
   }, [wire, hostId, sessionKey, resizeIfHolder, detach]);
 
@@ -175,8 +172,12 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
         if (ev.kind !== "terminal_frame" || ev.hostId !== hostId) return;
         if (ev.streamId === stream.current) onFrame(ev.seq, ev.frame);
         else if (stream.current === undefined) {
-          // Attach in flight: keep the frame until the reply names our stream.
-          const e = early.current;
+          // Attach in flight: keep the frame, per stream, until the reply names ours.
+          let e = early.current.get(ev.streamId);
+          if (!e) {
+            e = { frames: [], bytes: 0, overflowed: false };
+            early.current.set(ev.streamId, e);
+          }
           if (e.overflowed) return;
           e.bytes += frameBytes(ev.frame);
           if (e.bytes > EARLY_BUFFER_BYTES) {
@@ -184,7 +185,7 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
             e.overflowed = true; // the attach continuation re-attaches for a fresh snapshot
             return;
           }
-          e.frames.push({ streamId: ev.streamId, seq: ev.seq, frame: ev.frame });
+          e.frames.push({ seq: ev.seq, frame: ev.frame });
         }
       },
       [hostId, onFrame],
