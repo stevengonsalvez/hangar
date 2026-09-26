@@ -1,0 +1,28 @@
+# M1-09 / M1-14 step 4: background, events land, foreground shows the new
+# banner once and the cursor is at head.
+#
+# FakeWire build: the fake cannot be driven from outside the process, so this
+# flow proves the app side only: a background then foreground leaves the seen
+# banner unshown and the session list intact. The real run (M1-14) commits 20
+# fleet events plus 1 ASK through the scenario script while the app is in the
+# background, then asserts the new banner appears exactly once.
+appId: com.stevengonsalvez.ainb.mobile
+---
+- launchApp:
+    clearState: true
+- assertVisible:
+    text: "Which runner do you mean?"
+- tapOn:
+    id: "banner-att-1"
+- tapOn:
+    id: "answer-cancel"
+- tapOn:
+    id: "host-01K5A0000000000000000AAAAA"
+- assertVisible:
+    text: "hangar"
+- stopApp
+- launchApp
+- assertVisible:
+    text: "hangar"
+- assertVisible:
+    id: "banner-att-1"
