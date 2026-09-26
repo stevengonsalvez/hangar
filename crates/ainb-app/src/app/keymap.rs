@@ -553,6 +553,20 @@ pub fn command_contexts(state: &AppState) -> Vec<KeyContext> {
     contexts.into_iter().map(|(context, _)| context).collect()
 }
 
+/// Whether the row `id` names, bound in `ctx`, runs by name now. A host-authored
+/// row (a host's reports, a plugin action naming its plugin) runs from any
+/// screen. Every other row passes the gate a key passes: it runs only while its
+/// context is active and no overlay covers it, so a click resolved on one screen
+/// cannot act after the user has left it or opened a dialog over it. The
+/// reducer drops a name that fails this, and a host asks it first so the
+/// surface that sent the name hears the refusal rather than silence (#121).
+#[must_use]
+pub fn command_on_screen(state: &AppState, id: &CommandId, ctx: &KeyContext) -> bool {
+    let host_authored = crate::app::reports::ids::ALL.contains(&id.as_str())
+        || crate::app::plugin_action::ids::ALL.contains(&id.as_str());
+    host_authored || command_contexts(state).contains(ctx)
+}
+
 /// Mirror host dispatch precedence without allowing renderer state into `AppState`.
 #[must_use]
 pub fn active_contexts(state: &AppState) -> Vec<KeyContext> {
