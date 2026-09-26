@@ -227,7 +227,10 @@ jobs:
   # ──────────────────────────────────────────────────────────────────────────
   tmux-lanes:
     name: tmux lanes (ubuntu-latest)
-    timeout-minutes: 20
+    # 40, not 20: the terminal feed step builds the daemon with
+    # `terminal-stream`, which pulls in the wezterm emulator, and a cold
+    # cache must not read as a feed regression.
+    timeout-minutes: 40
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
