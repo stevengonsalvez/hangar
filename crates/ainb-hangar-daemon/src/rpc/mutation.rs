@@ -156,6 +156,9 @@ pub fn principal_of(caller: &Caller) -> String {
     match caller {
         Caller::Operator => LOCAL_PRINCIPAL.to_string(),
         Caller::Pal { scope_key } => format!("pal:{scope_key}"),
+        // `LedgerKey::device`'s spelling: the id comes from the token row, so
+        // two devices never share an op-id namespace.
+        Caller::Device { device_id, .. } => format!("device:{device_id}"),
     }
 }
 
@@ -700,6 +703,26 @@ mod tests {
                 scope_key: "channel:01J0".to_string()
             }),
             "pal:channel:01J0"
+        );
+    }
+
+    /// A device's ledger principal is `LedgerKey::device`'s spelling, from the
+    /// id its credential names, so two devices never share an op-id namespace
+    /// with each other or with the operator.
+    #[test]
+    fn a_device_is_its_own_principal() {
+        let device = |device_id: &str| Caller::Device {
+            device_id: device_id.to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        assert_eq!(principal_of(&device("01J0A")), "device:01J0A");
+        assert_eq!(
+            principal_of(&device("01J0A")),
+            ainb_hangar_store::repo::mutation_ledger::LedgerKey::device("01J0A", "op").principal
+        );
+        assert_ne!(
+            principal_of(&device("01J0A")),
+            principal_of(&device("01J0B"))
         );
     }
 
