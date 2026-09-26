@@ -1701,7 +1701,9 @@ async fn handle(
         // `attention/subscribe` acks with the current OPEN snapshot; the live
         // fleet-wide forwarder is the stream side (see `serve_conn`).
         methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req).await,
-        methods::ATTENTION_ANSWER => handle_attention_answer(pool, req, events, connection).await,
+        methods::ATTENTION_ANSWER => {
+            handle_attention_answer(pool, req, events, caller, connection).await
+        }
         methods::ATC_REGISTER => handle_atc_register(pool, req).await,
         methods::ATC_LIST => handle_atc_list(pool).await,
         methods::ATC_RETRY_LIST => handle_atc_retry_list(pool, req).await,
@@ -13203,10 +13205,31 @@ async fn handle_attention_answer(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
     connection: Option<&ConnectionRow>,
 ) -> Result<serde_json::Value, RpcError> {
     let mut params: ainb_hangar_proto::snapshots::AnswerParams =
         parse_params(req, "{ attention_id, answer, answered_by, is_answer? }")?;
+    // The kind-based scope gate (review F2): an approval, or an ask that
+    // resolves a live hook hold, takes `fleet/action` Approve's column
+    // verdict. Refused before anything is claimed.
+    if let Some(row) =
+        ainb_hangar_store::repo::attention::AttentionRepo::get(pool, &params.attention_id)
+            .await
+            .map_err(|e| store_err(&e))?
+    {
+        let resolves_hold = crate::hook_ingress::hold::registry().request_for(&row.id).is_some();
+        let column = crate::answer_scope::column_of(caller);
+        if !crate::answer_scope::answer_allowed(column, row.kind, resolves_hold) {
+            return Err(mutation::rejected(
+                ainb_hangar_proto::mutation::REASON_SCOPE,
+                format!(
+                    "this scope may not answer a {} row (an approval takes fleet/action Approve's verdict)",
+                    row.kind.as_str()
+                ),
+            ));
+        }
+    }
     if let Some(connection) = connection {
         params.answered_by = crate::answer::answered_by(connection);
     }
