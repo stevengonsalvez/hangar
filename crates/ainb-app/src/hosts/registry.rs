@@ -114,13 +114,18 @@ impl HostRegistry {
     /// The key matters: the daemon stamps every row with its minted id, and
     /// [`super::census::listing_from_read`] refuses rows that name another
     /// host, so a local host still keyed `local` would refuse its own rows.
-    pub fn set_local(
-        &mut self,
-        host_id: HostId,
-        now_ms: i64,
-    ) -> Result<&mut HostApp, RegistryError> {
-        if self.hosts.iter().any(|h| h.kind == HostKind::Remote && h.host_id == host_id) {
-            return Err(RegistryError::LocalIsPaired(host_id));
+    ///
+    /// A paired host already known under this id is this machine seen through
+    /// the peer leg (paired before the local daemon named itself). It is
+    /// dropped, and the local host takes the id: a host is never paired with
+    /// itself, and refusing here would leave the local host keyed `local`.
+    pub fn set_local(&mut self, host_id: HostId, now_ms: i64) -> &mut HostApp {
+        if let Some(at) = self
+            .hosts
+            .iter()
+            .position(|h| h.kind == HostKind::Remote && h.host_id == host_id)
+        {
+            self.hosts.remove(at);
         }
         let at = if let Some(at) = self.hosts.iter().position(|h| h.kind == HostKind::Local) {
             self.hosts[at].host_id = host_id;
@@ -129,7 +134,7 @@ impl HostRegistry {
             self.hosts.push(HostApp::new(host_id, HostKind::Local, now_ms));
             self.hosts.len() - 1
         };
-        Ok(&mut self.hosts[at])
+        &mut self.hosts[at]
     }
 
     /// Add a paired host, or return the one already there. A new host is
@@ -337,7 +342,7 @@ mod tests {
         let mut r = HostRegistry::new();
         r.upsert_remote(id(3), 10).unwrap();
         r.upsert_remote(id(2), 10).unwrap();
-        r.set_local(HostId::local(), 10).unwrap();
+        r.set_local(HostId::local(), 10);
         r.upsert_remote(id(1), 10).unwrap();
         r.touch(&id(3), 50);
         let order: Vec<&HostId> = r.ordered().iter().map(|h| &h.host_id).collect();
@@ -353,7 +358,7 @@ mod tests {
     #[test]
     fn only_a_paired_host_can_be_removed() {
         let mut r = HostRegistry::new();
-        r.set_local(HostId::local(), 0).unwrap();
+        r.set_local(HostId::local(), 0);
         r.upsert_remote(id(1), 0).unwrap();
         assert!(r.remove(&HostId::local()).is_none());
         assert_eq!(r.remove(&id(1)).map(|h| h.host_id), Some(id(1)));
@@ -366,10 +371,10 @@ mod tests {
     #[test]
     fn the_local_host_is_re_keyed_to_its_minted_id() {
         let mut r = HostRegistry::new();
-        r.set_local(HostId::local(), 10).unwrap();
+        r.set_local(HostId::local(), 10);
         r.reached(&HostId::local(), CarrierKind::SshL, 20);
         let minted = id(7);
-        r.set_local(minted.clone(), 30).unwrap();
+        r.set_local(minted.clone(), 30);
         assert_eq!(r.len(), 1, "one local host, re-keyed");
         let local = r.local().expect("local");
         assert_eq!(local.host_id, minted);
@@ -381,7 +386,7 @@ mod tests {
     #[test]
     fn a_host_is_never_paired_with_itself() {
         let mut r = HostRegistry::new();
-        r.set_local(id(1), 0).unwrap();
+        r.set_local(id(1), 0);
         assert_eq!(
             r.upsert_remote(id(1), 0).unwrap_err(),
             RegistryError::LocalIsPaired(id(1))
@@ -390,17 +395,41 @@ mod tests {
             r.upsert_remote(HostId::local(), 0).unwrap_err(),
             RegistryError::LocalIsPaired(HostId::local())
         );
-        r.upsert_remote(id(2), 0).unwrap();
+    }
+
+    /// The order the review found: this machine was paired as a remote under
+    /// its minted id before the local daemon named itself. Naming the local
+    /// host then drops that remote and re-keys the local host, which keeps
+    /// its own state, so its rows are no longer refused.
+    #[test]
+    fn naming_the_local_host_drops_a_remote_paired_under_its_id() {
+        let mut r = HostRegistry::new();
+        r.set_local(HostId::local(), 10);
+        r.reached(&HostId::local(), CarrierKind::SshL, 20);
+        r.upsert_remote(id(5), 30).unwrap();
+        r.upsert_remote(id(6), 30).unwrap();
+
+        let local = r.set_local(id(5), 40);
+        assert_eq!(local.kind, HostKind::Local);
+        assert_eq!(local.host_id, id(5));
+        assert_eq!(local.added_at_ms, 10, "the local host keeps its own state");
+        assert_eq!(local.last_contact_ms, Some(20));
+
+        assert_eq!(r.len(), 2, "the remote under that id is gone");
+        assert_eq!(r.get(&id(5)).map(|h| h.kind), Some(HostKind::Local));
+        assert_eq!(r.get(&id(6)).map(|h| h.kind), Some(HostKind::Remote));
+        assert!(r.get(&HostId::local()).is_none());
         assert_eq!(
-            r.set_local(id(2), 0).unwrap_err(),
-            RegistryError::LocalIsPaired(id(2))
+            r.upsert_remote(id(5), 50).unwrap_err(),
+            RegistryError::LocalIsPaired(id(5)),
+            "and it cannot be paired again"
         );
     }
 
     #[test]
     fn paired_hosts_are_capped_and_the_local_host_does_not_count() {
         let mut r = HostRegistry::new();
-        r.set_local(id(0), 0).unwrap();
+        r.set_local(id(0), 0);
         for n in 1..=u8::try_from(MAX_PAIRED_HOSTS).unwrap() {
             r.upsert_remote(id(n), 0).unwrap();
         }
