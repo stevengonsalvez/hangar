@@ -179,8 +179,12 @@ export class FakeWire implements WireClient {
     return [...this.host(hostId).attention.values()].filter((r) => !r.answeredBy);
   }
 
-  async answer(req: { hostId: HostId; attentionId: string; answer: string; version: number; opId?: string }) {
-    const opId = req.opId ?? `op-${this.nextOp++}`;
+  async mintOpId() {
+    return `op-${this.nextOp++}`;
+  }
+
+  async answer(req: { hostId: HostId; attentionId: string; answer: string; version: number; opId: string }) {
+    const { opId } = req;
     this.answers.push({ opId, attentionId: req.attentionId, answer: req.answer, version: req.version });
     if (this.dropNextAnswer) {
       this.dropNextAnswer = false;
@@ -200,7 +204,7 @@ export class FakeWire implements WireClient {
       row.answeredBy = "device:fake";
       outcome = { kind: "delivered", via: "fake" };
     }
-    return { opId, outcome, ack };
+    return { outcome, ack };
   }
 
   async sendPrompt(req: { hostId: HostId; sessionKey: SessionKey; text: string; lifecycleUpdatedAt: number }): Promise<MutationAck> {
