@@ -106,13 +106,15 @@ pub enum WireError {
 }
 
 impl WireError {
-    /// Whether a reconnect can succeed without a person acting: a network
-    /// loss, a timeout, a busy or draining host. An identity refusal, a
-    /// revocation or an incompatible protocol is not.
+    /// Whether a redial can succeed without a person acting: a network loss
+    /// (`Connect`), or a close the host marked retryable (busy, draining,
+    /// rate limited). An identity refusal, a revocation or an incompatible
+    /// protocol is not; nor is a `Timeout`, which is one slow request on a
+    /// live socket and is resent under the same op id, not redialled.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
-            Self::Connect { .. } | Self::Timeout { .. } => true,
+            Self::Connect { .. } => true,
             Self::Closed { retryable, .. } => *retryable,
             _ => false,
         }
@@ -125,9 +127,15 @@ impl WireError {
     }
 }
 
-/// The reason string under a JSON-RPC `error.data.reason`, when present.
+/// The reason string a JSON-RPC error carries: `error.data.reason`, or the
+/// ledger's `error.data.ack.reason` (a rejected or foreign op id answers
+/// with the D18 ack under `ack`).
 pub(crate) fn error_reason(data: Option<&serde_json::Value>) -> Option<String> {
-    data?.get("reason")?.as_str().map(str::to_owned)
+    let data = data?;
+    data.get("reason")
+        .or_else(|| data.get("ack")?.get("reason"))?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// What `auth/hello` said.
