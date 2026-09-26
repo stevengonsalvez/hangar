@@ -2,7 +2,7 @@ import { act, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { reset } from "../src/attention/store";
-import { backoffMs, connectHost, liveHosts, onAppState, resetLifecycle } from "../src/lifecycle";
+import { connectHost, liveHosts, onAppState, resetLifecycle, retryAfterSecs } from "../src/lifecycle";
 import { FakeWire, FAKE_HOST_A, FAKE_HOST_B } from "../src/wire/fake";
 import { setWire } from "../src/wire";
 
@@ -125,15 +125,65 @@ test("a retryable close redials with backoff; a latching close does not", async 
   expect(await hellos()).toBe(2);
 });
 
-test("backoff doubles from 1 s to a 60 s ceiling with a quarter of jitter", () => {
-  const low = () => 0; // -25 percent
-  const high = () => 1; // +25 percent
-  expect(backoffMs(0, () => 0.5)).toBe(1000);
-  expect(backoffMs(1, () => 0.5)).toBe(2000);
-  expect(backoffMs(0, low)).toBe(750);
-  expect(backoffMs(0, high)).toBe(1250);
-  expect(backoffMs(9, () => 0.5)).toBe(60_000);
-  expect(backoffMs(9, high)).toBe(75_000);
+test("retry-after is read from the close reason", () => {
+  expect(retryAfterSecs("retry-after=7")).toBe(7);
+  expect(retryAfterSecs("over capacity; retry-after=30")).toBe(30);
+  expect(retryAfterSecs("draining")).toBeUndefined();
+  expect(retryAfterSecs(undefined)).toBeUndefined();
+  expect(retryAfterSecs("retry-after=-1")).toBeUndefined();
+});
+
+test("a failed redial is rescheduled with growing backoff until one succeeds", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  fake.failNextConnect = 2; // the first two redials die on the wire
+  await act(async () => fake.dropConnection(FAKE_HOST_A, undefined));
+  await act(async () => {
+    jest.advanceTimersByTime(1000); // attempt 1 at 1 s: fails
+  });
+  await act(async () => {
+    jest.advanceTimersByTime(2000); // attempt 2 at +2 s: fails
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await act(async () => {
+    jest.advanceTimersByTime(4000); // attempt 3 at +4 s: succeeds
+  });
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+  const log = await fake.connectionLog();
+  expect(log.filter((l) => l.event === "dial-failed")).toHaveLength(2);
+  expect(log.filter((l) => l.event === "hello")).toHaveLength(2);
+});
+
+test("a close with retry-after waits that long, not the backoff", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4429, "retry-after=5"));
+  await act(async () => {
+    jest.advanceTimersByTime(3000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // not yet: 1 s backoff would have fired
+  await act(async () => {
+    jest.advanceTimersByTime(2500);
+  });
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+});
+
+test("a socket whose connect succeeded but whose subscribe failed is still closed on background", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(() => onAppState(fake, "background"));
+  fake.failNextSubscribe = 1;
+  await act(() => onAppState(fake, "active"));
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(true); // dialled, then the subscribe threw
+  await act(() => onAppState(fake, "background"));
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // tracked from the connect, so closed
+});
+
+test("a 4403 through either fake close hook latches the host", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByText("laptop");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4403, "revoked"));
+  expect(await screen.findByText("revoked or expired, pair again")).toBeTruthy();
 });
 
 test("a resync request resubscribes from a snapshot", async () => {
