@@ -256,10 +256,14 @@ pub enum TerminalFrameRecord {
 }
 
 fn gap_reason(reason: DataGapReason) -> String {
-    match serde_json::to_value(reason) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => "unknown".to_owned(),
+    match reason {
+        DataGapReason::Paused => "paused",
+        DataGapReason::FeedLost => "feed_lost",
+        DataGapReason::Dropped => "dropped",
+        DataGapReason::SessionGone => "session_gone",
+        DataGapReason::Unknown => "unknown",
     }
+    .to_owned()
 }
 
 fn decode(data: &str) -> Result<Vec<u8>, WireError> {
@@ -359,11 +363,20 @@ impl Streams {
         self.accts.lock().unwrap().remove(&stream_id);
     }
 
+    /// Drop every account: the session closed, or the event queue overflowed
+    /// and frames went uncounted, so the cumulative ack can no longer be
+    /// trusted and the app re-attaches.
+    pub(crate) fn reset(&self) {
+        self.accts.lock().unwrap().clear();
+    }
+
     /// Count `bytes` consumed on `stream_id`; `Some(consumed)` when an ack is
-    /// due, which also marks it sent.
+    /// due, which also marks it sent. A frame can arrive before `attach`
+    /// returns (the daemon pushes the snapshot right after its reply), so an
+    /// unknown stream is opened here rather than dropped from the count.
     fn consume(&self, stream_id: StreamId, bytes: u64) -> Option<u64> {
         let mut accts = self.accts.lock().unwrap();
-        let acct = accts.get_mut(&stream_id)?;
+        let acct = accts.entry(stream_id).or_default();
         acct.consumed += bytes;
         if acct.consumed - acct.acked >= ACK_EVERY_BYTES {
             acct.acked = acct.consumed;
@@ -462,13 +475,15 @@ pub(crate) async fn detach(
     streams: &Streams,
     stream_id: StreamId,
 ) -> Result<(), WireError> {
+    // The account goes first: a detach the daemon processed but whose
+    // reply was lost must not leave a stale count behind for a reused id.
+    streams.close(stream_id);
     let _: serde_json::Value = session
         .call(
             methods::TERMINAL_DETACH,
             &TerminalDetachParams { stream_id },
         )
         .await?;
-    streams.close(stream_id);
     Ok(())
 }
 
