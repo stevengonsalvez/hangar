@@ -50,6 +50,25 @@ pub mod transcript;
 /// and `AttentionRaised` event carry their resolved channels as.
 pub use ainb_hangar_core::channel::{Channel, ChannelSet};
 
+/// Stands in for a secret in a `Debug` rendering: prints `<redacted>`.
+///
+/// Wire types that carry a credential (a daemon or device token, an invite
+/// secret, a pairing URI) implement `Debug` by hand and print this in the
+/// secret's place, so a `{:?}` in a log line, a panic message or an
+/// `assert_eq!` failure never leaks the value. The hand-written impls
+/// destructure their struct, so a field added later fails to compile until
+/// someone decides whether it is secret.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The one shared marker, so a test or a log grep for it matches every
+        // redaction in the workspace.
+        f.write_str(ainb_hangar_core::redact::REDACTED)
+    }
+}
+
 /// The JSON-RPC protocol version string carried by every envelope.
 pub const JSONRPC_VERSION: &str = "2.0";
 

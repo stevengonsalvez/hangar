@@ -34,7 +34,11 @@ pub struct Endpoint {
 }
 
 /// A pairing offer (version 1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::invite_secret`] and the contents of
+/// [`Self::relay`]; the host key is public and prints.
+/// [`Self::to_uri`] carries the secret, so never log the URI either.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingOffer {
     /// Always [`OFFER_VERSION`].
     pub v: u32,
@@ -55,6 +59,36 @@ pub struct PairingOffer {
     /// The D12 relay slot; always absent in R1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<serde_json::Value>,
+}
+
+impl std::fmt::Debug for PairingOffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            v,
+            host_id,
+            host_static_pubkey,
+            endpoints,
+            invite_id,
+            invite_secret: _,
+            expires_at_ms,
+            relay,
+        } = self;
+        f.debug_struct("PairingOffer")
+            .field("v", v)
+            .field("host_id", host_id)
+            .field("host_static_pubkey", host_static_pubkey)
+            .field("endpoints", endpoints)
+            .field("invite_id", invite_id)
+            .field("invite_secret", &ainb_hangar_proto::Redacted)
+            .field("expires_at_ms", expires_at_ms)
+            // The reserved D12 relay slot may one day carry relay
+            // credentials, so only its presence prints.
+            .field(
+                "relay",
+                &relay.as_ref().map(|_| ainb_hangar_proto::Redacted),
+            )
+            .finish()
+    }
 }
 
 /// Why a string is not a pairing offer.
@@ -191,5 +225,45 @@ mod tests {
             PairingOffer::parse(&uri),
             Err(OfferError::Json(_))
         ));
+    }
+
+    /// The invite secret never reaches a `Debug` rendering in any encoding:
+    /// raw bytes, base64url (the wire and URI form) or hex.
+    #[test]
+    fn debug_redacts_the_invite_secret() {
+        let offer = PairingOffer {
+            invite_secret: [0xa7; 32],
+            ..sample()
+        };
+        let secret_b64 = URL_SAFE_NO_PAD.encode(offer.invite_secret);
+        let secret_bytes = format!("{:?}", offer.invite_secret);
+        let secret_hex = offer.invite_secret.iter().fold(String::new(), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        });
+        for rendered in [format!("{offer:?}"), format!("{offer:#?}")] {
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(!rendered.contains(&secret_b64), "{rendered}");
+            assert!(!rendered.contains(&secret_bytes), "{rendered}");
+            assert!(!rendered.contains(&secret_hex), "{rendered}");
+            assert!(
+                rendered.contains("01K5A0000000000000000ABCDE"),
+                "{rendered}"
+            );
+        }
+    }
+
+    /// The relay slot prints only whether it is set.
+    #[test]
+    fn debug_redacts_the_relay_contents() {
+        let offer = PairingOffer {
+            relay: Some(serde_json::json!({"url": "wss://relay", "token": "s3cr3tRelay"})),
+            ..sample()
+        };
+        let rendered = format!("{offer:?}");
+        assert!(!rendered.contains("s3cr3tRelay"), "{rendered}");
+        assert!(rendered.contains("relay: Some(<redacted>)"), "{rendered}");
+        assert!(format!("{:?}", sample()).contains("relay: None"));
     }
 }
