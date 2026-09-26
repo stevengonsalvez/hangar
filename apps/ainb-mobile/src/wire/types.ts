@@ -17,6 +17,12 @@ export interface HostRow {
   /** Set when unreachable: when the host was last seen, epoch ms. */
   sinceMs?: number;
   scope?: DeviceScope;
+  /**
+   * The pairing record latched a close that only a new pairing clears:
+   * 4403 (revoked) or 4401 after token expiry. Kept by the crate so it
+   * survives a restart; a 4503 rescope never sets it (T9).
+   */
+  repair?: "revoked" | "expired";
 }
 
 export type BaseScope = "desktop" | "mobile" | "mobile+type" | "unknown";
@@ -31,6 +37,9 @@ export interface PairingOffer {
   endpoints: { carrier: "tailnet" | "lan" | "ssh-l" | "unknown"; url: string }[];
   expiresAtMs: number;
 }
+
+/** `pair` refuses with this when the host's static key differs from the pinned one. */
+export const PEER_CHANGED = "peer_changed";
 
 export interface PairedHost {
   hostId: HostId;
