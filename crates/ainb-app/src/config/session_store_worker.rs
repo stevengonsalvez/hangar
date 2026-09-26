@@ -31,7 +31,18 @@ struct Live {
     /// Writes queued and not yet run. The worker holds the lock while it
     /// reports a failure, so a finish that counts under it sees each write
     /// once: still queued, or reported.
-    queued: Arc<Mutex<usize>>,
+    queued: Arc<Mutex<Pending>>,
+}
+
+/// What a live worker's writes owe, under one lock.
+#[derive(Default)]
+struct Pending {
+    /// Writes queued and not yet run.
+    count: usize,
+    /// Set by a finish as it counts `count`. A write still running then was
+    /// counted as not written already, so if it fails later it is logged, not
+    /// reported: a report would be counted again by the next finish.
+    abandoned: bool,
 }
 
 impl SessionStoreWorker {
@@ -69,11 +80,11 @@ impl SessionStoreWorker {
             let live = self.live.as_ref()?;
             // Counted before the send, so the worker never runs a write it
             // cannot subtract.
-            *lock(&live.queued) += 1;
+            lock(&live.queued).count += 1;
             match live.work.send(store) {
                 Ok(()) => return None,
                 Err(error) => {
-                    *lock(&live.queued) -= 1;
+                    lock(&live.queued).count -= 1;
                     // The worker is gone. Clear the slot so the next turn, and
                     // every later write, starts a new one.
                     self.live = None;
@@ -95,7 +106,7 @@ impl SessionStoreWorker {
         let (work, work_rx) = mpsc::channel::<Persist>();
         let (done_tx, done) = mpsc::channel::<()>();
         let report_tx = self.reports.clone();
-        let queued = Arc::new(Mutex::new(0));
+        let queued = Arc::new(Mutex::new(Pending::default()));
         let counted = Arc::clone(&queued);
         let handle =
             thread::Builder::new().name("ainb-session-store-write".into()).spawn(move || {
@@ -104,9 +115,18 @@ impl SessionStoreWorker {
                     let result = crate::config::persist::write(&store);
                     let mut pending = lock(&counted);
                     if let Err(error) = result {
-                        let _ = report_tx.send(reports::persist_failed(store.store_id(), &error));
+                        if pending.abandoned {
+                            tracing::warn!(
+                                store = store.store_id(),
+                                %error,
+                                "a session-store write failed after the exit stopped waiting for it"
+                            );
+                        } else {
+                            let _ =
+                                report_tx.send(reports::persist_failed(store.store_id(), &error));
+                        }
                     }
-                    *pending -= 1;
+                    pending.count -= 1;
                 }
                 // The queue is empty and the worker is leaving: a finish that
                 // is waiting can stop waiting.
@@ -127,9 +147,10 @@ impl SessionStoreWorker {
     ///
     /// A host calls this on its way out, once its loop has stopped reading
     /// reports, so an unread failure is a change the operator never heard
-    /// about. The reports are counted, logged and put back, not consumed.
-    /// Safe to call when no write ever ran; a later write starts the worker
-    /// again.
+    /// about. Each one is counted and logged here and then taken off the
+    /// queue, so a second finish does not count it again; every other report
+    /// is put back. Writes left queued past the bound are logged too. Safe to
+    /// call when no write ever ran; a later write starts the worker again.
     pub fn finish(&mut self, within: Duration, inbox: &mpsc::Receiver<Intent>) -> usize {
         let Some(Live {
             work,
@@ -150,12 +171,21 @@ impl SessionStoreWorker {
         }
         // Counted under the lock, so a write failing right now is counted
         // once: still queued, or reported.
-        let pending = lock(&queued);
-        *pending + self.count_unread_failures(inbox)
+        let mut pending = lock(&queued);
+        pending.abandoned = true;
+        if pending.count > 0 {
+            tracing::warn!(
+                pending = pending.count,
+                ?within,
+                "session-store writes were still queued when the bound ran out"
+            );
+        }
+        pending.count + self.count_unread_failures(inbox)
     }
 
     /// The `persist_failed` reports waiting on `inbox`, each logged with its
-    /// error. Every report goes back on the channel, in order.
+    /// error and consumed. Every other report goes back on the channel, in
+    /// order.
     fn count_unread_failures(&self, inbox: &mpsc::Receiver<Intent>) -> usize {
         let unread: Vec<Intent> = inbox.try_iter().collect();
         let mut failed = 0;
@@ -168,6 +198,7 @@ impl SessionStoreWorker {
                         error = %args["error"],
                         "a session-store write failed and no screen was left to say so"
                     );
+                    continue;
                 }
             }
             let _ = self.reports.send(report);
@@ -199,6 +230,6 @@ impl SessionStoreWorker {
 
 /// The count, even from a worker that panicked holding it: a count is still
 /// worth reading.
-fn lock(queued: &Mutex<usize>) -> std::sync::MutexGuard<'_, usize> {
+fn lock(queued: &Mutex<Pending>) -> std::sync::MutexGuard<'_, Pending> {
     queued.lock().unwrap_or_else(PoisonError::into_inner)
 }

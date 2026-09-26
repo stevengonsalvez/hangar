@@ -457,6 +457,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "curve25519-dalek",
  "dirs",
  "fs2",
  "futures-util",
@@ -484,6 +485,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "which",
+ "zeroize",
+]
+
+[[package]]
+name = "ainb-hangar-noise"
+version = "0.1.0"
+dependencies = [
+ "ainb-hangar-proto",
+ "base64 0.22.1",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

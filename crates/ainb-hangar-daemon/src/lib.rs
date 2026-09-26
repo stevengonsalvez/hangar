@@ -136,6 +136,9 @@ mod fsm;
 pub mod health_stats;
 /// The minted host identity's boot-time adoption of `local` fleet events (#1066).
 pub mod host_identity;
+/// The host's Noise static key for the peer leg (R1-02): minted once, kept in
+/// the keychain or a `0600` file, made only when the peer leg is switched on.
+mod host_key;
 /// The inbox aggregator: the writer that turns the live event stream into the
 /// durable notification inbox (e38.14).
 ///
@@ -206,6 +209,9 @@ pub mod pal;
 /// tier-5 discovery scan, binds when exactly one pane matches, and leaves the
 /// row `pane_unbound` when zero or two do rather than guessing.
 pub mod pane_binding;
+/// The off-box peer listener (R1-06), bound only when
+/// [`peer_listener::LISTEN_ENV`] is set at boot. Nothing binds in this tree.
+pub mod peer_listener;
 /// `gh`-backed PR status fetch behind an injectable seam (e38.34).
 ///
 /// Fetches a captured PR's CI rollup + mergeability + merge state by shelling out
@@ -365,6 +371,9 @@ pub mod task_executor;
 /// a hard [`templates::TemplateUseError::SkillNotImported`] with a sync hint and
 /// nothing is written. Idempotent by agent name within the workspace.
 pub mod templates;
+/// Terminal streams (R2), served only when [`term::STREAM_ENV`] is set at boot
+/// in a build with the `terminal-stream` feature. Nothing serves in this tree.
+pub mod term;
 /// Danger-full-access warning emission at provider invocation (P5.6).
 pub mod warnings;
 /// The local HTTP webhook ingress for webhook-triggered autopilots (e38.18).
@@ -905,6 +914,23 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
                 );
             }
             Err(error) => tracing::error!(%error, "could not mint the daemon identity"),
+        }
+
+        // R1-02: the peer leg's Noise static key, right after the identity it
+        // is recorded on, and only when the leg is switched on. Off, which is
+        // the default, no keychain item is read or written and the column
+        // stays NULL. Non-fatal: a key that cannot be loaded leaves the peer
+        // leg without a key for this boot, never the daemon down.
+        if crate::peer_listener::switched_on() {
+            let secrets = crate::claude_cred::default_backend();
+            match crate::host_key::ensure(store.pool(), secrets.as_ref(), &dir).await {
+                Ok(loaded) => tracing::info!(
+                    custody = ?loaded.custody,
+                    minted = loaded.minted,
+                    "peer leg host key"
+                ),
+                Err(error) => tracing::error!(%error, "could not load the peer leg host key"),
+            }
         }
 
         // D14 boot order, step one: every row that survived the restart is a

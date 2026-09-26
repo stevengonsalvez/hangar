@@ -118,7 +118,7 @@ impl Drop for DesktopExecutor {
         let dropped =
             self.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND);
         if dropped > 0 {
-            tracing::warn!(dropped, "session-store writes were still queued at drop");
+            tracing::warn!(dropped, "session-store writes were not written at drop");
         }
     }
 }
