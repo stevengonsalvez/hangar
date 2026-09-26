@@ -16,10 +16,10 @@ appId: com.stevengonsalvez.ainb.mobile
     id: "terminal"
 - assertVisible:
     id: "terminal-size"
-# painted, not merely up: the engine row counts the bytes xterm has written,
-# and a blank terminal reads "engine ready, 0 B" or shows no count at all
+# painted, not merely up, and exactly the fixture: 2284 bytes of f1-altscreen
+# plus the 68-byte OSC 8 line the fake appends, counted by xterm itself
 - assertVisible:
-    text: "engine ready, [1-9][0-9]* B.*"
+    text: "engine ready, 2352 B.*"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-f1-altscreen
