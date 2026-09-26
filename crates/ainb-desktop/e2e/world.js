@@ -196,6 +196,9 @@ export function seed() {
   const field = (label) => out.split("\n").find((line) => line.trim().startsWith(label))?.split(":").slice(1).join(":").trim();
   const session = {
     id: field("Session ID"),
+    // The id Claude runs under, minted by ainb for the launch: what the
+    // session's hooks report, and what the daemon files its requests under.
+    claude: field("Claude Session"),
     tmux: field("Tmux Session"),
     cwd: field("Working Dir"),
     branch: field("Branch"),
@@ -205,13 +208,34 @@ export function seed() {
 }
 
 /**
- * Append one hook event to the daemon's ingest file, from a separate process,
- * exactly as an agent's hook does: the daemon tails this file and raises what
- * the line announces.
+ * Raise one hook event for `session` through the real hook, `ainb fleet atc
+ * hook`, from a separate process and from the session's own pane, exactly as
+ * the agent's hook does: the command writes the daemon's ingest line, binds
+ * the pane it ran in, and the daemon raises what the line announces under the
+ * session id the hook reports, which is the id ainb minted for the launch.
  *
- * Written directly rather than through `ainb fleet atc hook`, because that
- * command refuses a line with no session id, and the sidebar only takes a
- * question raised with none (#1049). The line carries no `raw_payload_ref`:
+ * `payload` is the hook's stdin, the tool call as Claude hands it over.
+ */
+export function raiseHook(session, { event, matcher, payload }) {
+  const pane = run("tmux", ["display-message", "-p", "-t", `=${session.tmux}:`, "#{pane_id}"]).trim();
+  return run(
+    AINB_BIN,
+    ["fleet", "atc", "hook", "--event", event, "--matcher", matcher, "--session-id", session.claude, "--cwd", session.cwd],
+    {
+      cwd: session.cwd,
+      input: JSON.stringify({ session_id: session.claude, cwd: session.cwd, hook_event_name: event, ...payload }),
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { TMUX_PANE: pane },
+    },
+  );
+}
+
+/**
+ * Append one hook event to the daemon's ingest file, from a separate process:
+ * the daemon tails this file and raises what the line announces.
+ *
+ * Written directly rather than through `ainb fleet atc hook`, for a line that
+ * names no session id: the hook refuses one. The line carries no `raw_payload_ref`:
  * the hook sets one only beside a payload file it wrote, and a ref with no
  * file, or one that is not the line's own event id, holds the daemon's ingest
  * on a retry for good. With none, the daemon reads the inline payload.
