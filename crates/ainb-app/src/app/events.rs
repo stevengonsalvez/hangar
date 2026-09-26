@@ -2022,16 +2022,18 @@ impl EventHandler {
             .get_selected_session()
             .and_then(|session| session.provider_session_id.clone())
             .unwrap_or_default();
-        // The agent's pane as the fleet snapshot has it for this id: its index
-        // target and its fingerprint, so the send goes to that pane's stable
-        // id, not to whichever pane of the session is active.
+        // The agent's pane as the fleet snapshot has it for this id, from the
+        // row observed last (a resumed id has an older row whose pane is
+        // gone): its fingerprint, so the send goes to that pane's stable id,
+        // not to whichever pane of the session is active.
         let pane = state
             .fleet
             .fleet_snapshot
             .lock()
             .map(|rows| {
                 rows.iter()
-                    .find(|row| row.provider_session_id.as_deref() == Some(session_id.as_str()))
+                    .filter(|row| row.provider_session_id.as_deref() == Some(session_id.as_str()))
+                    .max_by_key(|row| row.last_observed_at)
                     .map(|row| crate::fleet::send::PaneHint {
                         target: row.tmux_target.clone(),
                         fingerprint: row.process_start_fingerprint.clone(),
