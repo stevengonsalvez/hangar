@@ -1,6 +1,8 @@
 //! M1-12: real pairing against an in-process peer that issues single-use
 //! invites and checks the token at hello.
 
+#![allow(clippy::too_many_lines)]
+
 mod common;
 
 use std::sync::Arc;
