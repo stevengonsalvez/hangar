@@ -70,7 +70,13 @@ pub fn canonical_dir(cwd: &str) -> String {
         if let Some(found) = seen.borrow().get(key) {
             return found.clone();
         }
-        let real = canonical_cwd(key).trim_end_matches('/').to_string();
+        // Only a path that resolved is remembered: one that does not exist
+        // yet (a worktree about to be created) is asked again next time,
+        // rather than kept as its own spelling for the thread's life.
+        let Ok(real) = std::fs::canonicalize(key) else {
+            return key.to_string();
+        };
+        let real = real.to_string_lossy().trim_end_matches('/').to_string();
         let mut seen = seen.borrow_mut();
         // ponytail: a flat cap, not an LRU; paths are worktrees, a few dozen.
         if seen.len() >= 4096 {
@@ -1322,6 +1328,50 @@ mod tests {
     }
 
     // --- cwd canonicalization (/tmp vs /private/tmp transcript matching) --
+
+    #[test]
+    fn canonical_dir_and_same_dir_see_through_a_symlink_and_a_trailing_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let real_s = real.to_string_lossy().into_owned();
+        let link_s = link.to_string_lossy().into_owned();
+
+        let expected = std::fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+        assert_eq!(canonical_dir(&link_s), expected);
+        assert_eq!(
+            canonical_dir(&format!("{link_s}/")),
+            expected,
+            "trailing slash"
+        );
+        assert!(same_dir(&link_s, &real_s));
+        assert!(same_dir(&format!("{real_s}/"), &link_s));
+        assert!(
+            !same_dir(&real_s, dir.path().to_str().unwrap()),
+            "the parent is another directory"
+        );
+        assert!(!same_dir("", ""), "two empty paths name nothing");
+        assert!(!same_dir(&real_s, ""));
+    }
+
+    /// A path that does not exist keeps its own spelling, and is not
+    /// remembered: once it exists it resolves.
+    #[test]
+    fn canonical_dir_does_not_remember_a_path_that_did_not_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let later = dir.path().join("later");
+        let later_s = later.to_string_lossy().into_owned();
+        assert_eq!(
+            canonical_dir(&format!("{later_s}/")),
+            later_s,
+            "kept verbatim, slash trimmed"
+        );
+        std::fs::create_dir(&later).unwrap();
+        let expected = std::fs::canonicalize(&later).unwrap().to_string_lossy().into_owned();
+        assert_eq!(canonical_dir(&later_s), expected, "resolved once it exists");
+    }
 
     #[test]
     fn canonical_cwd_resolves_symlinks_to_the_same_slug() {
