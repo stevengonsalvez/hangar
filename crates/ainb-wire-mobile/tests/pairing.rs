@@ -345,8 +345,12 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
         "no dial happened"
     );
 
-    // A re-pair offer carrying the key we already pin, refused by a host
-    // whose key has changed, is the legitimate PeerChanged and latches.
+    // A re-pair offer carrying the key we already pin, dialled at endpoints
+    // the offer names, meets a host with another key: PeerChanged, and the
+    // record is NOT latched. The offer's endpoints are as unauthenticated
+    // as the offer (a hostile endpoint with the real, public host key would
+    // otherwise latch a working pairing); only connect_host, which dials the
+    // stored endpoints, latches a PeerChanged.
     let moved = spawn(
         issuing_host(Arc::new(AtomicBool::new(false)), None),
         PeerOpts::default(),
@@ -362,9 +366,26 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     .unwrap_err();
     assert_eq!(err, WireError::PeerChanged);
     assert_eq!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair, None,
+        "an offer's dial never latches"
+    );
+
+    // Through the stored endpoints (connect_host) the same host latches.
+    let mut record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    record.endpoints[0].url = moved.url.clone();
+    ainb_wire_mobile::pairing::save(dir.path(), record, TOKEN).unwrap();
+    let err = connect_host(ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err, WireError::PeerChanged);
+    assert_eq!(
         list_pairings(dir_s.clone()).unwrap()[0].repair.as_deref(),
         Some("peer_changed"),
-        "PeerChanged on the pinned key latches"
+        "PeerChanged on the stored endpoints latches"
     );
 
     // A good pair clears it. The host really moved to a new key, so the
@@ -408,9 +429,10 @@ async fn an_unknown_close_code_parks_a_notice_that_a_good_hello_clears() {
     .await
     .unwrap();
 
-    // The same host, closing 1001 (a code this build does not know) at hello.
+    // The same host, closing 4999 (a daemon-range code this build does not
+    // know) at hello.
     let odd = spawn(
-        issuing_host(Arc::new(AtomicBool::new(true)), Some(1001)),
+        issuing_host(Arc::new(AtomicBool::new(true)), Some(4999)),
         PeerOpts::default(),
     )
     .await;
@@ -428,7 +450,7 @@ async fn an_unknown_close_code_parks_a_notice_that_a_good_hello_clears() {
         matches!(
             err,
             WireError::Closed {
-                code: Some(1001),
+                code: Some(4999),
                 retryable: false,
                 ..
             }
@@ -437,6 +459,35 @@ async fn an_unknown_close_code_parks_a_notice_that_a_good_hello_clears() {
     );
     let parked = list_pairings(dir_s.clone()).unwrap().remove(0);
     assert_eq!(parked.notice.as_deref(), Some("unknown_code"));
+
+    // A standard WebSocket close (1001, the daemon or a proxy going away) is
+    // a network loss: retryable, and it parks nothing on the record.
+    let away = spawn(
+        issuing_host(Arc::new(AtomicBool::new(true)), Some(1001)),
+        PeerOpts::default(),
+    )
+    .await;
+    let mut away_record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    away_record.endpoints[0].url = away.url.clone();
+    away_record.host_static_pubkey = away.host_pubkey.to_vec();
+    ainb_wire_mobile::pairing::save(dir.path(), away_record, TOKEN).unwrap();
+    let err = connect_host(params.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(1001),
+                retryable: true,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        list_pairings(dir_s.clone()).unwrap().remove(0).notice.as_deref(),
+        Some("unknown_code"),
+        "the earlier notice is untouched by a network loss"
+    );
     assert_eq!(
         parked.repair, None,
         "an unknown code is a notice, not a re-pair"
