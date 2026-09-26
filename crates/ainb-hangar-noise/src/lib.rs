@@ -30,7 +30,7 @@ pub mod reassembly;
 pub use frame::{FrameHeader, HEADER_LEN, MAGIC, VERSION};
 pub use noise::{
     Handshake, Keypair, NoiseError, Opener, Sealer, Session, generate_keypair, initiator,
-    public_key, responder,
+    is_low_order, public_key, responder,
 };
 pub use offer::{Endpoint, OfferError, PairingOffer};
 pub use opcode::Opcode;
@@ -45,6 +45,10 @@ pub const MAX_NOISE_MESSAGE: usize = 65_535;
 pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 /// Reassembly cap for one logical Rpc message, the unix leg's body cap.
 pub const MAX_REASSEMBLED: usize = 16 * 1024 * 1024;
+/// Reassembly cap before a session authenticates (`auth/hello` or
+/// `device/redeem` accepted): an unauthenticated peer can make the host hold
+/// at most this much for one message.
+pub const MAX_PREAUTH_REASSEMBLED: usize = 64 * 1024;
 /// The default peer port.
 pub const DEFAULT_PORT: u16 = 47_300;
 /// The client pings this often.
