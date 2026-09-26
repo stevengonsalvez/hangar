@@ -169,14 +169,28 @@ pub struct RpcError {
 /// Covers `params`, `result` and error `data`: the daemon or device token, the
 /// plaintext device token a redeem returns, the invite secret, and the pairing
 /// URI that carries it.
-pub const SECRET_KEYS: &[&str] = &["token", "device_token", "invite_secret", "offer"];
+///
+/// `agent_env` (per-agent environment values) and `mcp_config` (a raw MCP
+/// config that often embeds tokens) are redacted whole: their values are
+/// credentials under names no list can know.
+pub(crate) const SECRET_KEYS: &[&str] = &[
+    "token",
+    "device_token",
+    "invite_secret",
+    "offer",
+    "agent_env",
+    "mcp_config",
+];
 
 /// Methods whose whole `params` object is a credential exchange, so `Debug`
 /// prints none of it.
-pub const SECRET_PARAMS_METHODS: &[&str] = &[methods::AUTH_HELLO, methods::DEVICE_REDEEM];
+pub(crate) const SECRET_PARAMS_METHODS: &[&str] = &[methods::AUTH_HELLO, methods::DEVICE_REDEEM];
 
 /// A JSON value rendered for `Debug` with every [`SECRET_KEYS`] member, at any
-/// depth, replaced by [`Redacted`].
+/// depth, replaced by [`Redacted`], and every other string run through the
+/// shared credential-shape scrubber (`ainb_hangar_core::redact::scrub`), so a
+/// key, bearer or URL password under a name the list does not know is still
+/// redacted.
 struct RedactedValue<'a>(&'a serde_json::Value);
 
 impl std::fmt::Debug for RedactedValue<'_> {
@@ -195,6 +209,9 @@ impl std::fmt::Debug for RedactedValue<'_> {
             }
             serde_json::Value::Array(items) => {
                 f.debug_list().entries(items.iter().map(Self)).finish()
+            }
+            serde_json::Value::String(text) => {
+                std::fmt::Debug::fmt(&ainb_hangar_core::redact::scrub(text), f)
             }
             scalar => std::fmt::Debug::fmt(scalar, f),
         }
@@ -246,7 +263,10 @@ impl std::fmt::Debug for RpcError {
         } = self;
         f.debug_struct("RpcError")
             .field("code", code)
-            .field("message", message)
+            // A message can echo the rejected input (a serde type error, a
+            // handler that interpolates a param), so it gets the same
+            // credential-shape scrub as a string value.
+            .field("message", &ainb_hangar_core::redact::scrub(message))
             .field("data", &data.as_ref().map(RedactedValue))
             .finish()
     }
@@ -306,6 +326,45 @@ mod debug_redaction_tests {
             }
             assert!(rendered.contains("dev-visible"), "{rendered}");
         }
+    }
+
+    /// Per-agent env values and raw MCP configs are redacted whole, and a
+    /// credential-shaped string under a name no list knows is scrubbed.
+    #[test]
+    fn env_mcp_and_credential_shaped_strings_are_redacted() {
+        const KEY: &str = "sk-ant-api03-s3cr3tValueLongEnoughForTheShape";
+        let request = RpcRequest {
+            jsonrpc: jsonrpc_version(),
+            id: RpcId::Number(4),
+            method: methods::HANGAR_AGENT_UPDATE.to_string(),
+            params: serde_json::json!({
+                "agent_id": "agent-visible",
+                "agent_env": [["OPENAI_API_KEY", "envS3cr3tValue"]],
+                "mcp_config": "{\"env\":{\"TOKEN\":\"mcpS3cr3t\"}}",
+                "notes": format!("use {KEY} for now"),
+            }),
+        };
+        for rendered in [format!("{request:?}"), format!("{request:#?}")] {
+            for secret in ["envS3cr3tValue", "mcpS3cr3t", KEY] {
+                assert!(!rendered.contains(secret), "{secret} in {rendered}");
+            }
+            assert!(rendered.contains("agent-visible"), "{rendered}");
+            assert!(rendered.contains("use <redacted> for now"), "{rendered}");
+        }
+    }
+
+    /// An error message that echoes a credential is scrubbed like a value.
+    #[test]
+    fn error_message_credentials_are_scrubbed() {
+        let error = RpcError {
+            code: -32602,
+            message: "invalid type: string \"sk-ant-api03-s3cr3tEchoedValueLongEnough\""
+                .to_string(),
+            data: None,
+        };
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("s3cr3tEchoed"), "{rendered}");
+        assert!(rendered.contains("invalid type: string"), "{rendered}");
     }
 
     /// Other methods keep their params visible, secret keys aside.
