@@ -24,6 +24,7 @@ use ainb_hangar_proto::fleet::{
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
 use ainb_hangar_proto::mutation::{ACK_KEY, Fence, MutationAck, MutationEnvelope, OpId};
+use ainb_hangar_proto::peer_close;
 use ainb_hangar_proto::protocol::{ProtocolRange, catalogue_strings};
 use ainb_hangar_proto::snapshots::{
     AnswerParams, AnswerResult, AttentionListResult, AttentionSubscribeParams,
@@ -38,7 +39,7 @@ use crate::records::{
     AnswerReply, AttentionRecord, FleetSubscribeSummary, HelloSummary, InterruptReply,
     MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptPage, WireError, WireEvent,
 };
-use crate::session::{Session, SessionEvent, SessionStats, backoff_delay};
+use crate::session::{Session, SessionEvent, SessionStats, backoff_delay, classify_close};
 use crate::terminal::{
     self, ResizeOutcome, Streams, TerminalAttachRecord, TerminalFloorOutcome, TerminalInputOutcome,
 };
@@ -287,7 +288,13 @@ pub struct MobileHost {
 /// The re-pair latch: a 4401 or 4403 close from the host sets it on the
 /// pairing record; only a successful pair clears it.
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
-    if matches!(err, WireError::Unauthenticated | WireError::Revoked) {
+    if matches!(
+        err,
+        WireError::Closed {
+            code: Some(peer_close::UNAUTHENTICATED | peer_close::REVOKED),
+            ..
+        }
+    ) {
         let _ = pairing::mark_repair(custody_dir, host_id, true);
     }
 }
@@ -642,7 +649,13 @@ impl MobileHost {
                     if let Some(closed) = self.session.closed() {
                         latch_repair(&self.custody_dir, &self.host_id, &closed.error());
                     }
-                    WireEvent::Closed { code, reason }
+                    let (retryable, retry_after_ms) = classify_close(code, &reason);
+                    WireEvent::Closed {
+                        code,
+                        reason,
+                        retryable,
+                        retry_after_ms,
+                    }
                 }
             }
         })
@@ -650,6 +663,8 @@ impl MobileHost {
         .unwrap_or_else(|e| WireEvent::Closed {
             code: None,
             reason: e.to_string(),
+            retryable: true,
+            retry_after_ms: None,
         })
     }
 
