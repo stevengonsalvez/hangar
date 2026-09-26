@@ -466,7 +466,6 @@ impl AskState {
         &mut self,
         chip: &SessionAttention,
         session_id: &str,
-        cwd: &str,
         surface: ainb_hangar_proto::connections::SurfaceKind,
     ) -> Result<(), String> {
         // One outstanding send at a time. Key-repeat on Enter would otherwise
@@ -489,7 +488,6 @@ impl AskState {
         let reply_to = request.clone();
         let route = chip.answerable.clone();
         let session_id = session_id.to_string();
-        let cwd = cwd.to_string();
         let sent = text.clone();
         let spawned = std::thread::Builder::new().name("ainb-ask-send".into()).spawn(move || {
             let outcome = match route {
@@ -497,7 +495,7 @@ impl AskState {
                     crate::fleet::control::answer_via_daemon_blocking(attention_id, sent, surface)
                 }
                 Answerable::Tmux => {
-                    crate::fleet::control::answer_via_tmux_blocking(&session_id, &cwd, &sent)
+                    crate::fleet::control::answer_via_tmux_blocking(&session_id, &sent)
                 }
                 Answerable::Broker {
                     session_id: waiter, ..
@@ -776,7 +774,7 @@ mod tests {
         let mut state = AskState::default();
         state.push_char('y');
         state.focus = AskFocus::FreeText;
-        let refused = state.send(&chip, "s", "/w", SurfaceKind::Tui).expect_err("must refuse");
+        let refused = state.send(&chip, "s", SurfaceKind::Tui).expect_err("must refuse");
         assert!(
             refused.contains("attention/answer"),
             "and name the call that is unavailable: {refused}"
@@ -798,7 +796,7 @@ mod tests {
         // is filed under the question, not under whatever the pane shows.
         latch(&mut state, &chip, None);
         assert_eq!(
-            state.send(&chip, "s", "/w", SurfaceKind::Tui),
+            state.send(&chip, "s", SurfaceKind::Tui),
             Err("an answer is already in flight".to_string())
         );
     }
@@ -931,7 +929,7 @@ mod tests {
             "returning to A must still refuse a second send"
         );
         assert_eq!(
-            state.send(&a, "sid", "/work", SurfaceKind::Tui).unwrap_err(),
+            state.send(&a, "sid", SurfaceKind::Tui).unwrap_err(),
             "an answer is already in flight"
         );
     }
