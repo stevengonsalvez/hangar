@@ -41,7 +41,8 @@ use zeroize::Zeroizing;
 pub const KEYCHAIN_ACCOUNT: &str = "peer.host_static_key";
 
 /// The keychain account for one Hangar home: [`KEYCHAIN_ACCOUNT`] plus the
-/// first 16 hex digits of the home path's BLAKE3 hash.
+/// first 16 hex digits of the BLAKE3 hash of the home's canonical path, so
+/// `/h`, `/h/` and a symlinked spelling of the same home share one account.
 ///
 /// The keychain is per user, not per home, so a fixed account would give
 /// every home on the account one Noise static key: a device paired to one
@@ -49,7 +50,8 @@ pub const KEYCHAIN_ACCOUNT: &str = "peer.host_static_key";
 /// overwrite each other's key.
 #[must_use]
 pub fn keychain_account(hangar_home: &Path) -> String {
-    let digest = blake3::hash(hangar_home.as_os_str().as_encoded_bytes());
+    let canonical = std::fs::canonicalize(hangar_home).unwrap_or_else(|_| hangar_home.into());
+    let digest = blake3::hash(canonical.as_os_str().as_encoded_bytes());
     format!("{KEYCHAIN_ACCOUNT}.{}", &digest.to_hex()[..16])
 }
 
@@ -196,17 +198,25 @@ pub enum HostKeyError {
     /// moved. Nothing was minted, so restoring it is still possible.
     #[error(
         "a host public key is recorded but the host key is missing; nothing was minted. \
-         Restore the key; replacing it deliberately needs host key rotation, which is \
-         not available yet"
+         Restore it to {} or to the keychain item {account} (service {service}); \
+         replacing it deliberately needs host key rotation, which is not available yet",
+        file.display()
     )]
-    KeyMissing,
+    KeyMissing {
+        /// The `0600` file the key would be read from.
+        file: PathBuf,
+        /// The keychain account for this home.
+        account: String,
+        /// The keychain service the account lives under.
+        service: String,
+    },
     /// A stored key is not 32 bytes.
     #[error("the stored host key is {0} bytes, not 32")]
     Malformed(usize),
-    /// The public half could not be recorded in `daemon_identity`.
-    /// The blocking load task did not finish (it panicked).
+    /// The load thread ended without an answer (it panicked).
     #[error("the host key load did not finish: {0}")]
     Task(String),
+    /// The public half could not be recorded in `daemon_identity`.
     #[error("recording the host public key: {0}")]
     Store(#[from] sqlx::Error),
 }
@@ -227,8 +237,9 @@ pub fn load_or_mint(
     load(backend, hangar_home, true)
 }
 
-/// [`load_or_mint`], except that with `may_mint` false a home with no key is
-/// [`HostKeyError::KeyMissing`] and nothing is minted or written.
+/// Load the key in force, minting one when `may_mint`; with `may_mint` false
+/// a home with no key is [`HostKeyError::KeyMissing`] and nothing is minted
+/// or written.
 fn load(
     backend: &dyn SecretBackend,
     hangar_home: &Path,
@@ -249,7 +260,25 @@ fn load(
             custody: Custody::Keychain,
             minted: false,
         }),
-        Ok(None) if !may_mint => Err(HostKeyError::KeyMissing),
+        // A key recorded before the account was per home sits under the bare
+        // prefix. Only a home that already recorded a key reads it (`ensure`
+        // then checks it IS the recorded key), and it is copied to this
+        // home's account so the next boot finds it there.
+        Ok(None) if !may_mint => match backend.get(&Scope::Global, KEYCHAIN_ACCOUNT) {
+            Ok(Some(stored)) => {
+                let key = HostStaticKey::from_stored(stored.as_bytes())?;
+                if let Err(error) = backend.put(&Scope::Global, &account, key.secret()) {
+                    tracing::warn!(%error, "hangar host key: could not copy the key to this home's account");
+                }
+                Ok(Loaded {
+                    key,
+                    custody: Custody::Keychain,
+                    minted: false,
+                })
+            }
+            Ok(None) | Err(SecretError::NotImplemented) => Err(missing(&file, &account)),
+            Err(error) => Err(HostKeyError::Keychain(error)),
+        },
         Ok(None) => {
             let key = HostStaticKey::generate();
             match backend.put(&Scope::Global, &account, key.secret()) {
@@ -269,9 +298,18 @@ fn load(
                 }
             }
         }
-        Err(SecretError::NotImplemented) if !may_mint => Err(HostKeyError::KeyMissing),
+        Err(SecretError::NotImplemented) if !may_mint => Err(missing(&file, &account)),
         Err(SecretError::NotImplemented) => mint_to_file(HostStaticKey::generate(), file),
         Err(error) => Err(HostKeyError::Keychain(error)),
+    }
+}
+
+/// [`HostKeyError::KeyMissing`] naming where the key would be restored to.
+fn missing(file: &Path, account: &str) -> HostKeyError {
+    HostKeyError::KeyMissing {
+        file: file.to_path_buf(),
+        account: account.to_string(),
+        service: Scope::Global.service_string(),
     }
 }
 
@@ -283,13 +321,14 @@ fn load(
 /// silently re-identify the host. The operator restores the key or rotates it
 /// deliberately (R1-17).
 ///
-/// The keychain and file work runs on the blocking pool: a keychain call can
+/// The keychain and file work runs on its own thread: a keychain call can
 /// wait on an interactive prompt, and on the boot task it would keep the
 /// shutdown signal from being polled until the prompt was answered.
 ///
 /// # Errors
 ///
-/// [`HostKeyError`] from [`load_or_mint`], or when the row cannot be written.
+/// [`HostKeyError`] when the key cannot be read or kept safely, or when the
+/// row cannot be written.
 pub async fn ensure(
     pool: &SqlitePool,
     backend: std::sync::Arc<dyn SecretBackend + Send + Sync>,
@@ -301,9 +340,19 @@ pub async fn ensure(
     let recorded = DaemonIdentityRepo::host_static_pubkey(pool).await?;
     let may_mint = recorded.is_none();
     let home = hangar_home.to_path_buf();
-    let loaded = tokio::task::spawn_blocking(move || load(backend.as_ref(), &home, may_mint))
+    // A plain thread, not the blocking pool: the runtime waits for pool tasks
+    // when it drops, so a keychain prompt there would still hold the process
+    // open after SIGTERM. A detached thread does not.
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("hangar-host-key".into())
+        .spawn(move || {
+            let _ = answer.send(load(backend.as_ref(), &home, may_mint));
+        })
+        .map_err(|error| HostKeyError::Task(error.to_string()))?;
+    let loaded = answered
         .await
-        .map_err(|error| HostKeyError::Task(error.to_string()))??;
+        .map_err(|_| HostKeyError::Task("the load thread ended without an answer".into()))??;
     match DaemonIdentityRepo::record_host_static_pubkey(pool, loaded.key.public()).await? {
         PubkeyRecord::Recorded | PubkeyRecord::Unchanged => Ok(loaded),
         PubkeyRecord::Differs { recorded } => Err(HostKeyError::KeyChanged {
@@ -409,10 +458,13 @@ fn mint_to_file(key: HostStaticKey, path: PathBuf) -> Result<Loaded, HostKeyErro
         let _ = std::fs::remove_file(&temporary);
         return Err(file_error(error));
     }
+    // The key is already in place, so a directory fsync that fails (EIO, or
+    // a filesystem that refuses one) is logged, not fatal: failing here would
+    // leave a stored key that is never recorded.
     if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(file_error)?;
+        if let Err(error) = std::fs::File::open(parent).and_then(|directory| directory.sync_all()) {
+            tracing::warn!(%error, "hangar host key: could not fsync the key's directory");
+        }
     }
     Ok(Loaded {
         key,
@@ -609,6 +661,45 @@ mod tests {
         assert_eq!(again_a.key.public(), key_a.key.public());
     }
 
+    /// #102 review: a key minted before the account was per home sits under
+    /// the bare prefix. A home that recorded a key reads it there and copies
+    /// it to its own account; a home that may still mint never reads it, so
+    /// it cannot adopt another home's key.
+    #[test]
+    fn a_recorded_home_reads_the_pre_per_home_account_and_copies_it() {
+        let home = tempfile::tempdir().expect("home");
+        let keychain = InMemoryBackend::new();
+        let old = HostStaticKey::generate();
+        keychain.put(&Scope::Global, KEYCHAIN_ACCOUNT, old.secret()).expect("put");
+
+        let loaded = load(&keychain, home.path(), false).expect("legacy read");
+        assert_eq!(loaded.key.public(), old.public());
+        assert_eq!(loaded.custody, Custody::Keychain);
+        let copied = keychain
+            .get(&Scope::Global, &keychain_account(home.path()))
+            .expect("get")
+            .expect("copied to the per-home account");
+        assert_eq!(copied.as_bytes(), old.secret());
+
+        let fresh = tempfile::tempdir().expect("fresh");
+        let minted = load(&keychain, fresh.path(), true).expect("mint");
+        assert!(
+            minted.minted,
+            "a home that may mint does not adopt the legacy key"
+        );
+        assert_ne!(minted.key.public(), old.public());
+    }
+
+    /// The account follows the home's canonical path, not its spelling.
+    #[test]
+    fn the_account_is_the_same_for_every_spelling_of_a_home() {
+        let home = tempfile::tempdir().expect("home");
+        let trailing = std::path::PathBuf::from(format!("{}/", home.path().display()));
+        let dotted = home.path().join(".");
+        assert_eq!(keychain_account(home.path()), keychain_account(&trailing));
+        assert_eq!(keychain_account(home.path()), keychain_account(&dotted));
+    }
+
     #[test]
     fn a_short_stored_key_is_refused() {
         let home = tempfile::tempdir().expect("home");
@@ -621,8 +712,6 @@ mod tests {
         assert!(matches!(refused, HostKeyError::Malformed(3)), "{refused:?}");
     }
 
-    /// A symlink at the key path is refused, even one pointing at a valid
-    /// `0600` key: the path is opened `O_NOFOLLOW`.
     /// A FIFO at the key path is refused, and opening it does not wait for a
     /// writer (`O_NONBLOCK`).
     #[test]
@@ -667,6 +756,8 @@ mod tests {
         );
     }
 
+    /// A symlink at the key path is refused, even one pointing at a valid
+    /// `0600` key: the path is opened `O_NOFOLLOW`.
     #[test]
     fn a_symlinked_key_file_is_refused() {
         let home = tempfile::tempdir().expect("home");
@@ -736,7 +827,14 @@ mod tests {
         let missing = ensure(store.pool(), empty.clone(), home.path())
             .await
             .expect_err("a recorded key that is gone must not be replaced by a new one");
-        assert!(matches!(missing, HostKeyError::KeyMissing), "{missing:?}");
+        assert!(
+            matches!(missing, HostKeyError::KeyMissing { .. }),
+            "{missing:?}"
+        );
+        assert!(
+            missing.to_string().contains(&keychain_account(home.path())),
+            "the message names the account to restore: {missing}"
+        );
         assert!(
             missing.to_string().contains("not available yet"),
             "{missing}"
