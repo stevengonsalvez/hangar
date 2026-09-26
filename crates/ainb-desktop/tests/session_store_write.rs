@@ -53,6 +53,7 @@ fn a_session_store_write_is_queued_while_it_cannot_proceed_and_lands_after() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -120,6 +121,7 @@ fn a_worker_that_is_gone_is_replaced_rather_than_failing_every_write() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -182,6 +184,7 @@ fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -257,9 +260,12 @@ fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
+    // Collect logs from here on, before the write can fail.
+    log_says(LATE_FAILURE);
     let guard = SessionStore::try_lock()
         .expect("the sessions.json lock")
         .expect("the sessions.json lock was already held");
@@ -281,9 +287,23 @@ fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
     );
 
     // The write now takes the lock, runs and is refused, on a worker the
-    // flush has let go. It needs nothing but the lock just released.
+    // flush has let go. Wait for it to be done, which shows either as the
+    // warn the worker logs for it or as a report on the queue.
     drop(guard);
-    std::thread::sleep(Duration::from_secs(1));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reports = Vec::new();
+    while !log_says(LATE_FAILURE) && reports.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned write never finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        reports.extend(executor.take_deferred());
+    }
+    assert!(
+        reports.is_empty(),
+        "the late failure was reported: {reports:?}"
+    );
     assert_eq!(
         executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
         0,
@@ -294,4 +314,53 @@ fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
         reports.is_empty(),
         "the late failure was reported: {reports:?}"
     );
+}
+
+/// What the worker logs for a write that fails after the flush let it go.
+const LATE_FAILURE: &str = "a session-store write failed after the exit stopped waiting for it";
+
+/// Whether any thread has logged a message containing `text` since this
+/// binary started. The first call installs a process-wide collector; the
+/// worker logs from its own thread, so a thread-local one would not see it.
+fn log_says(text: &str) -> bool {
+    static LOG: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let log = std::sync::Arc::default();
+        let _ = tracing::subscriber::set_global_default(Collect(std::sync::Arc::clone(&log)));
+        log
+    });
+    log.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|line| line.contains(text))
+}
+
+/// A subscriber that keeps each event's message and nothing else.
+struct Collect(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Collect {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
 }

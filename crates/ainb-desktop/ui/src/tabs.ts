@@ -108,6 +108,50 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
   }
 }
 
+/** The shape of a focused element this needs: `document.activeElement` fits. */
+interface FocusedLike {
+  tagName: string;
+  className: string;
+}
+
+/**
+ * Whether `active`, the element with the keyboard, is a text field that is
+ * not the terminal's own: the palette's query, the answer banner's composer,
+ * the settings search.
+ */
+export function keyboardTaken(active: FocusedLike | null | undefined): boolean {
+  if (!active) return false;
+  const tag = active.tagName.toUpperCase();
+  if (tag !== "INPUT" && tag !== "TEXTAREA") return false;
+  return !active.className.split(/\s+/).includes("xterm-helper-textarea");
+}
+
+/** Who asked for a terminal to take the keyboard. */
+export type FocusRequest = {
+  /** The palette is open: it owns the keyboard until it closes. */
+  palette: boolean;
+  /**
+   * The host asked, on its own schedule (a tab-open answer, the strip tidying
+   * up), rather than a person pressing a tab chord or clicking a tab.
+   */
+  byHost: boolean;
+  /** The element with the keyboard as the request lands. */
+  active: FocusedLike | null | undefined;
+};
+
+/**
+ * Whether a terminal asked for focus may take it. Never under the open
+ * palette. A request of the host's stands down while a text field that is
+ * not the terminal's own has the keyboard: the host's answer to a tab open
+ * can land after the cursor was put in the answer banner's composer, and the
+ * answer being typed would go to the agent's pane (#47). A person's own
+ * chord or click on a tab is that person moving the keyboard, and it moves.
+ */
+export function terminalMayTakeFocus(request: FocusRequest): boolean {
+  if (request.palette) return false;
+  return !(request.byHost && keyboardTaken(request.active));
+}
+
 /** A tracker that answers `true` for the second Esc within `ESC_ESC_MS`. */
 export function escEsc(windowMs = ESC_ESC_MS): (now: number) => boolean {
   let last = -Infinity;
