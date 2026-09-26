@@ -1,14 +1,18 @@
 import { fireEvent, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
+import { resetLifecycle } from "../src/lifecycle";
 import { FakeWire, FAKE_HOST_A } from "../src/wire/fake";
 import { setWire } from "../src/wire";
 
-beforeEach(() => setWire(new FakeWire()));
+beforeEach(() => {
+  resetLifecycle();
+  setWire(new FakeWire());
+});
 
 test("hosts, sessions, session and pair are reachable from the root", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
-  expect(await screen.findByText("mbp")).toBeTruthy();
+  expect(await screen.findByText("laptop")).toBeTruthy();
   expect(screen.getByText(/unreachable since/)).toBeTruthy();
 
   fireEvent.press(screen.getByTestId(`host-${FAKE_HOST_A}`));
@@ -20,7 +24,7 @@ test("hosts, sessions, session and pair are reachable from the root", async () =
   expect(screen).toHavePathname(`/host/${FAKE_HOST_A}/session/claude:hangar`);
 
   fireEvent.press(screen.getByTestId("tab-terminal"));
-  expect(screen.getByTestId("terminal-placeholder")).toBeTruthy();
+  expect(await screen.findByTestId("terminal")).toBeTruthy();
 });
 
 test("pairing a pasted offer adds the host", async () => {

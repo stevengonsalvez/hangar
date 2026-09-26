@@ -20,8 +20,14 @@ npm test        # jest, always on FakeWire
 - `app/`: expo-router screens (Hosts, Pair, Sessions, Session with Transcript
   and Terminal tabs, Log).
 - `src/wire/types.ts`: the `WireClient` interface the screens use. It mirrors
-  the frozen proto records (docs/contracts/v2-next.md) and becomes a re-export
-  of the ubrn bindings when they land.
+  the frozen proto records (docs/contracts/v2-next.md). The native binding
+  (lane E's `MobileHost`, one object per host with a pull event loop) is
+  wrapped by an adapter in `src/wire/` that presents this hostId-keyed,
+  push-event interface; the screens never see the binding directly.
 - `src/wire/fake.ts`: `FakeWire`, the in-memory transport for dev and tests.
+- `src/terminal/`: xterm.js inside a locked-down webview. `postinstall`
+  bundles the engine into `src/terminal/engine/bundle.generated.ts`
+  (gitignored); with install scripts disabled run `npm run build:engine`
+  before `npm run check` or `npm test`.
 - `scripts/lint-wire.mjs`: fails `npm run check` if any file outside
   `src/wire/` parses wire JSON or names a snake_case wire field.

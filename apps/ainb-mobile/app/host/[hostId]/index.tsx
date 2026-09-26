@@ -27,7 +27,12 @@ export default function Sessions() {
             href={{ pathname: "/host/[hostId]/session/[key]", params: { hostId: item.hostId, key: item.sessionKey } }}
             asChild
           >
-            <Pressable style={styles.row} testID={`session-${item.sessionKey}`}>
+            <Pressable
+              style={styles.row}
+              testID={`session-${item.sessionKey}`}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.name}, ${item.state}`}
+            >
               <Text style={styles.name}>{item.name}</Text>
               <Text style={item.state === "ask" ? styles.ask : styles.muted}>
                 {item.state} · {item.provenance} · {item.tier}
