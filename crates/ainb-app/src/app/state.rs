@@ -10359,6 +10359,14 @@ impl AppState {
                     true, // resume_requested — Enter/r on a Stopped session
                     metadata.headroom_enabled,
                     codex_remote.as_ref(),
+                    // The id the record holds, kept across the resume: named
+                    // exactly when Claude holds a transcript under it.
+                    metadata.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&metadata.worktree_path, id),
+                        }
+                    }),
                 )
                 .await?;
 
@@ -10489,6 +10497,27 @@ impl AppState {
     pub fn find_latest_transcript(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
         let home = dirs::home_dir()?;
         Self::find_latest_transcript_in(&home, worktree_path)
+    }
+
+    /// Whether Claude holds a transcript for `session_id` in `worktree_path`'s
+    /// project directory, which is what a `--resume <session_id>` needs: the
+    /// transcript is named by the session id.
+    pub fn claude_transcript_exists(worktree_path: &std::path::Path, session_id: &str) -> bool {
+        dirs::home_dir()
+            .is_some_and(|home| Self::claude_transcript_exists_in(&home, worktree_path, session_id))
+    }
+
+    /// Test-friendly variant of [`Self::claude_transcript_exists`].
+    pub(crate) fn claude_transcript_exists_in(
+        home: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        home.join(".claude")
+            .join("projects")
+            .join(Self::claude_project_dir_name(worktree_path))
+            .join(format!("{session_id}.jsonl"))
+            .is_file()
     }
 
     /// Test-friendly variant: caller supplies the home directory so unit tests
@@ -13544,6 +13573,14 @@ impl AppState {
                 true,
                 headroom_enabled,
                 codex_remote.as_ref(),
+                metadata.and_then(|m| {
+                    m.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&m.worktree_path, id),
+                        }
+                    })
+                }),
             )
             .await?;
 
@@ -13636,7 +13673,7 @@ impl AppState {
         // held here. The write is the `Persist::SessionHeadroom` effect below,
         // a compare-and-set the resolver runs under its own lock, so a value
         // that moved between this read and that write is never overwritten.
-        let (skip_permissions, model, has_history) = {
+        let (skip_permissions, model, has_history, claude_session_id) = {
             let store = match crate::cli::util::load_session_store_async().await {
                 Ok(store) => store,
                 Err(e) => {
@@ -13664,6 +13701,13 @@ impl AppState {
                     meta.launch_model().or(session_model),
                     agent_type == SessionAgentType::Claude
                         && Self::find_latest_transcript(&meta.worktree_path).is_some(),
+                    // The id the record holds, kept across the respawn: a
+                    // resume names it exactly when Claude holds a transcript
+                    // under it, so the daemon's rows for it still land here.
+                    meta.claude_session_id.clone().map(|id| {
+                        let resumable = Self::claude_transcript_exists(&meta.worktree_path, &id);
+                        (id, resumable)
+                    }),
                 ),
             };
 
@@ -13692,6 +13736,12 @@ impl AppState {
                 model.as_deref(),
                 true,
                 has_history,
+                claude_session_id.as_ref().map(|(id, resumable)| {
+                    crate::interactive::session_manager::ClaudeSession {
+                        id,
+                        resumable: *resumable,
+                    }
+                }),
             );
         let cli_cmd = cmd_parts
             .iter()
@@ -15214,6 +15264,7 @@ mod codex_degrade_notice_tests {
             headroom_enabled: false,
             rtk_enabled: false,
             codex_thread_id: None,
+            claude_session_id: None,
             codex_degrade: degrade,
         }
     }
