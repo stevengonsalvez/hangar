@@ -828,7 +828,7 @@ where
                             rx,
                             params.session_key,
                             cursor,
-                            authenticated.caller.device_id().is_some(),
+                            authenticated.caller.reads_transcript_lines(),
                             out_tx.clone(),
                         ));
                     }
@@ -1236,7 +1236,7 @@ fn spawn_transcript_forwarder(
     mut rx: broadcast::Receiver<(String, i64)>,
     session_key: String,
     mut cursor: i64,
-    for_device: bool,
+    as_lines: bool,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     use ainb_hangar_store::repo::fleet_provider_event::FleetProviderEventRepo;
@@ -1274,10 +1274,10 @@ fn spawn_transcript_forwarder(
                 if !rows.is_empty() {
                     for row in &rows {
                         cursor = row.ingest_order;
-                        // A device reads render-ready lines only; the
+                        // A phone reads render-ready lines only; the
                         // classifier lives as long as the subscription, so a
                         // tool update names the call it belongs to.
-                        let chunk = if for_device {
+                        let chunk = if as_lines {
                             device_transcript_chunk(row, &mut classifier)
                         } else {
                             transcript_chunk_wire(row)
@@ -1732,10 +1732,10 @@ async fn handle(
         methods::FLEET_REPROJECT_CLAUDE_INTERVIEW => {
             handle_fleet_reproject_claude_interview(pool, req, events).await
         }
-        methods::ATTENTION_LIST => handle_attention_list(pool, req).await,
+        methods::ATTENTION_LIST => handle_attention_list(pool, req, caller).await,
         // `attention/subscribe` acks with the current OPEN snapshot; the live
         // fleet-wide forwarder is the stream side (see `serve_conn`).
-        methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req).await,
+        methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req, caller).await,
         methods::ATTENTION_ANSWER => {
             handle_attention_answer(pool, req, events, caller, connection).await
         }
@@ -3057,6 +3057,16 @@ async fn handle_fleet_transcript_list(
         ));
     }
     let limit = i64::from(params.limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX));
+    // A phone's page is budgeted on the lines it receives, which the
+    // classifier caps, not on the stored payloads it never sees: the store
+    // read is bounded by rows alone (it fetches them all anyway) and the byte
+    // budget is applied after classification, in `device_page`.
+    let as_lines = caller.reads_transcript_lines();
+    let payload_budget = if as_lines {
+        usize::MAX
+    } else {
+        FLEET_TRANSCRIPT_LIST_MAX_BYTES
+    };
     // A transcript read with NO cursor answers with the newest page, because
     // that is what opening an execution view means. With a cursor it walks
     // forward from that row exactly as before, so paging is untouched.
@@ -3087,13 +3097,7 @@ async fn handle_fleet_transcript_list(
         // updates. It answers "what came after this row", so stopping early
         // has nothing to admit: `next_after_order` already tells the caller
         // where to resume.
-        .map(|rows| {
-            (
-                within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES),
-                false,
-                None,
-            )
-        }),
+        .map(|rows| (within_bytes(rows, payload_budget), false, None)),
         // No forward cursor: the newest page, or with `before_order` the
         // newest page strictly older than it (a phone scrolling back). Both
         // are the tail read, bounded by rows and bytes, with `truncated`
@@ -3103,21 +3107,36 @@ async fn handle_fleet_transcript_list(
             &params.session_key,
             params.before_order,
             limit,
-            FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+            payload_budget,
         )
         .await
         .map(|page| (page.rows, page.truncated, page.lowest_scanned)),
     }
     .map_err(|error| store_err(&error))?;
-    // A paired device gets render-ready lines, classified oldest first across
-    // the page, and no raw payload: the phone does no parsing or secret
-    // filtering of its own. A tool update whose call fell outside this page
-    // degrades to the unnamed `tool` form, as the board timeline's tail does.
-    let chunks: Vec<_> = if caller.device_id().is_some() {
-        let mut classifier = ainb_hangar_proto::transcript::AcpClassifier::default();
-        rows.iter().map(|row| device_transcript_chunk(row, &mut classifier)).collect()
+    // A phone gets render-ready lines, classified oldest first across the
+    // page, and no raw payload: it does no parsing or secret filtering of its
+    // own. A tool update whose call fell outside this page degrades to the
+    // unnamed `tool` form, as the board timeline's tail does. Everyone else,
+    // a desktop-scope device included, keeps the scrubbed payload.
+    let (chunks, truncated, lowest_scanned) = if as_lines {
+        let walk = if params.after_order.is_some() {
+            PageWalk::Forward
+        } else {
+            PageWalk::Back
+        };
+        device_page(
+            &rows,
+            walk,
+            FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+            truncated,
+            lowest_scanned,
+        )
     } else {
-        rows.iter().map(transcript_chunk_wire).collect()
+        (
+            rows.iter().map(transcript_chunk_wire).collect(),
+            truncated,
+            lowest_scanned,
+        )
     };
     to_value(&FleetTranscriptListResult {
         // A backward page is not a place to walk forward from.
@@ -3133,6 +3152,69 @@ async fn handle_fleet_transcript_list(
         chunks,
         truncated,
     })
+}
+
+/// Which end of a transcript page a byte budget keeps.
+#[derive(Clone, Copy)]
+enum PageWalk {
+    /// A cursored walk forward: keep the oldest rows, resume after the last.
+    Forward,
+    /// The tail, or a page back: keep the newest rows, page back from the first.
+    Back,
+}
+
+/// A phone's transcript page: `rows` classified oldest first, then cut to
+/// `max_bytes` of line text, never below one chunk.
+///
+/// Walking back, the newest chunks are kept and a cut sets `truncated` and
+/// moves `lowest_scanned` to the oldest chunk kept, so the next page back
+/// starts there. Walking forward, the oldest are kept and the caller resumes
+/// after the last, so a cut has nothing to report.
+fn device_page(
+    rows: &[ainb_hangar_store::repo::fleet_provider_event::FleetProviderEventRow],
+    walk: PageWalk,
+    max_bytes: usize,
+    truncated: bool,
+    lowest_scanned: Option<i64>,
+) -> (
+    Vec<ainb_hangar_proto::fleet::FleetTranscriptChunk>,
+    bool,
+    Option<i64>,
+) {
+    let mut classifier = ainb_hangar_proto::transcript::AcpClassifier::default();
+    let mut chunks: Vec<_> =
+        rows.iter().map(|row| device_transcript_chunk(row, &mut classifier)).collect();
+    // Line text per chunk, in the order the budget walks them.
+    let mut costs: Vec<usize> = chunks
+        .iter()
+        .map(|chunk| chunk.lines.iter().map(|line| line.text.len()).sum())
+        .collect();
+    if matches!(walk, PageWalk::Back) {
+        costs.reverse();
+    }
+    let mut budget = max_bytes;
+    let mut kept = 0;
+    for cost in costs {
+        if kept > 0 && cost > budget {
+            break;
+        }
+        budget = budget.saturating_sub(cost);
+        kept += 1;
+    }
+    if kept == chunks.len() {
+        return (chunks, truncated, lowest_scanned);
+    }
+    match walk {
+        PageWalk::Forward => {
+            chunks.truncate(kept);
+            (chunks, truncated, lowest_scanned)
+        }
+        PageWalk::Back => {
+            let chunks = chunks.split_off(chunks.len() - kept);
+            let lowest = chunks.first().map(|chunk| chunk.ingest_order);
+            (chunks, true, lowest)
+        }
+    }
 }
 
 /// The longest oldest-first prefix of `rows` whose stored payloads fit in
@@ -13128,10 +13210,13 @@ async fn handle_inbox_mark_read(
 async fn handle_attention_list(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::snapshots::AttentionListParams =
         parse_params(req, "{ workspace_id?, fleet }")?;
-    let attention = attention_snapshot(pool, params.fleet, params.workspace_id.as_deref()).await?;
+    let mut attention =
+        attention_snapshot(pool, params.fleet, params.workspace_id.as_deref()).await?;
+    scrub_attention_for(caller, &mut attention);
     to_value(&ainb_hangar_proto::snapshots::AttentionListResult { attention })
 }
 
@@ -13142,14 +13227,42 @@ async fn handle_attention_list(
 async fn handle_attention_subscribe(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::snapshots::AttentionSubscribeParams =
         parse_params(req, "{ workspace_id? }")?;
     // No workspace filter → the fleet-wide snapshot (every workspace + host);
     // a narrowing workspace → that workspace's open rows.
     let fleet = params.workspace_id.is_none();
-    let attention = attention_snapshot(pool, fleet, params.workspace_id.as_deref()).await?;
+    let mut attention = attention_snapshot(pool, fleet, params.workspace_id.as_deref()).await?;
+    scrub_attention_for(caller, &mut attention);
     to_value(&ainb_hangar_proto::snapshots::AttentionSubscribeResult { attention })
+}
+
+/// Scrub each row's request context before it reaches a paired device.
+///
+/// The payload is the context the card renders: an error snippet, the ask's
+/// text, a command awaiting approval, any of which can carry a credential.
+/// The operator's own surfaces read it as stored; a device gets every string
+/// value run through the redactor, and a payload that is not JSON is scrubbed
+/// as text. The live stream needs nothing: `AttentionRaised` carries no
+/// payload.
+fn scrub_attention_for(
+    caller: &auth::Caller,
+    rows: &mut [ainb_hangar_proto::events::AttentionRow],
+) {
+    if caller.device_id().is_none() {
+        return;
+    }
+    for row in rows {
+        row.payload = match serde_json::from_str::<serde_json::Value>(&row.payload) {
+            Ok(mut value) => {
+                ainb_hangar_core::redact::scrub_json(&mut value);
+                value.to_string()
+            }
+            Err(_) => ainb_hangar_core::redact::scrub(&row.payload),
+        };
+    }
 }
 
 /// Shared open-attention snapshot for `attention/list` + `attention/subscribe`.
@@ -14828,12 +14941,14 @@ mod tests {
         FleetProviderEventRepo::append_batch(pool, &events).await.expect("seed");
     }
 
-    /// Lead item: a paired device reads transcript chunks already classified
-    /// and scrubbed: no raw payload, render-ready lines in the daemon's own
+    /// Lead item: a phone reads transcript chunks already classified and
+    /// scrubbed: no raw payload, render-ready lines in the daemon's own
     /// lanes, the tool update named from its call, and no secret anywhere.
-    /// The operator's chunks are unchanged: a payload, and no lines.
+    /// The operator's chunks are unchanged: a payload, and no lines. So are a
+    /// desktop-scope device's, because the desktop renders from the payload
+    /// and would show an empty transcript without it.
     #[tokio::test]
-    async fn a_device_reads_transcript_lines_classified_and_scrubbed() {
+    async fn a_phone_reads_transcript_lines_and_a_desktop_device_keeps_payloads() {
         let home = tempfile::tempdir().expect("home");
         let store = Store::open_in(home.path()).await.expect("store");
         seed_device_transcript(store.pool()).await;
@@ -14902,6 +15017,296 @@ mod tests {
             chunks.iter().all(|c| c.get("lines").is_none()),
             "and gets no lines"
         );
+
+        let laptop = auth::Caller::Device {
+            device_id: "01J0LAPTOP".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::DESKTOP,
+        };
+        let desktop = dispatch_as(store.pool(), &request, &health(), &sink(), &laptop).await;
+        assert!(desktop.error.is_none(), "{:?}", desktop.error);
+        let body = serde_json::to_string(desktop.result.as_ref().unwrap()).unwrap();
+        assert!(
+            !body.contains("ghp_AAAA"),
+            "the payload a desktop device reads is scrubbed: {body}"
+        );
+        let chunks = desktop.result.as_ref().unwrap()["chunks"].as_array().unwrap().clone();
+        assert_eq!(chunks.len(), 3);
+        assert!(
+            chunks.iter().all(|c| c["payload"].is_object()),
+            "a desktop-scope device keeps payloads: {body}"
+        );
+        assert!(
+            chunks.iter().all(|c| c.get("lines").is_none()),
+            "and gets no lines: {body}"
+        );
+    }
+
+    /// The reviewer's probe (#142 F5): a secret in the tool CALL itself (its
+    /// title and its input, an opaque bearer token and a GitHub token), read
+    /// by a phone through every cursor. No page, forward, back or tail,
+    /// carries either secret, including a forward page that starts after the
+    /// call and so renders its update unnamed.
+    #[tokio::test]
+    async fn a_secret_in_a_tool_call_never_reaches_a_phone_through_any_cursor() {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let opaque = "q7Rt2Vx9Kp4Lm8Nz3Bw6Hc1J";
+        let github = format!("ghp_{}", "B".repeat(36));
+        let command = format!(
+            "curl -H 'Authorization: Bearer {opaque}' -H 'X-Token: {github}' https://api.example"
+        );
+        let rows = [
+            serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": command, "status": "pending",
+                "rawInput": {"command": command}}),
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawInput": {"command": command},
+                "content": [{"type": "content", "content": {"type": "text",
+                    "text": format!("echoed {command}")}}]}),
+        ];
+        let events: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, payload)| NewFleetProviderEvent {
+                event_id: format!("probe-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("acp:probe".to_string()),
+                provider_session_id: None,
+                observed_at: i64::try_from(n).unwrap(),
+                received_at: i64::try_from(n).unwrap(),
+                event_type: "acp.tool_call".to_string(),
+                raw_payload: payload.to_string(),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(store.pool(), &events).await.expect("seed");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE_TYPE,
+        };
+        let tail = dispatch_as(
+            store.pool(),
+            &req(
+                methods::FLEET_TRANSCRIPT_LIST,
+                serde_json::json!({"session_key": "acp:probe", "limit": 100}),
+            ),
+            &health(),
+            &sink(),
+            &phone,
+        )
+        .await;
+        let orders: Vec<i64> = tail.result.as_ref().unwrap()["chunks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["ingest_order"].as_i64().unwrap())
+            .collect();
+        assert_eq!(orders.len(), 2);
+        for cursor in [
+            serde_json::json!({}),
+            serde_json::json!({"after_order": 0}),
+            serde_json::json!({"after_order": orders[0]}),
+            serde_json::json!({"before_order": orders[1]}),
+            serde_json::json!({"before_order": i64::MAX}),
+        ] {
+            let mut params = serde_json::json!({"session_key": "acp:probe", "limit": 100});
+            params.as_object_mut().unwrap().extend(cursor.as_object().unwrap().clone());
+            let page = dispatch_as(
+                store.pool(),
+                &req(methods::FLEET_TRANSCRIPT_LIST, params),
+                &health(),
+                &sink(),
+                &phone,
+            )
+            .await;
+            assert!(page.error.is_none(), "{cursor}: {:?}", page.error);
+            let body = serde_json::to_string(page.result.as_ref().unwrap()).unwrap();
+            assert!(!body.contains(opaque), "{cursor}: {body}");
+            assert!(!body.contains(&github), "{cursor}: {body}");
+            assert_eq!(
+                ainb_hangar_core::redact::find_secret(&body),
+                None,
+                "{cursor}: {body}"
+            );
+            let chunks = page.result.as_ref().unwrap()["chunks"].as_array().unwrap().clone();
+            assert!(!chunks.is_empty(), "{cursor}: {body}");
+            assert!(
+                chunks.iter().all(|c| c["payload"].is_null() && c["lines"].is_array()),
+                "{cursor}: {body}"
+            );
+        }
+    }
+
+    /// #142 F4: a phone's page is budgeted on the line text it receives, not
+    /// the stored payloads. Eighty 20 KiB messages: the operator's 512 KiB
+    /// payload budget stops at 25 rows, while each phone line is capped near
+    /// 8 KiB, so the phone's page holds about three times as many, is cut on
+    /// its own line bytes, and pages back from its oldest chunk to the rest.
+    #[tokio::test]
+    async fn a_phone_page_is_budgeted_on_line_bytes_not_payload_bytes() {
+        use ainb_hangar_proto::fleet::FLEET_TRANSCRIPT_LIST_MAX_BYTES;
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let text = "x".repeat(20 * 1024);
+        let events: Vec<_> = (0..80)
+            .map(|n: i64| NewFleetProviderEvent {
+                event_id: format!("big-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("acp:big".to_string()),
+                provider_session_id: None,
+                observed_at: n,
+                received_at: n,
+                event_type: "acp.message".to_string(),
+                raw_payload: serde_json::json!({ "text": text }).to_string(),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(store.pool(), &events).await.expect("seed");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let list = |caller: auth::Caller, extra: serde_json::Value| {
+            let pool = store.pool().clone();
+            async move {
+                let mut params = serde_json::json!({"session_key": "acp:big", "limit": 100});
+                params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+                let resp = dispatch_as(
+                    &pool,
+                    &req(methods::FLEET_TRANSCRIPT_LIST, params),
+                    &health(),
+                    &sink(),
+                    &caller,
+                )
+                .await;
+                assert!(resp.error.is_none(), "{:?}", resp.error);
+                resp.result.unwrap()
+            }
+        };
+        let line_bytes = |page: &serde_json::Value| -> usize {
+            page["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|c| c["lines"].as_array().unwrap().clone())
+                .map(|l| l["text"].as_str().unwrap().len())
+                .sum()
+        };
+
+        let operator = list(auth::Caller::Operator, serde_json::json!({})).await;
+        assert_eq!(operator["chunks"].as_array().unwrap().len(), 25);
+        assert_eq!(operator["truncated"], true);
+
+        let tail = list(phone.clone(), serde_json::json!({})).await;
+        let tail_chunks = tail["chunks"].as_array().unwrap().clone();
+        assert!(
+            tail_chunks.len() > 50 && tail_chunks.len() < 80,
+            "{} chunks",
+            tail_chunks.len()
+        );
+        assert!(line_bytes(&tail) <= FLEET_TRANSCRIPT_LIST_MAX_BYTES);
+        assert_eq!(tail["truncated"], true, "older rows remain");
+        let oldest = tail_chunks[0]["ingest_order"].as_i64().unwrap();
+        assert_eq!(
+            tail["next_before_order"].as_i64(),
+            Some(oldest),
+            "the next page back starts at the oldest chunk kept"
+        );
+        let back = list(phone.clone(), serde_json::json!({"before_order": oldest})).await;
+        assert_eq!(
+            back["chunks"].as_array().unwrap().len() + tail_chunks.len(),
+            80,
+            "paging back reaches every row once"
+        );
+        assert_eq!(back["truncated"], false);
+
+        let forward = list(phone, serde_json::json!({"after_order": 0})).await;
+        let forward_chunks = forward["chunks"].as_array().unwrap();
+        assert_eq!(forward_chunks.len(), tail_chunks.len());
+        assert!(line_bytes(&forward) <= FLEET_TRANSCRIPT_LIST_MAX_BYTES);
+        assert_eq!(
+            forward["next_after_order"],
+            forward_chunks.last().unwrap()["ingest_order"],
+            "a forward walk resumes after the last chunk kept"
+        );
+    }
+
+    /// #142 F2: an attention row's request context (an error snippet, an
+    /// ask's text) is scrubbed before `attention/list` or the
+    /// `attention/subscribe` snapshot hands it to a paired device. The
+    /// operator reads it as stored.
+    #[tokio::test]
+    async fn attention_payloads_reach_a_device_scrubbed() {
+        use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttention};
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let opaque = "z3Kd8Qw1Pv6Ty0Hn4Bm7Xc2R";
+        let payload = serde_json::json!({
+            "snippet": format!("401 from api: sent Authorization: Bearer {opaque}"),
+            "question": format!("retry with {}?", format!("ghp_{}", "C".repeat(36))),
+        })
+        .to_string();
+        AttentionRepo::insert(
+            store.pool(),
+            &NewAttention {
+                id: "01J0ATTNAAAAAAAAAAAAAAAAAA".to_string(),
+                session_id: "s-1".to_string(),
+                cwd: String::new(),
+                workspace_id: None,
+                kind: AttentionKind::Error,
+                payload: payload.clone(),
+                degraded: false,
+                created_at: 1,
+                raise_transcript: None,
+                channels: ainb_hangar_core::channel::ChannelSet::default(),
+            },
+        )
+        .await
+        .expect("raise");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        for request in [
+            req(methods::ATTENTION_LIST, serde_json::json!({"fleet": true})),
+            req(methods::ATTENTION_SUBSCRIBE, serde_json::json!({})),
+        ] {
+            let device = dispatch_as(store.pool(), &request, &health(), &sink(), &phone).await;
+            assert!(device.error.is_none(), "{:?}", device.error);
+            let rows = device.result.as_ref().unwrap()["attention"].as_array().unwrap().clone();
+            assert_eq!(rows.len(), 1, "{}: {rows:?}", request.method);
+            let seen = rows[0]["payload"].as_str().unwrap();
+            assert!(!seen.contains(opaque), "{}: {seen}", request.method);
+            assert!(!seen.contains("ghp_CCCC"), "{}: {seen}", request.method);
+            let context: serde_json::Value = serde_json::from_str(seen).expect("still JSON");
+            assert!(
+                context["snippet"]
+                    .as_str()
+                    .unwrap()
+                    .contains(ainb_hangar_core::redact::REDACTED),
+                "{seen}"
+            );
+
+            let operator = dispatch_as(
+                store.pool(),
+                &request,
+                &health(),
+                &sink(),
+                &auth::Caller::Operator,
+            )
+            .await;
+            assert_eq!(
+                operator.result.as_ref().unwrap()["attention"][0]["payload"],
+                payload.as_str(),
+                "the operator reads the context as stored"
+            );
+        }
     }
 
     /// The live subscription does the same for a device, with one classifier
