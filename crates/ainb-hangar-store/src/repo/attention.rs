@@ -803,6 +803,45 @@ impl AttentionDrift {
 /// card", which is true and survivable. The count is logged so the condition
 /// is visible rather than silent. Note this can only ever help the NEXT new
 /// kind: a binary already shipped without this tolerance still breaks.
+impl AttentionRepo {
+    /// Keep the pane `attention_id` was raised in: the tmux pane id
+    /// (`%N`) ainb handed the agent as `AINB_PANE_KEY` and the hook carried
+    /// on the line. Replaces an earlier record for the row.
+    ///
+    /// # Errors
+    /// Propagates the `SQLite` write failure.
+    pub async fn record_pane_key(
+        pool: &SqlitePool,
+        attention_id: &str,
+        pane_key: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO attention_pane (attention_id, pane_key) VALUES (?, ?) \
+             ON CONFLICT(attention_id) DO UPDATE SET pane_key = excluded.pane_key",
+        )
+        .bind(attention_id)
+        .bind(pane_key)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The pane `attention_id` was raised in, or `None` for a row raised
+    /// without the key.
+    ///
+    /// # Errors
+    /// Propagates the `SQLite` read failure.
+    pub async fn pane_key(
+        pool: &SqlitePool,
+        attention_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT pane_key FROM attention_pane WHERE attention_id = ?")
+            .bind(attention_id)
+            .fetch_optional(pool)
+            .await
+    }
+}
+
 fn row_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<Option<AttentionRow>, sqlx::Error> {
     let kind_token: String = row.try_get("kind")?;
     let Some(kind) = AttentionKind::parse(&kind_token) else {
@@ -1339,5 +1378,51 @@ mod tests {
             .unwrap();
         let board_only = AttentionRepo::get(store.pool(), "c2").await.unwrap().unwrap();
         assert!(board_only.channels.is_empty());
+    }
+
+    /// The pane key rides beside the row by its id: recorded, replaced,
+    /// absent for a row that never carried one, and gone with the row.
+    #[tokio::test]
+    async fn the_pane_key_is_kept_beside_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let pool = store.pool();
+        sqlx::query(
+            "INSERT INTO workspace (id, slug, name, created_at) VALUES ('ws', 'ws', 'ws', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let row = NewAttention {
+            id: "att-pane".to_string(),
+            session_id: String::new(),
+            cwd: "/work".to_string(),
+            workspace_id: None,
+            kind: AttentionKind::AskUserQuestion,
+            payload: "{}".to_string(),
+            degraded: false,
+            created_at: 1,
+            raise_transcript: None,
+            channels: ChannelSet::NONE,
+        };
+        AttentionRepo::insert(pool, &row).await.unwrap();
+        assert_eq!(
+            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
+            None
+        );
+        AttentionRepo::record_pane_key(pool, "att-pane", "%4").await.unwrap();
+        assert_eq!(
+            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
+            Some("%4".to_string())
+        );
+        AttentionRepo::record_pane_key(pool, "att-pane", "%5").await.unwrap();
+        assert_eq!(
+            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
+            Some("%5".to_string())
+        );
+        assert_eq!(
+            AttentionRepo::pane_key(pool, "att-none").await.unwrap(),
+            None
+        );
     }
 }
