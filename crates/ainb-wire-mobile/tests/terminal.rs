@@ -116,6 +116,7 @@ fn params_for(peer: &FakePeer, dir: &std::path::Path) -> ConnectParams {
             admin: false,
             expires_at_ms: 1_800_000_000_000,
             paired_at_ms: 1,
+            repair: false,
         },
         "mdd_test",
     )
