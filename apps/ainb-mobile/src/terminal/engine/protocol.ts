@@ -14,7 +14,9 @@ export type FromEngine =
   | { t: "fit"; cols: number; rows: number }
   | { t: "input"; data: string }
   /** An OSC 8 link was activated in the pane; the engine opened nothing. */
-  | { t: "link"; uri: string };
+  | { t: "link"; uri: string }
+  /** After each flush: bytes written since load and the fitted grid. */
+  | { t: "stats"; bytes: number; cols: number; rows: number };
 
 export function encode(msg: ToEngine | FromEngine): string {
   return JSON.stringify(msg);
@@ -27,6 +29,8 @@ export function decodeFromEngine(raw: string): FromEngine | undefined {
     if (v.t === "fit" && typeof v.cols === "number" && typeof v.rows === "number") return { t: "fit", cols: v.cols, rows: v.rows };
     if (v.t === "input" && typeof v.data === "string") return { t: "input", data: v.data };
     if (v.t === "link" && typeof v.uri === "string") return { t: "link", uri: v.uri.slice(0, 512) };
+    if (v.t === "stats" && typeof v.bytes === "number" && typeof v.cols === "number" && typeof v.rows === "number")
+      return { t: "stats", bytes: v.bytes, cols: v.cols, rows: v.rows };
   } catch {
     // not ours
   }
