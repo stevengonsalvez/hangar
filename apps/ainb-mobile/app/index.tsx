@@ -15,12 +15,21 @@ export default function Hosts() {
         ListEmptyComponent={<Text style={styles.muted}>No paired hosts yet.</Text>}
         renderItem={({ item }) => (
           <Link href={{ pathname: "/host/[hostId]", params: { hostId: item.hostId } }} asChild>
-            <Pressable style={styles.row} testID={`host-${item.hostId}`}>
+            <Pressable
+              style={styles.row}
+              testID={`host-${item.hostId}`}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.displayName}, ${item.repair ?? item.notice ?? item.reachability}`}
+            >
               <Text style={styles.name}>{item.displayName}</Text>
               <Text style={item.reachability === "reachable" ? styles.up : styles.down}>
                 {item.reachability === "reachable"
                   ? "reachable"
-                  : `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`}
+                  : item.reachability === "stale"
+                    ? `stale since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                    : item.reachability === "unreachable"
+                      ? `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                      : "unknown"}
               </Text>
             </Pressable>
           </Link>
