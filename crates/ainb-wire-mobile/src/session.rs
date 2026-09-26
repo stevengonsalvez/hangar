@@ -150,6 +150,9 @@ pub struct Closed {
     pub code: Option<u16>,
     /// Why.
     pub reason: String,
+    /// Whether this side closed on purpose (`close()`): never retryable,
+    /// the app asked for it.
+    pub local: bool,
 }
 
 impl Closed {
@@ -157,7 +160,11 @@ impl Closed {
     /// with the code and the crate's classification of it.
     #[must_use]
     pub fn error(&self) -> WireError {
-        let (retryable, retry_after_ms) = classify_close(self.code, &self.reason);
+        let (retryable, retry_after_ms) = if self.local {
+            (false, None)
+        } else {
+            classify_close(self.code, &self.reason)
+        };
         WireError::Closed {
             code: self.code,
             reason: self.reason.clone(),
@@ -462,6 +469,7 @@ impl Session {
                     let closed = Closed {
                         code: frame.as_ref().map(|f| u16::from(f.code)),
                         reason: frame.map(|f| f.reason.into_owned()).unwrap_or_default(),
+                        local: false,
                     };
                     return Err(closed.handshake_error());
                 }
@@ -606,12 +614,17 @@ impl Session {
     }
 
     fn mark_closed(&self, code: Option<u16>, reason: String) {
+        self.mark_closed_by(code, reason, false);
+    }
+
+    fn mark_closed_by(&self, code: Option<u16>, reason: String, local: bool) {
         let mut closed = self.closed.lock().unwrap();
         let first = closed.is_none();
         if first {
             *closed = Some(Closed {
                 code,
                 reason: reason.clone(),
+                local,
             });
         }
         drop(closed);
@@ -819,6 +832,7 @@ impl Session {
             let closed = self.closed().unwrap_or(Closed {
                 code: None,
                 reason: "closed".to_owned(),
+                local: false,
             });
             SessionEvent::Closed {
                 code: closed.code,
@@ -839,7 +853,7 @@ impl Session {
             &[],
         );
         let _ = self.out.send(Vec::new());
-        self.mark_closed(None, "closed by client".to_owned());
+        self.mark_closed_by(None, "closed by client".to_owned(), true);
     }
 
     /// The counters.
