@@ -804,41 +804,79 @@ impl AttentionDrift {
 /// is visible rather than silent. Note this can only ever help the NEXT new
 /// kind: a binary already shipped without this tolerance still breaks.
 impl AttentionRepo {
-    /// Keep the pane `attention_id` was raised in: the tmux pane id
-    /// (`%N`) ainb handed the agent as `AINB_PANE_KEY` and the hook carried
-    /// on the line. Replaces an earlier record for the row.
+    /// Keep the pane `attention_id` was raised in beside the row: the hook
+    /// line's process-start fingerprint (`pane=%N;pid=P;session_started=S`),
+    /// as the answer path hands it to the pane resolver. A later line for
+    /// the same row replaces it.
     ///
     /// # Errors
-    /// Propagates the `SQLite` write failure.
-    pub async fn record_pane_key(
+    ///
+    /// Returns the sqlx error if the write fails.
+    pub async fn record_pane_fingerprint(
         pool: &SqlitePool,
         attention_id: &str,
-        pane_key: &str,
+        fingerprint: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO attention_pane (attention_id, pane_key) VALUES (?, ?) \
-             ON CONFLICT(attention_id) DO UPDATE SET pane_key = excluded.pane_key",
+            "INSERT INTO attention_pane (attention_id, fingerprint) VALUES (?, ?) \
+             ON CONFLICT(attention_id) DO UPDATE SET fingerprint = excluded.fingerprint",
         )
         .bind(attention_id)
-        .bind(pane_key)
+        .bind(fingerprint)
         .execute(pool)
         .await?;
         Ok(())
     }
 
-    /// The pane `attention_id` was raised in, or `None` for a row raised
-    /// without the key.
+    /// The fingerprint of the pane `attention_id` was raised in, as
+    /// [`Self::record_pane_fingerprint`] kept it, or `None` for a row raised
+    /// outside tmux.
     ///
     /// # Errors
-    /// Propagates the `SQLite` read failure.
+    ///
+    /// Returns the sqlx error if the read fails.
+    pub async fn pane_fingerprint(
+        pool: &SqlitePool,
+        attention_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT fingerprint FROM attention_pane WHERE attention_id = ?")
+            .bind(attention_id)
+            .fetch_optional(pool)
+            .await
+    }
+
+    /// Superseded by [`Self::record_pane_fingerprint`]; kept until the daemon
+    /// has moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sqlx error if the write fails.
+    pub async fn record_pane_key(
+        pool: &SqlitePool,
+        attention_id: &str,
+        pane_key: &str,
+    ) -> Result<(), sqlx::Error> {
+        Self::record_pane_fingerprint(pool, attention_id, &format!("pane={pane_key}")).await
+    }
+
+    /// Superseded by [`Self::pane_fingerprint`]; kept until the daemon has
+    /// moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sqlx error if the read fails.
     pub async fn pane_key(
         pool: &SqlitePool,
         attention_id: &str,
     ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT pane_key FROM attention_pane WHERE attention_id = ?")
-            .bind(attention_id)
-            .fetch_optional(pool)
-            .await
+        Ok(
+            Self::pane_fingerprint(pool, attention_id).await?.and_then(|fingerprint| {
+                fingerprint
+                    .split(';')
+                    .find_map(|part| part.strip_prefix("pane="))
+                    .map(str::to_string)
+            }),
+        )
     }
 }
 
@@ -1422,6 +1460,27 @@ mod tests {
         );
         assert_eq!(
             AttentionRepo::pane_key(pool, "att-none").await.unwrap(),
+            None
+        );
+        // The whole fingerprint rides beside the row, and a later line
+        // replaces it.
+        AttentionRepo::record_pane_fingerprint(
+            pool,
+            "att-pane",
+            "pane=%6;pid=4242;session_started=9",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
+            Some("pane=%6;pid=4242;session_started=9".to_string())
+        );
+        assert_eq!(
+            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
+            Some("%6".to_string())
+        );
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-none").await.unwrap(),
             None
         );
     }
