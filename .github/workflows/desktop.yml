@@ -6,13 +6,20 @@ name: Desktop
 # build, the headless host contract, the sidecar supervisor against the real
 # hangar daemon, the DOM journey and the bundle smoke, on both runners.
 #
-# Dispatch and call only. The Linux shell leg already runs every night
-# (nightly.yml `desktop`), and release.yml calls this whole workflow as its
-# `desktop_gate`, so a release never ships a desktop bundle this gate has not
-# passed on the same commit. It holds no secrets and publishes nothing.
+# Runs on dispatch, when release.yml calls it as its `desktop_gate` (so a
+# release never ships a desktop bundle this gate has not passed on the same
+# commit), and on pull requests that touch the desktop, its UI, or the app
+# state it renders, so a desktop change is gated before it merges rather than
+# first at release. The Linux shell leg also runs every night (nightly.yml
+# `desktop`). It holds no secrets and publishes nothing.
 on:
   workflow_dispatch:
   workflow_call:
+  pull_request:
+    paths:
+      - "crates/ainb-desktop/**"
+      - "crates/ainb-app/**"
+      - ".github/workflows/desktop.yml"
 
 permissions:
   contents: read
