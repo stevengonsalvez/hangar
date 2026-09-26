@@ -21,11 +21,24 @@ for (const name of ["Node", "Element", "HTMLElement", "MutationObserver"]) {
   install(name, (window as unknown as Record<string, unknown>)[name]);
 }
 
-/** What the stand-in host answers each command with; a test sets it. */
+/** What the stand-in host answers each command with; a test sets it. An
+ * `Error` rejects the call with its message instead, so a test can simulate
+ * a daemon refusal (a `Result<T, String>` Tauri command rejects with the
+ * bare string) without a real round trip. */
 export const hostReplies = new Map<string, unknown>();
 
+/** The `args` object the most recent call to each command carried; a test
+ * reads this to assert exactly what a component sent, rather than re-deriving
+ * it from the component's own internals. */
+export const hostCalls = new Map<string, unknown>();
+
 (window as unknown as { __TAURI_INTERNALS__: unknown }).__TAURI_INTERNALS__ = {
-  invoke: async (command: string) => hostReplies.get(command) ?? null,
+  invoke: async (command: string, args?: unknown) => {
+    hostCalls.set(command, args);
+    const reply = hostReplies.get(command);
+    if (reply instanceof Error) throw reply.message;
+    return reply ?? null;
+  },
   transformCallback: () => 0,
   unregisterCallback: () => undefined,
 };
