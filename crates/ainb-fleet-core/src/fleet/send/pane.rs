@@ -192,18 +192,6 @@ pub async fn resolve_send_pane(session: &str, hint: &PaneHint) -> Result<Option<
     })
 }
 
-/// [`resolve_send_pane`], with a session tmux has no name for refused here;
-/// kept until every caller has moved.
-///
-/// # Errors
-///
-/// As [`resolve_send_pane`], plus the missing session.
-pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<String, String> {
-    resolve_send_pane(session, hint)
-        .await?
-        .ok_or_else(|| format!("no tmux session {session} to type into"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
