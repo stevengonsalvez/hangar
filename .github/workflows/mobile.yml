@@ -89,6 +89,10 @@ jobs:
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android24-clang"
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$tc/x86_64-linux-android24-clang"
           export RUSTFLAGS="-C link-arg=-Wl,--gc-sections"
+          # Before: cargo's default release profile. After: the size-tuned
+          # mobile profile the app ships. Both are printed by the gate step.
+          cargo build --release --lib --target aarch64-linux-android
+          cargo build --release --lib --target x86_64-linux-android
           cargo build --profile mobile --lib --target aarch64-linux-android
           cargo build --profile mobile --lib --target x86_64-linux-android
       # Per ABI: a warning above the 2 MiB M1-03 budget, a failure above
@@ -97,6 +101,10 @@ jobs:
       # for the same crate). Both numbers are printed before either fails.
       - name: Size gate, warn above 2 MiB and fail above 3 MiB per ABI
         run: |
+          echo "before (release profile, not gated):"
+          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 9999999999 9999999999 "arm64-v8a release"
+          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 9999999999 9999999999 "x86_64 release"
+          echo "after (mobile profile, gated):"
           rc=0
           bash scripts/size-gate.sh target/aarch64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=1
           bash scripts/size-gate.sh target/x86_64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 x86_64 || rc=1
