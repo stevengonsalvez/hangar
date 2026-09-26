@@ -534,6 +534,7 @@ mod tests {
 
     fn fleet_session(cwd: &str, workspace: &str) -> Session {
         Session {
+            provider_session_id: None,
             id: cwd.to_string(),
             cwd: cwd.to_string(),
             pid: None,
