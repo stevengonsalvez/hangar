@@ -23,11 +23,6 @@ async function shot(name) {
 /** The element that has keyboard focus, by class. */
 const focused = () => browser.execute(() => document.activeElement?.className ?? "");
 
-/** Whether the terminal's own textarea has focus. */
-async function terminalFocused() {
-  return browser.execute(() => document.activeElement?.classList.contains("xterm-helper-textarea") ?? false);
-}
-
 /** Where the keyboard is and whether the page is on screen, for a failure to say. */
 async function focusState() {
   return browser.execute(() => ({
@@ -37,23 +32,31 @@ async function focusState() {
   }));
 }
 
+/** How many lines the agent in `session`'s pane has read so far. */
+const linesRead = (session) => (paneText(session.tmux).match(/agent read:/g) ?? []).length;
+
 /**
  * Give `session`'s terminal the keyboard the way a person does: choose its
  * row, then click its pane. The shell also focuses a tab it has just opened,
  * but from an animation frame, and a page the runner keeps off screen (xvfb,
- * an occluded window) never runs one, so a wait on that focus alone holds on
- * one runner and not another. The click, and the textarea's own focus behind
- * it, is what the journey spec types through on both.
+ * an occluded window) never runs one, so a wait on that alone holds on one
+ * runner and not another. The keyboard is then proven where it matters: an
+ * Enter through the driver reaches the agent, which echoes the line it read.
+ * `document.activeElement` is not read for it, because WebKitGTK under xvfb
+ * never names the terminal's textarea there even while its keys land.
  */
 async function focusTerminal(session) {
   await click(`.session-row[data-session="${session.id}"]`);
   await $(".terminal[data-tab]").waitForExist({ timeout: 60_000 });
   await click(".terminal[data-tab] .xterm");
   await browser.execute(() => document.querySelector(".xterm-helper-textarea")?.focus());
-  await browser.waitUntil(terminalFocused, {
-    timeout: 30_000,
-    timeoutMsg: async () => `the terminal never took focus: ${JSON.stringify(await focusState())}`,
-  });
+  const before = linesRead(session);
+  await browser.keys(["Enter"]);
+  try {
+    await browser.waitUntil(() => linesRead(session) > before, { timeout: 30_000 });
+  } catch {
+    assert.fail(`the terminal never took the keyboard: ${JSON.stringify(await focusState())}`);
+  }
 }
 
 /** Open the palette by its chord, type the query, and read back where it went. */
