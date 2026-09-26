@@ -29,7 +29,7 @@ export function Banner() {
   useWireEvents(
     useCallback((ev) => {
       if (ev.kind === "attention_raised") raise(ev.row);
-      if (ev.kind === "attention_answered") retire(ev.attentionId);
+      if (ev.kind === "attention_answered") retire(ev.hostId, ev.attentionId);
     }, []),
   );
 
