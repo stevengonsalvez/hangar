@@ -172,7 +172,8 @@ pub fn public_key(private: &[u8; KEY_LEN]) -> Result<[u8; KEY_LEN], NoiseError> 
 ///
 /// Such a point's Diffie-Hellman output is all zero whatever the other side's
 /// key, so a session keyed on it is not secret. The host refuses one at
-/// message 1 and at redeem (R1-07).
+/// message 1 (the responder calls this). Redeem does not call it yet: R1-07
+/// (lane r1-daemon) is to refuse such a device key there too.
 ///
 /// The check multiplies `public` by a clamped scalar, which is a multiple of
 /// the cofactor 8, so the product is zero exactly when `public` lies in the
