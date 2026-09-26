@@ -36,7 +36,6 @@ impl EndpointFiles {
         let endpoint = dir.join(ENDPOINT_FILE_NAME);
         let headers_abs = std::fs::canonicalize(&dir)?.join(HEADERS_FILE_NAME);
 
-        write_private(&headers, render_headers_file(token).as_bytes())?;
         let rendered = HookEndpoint {
             port,
             version: HOOK_ENDPOINT_VERSION,
@@ -44,6 +43,16 @@ impl EndpointFiles {
             headers_path: headers_abs,
         }
         .render_env_file();
+        // The hook script applies the same allowlist, so a home path it would
+        // refuse (a space, a quote, `..`) would publish an endpoint no hook can
+        // use. Refuse to bind instead, loudly, before any file is written.
+        if let Err(e) = HookEndpoint::parse_env_file(&rendered) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("hangar home path is not usable by the hook script: {e}"),
+            ));
+        }
+        write_private(&headers, render_headers_file(token).as_bytes())?;
         write_private(&endpoint, rendered.as_bytes())?;
         Ok(Self {
             endpoint,
@@ -138,5 +147,16 @@ mod tests {
         let text = std::fs::read_to_string(fresh.endpoint_path()).unwrap();
         assert!(text.contains("AINB_HOOK_PORT=2222"));
         assert!(std::fs::read_to_string(fresh.headers_path()).unwrap().contains("new"));
+    }
+
+    #[test]
+    fn a_home_the_script_would_refuse_is_refused_before_any_file_is_written() {
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("with space");
+        std::fs::create_dir_all(&home).unwrap();
+        let err = EndpointFiles::publish(&home, 1234, "tok").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!home.join("hangar").join(HEADERS_FILE_NAME).exists());
+        assert!(!home.join("hangar").join(ENDPOINT_FILE_NAME).exists());
     }
 }
