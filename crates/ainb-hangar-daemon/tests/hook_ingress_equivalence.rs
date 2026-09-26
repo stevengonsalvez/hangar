@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use ainb_hangar_daemon::attention_ingest::AttentionIngest;
 use ainb_hangar_daemon::hook_ingress::{self, IngestSink};
-use ainb_hangar_proto::hooks::{ENDPOINT_FILE_NAME, HookEndpoint};
 use ainb_hangar_store::Store;
 use ainb_hangar_store::repo::attention::AttentionRepo;
 use ainb_hangar_store::repo::fleet::FleetRepo;
@@ -123,11 +122,12 @@ async fn via_http(dir: &Path, cwd: &str) -> Store {
     );
     let sink = Arc::new(IngestSink::new(ingest, dir.to_path_buf()));
     let running = hook_ingress::start(dir, sink).await.unwrap();
-    let endpoint = HookEndpoint::parse_env_file(
-        &std::fs::read_to_string(dir.join("hangar").join(ENDPOINT_FILE_NAME)).unwrap(),
-    )
-    .unwrap();
-    let token_line = std::fs::read_to_string(&endpoint.headers_path).unwrap();
+    let token_line = format!(
+        "{}\r\n",
+        std::fs::read_to_string(dir.join("hangar").join("hook-headers"))
+            .unwrap()
+            .trim_end()
+    );
     for payload in sequence(cwd) {
         let body = payload.to_string();
         let request = format!(
