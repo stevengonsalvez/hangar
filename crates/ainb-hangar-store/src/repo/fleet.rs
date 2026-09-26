@@ -1282,6 +1282,25 @@ impl FleetRepo {
     ///
     /// # Errors
     /// Propagates the `SQLite` read failure.
+    /// The exact tmux target (`session:window.pane`) the fleet row registered
+    /// under `provider_session_id` was observed in, newest observation first,
+    /// or `None` when no visible row names one. What an answer is typed into:
+    /// a session's active pane is not the agent's once the session is split.
+    pub async fn tmux_target_for_provider_session(
+        pool: &SqlitePool,
+        provider_session_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let target: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT tmux_target FROM fleet_session \
+             WHERE provider_session_id = ? AND visible = 1 AND tmux_target IS NOT NULL \
+             ORDER BY last_observed_at DESC LIMIT 1",
+        )
+        .bind(provider_session_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(target.flatten().filter(|target| !target.is_empty()))
+    }
+
     pub async fn list_attention_error(
         pool: &SqlitePool,
     ) -> Result<Vec<FleetSessionRow>, sqlx::Error> {
