@@ -18,6 +18,15 @@ const VISIBLE_WITHIN_MS = 10_000;
  */
 const SLOW_READ_MS = 5_000;
 
+/** The error for a page that stopped answering a read that ran `ms`. */
+function hung(ms, cause) {
+  return new Error(
+    `the page did not answer a visibility read for ${(ms / 1000).toFixed(1)} s: ` +
+      "the session or the webview has stopped responding",
+    { cause },
+  );
+}
+
 export const mochaHooks = {
   /**
    * Put the window on screen on macOS, and fail the spec when it will not go.
@@ -68,30 +77,29 @@ export const mochaHooks = {
       // then judged by what it did rather than by when the timer fired.
       if (inFlight !== null) {
         const { read, started } = inFlight;
+        let grace;
         const settled = await Promise.race([
           read.then(
             () => true,
             () => true,
           ),
-          new Promise((resolve) => setTimeout(() => resolve(false), SLOW_READ_MS)),
+          new Promise((resolve) => {
+            grace = setTimeout(() => resolve(false), SLOW_READ_MS);
+          }),
         ]);
-        if (!settled) {
-          throw new Error(
-            `the page did not answer a visibility read for ${((Date.now() - started) / 1000).toFixed(1)} s: ` +
-              "the session or the webview has stopped responding",
-            { cause: error },
+        clearTimeout(grace);
+        if (!settled) throw hung(Date.now() - started, error);
+        if (lastError === null && state === "visible") {
+          // The window made it, but only after the wait's deadline: worth a
+          // line in the run's output, since a spec that follows may be tight.
+          console.warn(
+            `window.hooks: the window read visible only after the ${VISIBLE_WITHIN_MS / 1000} s wait ` +
+              `(a read that started ${((Date.now() - started) / 1000).toFixed(1)} s ago answered late)`,
           );
+          return;
         }
-        // The late read landed visible: the window made it after all.
-        if (lastError === null && state === "visible") return;
       }
-      if (lastError !== null && lastReadMs >= SLOW_READ_MS) {
-        throw new Error(
-          `the page did not answer a visibility read for ${(lastReadMs / 1000).toFixed(1)} s: ` +
-            "the session or the webview has stopped responding",
-          { cause: lastError },
-        );
-      }
+      if (lastError !== null && lastReadMs >= SLOW_READ_MS) throw hung(lastReadMs, lastError);
       if (lastError !== null) {
         throw new Error(`the window's visibility could not be read: ${lastError.message ?? lastError}`, {
           cause: lastError,
