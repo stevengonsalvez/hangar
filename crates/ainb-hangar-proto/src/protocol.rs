@@ -288,6 +288,10 @@ pub const CAP_TERMINAL_STREAM: &str = "terminal.stream";
 /// Capability (dark until WP15): terminal input, `terminal/input`,
 /// `terminal/floor`, `terminal/resize`.
 pub const CAP_TERMINAL_INPUT: &str = "terminal.input";
+/// Capability (dark until the hooks flip): agent hooks POST to a loopback
+/// HTTP listener in the daemon (`AINB_HANGAR_HOOK_LISTEN`), found through the
+/// endpoint and headers files in [`crate::hooks`].
+pub const CAP_HOOKS_HTTP: &str = "hangar.hooks.http";
 
 /// Every capability defined by the v2-next freeze and not yet advertised.
 ///
@@ -302,6 +306,7 @@ pub const DARK_CAPABILITIES: &[&str] = &[
     CAP_SESSION_REF,
     CAP_TERMINAL_STREAM,
     CAP_TERMINAL_INPUT,
+    CAP_HOOKS_HTTP,
 ];
 
 /// The ONE capability catalogue: every string this build advertises.
@@ -392,6 +397,9 @@ pub const CAPABILITY_CATALOGUE: &[&str] = &[
     // `capabilities.catalogue` is a prefix of this array in order, so a
     // removal cannot hide as a move.
     CAP_WORKSPACE_SESSIONS,
+    // `fleet/transcript_list { before_order }`: a phone pages back only when
+    // the daemon says it can.
+    crate::fleet::FLEET_CAPABILITY_TRANSCRIPT_PAGE_BACK,
 ];
 
 /// Whether this build advertises `id`.
@@ -424,7 +432,7 @@ mod tests {
     /// this test in the same change that appends its strings.
     #[test]
     fn the_v2_next_capabilities_are_dark() {
-        assert_eq!(DARK_CAPABILITIES.len(), 8);
+        assert_eq!(DARK_CAPABILITIES.len(), 9);
         for id in DARK_CAPABILITIES {
             assert!(!advertises(id), "{id:?} is advertised before its flip");
         }
@@ -461,11 +469,12 @@ mod tests {
         }
         assert_eq!(
             crate::fleet::FLEET_PROTOCOL_CAPABILITY_IDS.len(),
-            27,
+            28,
             "D17 names 26 fleet ids; the append rule is written against that count. \
-             Bumping this is the conscious act the guard exists to require: 27 is \
+             Bumping this is the conscious act the guard exists to require: 28 is \
              25 plus `fleet.status.read`, the D14 status derivation, plus \
-             `fleet.roster_status.read`, its joined read (#1015)"
+             `fleet.roster_status.read`, its joined read (#1015), plus \
+             `fleet.transcript.page_back`, the backward transcript page"
         );
     }
 
