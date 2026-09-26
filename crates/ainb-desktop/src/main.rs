@@ -18,12 +18,13 @@ use std::time::Duration;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
+use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
-use ainb_desktop::terminal::{TabEvents, TabsView, Terminals, Tmux};
+use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
 use ainb_desktop::updater::{self, Check, Install, Phase, Settings as UpdateSettings, Updater};
 use ainb_hangar_proto::agent_status::AgentState;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -276,6 +277,37 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
     if let Some(terminals) = &window.terminals {
         terminals.close(&key);
     }
+}
+
+/// Create a worktree with an agent in it, then open its tab.
+///
+/// The daemon does the work (`worktree/create`); this command only asks and
+/// attaches the tmux session it names. The sidebar picks the session up on
+/// its next scan. A refusal comes back as the sentence the composer shows.
+#[tauri::command]
+async fn worktree_create(
+    window: tauri::State<'_, Window>,
+    args: CreateWorktreeArgs,
+) -> Result<CreatedWorktree, String> {
+    let client = ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| ainb_desktop::create::refusal_text(&error))?;
+    let created = ainb_desktop::create::request(&client, args).await?;
+    tracing::info!(session = %created.session_id, "window created a worktree session");
+    if let (Some(terminals), Ok(id)) = (
+        &window.terminals,
+        uuid::Uuid::parse_str(&created.session_id),
+    ) {
+        let target = TabTarget::Session {
+            id,
+            tmux: created.tmux_session_name.clone(),
+        };
+        if let Some(report) = terminals.open(target) {
+            window.shell.dispatch(report);
+        }
+    }
+    Ok(created)
 }
 
 /// The most of the sidecar log "show log" returns.
@@ -859,6 +891,7 @@ fn main() {
             terminal_input,
             terminal_resize,
             terminal_close,
+            worktree_create,
             update_check,
             update_apply,
             update_settings
