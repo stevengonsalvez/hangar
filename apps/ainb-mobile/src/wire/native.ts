@@ -35,7 +35,7 @@ import type {
   WireErrorKind,
   WireEvent,
 } from "./types";
-import { PeerCloseError } from "./types";
+import { PeerCloseError, isPeerCloseError } from "./types";
 
 // ---------------------------------------------------------------------------
 // The generated surface this adapter relies on. Field and method names are
@@ -107,11 +107,12 @@ export interface NativeMutationReceipt {
 }
 
 /**
- * `TranscriptChunkRecord`: `role` and `text` are the crate's own read of the
- * chunk body. The text is UNSCRUBBED and uncapped until classification moves
- * to the daemon (the crate cannot carry the daemon's regex scrub under the
- * 3 MiB library gate); once the daemon serves classified chunks the crate
- * record drops its raw `payload` and `text` is the daemon's scrubbed line.
+ * `TranscriptChunkRecord`: `role` comes from the event type, `text` is the
+ * crate's own read of the chunk body. The body is already scrubbed of
+ * credentials by the daemon at its wire boundary (`transcript_chunk_wire`),
+ * and the crate caps a line at 8192 chars; the daemon's own classification
+ * (one line per lane, the desktop's rendering) arrives with its
+ * `lines` field and replaces this read when it lands.
  */
 export interface NativeTranscriptChunk {
   ingestOrder: bigint | number;
@@ -128,34 +129,34 @@ export interface NativeMobileHost {
   advertises(capability: string): boolean;
   canType(): boolean;
   rosterStatus(): Promise<{ rows: NativeRosterRow[]; readRevision: bigint | number; readAtMs: bigint | number }>;
-  subscribeFleet(afterRevision: bigint | number): Promise<{
+  subscribeFleet(afterRevision: bigint): Promise<{
     headRevision: bigint | number;
     replayComplete: boolean;
     resetReason?: string;
   }>;
   attentionList(): Promise<NativeAttentionRecord[]>;
   subscribeAttention(): Promise<NativeAttentionRecord[]>;
-  answer(attentionId: string, answer: string, version: bigint | number, opId: string): Promise<{
+  answer(attentionId: string, answer: string, version: bigint, opId: string): Promise<{
     opId: string;
     outcome: Tagged;
     ack?: NativeMutationReceipt;
   }>;
-  sendPrompt(sessionKey: string, text: string, lifecycleUpdatedAt: bigint | number, opId: string): Promise<{
+  sendPrompt(sessionKey: string, text: string, lifecycleUpdatedAt: bigint, opId: string): Promise<{
     opId: string;
     messageId: string;
     ack?: NativeMutationReceipt;
   }>;
-  interrupt(sessionKey: string, version: bigint | number, processStartFingerprint: string, opId: string): Promise<{
+  interrupt(sessionKey: string, version: bigint, processStartFingerprint: string, opId: string): Promise<{
     opId: string;
     receiptStatus: string;
     ack?: NativeMutationReceipt;
   }>;
-  transcriptPage(sessionKey: string, afterOrder: bigint | number | undefined, limit: number): Promise<{
+  transcriptPage(sessionKey: string, afterOrder: bigint | undefined, limit: number): Promise<{
     chunks: NativeTranscriptChunk[];
     nextAfterOrder?: bigint | number;
     truncated: boolean;
   }>;
-  subscribeTranscript(sessionKey: string, afterOrder?: bigint | number): Promise<bigint | number | undefined>;
+  subscribeTranscript(sessionKey: string, afterOrder?: bigint): Promise<bigint | number | undefined>;
   terminalAttach(sessionKey: string, cols: number | undefined, rows: number | undefined, wantInput: boolean, scrollbackRows: number | undefined): Promise<{
     streamId: bigint | number;
     epoch: bigint | number;
@@ -165,10 +166,10 @@ export interface NativeMobileHost {
     floor: { holder?: { principal: string; label: string; streamId: bigint | number }; floorGen: bigint | number };
     nativeClients: number;
   }>;
-  terminalDetach(streamId: bigint | number): Promise<void>;
-  terminalInput(streamId: bigint | number, data: ArrayBuffer | Uint8Array, floorGen: bigint | number | undefined, opId: string): Promise<Tagged>;
-  terminalFloor(streamId: bigint | number, action: string, opId: string): Promise<Tagged>;
-  terminalResize(streamId: bigint | number, cols: number, rows: number): Promise<Tagged>;
+  terminalDetach(streamId: bigint): Promise<void>;
+  terminalInput(streamId: bigint, data: ArrayBuffer | Uint8Array, floorGen: bigint | undefined, opId: string): Promise<Tagged>;
+  terminalFloor(streamId: bigint, action: string, opId: string): Promise<Tagged>;
+  terminalResize(streamId: bigint, cols: number, rows: number): Promise<Tagged>;
   nextEvent(): Promise<Tagged>;
   close(): void;
   isClosed(): boolean;
@@ -197,8 +198,10 @@ let bindings: Bindings | undefined;
 export function loadBindings(): Bindings {
   if (bindings) return bindings;
   try {
+    // A string literal, not the constant: Metro rejects a dynamic require
+    // in app source at bundle time.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    bindings = require(BINDINGS_MODULE) as Bindings;
+    bindings = require("../../modules/ainb-wire-mobile") as Bindings;
   } catch (e) {
     throw new Error(`ainb-wire-mobile is not linked (${String(e)}); run with EXPO_PUBLIC_FAKE_WIRE=1`);
   }
@@ -218,6 +221,9 @@ export function setBindings(b: Bindings | undefined) {
 export const num = (v: bigint | number | undefined): number | undefined =>
   v === undefined ? undefined : Number(v);
 const n0 = (v: bigint | number): number => Number(v);
+/** A JS number lowered as the crate's i64/u64: ubrn wants a BigInt there. */
+export const big = (v: number): bigint => BigInt(Math.trunc(v));
+const bigOpt = (v: number | undefined): bigint | undefined => (v === undefined ? undefined : big(v));
 const bytes = (b: ArrayBuffer | Uint8Array): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
 
 /** The D18 codes a mutation answers with instead of a result. */
@@ -242,6 +248,9 @@ export function mutationVerdict(e: unknown): MutationAck | undefined {
 
 /** The crate's `WireError` (a thrown uniffi error) as a `PeerCloseError`, one to one. */
 export function toPeerCloseError(e: unknown): PeerCloseError {
+  // One already mapped (the adapter's own `not_connected`, or a mapped
+  // error re-thrown through a second catch) passes through unchanged.
+  if (isPeerCloseError(e)) return e;
   const err = e as { tag?: string; inner?: Record<string, unknown>; message?: string };
   const inner = err?.inner ?? {};
   const kindOf: Record<string, WireErrorKind> = {
@@ -321,12 +330,13 @@ type Req<K extends keyof WireClient> = WireClient[K] extends (req: infer R) => u
  * `WireClient` without `opId` or `version` pass tsc and fail at the binding;
  * this line fails tsc instead when types.ts and the adapter drift.
  */
-export const REQUEST_SHAPES_MATCH: [
-  Same<Req<"interrupt">, InterruptRequest>,
-  Same<Req<"terminalInput">, TerminalInputRequest>,
-  Same<Req<"terminalFloor">, TerminalFloorRequest>,
-  Same<SessionRow["version"], number>,
-] = [true, true, true, true];
+type Assert<T extends true> = T;
+export type RequestShapesMatch = [
+  Assert<Same<Req<"interrupt">, InterruptRequest>>,
+  Assert<Same<Req<"terminalInput">, TerminalInputRequest>>,
+  Assert<Same<Req<"terminalFloor">, TerminalFloorRequest>>,
+  Assert<Same<SessionRow["version"], number>>,
+];
 
 export function toSessionRow(hostId: HostId, r: NativeRosterRow): SessionRow {
   return {
@@ -435,10 +445,15 @@ export function toTerminalFrame(t: Tagged): TerminalFrame {
   }
 }
 
-/** One chunk as the crate decoded it: no JSON is parsed here. */
-export function toTranscriptEntry(c: NativeTranscriptChunk): TranscriptEntry {
+/**
+ * One chunk as the crate decoded it: no JSON is parsed here. A chunk with
+ * no text (usage, turn bookkeeping, an in-progress tool update) is not a
+ * line: `undefined`, never the wire token shown as prose.
+ */
+export function toTranscriptEntry(c: NativeTranscriptChunk): TranscriptEntry | undefined {
+  if (c.text === undefined || c.text === "") return undefined;
   const role = (["user", "agent", "tool", "system"] as const).find((r) => r === c.role) ?? "system";
-  return { seq: n0(c.ingestOrder), role, text: c.text ?? c.eventType, atMs: n0(c.observedAt) };
+  return { seq: n0(c.ingestOrder), role, text: c.text, atMs: n0(c.observedAt) };
 }
 
 /**
@@ -457,7 +472,8 @@ export function toWireEvent(hostId: HostId, t: Tagged): WireEvent | undefined {
       return { kind: "attention_answered", hostId, attentionId: String(inner.attentionId), by: String(inner.by) };
     case "TranscriptChunk": {
       const chunk = inner.chunk as NativeTranscriptChunk;
-      return { kind: "transcript_line", hostId, sessionKey: chunk.sessionKey, entry: toTranscriptEntry(chunk) };
+      const entry = toTranscriptEntry(chunk);
+      return entry && { kind: "transcript_line", hostId, sessionKey: chunk.sessionKey, entry };
     }
     case "TerminalFrame":
       return { kind: "terminal_frame", hostId, streamId: Number(inner.streamId), seq: Number(inner.seq), frame: toTerminalFrame(inner.frame as Tagged) };
@@ -506,6 +522,10 @@ export class NativeWire implements WireClient {
   /** A dial in flight per host: concurrent `connect` callers share it. */
   private readonly dialing = new Map<HostId, Promise<void>>();
   private readonly lastSeen = new Map<HostId, number>();
+  /** The `read_revision` of the roster the app last read per host: the first subscribe's cursor. */
+  private readonly lastRead = new Map<HostId, number>();
+  /** Sessions whose transcript is subscribed on the host, per host. */
+  private readonly transcriptSubscribed = new Set<string>();
   private readonly listeners = new Set<(ev: WireEvent) => void>();
   private readonly transcriptTaps = new Map<string, Set<(entry: TranscriptEntry) => void>>();
 
@@ -523,9 +543,10 @@ export class NativeWire implements WireClient {
   }
 
   /**
-   * A call on a host with no live socket is `not_connected`, its own kind:
-   * the cure is `connect`, never a re-pair, so it is retryable and it is
-   * not `not_paired` (which the crate answers when no record exists).
+   * A call on a host with no live socket is `not_connected`, its own kind,
+   * distinct from the crate's `not_paired` (no record). It is retryable:
+   * the app's redial gate (`mayRedial`) reads that, and the cure is a
+   * `connect`, never a re-pair.
    */
   private hostOf(hostId: HostId): NativeMobileHost {
     const l = this.live.get(hostId);
@@ -548,20 +569,14 @@ export class NativeWire implements WireClient {
       try {
         ev = await l.host.nextEvent();
       } catch (e) {
+        // The socket is not known to be gone: close it, or it leaks.
+        l.host.close();
         this.emit({ kind: "closed", hostId, reason: `event loop failed: ${String(e)}`, retryable: false });
         break;
       }
       if (ev.tag === "AttentionRaised") {
-        const id = String((ev.inner ?? {}).attentionId);
-        try {
-          const row = (await l.host.attentionList()).find((r) => r.id === id);
-          // A row already answered by the time we look is not news.
-          if (row) this.emit({ kind: "attention_raised", row: toAttentionRow(hostId, row) });
-        } catch {
-          // The list read failed, so the app's attention view is behind: it
-          // resyncs (a fresh subscribeAttention snapshot) rather than miss the row.
-          this.emit({ kind: "fleet_resync_required", hostId });
-        }
+        // Off the loop: the list read must not hold back terminal frames.
+        void this.raised(hostId, l, String((ev.inner ?? {}).attentionId));
         continue;
       }
       const mapped = toWireEvent(hostId, ev);
@@ -569,8 +584,33 @@ export class NativeWire implements WireClient {
       if (ev.tag === "Closed") break;
     }
     l.pumping = false;
-    this.live.delete(hostId);
-    this.lastSeen.set(hostId, Date.now());
+    // Only this connection's entry: a newer dial may own the host by now.
+    if (this.live.get(hostId) === l) {
+      this.live.delete(hostId);
+      this.lastSeen.set(hostId, Date.now());
+    }
+  }
+
+  /** The raised row, whole, so the banner carries its real `version`. */
+  private async raised(hostId: HostId, l: Live, id: string) {
+    try {
+      const row = (await l.host.attentionList()).find((r) => r.id === id);
+      // A row already answered by the time we look is not news.
+      if (row) this.emit({ kind: "attention_raised", row: toAttentionRow(hostId, row) });
+    } catch {
+      // The list read failed, so the app's attention view is behind: it
+      // resyncs (a fresh subscribeAttention snapshot) rather than miss the row.
+      this.emit({ kind: "fleet_resync_required", hostId });
+    }
+  }
+
+  /** Every binding call answers a `PeerCloseError`, never the raw uniffi object. */
+  private async guard<T>(f: () => Promise<T>): Promise<T> {
+    try {
+      return await f();
+    } catch (e) {
+      throw toPeerCloseError(e);
+    }
   }
 
   async hosts(): Promise<HostRow[]> {
@@ -644,24 +684,31 @@ export class NativeWire implements WireClient {
   }
 
   async rosterStatus(hostId: HostId): Promise<SessionRow[]> {
-    const r = await this.hostOf(hostId).rosterStatus();
+    const host = this.hostOf(hostId);
+    const r = await this.guard(() => host.rosterStatus());
+    this.lastRead.set(hostId, n0(r.readRevision));
     return r.rows.map((row) => toSessionRow(hostId, row));
   }
 
   /**
-   * No `afterRevision` is the first connect: it asks for the snapshot, that
-   * is the roster's `read_revision` as the cursor, so nothing is replayed
-   * from 0. With a cursor, the daemon replays from it.
+   * No `afterRevision` is the first connect: it asks for the snapshot at
+   * the `read_revision` of the roster the app last read on this host (so
+   * every revision after what the app rendered is replayed, and nothing
+   * from 0); with no roster read yet, a fresh read's. With a cursor, the
+   * daemon replays from it.
    */
   async subscribeFleet(hostId: HostId, afterRevision?: number): Promise<FleetCursor> {
     const host = this.hostOf(hostId);
-    const from = afterRevision ?? n0((await host.rosterStatus()).readRevision);
-    const r = await host.subscribeFleet(from);
-    return { revision: n0(r.headRevision), replayState: r.replayComplete ? "complete" : "snapshot_reset" };
+    return this.guard(async () => {
+      const from = afterRevision ?? this.lastRead.get(hostId) ?? n0((await host.rosterStatus()).readRevision);
+      const r = await host.subscribeFleet(big(from));
+      return { revision: n0(r.headRevision), replayState: r.replayComplete ? "complete" : "snapshot_reset" };
+    });
   }
 
   async subscribeAttention(hostId: HostId): Promise<AttentionRow[]> {
-    const rows = await this.hostOf(hostId).subscribeAttention();
+    const host = this.hostOf(hostId);
+    const rows = await this.guard(() => host.subscribeAttention());
     return rows.map((r) => toAttentionRow(hostId, r));
   }
 
@@ -671,7 +718,7 @@ export class NativeWire implements WireClient {
 
   async answer(req: { hostId: HostId; attentionId: string; answer: string; version: number; opId: string }) {
     try {
-      const r = await this.hostOf(req.hostId).answer(req.attentionId, req.answer, req.version, req.opId);
+      const r = await this.hostOf(req.hostId).answer(req.attentionId, req.answer, big(req.version), req.opId);
       return { outcome: toAnswerOutcome(r.outcome), ack: toAck(r.ack) };
     } catch (e) {
       const verdict = mutationVerdict(e);
@@ -686,7 +733,7 @@ export class NativeWire implements WireClient {
 
   async sendPrompt(req: { hostId: HostId; sessionKey: SessionKey; text: string; lifecycleUpdatedAt: number; opId: string }): Promise<MutationAck> {
     try {
-      const r = await this.hostOf(req.hostId).sendPrompt(req.sessionKey, req.text, req.lifecycleUpdatedAt, req.opId);
+      const r = await this.hostOf(req.hostId).sendPrompt(req.sessionKey, req.text, big(req.lifecycleUpdatedAt), req.opId);
       return toAck(r.ack) ?? { status: "accepted" };
     } catch (e) {
       const verdict = mutationVerdict(e);
@@ -698,7 +745,7 @@ export class NativeWire implements WireClient {
   /** `fleet/action { interrupt }` fenced on the row the user saw: its `version` and incarnation. */
   async interrupt(req: InterruptRequest): Promise<MutationAck> {
     try {
-      const r = await this.hostOf(req.hostId).interrupt(req.sessionKey, req.version, req.sessionIncarnation, req.opId);
+      const r = await this.hostOf(req.hostId).interrupt(req.sessionKey, big(req.version), req.sessionIncarnation, req.opId);
       return toAck(r.ack) ?? { status: "accepted" };
     } catch (e) {
       const verdict = mutationVerdict(e);
@@ -720,16 +767,26 @@ export class NativeWire implements WireClient {
   async transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]> {
     const host = this.hostOf(hostId);
     if (beforeSeq !== undefined) return [];
-    const tail = await host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE);
-    return tail.chunks.map(toTranscriptEntry);
+    const tail = await this.guard(() => host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE));
+    return tail.chunks.map(toTranscriptEntry).filter((e): e is TranscriptEntry => e !== undefined);
   }
 
+  /**
+   * The host is subscribed once per session (the wire has no unsubscribe;
+   * the daemon stops at close); every tap after the first is local. A host
+   * that is not connected throws before any tap is added, so nothing leaks.
+   * A subscribe the host refuses is not fatal: the page read still works.
+   */
   subscribeTranscript(hostId: HostId, sessionKey: SessionKey, cb: (entry: TranscriptEntry) => void): Unsubscribe {
+    const host = this.hostOf(hostId);
     const key = `${hostId}\u0000${sessionKey}`;
     const taps = this.transcriptTaps.get(key) ?? new Set();
     taps.add(cb);
     this.transcriptTaps.set(key, taps);
-    void this.hostOf(hostId).subscribeTranscript(sessionKey, undefined);
+    if (!this.transcriptSubscribed.has(key)) {
+      this.transcriptSubscribed.add(key);
+      host.subscribeTranscript(sessionKey, undefined).catch(() => this.transcriptSubscribed.delete(key));
+    }
     return () => {
       taps.delete(cb);
       if (taps.size === 0) this.transcriptTaps.delete(key);
@@ -737,27 +794,32 @@ export class NativeWire implements WireClient {
   }
 
   async terminalAttach(req: { hostId: HostId; sessionKey: SessionKey; cols?: number; rows?: number; wantInput?: boolean }): Promise<TerminalAttached> {
-    const a = await this.hostOf(req.hostId).terminalAttach(req.sessionKey, req.cols, req.rows, req.wantInput ?? false, undefined);
+    const host = this.hostOf(req.hostId);
+    const a = await this.guard(() => host.terminalAttach(req.sessionKey, req.cols, req.rows, req.wantInput ?? false, undefined));
     return { streamId: n0(a.streamId), epoch: n0(a.epoch), snapshotSeq: n0(a.snapshotSeq), cols: a.cols, rows: a.rows, floor: toFloorState(a.floor), nativeClients: a.nativeClients };
   }
 
   async terminalDetach(hostId: HostId, streamId: number): Promise<void> {
-    await this.hostOf(hostId).terminalDetach(streamId);
+    const host = this.hostOf(hostId);
+    await this.guard(() => host.terminalDetach(big(streamId)));
   }
 
   /** Receipt tier: `opId` is the app's, a fresh id per batch of input. */
   async terminalInput(req: TerminalInputRequest): Promise<{ floorGen: number } | FloorDenied> {
-    const t = await this.hostOf(req.hostId).terminalInput(req.streamId, new TextEncoder().encode(req.data), req.floorGen, req.opId);
+    const host = this.hostOf(req.hostId);
+    const t = await this.guard(() => host.terminalInput(big(req.streamId), new TextEncoder().encode(req.data), bigOpt(req.floorGen), req.opId));
     return toFloorDenied(t) ?? { floorGen: Number(((t.inner ?? {}) as { floorGen: bigint | number }).floorGen) };
   }
 
   async terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome> {
-    return toResizeOutcome(await this.hostOf(req.hostId).terminalResize(req.streamId, req.cols, req.rows));
+    const host = this.hostOf(req.hostId);
+    return toResizeOutcome(await this.guard(() => host.terminalResize(big(req.streamId), req.cols, req.rows)));
   }
 
   /** Dedupe tier: `opId` is the app's, a fresh id per action. */
   async terminalFloor(req: TerminalFloorRequest): Promise<FloorState | FloorDenied> {
-    const t = await this.hostOf(req.hostId).terminalFloor(req.streamId, req.action, req.opId);
+    const host = this.hostOf(req.hostId);
+    const t = await this.guard(() => host.terminalFloor(big(req.streamId), req.action, req.opId));
     return toFloorDenied(t) ?? toFloorState(((t.inner ?? {}) as { floor: Parameters<typeof toFloorState>[0] }).floor);
   }
 
