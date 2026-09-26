@@ -138,16 +138,11 @@ pub fn save(custody_dir: &Path, record: PairingRecord, token: &str) -> Result<()
 
 /// Set or clear the re-pair latch on `host_id`; absent is not an error.
 pub fn mark_repair(custody_dir: &Path, host_id: &str, repair: bool) -> Result<(), WireError> {
-    let mut records = list(custody_dir)?;
-    let mut changed = false;
-    for r in records.iter_mut().filter(|r| r.host_id == host_id) {
-        changed |= r.repair != repair;
-        r.repair = repair;
-    }
-    if changed {
-        write_index(custody_dir, &records)?;
-    }
-    Ok(())
+    with_index(custody_dir, |records| {
+        for r in records.iter_mut().filter(|r| r.host_id == host_id) {
+            r.repair = repair;
+        }
+    })
 }
 
 /// Forget a pairing: the token and the record. Absent is not an error.
