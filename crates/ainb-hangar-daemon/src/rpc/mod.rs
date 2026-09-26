@@ -2419,7 +2419,17 @@ async fn handle_fleet_message_send(
         // A lifecycle clock is one session's, so a fenced send names exactly
         // one target: fanning one clock across several sessions would check
         // all but one of them against a value nobody read.
-        let [target] = params.targets.as_slice() else {
+        // Counted the way the send will deliver: blanks dropped and
+        // duplicates folded, so `["s1", "s1"]` is still one target.
+        let mut distinct: Vec<&str> = params
+            .targets
+            .iter()
+            .map(String::as_str)
+            .filter(|target| !target.trim().is_empty())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let [target] = distinct.as_slice() else {
             return Err(invalid_params(
                 "a fenced fleet/message_send must name exactly one target",
             ));
@@ -14590,6 +14600,24 @@ mod tests {
             two.error.as_ref().map(|e| e.code),
             Some(INVALID_PARAMS),
             "{two:?}"
+        );
+        // #139 review: counted after the send's own normalisation, so a
+        // repeated or blank target still names one session.
+        let repeated = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s1", " "],
+                "text": "go on",
+                "request_id": "req-repeated",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_ne!(
+            repeated.error.as_ref().map(|e| e.message.as_str()),
+            Some("a fenced fleet/message_send must name exactly one target"),
+            "{repeated:?}"
         );
 
         let wrong_kind = call(
