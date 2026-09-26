@@ -176,7 +176,7 @@ static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
 /// lower-case `apikey`), so a camel-case `apiKey: SomeType` in code is too.
 static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"\b((?:(?i:x-[a-z0-9-]*(?:key|token|secret))|(?i:api-key|api-token|auth-token|access-token|private-token)|apikey)["']?\s*:\s*["']?)[A-Za-z0-9._~+/=-]{16,}"#,
+        r#"\b((?:(?i:x-[a-z0-9-]*(?:key|token|secret))|(?i:api-key|api-token|auth-token|access-token|private-token)|apikey)["']?\s*:\s*["']?)[A-Za-z0-9_.~+/=-]{16,}"#,
     )
     .expect("valid api key header regex")
 });
@@ -189,7 +189,7 @@ static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 /// file's path, a `$VAR` or `${VAR:-...}` expansion and a placeholder stay.
 static SECRET_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"\b((?:export\s+)?[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|KEY)=["']?)[A-Za-z0-9+_-][A-Za-z0-9._~+/=:@-]{15,}"#,
+        r#"\b((?:export\s+)?[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|KEY)=["']?)[A-Za-z0-9+_-][A-Za-z0-9_.~+/=:@-]{15,}"#,
     )
     .expect("valid secret env assignment regex")
 });
@@ -646,6 +646,14 @@ mod tests {
             (
                 format!("DB_KEY={opaque}\nOTHER=1"),
                 "DB_KEY=<redacted>\nOTHER=1",
+            ),
+            (
+                "WEBHOOK_SECRET=whsec_4f9Kq2_Zx8Lm1_Tp6Vb3".to_string(),
+                "WEBHOOK_SECRET=<redacted>",
+            ),
+            (
+                "X-Api-Key: live_7Hq2_Zp9Wd4Lx1Tn".to_string(),
+                "X-Api-Key: <redacted>",
             ),
         ] {
             assert_eq!(scrub(&text), kept, "{text}");
