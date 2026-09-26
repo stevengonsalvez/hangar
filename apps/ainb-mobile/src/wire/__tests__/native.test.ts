@@ -31,7 +31,7 @@ interface Calls {
   answer: { version: number; opId: string }[];
   sendPrompt: { opId: string }[];
   interrupt: { version: number; fingerprint: string; opId: string }[];
-  transcriptPage: { afterOrder?: number; limit: number }[];
+  transcriptPage: { afterOrder?: number; beforeOrder?: number; limit: number }[];
   terminalInput: string[];
   terminalFloor: string[];
   attentionList: number;
@@ -47,6 +47,10 @@ interface HostOpts {
   attentionListFails?: boolean;
   /** A global transcript: `ingest_order` values this session has. */
   transcript?: number[];
+  /** The host advertises `fleet.transcript.page_back`. */
+  pagesBack?: boolean;
+  /** A backward page answers rows at or past the cursor (a daemon bug). */
+  badBackwardPage?: boolean;
 }
 
 function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobileHost; calls: Calls } {
@@ -71,7 +75,7 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
   const localClose: Tagged = { tag: "Closed", inner: { code: undefined, reason: "closed by client", retryable: false } };
   const host: NativeMobileHost = {
     hello: () => ({ selectedProtocol: 1, capabilities: ["hangar.scopes", "terminal.input"], hostId: "h1", scope: "mobile+type", admin: false }),
-    advertises: (c) => c === "terminal.input",
+    advertises: (c) => c === "terminal.input" || (c === "fleet.transcript.page_back" && opts.pagesBack === true),
     canType: () => true,
     rosterStatus: async () => ({
       rows: [
@@ -121,12 +125,19 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
       refuse();
       return { opId, receiptStatus: "DELIVERED", ack: { status: "accepted" } };
     },
-    transcriptPage: async (_s, afterOrder, limit) => {
+    transcriptPage: async (_s, afterOrder, beforeOrder, limit) => {
       const after = afterOrder === undefined ? undefined : Number(afterOrder);
-      calls.transcriptPage.push({ afterOrder: after, limit });
-      // The daemon caps a page at 100 and reads forward from the cursor.
+      const before = beforeOrder === undefined ? undefined : Number(beforeOrder);
+      calls.transcriptPage.push({ afterOrder: after, beforeOrder: before, limit });
+      // The daemon caps a page at 100; forward from the cursor, or the
+      // newest page below it when asked backward.
       const cap = Math.min(limit, 100);
       const all = opts.transcript ?? [9];
+      if (before !== undefined) {
+        if (opts.badBackwardPage) throw { tag: "Protocol", inner: { message: "a backward page carried rows at or past the cursor" } };
+        const below = all.filter((o) => o < before).slice(-cap);
+        return { chunks: below.map(chunk), nextBeforeOrder: below[0] === undefined ? undefined : BigInt(below[0]), truncated: true };
+      }
       const from = after === undefined ? all.slice(-cap) : all.filter((o) => o > after).slice(0, cap);
       return { chunks: from.map(chunk), truncated: false };
     },
@@ -387,11 +398,27 @@ describe("native adapter", () => {
     expect(newest).toHaveLength(100);
     expect(newest[0]).toEqual({ seq: 1200, role: "agent", text: "line 1200", atMs: 2 });
     expect(newest.at(-1)?.seq).toBe(1299);
-    expect(calls.transcriptPage).toEqual([{ afterOrder: undefined, limit: 100 }]);
-    // An older page would come back as the session's oldest window (1000 to 1099),
-    // not the rows below 1200: the adapter answers empty instead and makes no call.
+    expect(calls.transcriptPage).toEqual([{ afterOrder: undefined, beforeOrder: undefined, limit: 100 }]);
+    // Without the capability an older page is empty and no call is made: an
+    // older daemon would answer the session's oldest window as if it were history.
     expect(await wire.transcriptPage("h1", "claude:s-1", 1200)).toEqual([]);
     expect(calls.transcriptPage).toHaveLength(1);
+  });
+
+  test("a host that pages back answers the rows below the cursor, and a wrong page is refused", async () => {
+    const transcript = Array.from({ length: 300 }, (_, i) => 1000 + i);
+    const { host, calls } = scriptedHost([], { transcript, pagesBack: true });
+    const wire = wireOver(host);
+    await wire.connect("h1");
+    const older = await wire.transcriptPage("h1", "claude:s-1", 1200);
+    expect(older).toHaveLength(100);
+    expect(older[0]?.seq).toBe(1100);
+    expect(older.at(-1)?.seq).toBe(1199);
+    expect(must(calls.transcriptPage[0], "backward call")).toEqual({ afterOrder: undefined, beforeOrder: 1200, limit: 100 });
+    expect(await wire.transcriptPage("h1", "claude:s-1", 1000)).toEqual([]);
+    const bad = wireOver(scriptedHost([], { transcript, pagesBack: true, badBackwardPage: true }).host);
+    await bad.connect("h1");
+    await expect(bad.transcriptPage("h1", "claude:s-1", 1200)).rejects.toMatchObject({ kind: "protocol" });
   });
 
   test("a close during a dial waits for the dial, then closes the socket it produced", async () => {
