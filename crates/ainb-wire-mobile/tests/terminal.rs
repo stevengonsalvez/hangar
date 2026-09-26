@@ -141,6 +141,26 @@ fn frame(stream_id: u64, seq: u64, frame: Value) -> (String, Value) {
 }
 
 #[tokio::test]
+async fn can_type_is_true_for_a_typing_scope_when_the_daemon_advertises_input() {
+    let peer = spawn(
+        Arc::new(|method: &str, _| {
+            assert_eq!(method, "auth/hello");
+            Reply::Result(json!({
+                "protocol": {"min": 1, "max": 1}, "selected": 1,
+                "capabilities": ["hangar.scopes", "terminal.input"],
+                "host_id": HOST_ID, "scope": {"base": "mobile+type", "admin": false}
+            }))
+        }),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let host = connect_host(params_for(&peer, dir.path())).await.unwrap();
+    assert!(host.can_type());
+    assert!(host.advertises("terminal.input".into()));
+}
+
+#[tokio::test]
 async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
     let floor_gen = Arc::new(AtomicU64::new(4));
     let acks = Arc::new(Mutex::new(Vec::new()));

@@ -36,6 +36,15 @@ pub enum Reply {
     },
     /// Close the socket with this code instead of answering.
     Close(u16, String),
+    /// Answer with this JSON-RPC error, then close with this code: what the
+    /// daemon does for a refused hello (the error reply first, the 4401 or
+    /// 4403 close a moment later).
+    ErrorThenClose {
+        code: i32,
+        message: String,
+        close: u16,
+        reason: String,
+    },
 }
 
 pub type Handler = Arc<dyn Fn(&str, Value) -> Reply + Send + Sync>;
@@ -50,6 +59,9 @@ pub struct PeerOpts {
     pub refuse_before_handshake: Option<(u16, String)>,
     /// Accept the WebSocket and never answer (a black hole).
     pub hang: bool,
+    /// Complete the handshake, then stop reading and writing for good: a
+    /// peer whose network died under it. No pong, no close frame ever.
+    pub deaf_after_handshake: bool,
     /// After reading Noise message 1, drop the socket this way instead of
     /// answering: a clean end of stream, or a TCP reset.
     pub after_message_1: Option<DropKind>,
@@ -72,6 +84,7 @@ impl Default for PeerOpts {
             host_id: HostId::parse(HOST_ID).unwrap(),
             refuse_before_handshake: None,
             hang: false,
+            deaf_after_handshake: false,
             after_message_1: None,
         }
     }
@@ -274,6 +287,9 @@ async fn serve(
     sink.send(Message::Binary(buf[..n].to_vec())).await.map_err(|e| e.to_string())?;
     let mut transport = hs.into_transport_mode().map_err(|e| e.to_string())?;
     handshakes.fetch_add(1, Ordering::SeqCst);
+    if opts.deaf_after_handshake {
+        std::future::pending::<()>().await;
+    }
 
     let mut reasm: Vec<u8> = Vec::new();
     let encrypt = |transport: &mut snow::TransportState, plain: Vec<u8>| {
@@ -327,6 +343,16 @@ async fn serve(
                             Reply::Error { code, message, data } => RpcResponse { jsonrpc: "2.0".into(), id: req.id, result: None, error: Some(RpcError { code, message, data }) },
                             Reply::Close(code, reason) => {
                                 let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::from(code), reason: reason.into() }))).await;
+                                return Ok(());
+                            }
+                            Reply::ErrorThenClose { code, message, close, reason } => {
+                                let response = RpcResponse { jsonrpc: "2.0".into(), id: req.id, result: None, error: Some(RpcError { code, message, data: None }) };
+                                let body = serde_json::to_vec(&response).unwrap();
+                                for f in frames(Opcode::Rpc, &lsp_encode(&body)) {
+                                    let cipher = encrypt(&mut transport, f);
+                                    sink.send(Message::Binary(cipher)).await.map_err(|e| e.to_string())?;
+                                }
+                                let _ = sink.send(Message::Close(Some(CloseFrame { code: CloseCode::from(close), reason: reason.into() }))).await;
                                 return Ok(());
                             }
                         };
