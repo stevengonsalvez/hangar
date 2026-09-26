@@ -508,17 +508,12 @@ where
 {
     // The single writer: every outbound frame is queued here so a pushed event
     // can never split a response frame (or vice versa).
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if write_half.write_all(&frame).await.is_err() {
-                break;
-            }
-            if write_half.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+    let writer = spawn_writer(
+        write_half,
+        out_rx,
+        idle_timeout_from_env(WRITE_DEADLINE_ENV, DEFAULT_WRITE_DEADLINE),
+    );
 
     // Gate 2 — first-frame token auth: the connection's first frame must be a
     // valid `auth/hello`. Unauthenticated or wrong-token connections get an
@@ -590,17 +585,18 @@ where
             },
         )
         .await;
-    if listed {
-        emit_connections_changed(&events, &registry).await;
-    }
     // The connection's event subscriptions: at most one forwarder per stream,
     // and a re-subscribe replaces it (last subscribe wins, no duplicate
     // delivery). See [`Subscriptions`] for what each one carries.
     //
     // The guard owns them from here to the end of the connection, so the
     // teardown runs on every exit: the read loop ending, a handler panic, or
-    // the task being aborted.
+    // the task being aborted. It is built with no await between it and the
+    // insert, so an abort during the announcement below still removes the row.
     let mut guard = ConnectionTeardown::new(connection.conn_id, registry.clone(), events.clone());
+    if listed {
+        emit_connections_changed(&events, &registry).await;
+    }
 
     // Idle read timeout so an abandoned / half-open client connection cannot pin
     // this per-connection task (and its fd) forever. Request/response clients
@@ -939,11 +935,14 @@ impl ConnectionTeardown {
         }
     }
 
-    /// The normal end: run the teardown now and disarm the `Drop` path.
+    /// The normal end: run the teardown now, and disarm the `Drop` path only
+    /// once the row is gone. An abort during the removal's await therefore
+    /// still reaches `Drop`, which retries it; a repeated removal is a no-op
+    /// that announces nothing.
     async fn finish(mut self) {
-        self.armed = false;
         std::mem::take(&mut self.subscriptions).abort_all();
         release_registry_row(&self.registry, self.conn_id, &self.events).await;
+        self.armed = false;
     }
 }
 
@@ -978,6 +977,47 @@ async fn release_registry_row(
     if registry.remove(conn_id).await {
         emit_connections_changed(events, registry).await;
     }
+}
+
+/// Longest one outbound frame may take to write before the connection is
+/// dropped. A peer that stops reading fills its socket buffer, and without a
+/// bound the writer would wait on it forever: every forwarder then blocks on the
+/// full queue and the connection's task is pinned. Generous, because a slow
+/// but live client is not a dead one.
+const DEFAULT_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Operator override (milliseconds) for [`DEFAULT_WRITE_DEADLINE`].
+const WRITE_DEADLINE_ENV: &str = "AINB_HANGAR_RPC_WRITE_DEADLINE_MS";
+
+/// The connection's single writer: drain `frames` onto `write_half` one frame
+/// at a time, so a pushed event can never split a response frame (or vice
+/// versa). Ends when every sender is gone, on a write fault, or when one frame
+/// cannot be written and flushed within `deadline`. Ending drops the receiver,
+/// so the read loop's next queue fails and the connection closes.
+fn spawn_writer<W>(
+    mut write_half: W,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            let written = tokio::time::timeout(deadline, async {
+                write_half.write_all(&frame).await?;
+                write_half.flush().await
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    tracing::debug!(?deadline, "hangar rpc: peer stopped reading; closing");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Outbound frame queue depth per connection (responses + pushed events).
@@ -14555,6 +14595,67 @@ mod tests {
             }
             assert_eq!(removals, 1, "{exit:?}: teardown must run exactly once");
         }
+    }
+
+    /// Review follow-up C: a peer that never reads cannot pin the writer. The
+    /// socket buffer fills, the one frame in flight misses the deadline, the
+    /// writer ends, and the next queued frame fails, which is what ends the
+    /// read loop and runs the teardown.
+    #[tokio::test]
+    async fn a_peer_that_never_reads_times_the_writer_out() {
+        let (client, server) = tokio::io::duplex(1024);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        let deadline = std::time::Duration::from_millis(100);
+        let writer = spawn_writer(server_write, out_rx, deadline);
+
+        // Far more than the 1 KiB buffer, and the client reads none of it.
+        out_tx.send(vec![b'x'; 64 * 1024]).await.expect("queued");
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("the writer must give up at its deadline, not wait forever")
+            .expect("the writer must not panic");
+        assert!(
+            out_tx.send(b"next".to_vec()).await.is_err(),
+            "with the writer gone, the connection's next frame fails"
+        );
+        drop(client);
+    }
+
+    /// The deadline is per frame, not per connection: a reader that keeps up
+    /// is never cut off, however long the connection lives.
+    #[tokio::test]
+    async fn a_peer_that_reads_is_never_timed_out() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_millis(200));
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = client.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        for _ in 0..8 {
+            out_tx.send(vec![b'y'; 16 * 1024]).await.expect("queued");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(out_tx);
+        writer.await.expect("writer ends when the senders do");
+        // Both split halves must go before the client reads EOF.
+        drop(server_read);
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("the client reads EOF once the server side is gone")
+            .expect("reader");
+        assert_eq!(total, 8 * 16 * 1024);
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
