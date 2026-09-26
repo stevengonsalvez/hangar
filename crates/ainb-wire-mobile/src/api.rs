@@ -70,8 +70,11 @@ fn split_ack<R: serde::de::DeserializeOwned>(
     Ok((typed, ack))
 }
 
-fn open_log(log_dir: &str) -> Result<Arc<ConnLog>, WireError> {
-    ConnLog::open(Path::new(log_dir))
+/// The connection log, or none when its directory cannot be used: the log
+/// is diagnostic, and an unwritable log dir must never keep a phone from
+/// connecting.
+fn open_log(log_dir: &str) -> Option<Arc<ConnLog>> {
+    ConnLog::open(Path::new(log_dir)).ok()
 }
 
 /// A fresh 128-bit op id from the crate's CSPRNG, for an app that mints
@@ -139,8 +142,9 @@ pub fn read_connection_log(log_dir: String, limit: u32) -> Result<Vec<ConnLogEnt
     Ok(log.tail(limit as usize).into_iter().map(ConnLogEntry::from).collect())
 }
 
-/// The fingerprint of the device key kept under `custody_dir`, minting the
-/// key on first use. All the app ever sees of the key.
+/// The fingerprint of the device key, minting the key on first use. All the
+/// app ever sees of the key. `custody_dir` is where the file backend keeps
+/// it; on iOS the key is a Keychain item and the directory is unused.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn device_key_fingerprint(custody_dir: String) -> Result<String, WireError> {
@@ -199,9 +203,12 @@ pub fn parse_offer(uri: String) -> Result<OfferSummary, WireError> {
     })
 }
 
-/// Redeem an offer as `display_name`: dial, `device/redeem`, `auth/hello`,
-/// then save the pairing (token in custody). The session is closed; the app
-/// calls `connect_host` with the returned host id.
+/// Redeem an offer as `display_name`: dial, `device/redeem`, save the
+/// pairing (token in custody), then `auth/hello`. The pairing is saved the
+/// moment redeem succeeds, because the invite is burned then: a hello that
+/// fails (a dropped socket, a 4401 from a clock skew) still leaves a pairing
+/// the app lists and connects later, never a lost token. The session is
+/// closed; the app calls `connect_host` with the returned host id.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn pair(
@@ -211,9 +218,9 @@ pub async fn pair(
     log_dir: String,
 ) -> Result<PairingRecord, WireError> {
     rt().spawn(async move {
-        let log = open_log(&log_dir)?;
+        let log = open_log(&log_dir);
         let (record, _hello) =
-            pairing::pair(&uri, &display_name, Path::new(&custody_dir), Some(log)).await?;
+            pairing::pair(&uri, &display_name, Path::new(&custody_dir), log).await?;
         Ok(record)
     })
     .await
@@ -243,7 +250,10 @@ pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireEr
 pub struct ConnectParams {
     /// The paired host.
     pub host_id: String,
-    /// The directory the device secrets are kept under.
+    /// The directory the pairing index and, on the file backend, the device
+    /// secrets are kept under. On iOS the secrets are Keychain items and the
+    /// directory holds the index only: clearing it does not reset the
+    /// device identity there.
     pub custody_dir: String,
     /// The directory the connection log is kept under.
     pub log_dir: String,
@@ -371,24 +381,17 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
                 ),
             })?;
         let key = DeviceKey::load_or_create(custody_dir)?;
-        let log = open_log(&params.log_dir)?;
-        let session = match pairing::dial(
-            &record.endpoints,
-            &host_id,
-            host_static_pubkey,
-            &key,
-            Some(log),
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                // A wrong pinned host key, or 4401 before message 2, is the
-                // host refusing this device's identity: latch re-pair.
-                latch_repair(custody_dir, &params.host_id, &e);
-                return Err(e);
-            }
-        };
+        let log = open_log(&params.log_dir);
+        let session =
+            match pairing::dial(&record.endpoints, &host_id, host_static_pubkey, &key, log).await {
+                Ok(session) => session,
+                Err(e) => {
+                    // A wrong pinned host key, or 4401 before message 2, is the
+                    // host refusing this device's identity: latch re-pair.
+                    latch_repair(custody_dir, &params.host_id, &e);
+                    return Err(e);
+                }
+            };
         let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
             Ok(hello) => {
                 session.start_heartbeat();
