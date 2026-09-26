@@ -176,6 +176,8 @@ fn every_dispatched_method_is_classified() {
 /// merely mention an arm, and comparisons are not.
 #[test]
 fn the_arm_parser_sees_every_arm_shape() {
+    // Two hashes are needed: the source holds `""#` inside a raw string.
+    #[allow(clippy::needless_raw_string_hashes)]
     let source = r##"
         match req.method.as_str() {
             methods::SINGLE => a(),
