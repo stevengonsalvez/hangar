@@ -264,6 +264,79 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
 }
 
 #[tokio::test]
+async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
+    let redeemed = Arc::new(AtomicBool::new(false));
+    let peer = spawn(
+        issuing_host(Arc::clone(&redeemed), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let dir_s = dir.path().to_string_lossy().into_owned();
+    pair(
+        offer_for(&peer, peer.host_pubkey, vec![live(&peer)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+
+    // The host's key changed under the pairing: connect_host is PeerChanged
+    // and the latch is set.
+    let mut record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    record.host_static_pubkey = vec![7u8; 32];
+    ainb_wire_mobile::pairing::save(dir.path(), record, TOKEN).unwrap();
+    let err = connect_host(ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(err, WireError::PeerChanged);
+    assert!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair,
+        "PeerChanged at connect latches"
+    );
+
+    // Re-pairing with an offer the host refuses at message 1 keeps the
+    // latch set (it stays a re-pair until a pair succeeds).
+    ainb_wire_mobile::pairing::mark_repair(dir.path(), HOST_ID, false).unwrap();
+    let err = pair(
+        offer_for(&peer, [9u8; 32], vec![live(&peer)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, WireError::PeerChanged);
+    assert!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair,
+        "PeerChanged at pair latches"
+    );
+
+    // A good pair clears it.
+    let fresh = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let record = pair(
+        offer_for(&fresh, fresh.host_pubkey, vec![live(&fresh)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!record.repair);
+    assert!(!list_pairings(dir_s).unwrap()[0].repair);
+}
+
+#[tokio::test]
 async fn an_offer_with_another_key_is_peer_changed_and_an_expired_one_is_refused() {
     let redeemed = Arc::new(AtomicBool::new(false));
     let peer = spawn(
