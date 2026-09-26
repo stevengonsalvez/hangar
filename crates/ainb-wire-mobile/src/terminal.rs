@@ -16,7 +16,7 @@
 //! [`WireError::FloorDenied`] with the holder, mapped by the session.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
@@ -380,17 +380,17 @@ impl Streams {
     }
 }
 
-/// Decode a `terminal/frame` notification, account its bytes, and send the
-/// ack when one is due. Returns the frame for the app.
+/// Decode a `terminal/frame` notification, account its bytes, and, when an
+/// ack is due, send it from its own task. Returns the frame for the app at
+/// once: the event loop never waits on the ack's round trip or its timeout.
 ///
-/// The frame is delivered whatever happens to the ack: a refused or lost
-/// `terminal/ack` is logged as [`crate::connlog::Event::AckFailed`] and
-/// counted, and the daemon's window closing is the `data_gap {paused}` the
-/// app already handles. The only error here is a frame that does not
-/// decode.
-pub(crate) async fn on_frame(
-    session: &Session,
-    streams: &Streams,
+/// A refused or lost `terminal/ack` is logged as
+/// [`crate::connlog::Event::AckFailed`] and counted; the daemon's window
+/// closing is the `data_gap {paused}` the app already handles. The only
+/// error here is a frame that does not decode.
+pub(crate) fn on_frame(
+    session: Arc<Session>,
+    streams: Arc<Streams>,
     params: serde_json::Value,
 ) -> Result<(StreamId, u64, TerminalFrameRecord), WireError> {
     let params: TerminalFrameParams =
@@ -399,25 +399,28 @@ pub(crate) async fn on_frame(
     if matches!(frame, TerminalFrameRecord::Closed { .. }) {
         streams.close(params.stream_id);
     } else if let Some(consumed) = streams.consume(params.stream_id, bytes) {
-        let ack: Result<TerminalAckResult, WireError> = session
-            .call(
-                methods::TERMINAL_ACK,
-                &TerminalAckParams {
-                    stream_id: params.stream_id,
-                    consumed,
-                },
-            )
-            .await;
-        if let Err(e) = ack {
-            streams.ack_failed();
-            if let Some(log) = session.log() {
-                log.log(crate::connlog::Event::AckFailed {
-                    stream_id: params.stream_id,
-                    consumed,
-                    detail: e.to_string(),
-                });
+        let stream_id = params.stream_id;
+        tokio::spawn(async move {
+            let ack: Result<TerminalAckResult, WireError> = session
+                .call(
+                    methods::TERMINAL_ACK,
+                    &TerminalAckParams {
+                        stream_id,
+                        consumed,
+                    },
+                )
+                .await;
+            if let Err(e) = ack {
+                streams.ack_failed();
+                if let Some(log) = session.log() {
+                    log.log(crate::connlog::Event::AckFailed {
+                        stream_id,
+                        consumed,
+                        detail: e.to_string(),
+                    });
+                }
             }
-        }
+        });
     }
     Ok((params.stream_id, params.seq, frame))
 }
