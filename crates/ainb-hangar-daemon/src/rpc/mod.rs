@@ -14674,17 +14674,29 @@ mod tests {
         .unwrap();
         assert_eq!(receipts, 0, "a refused action writes no receipt");
 
+        // The retry with the re-read version RUNS: the refusal was never this
+        // request id's recorded answer.
         let retried = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
-        assert_ne!(
-            rejection_reason(&retried).as_deref(),
-            Some(ainb_hangar_proto::mutation::REASON_CONFLICT),
-            "the refusal was not recorded as this request id's answer: {retried:?}"
+        assert!(
+            retried.error.is_none(),
+            "the retry succeeds: {:?}",
+            retried.error
         );
-        assert_ne!(
-            retried.error.as_ref().map(|e| e.code),
-            Some(INVALID_PARAMS),
-            "the retry is not refused as a reused request id: {retried:?}"
-        );
+        let ack = &retried.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "created", "{ack}");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 1, "the retry wrote exactly one receipt");
+
+        // And from then on the op id has an answer: the same call replays it.
+        let again = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert!(again.error.is_none(), "{:?}", again.error);
+        let ack = &again.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "replayed", "{ack}");
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
