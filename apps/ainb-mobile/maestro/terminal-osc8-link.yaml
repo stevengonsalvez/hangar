@@ -16,16 +16,18 @@ appId: com.stevengonsalvez.ainb.mobile
 - assertVisible:
     id: "terminal-webview"
 - assertVisible:
-    text: "engine ready"
+    text: "engine ready.*"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-before
-# the link text sits at the cursor row inside the webview; tap it twice
-# (xterm activates a link on a second tap when the first only hovers)
+# the link line is printed at the alt screen's cursor row (row 10 of the
+# fixture); on the emulator's 1080x2400 screen that is about 36 percent down.
+# Tap it twice: xterm activates a link on the second tap when the first only
+# hovers.
 - tapOn:
-    point: "20%,32%"
+    point: "40%,36%"
 - tapOn:
-    point: "20%,32%"
+    point: "40%,36%"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-after
