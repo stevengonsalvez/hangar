@@ -77,3 +77,24 @@ export function ackTurn(acks: AckMap, sessionKey: string, turnMarker: number): A
   if (isAcked(acks, sessionKey, turnMarker)) return acks;
   return { ...acks, [sessionKey]: turnMarker };
 }
+
+/**
+ * The ack key for a row whose Done comes only from an attention chip (no
+ * agent card, so no turn marker): acked at marker 0 until the chip clears.
+ */
+export function rowAckKey(sessionId: string): string {
+  return `row:${sessionId}`;
+}
+
+/**
+ * `acks` keeping only the keys in `live`: the cards and chip-only Done rows
+ * this window can still see. Pruning is what lets a chip-only Done show
+ * again after its chip clears and returns, and keeps storage from growing
+ * with every session that ever existed. Returns `acks` itself when nothing
+ * is dropped, so a caller can skip the write.
+ */
+export function pruneAcks(acks: AckMap, live: ReadonlySet<string>): AckMap {
+  const kept = Object.entries(acks).filter(([key]) => live.has(key));
+  if (kept.length === Object.keys(acks).length) return acks;
+  return Object.fromEntries(kept);
+}
