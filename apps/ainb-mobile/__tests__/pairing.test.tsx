@@ -18,12 +18,14 @@ beforeEach(() => {
   fake = new FakeWire();
   setWire(fake);
   jest.restoreAllMocks();
+  cam.scan = undefined; // never hit a previous test's camera instance
 });
 
 test("a scanned offer fills the field, shows the decoded host, and pairs only on the Pair tap", async () => {
   const screen = renderRouter("./app", { initialUrl: "/pair" });
   fireEvent.press(screen.getByTestId("scan"));
   await screen.findByTestId("camera");
+  await waitFor(() => expect(cam.scan).toBeDefined());
   cam.scan!("not-an-offer");
   cam.scan!(`ainb://pair#${HOST_C}.k1`);
   cam.scan!(`ainb://pair#${HOST_C}.k9`); // a second frame changes nothing
