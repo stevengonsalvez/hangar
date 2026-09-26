@@ -227,7 +227,9 @@ impl Caller {
     ///   if a row ever changes;
     /// - a device rescopes only a phone (`mobile` or `mobile+type`, never
     ///   `admin`), so one admin desktop cannot demote another, nor a plain
-    ///   laptop the operator granted. Only the operator can.
+    ///   laptop the operator granted. Only the operator can;
+    /// - a device never invites (`subject` `None`): `device/invite_create` is
+    ///   operator-only in the scope table.
     ///
     /// Pal grants nothing.
     #[must_use]
@@ -238,9 +240,11 @@ impl Caller {
             // An admin desktop moves a phone between the two phone scopes
             // and no further (`Grantor::may_grant`): the subject must be a
             // phone too, so it cannot demote a laptop the operator granted.
+            // A device never invites (`device/invite_create` is operator-only
+            // in the scope table), so no subject means no grant.
             Self::Device { scope, .. } => {
                 scope.admin()
-                    && subject.is_none_or(|subject| {
+                    && subject.is_some_and(|subject| {
                         !subject.admin()
                             && matches!(subject.base(), BaseScope::Mobile | BaseScope::MobileType)
                     })
@@ -1118,7 +1122,10 @@ mod tests {
         let admin = device(DeviceScope::DESKTOP_ADMIN);
         let phone = Some(DeviceScope::MOBILE_TYPE);
         assert!(admin.may_grant(DeviceScope::MOBILE, phone));
-        assert!(admin.may_grant(DeviceScope::MOBILE_TYPE, None));
+        assert!(
+            !admin.may_grant(DeviceScope::MOBILE_TYPE, None),
+            "a device never invites: device/invite_create is operator-only"
+        );
         assert!(
             !admin.may_grant(DeviceScope::DESKTOP, None),
             "DV5: desktop is operator-only"
