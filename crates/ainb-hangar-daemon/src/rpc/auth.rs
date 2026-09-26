@@ -367,6 +367,25 @@ pub fn refuse_reserved_member(actor: &ActorRef) -> Result<(), RpcError> {
     Ok(())
 }
 
+/// Refuse a claimed TEXT principal that reads as a device in either spelling
+/// (`device:<id>`, `member:device:<id>`): only [`Caller::sender`] writes one.
+///
+/// # Errors
+///
+/// `INVALID_PARAMS` naming the reserved prefix.
+pub fn refuse_reserved_text(claimed: &str) -> Result<(), RpcError> {
+    if device_principal(claimed.trim()).is_some() {
+        return Err(RpcError {
+            code: super::INVALID_PARAMS,
+            message: format!(
+                "principals starting `{DEVICE_PRINCIPAL_PREFIX}` are reserved for paired devices: {claimed}"
+            ),
+            data: None,
+        });
+    }
+    Ok(())
+}
+
 /// Live Pal credentials: `sha256(plaintext) -> scope_key`.
 ///
 /// ponytail: process-memory, not a table. A Pal token is only useful to the
@@ -1314,6 +1333,27 @@ mod tests {
         ] {
             let actor: ActorRef = fine.parse().unwrap();
             assert!(refuse_reserved_member(&actor).is_ok(), "{fine}");
+        }
+    }
+
+    /// Text principals too: neither spelling of a device may be claimed.
+    #[test]
+    fn a_text_principal_reading_as_a_device_is_reserved() {
+        for reserved in [
+            "device:01J0LAPTOP",
+            "member:device:01J0LAPTOP",
+            " device:x ",
+        ] {
+            assert!(refuse_reserved_text(reserved).is_err(), "{reserved}");
+        }
+        for fine in [
+            "operator",
+            "copilot",
+            "member:me",
+            "agent:device:x",
+            "device:",
+        ] {
+            assert!(refuse_reserved_text(fine).is_ok(), "{fine}");
         }
     }
 }
