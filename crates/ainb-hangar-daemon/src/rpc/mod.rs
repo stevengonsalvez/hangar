@@ -776,6 +776,7 @@ where
                         pool.clone(),
                         rx,
                         head_revision,
+                        authenticated.caller.device_id().is_some(),
                         out_tx.clone(),
                     ));
                 } else if acked && req.method == methods::FLEET_MESSAGE_SUBSCRIBE {
@@ -1170,6 +1171,7 @@ fn spawn_fleet_forwarder(
     pool: SqlitePool,
     mut rx: broadcast::Receiver<i64>,
     mut cursor: i64,
+    scrub: bool,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -1184,9 +1186,13 @@ fn spawn_fleet_forwarder(
             if !events.is_empty() {
                 for event in events {
                     cursor = event.revision;
-                    let Ok(params) = serde_json::to_value(&event) else {
+                    let Ok(mut params) = serde_json::to_value(&event) else {
                         continue;
                     };
+                    // A device's push is scrubbed like its snapshot.
+                    if scrub {
+                        ainb_hangar_core::redact::scrub_json(&mut params);
+                    }
                     if out.send(encode_notification_frame("fleet/event", &params)).await.is_err() {
                         return;
                     }
@@ -1803,13 +1809,13 @@ async fn handle(
         methods::HANGAR_BOARD_CARD_SET_AUTO_RUN => handle_board_card_set_auto_run(pool, req).await,
         methods::HANGAR_REPO_LIST => handle_repo_list(req),
         methods::FLEET_NEGOTIATE => handle_fleet_negotiate(req, health).await,
-        methods::FLEET_SNAPSHOT => handle_fleet_snapshot(pool).await,
+        methods::FLEET_SNAPSHOT => handle_fleet_snapshot(pool, caller).await,
         methods::FLEET_STATUS => handle_fleet_status(pool).await,
         methods::FLEET_ROSTER_STATUS => handle_fleet_roster_status(pool).await,
         // Receiver registration occurs in `serve_conn` before this snapshot is
         // read. The ack carries its exact head, then the forwarder drains rows
         // committed after that head before waiting for live wakeups.
-        methods::FLEET_SUBSCRIBE => handle_fleet_subscribe(pool, req).await,
+        methods::FLEET_SUBSCRIBE => handle_fleet_subscribe(pool, req, caller).await,
         methods::FLEET_ACTION => handle_fleet_action(pool, req, events).await,
         methods::FLEET_BROADCAST => handle_fleet_broadcast(pool, req, events).await,
         methods::FLEET_RECEIPT_LIST => handle_fleet_receipt_list(pool, req).await,
@@ -1887,9 +1893,23 @@ async fn handle(
 }
 
 /// Return the authoritative host Fleet snapshot.
-async fn handle_fleet_snapshot(pool: &SqlitePool) -> Result<serde_json::Value, RpcError> {
+async fn handle_fleet_snapshot(
+    pool: &SqlitePool,
+    caller: &auth::Caller,
+) -> Result<serde_json::Value, RpcError> {
     let snapshot = crate::fleet::snapshot_wire(pool).await.map_err(|error| store_err(&error))?;
-    to_value(&snapshot)
+    to_value(&snapshot).map(|value| scrubbed_for(caller, value))
+}
+
+/// Fleet session state for a paired device goes out scrubbed: each session's
+/// `current_request` is the pending ask or approval, the same request context
+/// `attention/*` scrubs, and a command awaiting approval can carry a
+/// credential. The operator reads it as stored.
+fn scrubbed_for(caller: &auth::Caller, mut value: serde_json::Value) -> serde_json::Value {
+    if caller.device_id().is_some() {
+        ainb_hangar_core::redact::scrub_json(&mut value);
+    }
+    value
 }
 
 /// Negotiate the exact Fleet protocol version and capability catalogue.
@@ -1924,6 +1944,7 @@ async fn handle_fleet_negotiate(
 async fn handle_fleet_subscribe(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::fleet::FleetSubscribeParams =
         parse_params(req, "{ after_revision }")?;
@@ -1967,6 +1988,7 @@ async fn handle_fleet_subscribe(
         replay,
         replay_state,
     })
+    .map(|value| scrubbed_for(caller, value))
 }
 
 /// Execute one optimistic, idempotent Fleet action.
@@ -3386,7 +3408,7 @@ enum PageWalk {
 }
 
 /// A phone's transcript page: `rows` classified oldest first, then cut to
-/// `max_bytes` of line text, never below one chunk.
+/// `max_bytes` of serialized lines, never below one chunk.
 ///
 /// Walking back, the newest chunks are kept and a cut sets `truncated` and
 /// moves `lowest_scanned` to the oldest chunk kept, so the next page back
@@ -3406,10 +3428,19 @@ fn device_page(
     let mut classifier = ainb_hangar_proto::transcript::AcpClassifier::default();
     let mut chunks: Vec<_> =
         rows.iter().map(|row| device_transcript_chunk(row, &mut classifier)).collect();
-    // Line text per chunk, in the order the budget walks them.
+    // Serialized line bytes per chunk, in the order the budget walks them.
     let mut costs: Vec<usize> = chunks
         .iter()
-        .map(|chunk| chunk.lines.iter().map(|line| line.text.len()).sum())
+        // What the line costs on the wire, JSON escaping included: text full
+        // of quotes, backslashes or control characters serialises to several
+        // times its length, so raw text would let a page overrun the budget.
+        .map(|chunk| {
+            chunk
+                .lines
+                .iter()
+                .map(|line| serde_json::to_vec(line).map_or(line.text.len(), |wire| wire.len()))
+                .sum()
+        })
         .collect();
     if matches!(walk, PageWalk::Back) {
         costs.reverse();
@@ -16206,6 +16237,41 @@ mod tests {
                 "the operator reads the context as stored"
             );
         }
+    }
+
+    /// #142 review: fleet session state carries each session's pending
+    /// request (`current_request`), a command awaiting approval included. A
+    /// paired device gets it scrubbed, on `fleet/snapshot`, the
+    /// `fleet/subscribe` ack and the forwarder's pushes alike (all three go
+    /// through `scrubbed_for` or the forwarder's `scrub` flag); the operator
+    /// reads it as stored.
+    #[test]
+    fn fleet_state_reaches_a_device_scrubbed() {
+        let github = format!("ghp_{}", "D".repeat(36));
+        let snapshot = serde_json::json!({
+            "sessions": [{
+                "session_key": "s1",
+                "current_request": {
+                    "tool": "Bash",
+                    "command": format!("git push https://x:{github}@github.com/o/r"),
+                },
+            }],
+        });
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let device = scrubbed_for(&phone, snapshot.clone()).to_string();
+        assert!(!device.contains(&github), "{device}");
+        assert!(
+            device.contains(ainb_hangar_core::redact::REDACTED),
+            "{device}"
+        );
+        assert_eq!(
+            scrubbed_for(&auth::Caller::Operator, snapshot.clone()),
+            snapshot,
+            "the operator reads it as stored"
+        );
     }
 
     /// The live subscription does the same for a device, with one classifier
