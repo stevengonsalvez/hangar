@@ -198,6 +198,31 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     let saved = list_pairings(dir_s.clone()).unwrap();
     assert_eq!(saved.len(), 1, "the pairing is saved before hello");
     assert_eq!(saved[0].device_id, DEVICE_ID);
+    assert!(!saved[0].repair, "a draining host is not a refusal");
+
+    // The same failure at hello with a 4403 keeps the pairing AND latches.
+    let revoking = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), Some(4403)),
+        PeerOpts::default(),
+    )
+    .await;
+    let other = tempfile::tempdir().unwrap();
+    let other_s = other.path().to_string_lossy().into_owned();
+    let err = pair(
+        offer_for(&revoking, revoking.host_pubkey, vec![live(&revoking)]),
+        "my phone".into(),
+        other_s.clone(),
+        other_s.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, WireError::Revoked);
+    let latched = list_pairings(other_s).unwrap();
+    assert_eq!(latched.len(), 1);
+    assert!(
+        latched[0].repair,
+        "4403 on the first hello sets the re-pair latch"
+    );
 
     // The saved token works on the next connect, against the same host once
     // it answers hello.
