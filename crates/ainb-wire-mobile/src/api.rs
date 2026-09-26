@@ -226,8 +226,10 @@ pub fn list_pairings(custody_dir: String) -> Result<Vec<PairingRecord>, WireErro
     pairing::list(Path::new(&custody_dir))
 }
 
-/// Forget a pairing: the token and the record. What the app does after a
-/// 4403 or when the owner removes a host.
+/// Forget a pairing: the token and the record. Only an explicit user action
+/// calls this (the owner removes a host). A 4401 or 4403 never forgets: it
+/// sets the re-pair latch (`PairingRecord.repair`) and the app shows
+/// "re-pair" while keeping the pairing.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireError> {
@@ -309,8 +311,9 @@ impl std::fmt::Debug for MobileHost {
 }
 
 /// Dial the paired host, handshake with its pinned key, and `auth/hello` as
-/// the paired device. A revoked device comes back as `Revoked`: the app
-/// forgets the pairing and shows "re-pair".
+/// the paired device. A 4401 or 4403 comes back as `Unauthenticated` or
+/// `Revoked` and sets the re-pair latch on the pairing record; the app shows
+/// "re-pair" and keeps the pairing until the user forgets it or pairs again.
 #[uniffi::export]
 pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, WireError> {
     rt().spawn(async move {
@@ -438,17 +441,18 @@ impl MobileHost {
 
     /// Answer one attention row, fenced on the `version` the app read.
     ///
-    /// `retry_op_id` is the id of a lost reply; the daemon replays it rather
-    /// than delivering twice.
+    /// `op_id` is minted by the app with `mint_op_id` BEFORE the send and
+    /// kept until a reply arrives, so a retry after a lost reply sends the
+    /// same id and the daemon replays it rather than delivering twice.
     pub async fn answer(
         self: Arc<Self>,
         attention_id: String,
         answer: String,
         version: i64,
-        retry_op_id: Option<String>,
+        op_id: String,
     ) -> Result<AnswerReply, WireError> {
         rt().spawn(async move {
-            let op = op_id(retry_op_id)?;
+            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
             let params = AnswerParams {
                 attention_id,
                 answer,
