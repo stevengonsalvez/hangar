@@ -75,8 +75,9 @@ async fn a_real_run_logs_events_with_digests_and_never_a_secret() {
             "handshake",
             "hello",
             "close",
+            "backoff",
         ],
-        "events in order; the backoff went to the file after this view"
+        "events in order; the backoff noted through a second open lands in the same log"
     );
 
     // Survives the app: read back from disk alone.
