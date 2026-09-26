@@ -13,41 +13,31 @@
 //                                    ▼ tmux send-keys
 //                              agent pane: "agent read: prod"
 //
-// Two hook lines, not one, and the reason is a product gap rather than the
-// harness (#1049): a Claude session row never learns its provider session id,
-// so the sidebar takes only a question raised with no session id (matched by
-// its unique worktree), while the board's waiting card needs one raised with
-// the id its Fleet session carries. One line per half, same question, same
-// worktree. The row with the id is never answered, so its card is still
-// waiting when the journey ends; it is asserted that way, not as answered,
-// and #1049 is what lets one question do both.
+// The question is raised through the real hook, `ainb fleet atc hook`, from
+// the session's own pane, under the session id ainb minted for the launch
+// and handed to `claude --session-id`: the id the session record holds. The
+// row takes the request by that id exactly, and the board's waiting card is
+// keyed by it. Nothing is matched by worktree.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { click } from "../support.js";
-import { AINB_BIN, env, hook, paneText, run, seeded } from "../world.js";
+import { AINB_BIN, env, paneText, raiseHook, run, seeded } from "../world.js";
 
 const QUESTION = "Ship to which environment?";
 const OPTIONS = ["staging", "prod", "canary"];
 /** Option two, as a person picks it: the second button, answered by label. */
 const PICK = 1;
 
-/** A PreToolUse line announcing the question, as the Claude hook writes it. */
-function askLine(eventId, sessionId, cwd) {
-  return {
-    event_id: eventId,
-    ts: Date.now(),
-    session_id: sessionId,
-    cwd,
-    event_type: "PreToolUse",
-    matcher: "AskUserQuestion",
-    agent: "claude",
-    payload: {
-      tool_name: "AskUserQuestion",
-      tool_input: { questions: [{ question: QUESTION, options: OPTIONS.map((label) => ({ label })) }] },
-    },
-  };
-}
+/** The AskUserQuestion call, as Claude hands it to its PreToolUse hook. */
+const ASK = {
+  event: "PreToolUse",
+  matcher: "AskUserQuestion",
+  payload: {
+    tool_name: "AskUserQuestion",
+    tool_input: { questions: [{ question: QUESTION, options: OPTIONS.map((label) => ({ label })) }] },
+  },
+};
 
 /**
  * What the window asked the host to do and what became of it, in order: each
@@ -85,7 +75,7 @@ async function settle(condition, timeout, explain) {
   try {
     await browser.waitUntil(condition, { timeout, interval: 100 });
   } catch {
-    throw new Error(explain());
+    throw new Error(await explain());
   }
 }
 
@@ -101,7 +91,8 @@ describe("answering from the window", () => {
   it("answers a daemon question from the banner and the daemon records the desktop", async () => {
     const target = seeded()[0];
     const stamp = Date.now();
-    const provider = `e2e-provider-${stamp}`;
+    assert.ok(target.claude, "the world seeded a Claude session with a minted session id");
+    const provider = target.claude;
 
     await $(".sidebar").waitForExist({ timeout: 90_000 });
     await browser.waitUntil(async () => !(await $(".banner").isExisting()), {
@@ -111,8 +102,7 @@ describe("answering from the window", () => {
     await $(`.session-row[data-session="${target.id}"]`).waitForExist({ timeout: 60_000 });
 
     // Raised while the window is open, by a process that is not the window.
-    hook(askLine(`e2e-ask-board-${stamp}`, provider, target.cwd));
-    hook(askLine(`e2e-ask-row-${stamp}`, "", target.cwd));
+    raiseHook(target, ASK);
 
     // The board: the agent the id names sits in the waiting column.
     await click(".board-tab .tab-title");
@@ -220,15 +210,74 @@ describe("answering from the window", () => {
     // `<surface>@<host>`: the surface is what the person sat at.
     assert.match(second.by, /^desktop@/, `the desktop answered, not the terminal: ${JSON.stringify(second)}`);
 
-    // The board's card is the row raised with the provider id, which no one
-    // answered, so it is still waiting. With #1049 closed, one question would
-    // be both the banner's and the card's, and this would read answered.
-    // Selecting the row opened its terminal tab, so the board is brought back
-    // to be read.
+    // The board's card is the daemon's view of the agent, which stays waiting
+    // until the agent's next hook event; the fixture agent fires none, so the
+    // card is still there. The request itself reads answered, as the second
+    // surface just found. Selecting the row opened its terminal tab, so the
+    // board is brought back to be read.
     await click(".board-tab .tab-title");
     await $(card).waitForExist({
       timeout: 30_000,
-      timeoutMsg: "the card for the unanswered row left the waiting column (#1049 keeps it there)",
+      timeoutMsg: "the agent's card left the board",
     });
+  });
+
+  it("answers from the banner over the inbox page, and the pick walks the reducer back", async () => {
+    // The banner is drawn over the inbox page, but its rows are the session
+    // list's, and the reducer refused them while it was on its Inbox screen:
+    // the pick went nowhere and the window logged it as dispatched (#121).
+    const target = seeded()[0];
+    const chosen = 2;
+    const readBefore = paneText(target.tmux).split(`agent read: ${OPTIONS[chosen]}`).length - 1;
+
+    await click(".inbox-button");
+    await $(".inbox").waitForExist({ timeout: 60_000 });
+    raiseHook(target, ASK);
+    await click(`.session-row[data-session="${target.id}"]`);
+    // The question just raised, not the one the case before answered, whose
+    // banner lingers as delivered.
+    let phase = "";
+    await settle(
+      async () => {
+        phase = await browser.execute(() => document.querySelector(".answer-banner[data-request] .answer-phase")?.dataset.phase ?? "");
+        return phase === "none";
+      },
+      60_000,
+      () => `no unanswered question came up over the inbox (last phase: ${phase || "no banner"})\n${desktopLog()}`,
+    );
+    const request = await $(".answer-banner[data-request]").getAttribute("data-request");
+    assert.ok(await $(".inbox").isExisting(), "the inbox page is still up under the banner");
+
+    const sentBefore = intentsSent().length;
+    await click(`.answer-banner .answer-option[data-option="${chosen}"]`);
+    await settle(
+      async () => {
+        phase = await browser.execute(
+          (id) => document.querySelector(`.answer-banner[data-request="${id}"] .answer-phase`)?.dataset.phase ?? "",
+          request,
+        );
+        return phase === "delivered";
+      },
+      60_000,
+      async () =>
+        `the pick over the inbox never read delivered (last phase: ${phase || "none"}; toasts: ${JSON.stringify(
+          await browser.execute(() => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent)),
+        )}; screen: ${await browser.execute(() => document.querySelector(".inbox") ? "inbox" : "not inbox")})\n${desktopLog()}`,
+    );
+    const sent = intentsSent().slice(sentBefore);
+    const shown = sent.map(({ command, outcome }) => `${command}:${outcome}`).join(", ");
+    assert.deepEqual(
+      sent.filter(({ outcome }) => outcome !== "dispatched"),
+      [],
+      `the host applied every intent of the pick: ${shown}`,
+    );
+    assert.equal(sent.at(-1)?.command, "session_list.ask.pick", `the pick is the last thing sent: ${shown}`);
+    await $(".inbox").waitForExist({ timeout: 30_000, reverse: true });
+
+    // The last mile, once more: the label reached the agent in the pane.
+    await browser.waitUntil(
+      () => paneText(target.tmux).split(`agent read: ${OPTIONS[chosen]}`).length - 1 > readBefore,
+      { timeout: 30_000, timeoutMsg: `the answer never reached the agent in ${target.tmux}` },
+    );
   });
 });
