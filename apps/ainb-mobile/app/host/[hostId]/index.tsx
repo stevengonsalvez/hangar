@@ -2,6 +2,7 @@ import { Link, useLocalSearchParams } from "expo-router";
 import { useEffect } from "react";
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 
+import { connectHost } from "../../../src/lifecycle";
 import { colors } from "../../../src/theme";
 import { useWire, useWireQuery } from "../../../src/wire/context";
 
@@ -9,7 +10,7 @@ export default function Sessions() {
   const { hostId } = useLocalSearchParams<{ hostId: string }>();
   const wire = useWire();
   useEffect(() => {
-    if (hostId) wire.connect(hostId).catch(() => undefined);
+    if (hostId) connectHost(wire, hostId).catch(() => undefined);
   }, [wire, hostId]);
   const { data, error } = useWireQuery((w) => (hostId ? w.rosterStatus(hostId) : Promise.resolve([])), [
     "fleet_revision",
