@@ -38,16 +38,33 @@ const root = document.getElementById("term")!;
 term.open(root);
 
 let readonly = true;
+function setReadonly(on: boolean) {
+  readonly = on;
+  // No stdin while read only: the hidden textarea never takes focus, so a tap
+  // does not raise the soft keyboard and nothing is buffered as input.
+  term.options.disableStdin = on;
+  term.textarea?.setAttribute("inputmode", on ? "none" : "text");
+}
 term.onData((data) => {
   if (!readonly) post({ t: "input", data });
 });
 
 let bytesWritten = 0;
+let statsTimer: ReturnType<typeof setTimeout> | undefined;
+const STATS_EVERY_MS = 250;
+/** One stats message per quarter second at most, after the write has landed. */
+function statsSoon() {
+  if (statsTimer !== undefined) return;
+  statsTimer = setTimeout(() => {
+    statsTimer = undefined;
+    post({ t: "stats", bytes: bytesWritten, cols: term.cols, rows: term.rows });
+  }, STATS_EVERY_MS);
+}
 const writes = makeCoalescer<Uint8Array>(
   (batch) => {
     const data = concat(batch);
     bytesWritten += data.length;
-    term.write(data, () => post({ t: "stats", bytes: bytesWritten, cols: term.cols, rows: term.rows }));
+    term.write(data, statsSoon);
   },
   (cb) => requestAnimationFrame(cb),
 );
@@ -74,12 +91,13 @@ window.__ainb = {
         refit();
         break;
       case "readonly":
-        readonly = msg.on;
+        setReadonly(msg.on);
         break;
     }
   },
 };
 
 window.addEventListener("resize", refit);
+setReadonly(true);
 refit();
 post({ t: "ready" });
