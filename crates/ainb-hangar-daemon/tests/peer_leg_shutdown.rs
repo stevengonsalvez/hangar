@@ -48,11 +48,11 @@ fn free_loopback_port() -> SocketAddr {
 }
 
 /// Write the host key the daemon will find before it asks any keychain, at
-/// the path the daemon itself resolves (`host_key::key_file_in`), 32 raw
+/// the path the daemon itself resolves (`host_key_file_in`), 32 raw
 /// bytes, mode 0600. Resolved, not spelled out here, so a change to that path
 /// moves the seed with it instead of leaving the daemon to reach a keychain.
 fn seed_host_key(hangar_home: &Path, secret: &[u8; 32]) -> std::path::PathBuf {
-    let file = ainb_hangar_daemon::host_key::key_file_in(hangar_home);
+    let file = ainb_hangar_daemon::host_key_file_in(hangar_home);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
     std::fs::OpenOptions::new()
         .write(true)
