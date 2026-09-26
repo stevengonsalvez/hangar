@@ -40,10 +40,10 @@ import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar
 import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
   accelerator,
-  keyboardTaken,
   openRowIntent,
   rowOf,
   stepTab,
+  terminalMayTakeFocus,
   type Accelerator,
   type RendererIntent,
   type RowId,
@@ -139,26 +139,30 @@ function Shell() {
 
   /**
    * Give the keyboard to `key`'s terminal, on the next frame so a tab that
-   * was just listed has mounted. Not while the palette is open, and not
-   * while another text field has the keyboard (the answer banner's composer,
-   * the settings search): the host answers a tab open on its own schedule,
-   * and an accelerator lands whenever it is pressed, so either can arrive
-   * after the chord that opened the palette or the click that put the cursor
-   * in the composer. Focus taken then sends the keystrokes meant for that
-   * field, Escape among them, to the agent's pane (#47). The palette gives
-   * the keyboard back to the active tab when it closes.
+   * was just listed has mounted, when `terminalMayTakeFocus` allows it: never
+   * under the open palette, and not for the host's own answer while a text
+   * field such as the answer banner's composer has the keyboard. The host
+   * answers a tab open on its own schedule, so its focus can land after the
+   * chord that opened the palette or the click that put the cursor in the
+   * composer, and the keystrokes meant for that field, Escape among them,
+   * would go to the agent's pane (#47). A person's own tab chord or click
+   * moves the keyboard as asked. The palette gives the keyboard back to the
+   * active tab when it closes.
    */
-  const focusTab = (key: string) =>
+  const focusTab = (key: string, byHost: boolean) =>
     requestAnimationFrame(() => {
-      if (!palette() && !keyboardTaken(document.activeElement)) focusers.get(key)?.();
+      if (terminalMayTakeFocus({ palette: palette(), byHost, active: document.activeElement })) {
+        focusers.get(key)?.();
+      }
     });
-  const activate = (key: string | null) => {
+  /** Show `key`'s terminal; `byHost` says the host asked, not a person. */
+  const activate = (key: string | null, byHost = false) => {
     setActive(key);
     if (key !== null) {
       setPane("terminal");
       closeTranscript();
       closeSettings();
-      focusTab(key);
+      focusTab(key, byHost);
     }
   };
   const showTabs = (view: TabsView) => {
@@ -166,14 +170,14 @@ function Shell() {
     for (const key of focusers.keys()) {
       if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
     }
-    if (view.focus !== null) activate(view.focus);
+    if (view.focus !== null) activate(view.focus, true);
     else if (!view.tabs.some((tab) => tab.key === active())) {
       // The shown tab ended (an unrelated tmux session died, say): point at
       // the next one WITHOUT leaving the board. `activate` means a person chose
       // a terminal; this is the strip tidying up after itself.
       const next = view.tabs[0]?.key ?? null;
       setActive(next);
-      if (next !== null && pane() === "terminal") focusTab(next);
+      if (next !== null && pane() === "terminal") focusTab(next, true);
     }
   };
   // A refused intent comes back with the row and the reason: say so, or a

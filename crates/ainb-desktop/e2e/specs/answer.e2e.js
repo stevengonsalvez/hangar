@@ -13,41 +13,31 @@
 //                                    ▼ tmux send-keys
 //                              agent pane: "agent read: prod"
 //
-// Two hook lines, not one, and the reason is a product gap rather than the
-// harness (#1049): a Claude session row never learns its provider session id,
-// so the sidebar takes only a question raised with no session id (matched by
-// its unique worktree), while the board's waiting card needs one raised with
-// the id its Fleet session carries. One line per half, same question, same
-// worktree. The row with the id is never answered, so its card is still
-// waiting when the journey ends; it is asserted that way, not as answered,
-// and #1049 is what lets one question do both.
+// The question is raised through the real hook, `ainb fleet atc hook`, from
+// the session's own pane, under the session id ainb minted for the launch
+// and handed to `claude --session-id`: the id the session record holds. The
+// row takes the request by that id exactly, and the board's waiting card is
+// keyed by it. Nothing is matched by worktree.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { click } from "../support.js";
-import { AINB_BIN, env, hook, paneText, run, seeded } from "../world.js";
+import { AINB_BIN, env, paneText, raiseHook, run, seeded } from "../world.js";
 
 const QUESTION = "Ship to which environment?";
 const OPTIONS = ["staging", "prod", "canary"];
 /** Option two, as a person picks it: the second button, answered by label. */
 const PICK = 1;
 
-/** A PreToolUse line announcing the question, as the Claude hook writes it. */
-function askLine(eventId, sessionId, cwd) {
-  return {
-    event_id: eventId,
-    ts: Date.now(),
-    session_id: sessionId,
-    cwd,
-    event_type: "PreToolUse",
-    matcher: "AskUserQuestion",
-    agent: "claude",
-    payload: {
-      tool_name: "AskUserQuestion",
-      tool_input: { questions: [{ question: QUESTION, options: OPTIONS.map((label) => ({ label })) }] },
-    },
-  };
-}
+/** The AskUserQuestion call, as Claude hands it to its PreToolUse hook. */
+const ASK = {
+  event: "PreToolUse",
+  matcher: "AskUserQuestion",
+  payload: {
+    tool_name: "AskUserQuestion",
+    tool_input: { questions: [{ question: QUESTION, options: OPTIONS.map((label) => ({ label })) }] },
+  },
+};
 
 /**
  * What the window asked the host to do and what became of it, in order: each
@@ -101,7 +91,8 @@ describe("answering from the window", () => {
   it("answers a daemon question from the banner and the daemon records the desktop", async () => {
     const target = seeded()[0];
     const stamp = Date.now();
-    const provider = `e2e-provider-${stamp}`;
+    assert.ok(target.claude, "the world seeded a Claude session with a minted session id");
+    const provider = target.claude;
 
     await $(".sidebar").waitForExist({ timeout: 90_000 });
     await browser.waitUntil(async () => !(await $(".banner").isExisting()), {
@@ -111,8 +102,7 @@ describe("answering from the window", () => {
     await $(`.session-row[data-session="${target.id}"]`).waitForExist({ timeout: 60_000 });
 
     // Raised while the window is open, by a process that is not the window.
-    hook(askLine(`e2e-ask-board-${stamp}`, provider, target.cwd));
-    hook(askLine(`e2e-ask-row-${stamp}`, "", target.cwd));
+    raiseHook(target, ASK);
 
     // The board: the agent the id names sits in the waiting column.
     await click(".board-tab .tab-title");
@@ -220,15 +210,15 @@ describe("answering from the window", () => {
     // `<surface>@<host>`: the surface is what the person sat at.
     assert.match(second.by, /^desktop@/, `the desktop answered, not the terminal: ${JSON.stringify(second)}`);
 
-    // The board's card is the row raised with the provider id, which no one
-    // answered, so it is still waiting. With #1049 closed, one question would
-    // be both the banner's and the card's, and this would read answered.
-    // Selecting the row opened its terminal tab, so the board is brought back
-    // to be read.
+    // The board's card is the daemon's view of the agent, which stays waiting
+    // until the agent's next hook event; the fixture agent fires none, so the
+    // card is still there. The request itself reads answered, as the second
+    // surface just found. Selecting the row opened its terminal tab, so the
+    // board is brought back to be read.
     await click(".board-tab .tab-title");
     await $(card).waitForExist({
       timeout: 30_000,
-      timeoutMsg: "the card for the unanswered row left the waiting column (#1049 keeps it there)",
+      timeoutMsg: "the agent's card left the board",
     });
   });
 
