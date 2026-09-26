@@ -1,30 +1,22 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { Pressable, StyleSheet, Text } from "react-native";
 
 import { colors } from "../theme";
-import { useWire, useWireEvents } from "../wire/context";
+import { useWireEvents } from "../wire/context";
 import { AnswerSheet } from "./AnswerSheet";
 import type { AttentionRow } from "../wire/types";
-import { raise, reconcile, retire, useAttentionRows } from "./store";
+import { raise, retire, useAttentionRows } from "./store";
 
 /**
  * The first tap. One in-app banner per open attention row, newest on top,
- * shown once per id (S9). Raised from the live socket; the initial pull per
- * host covers rows that were already open when we connected.
+ * announced once per id (S9). Raised from the live socket; the lifecycle's
+ * reconcile on every connect covers rows already open when we connected.
  */
 export function Banner() {
-  const wire = useWire();
   const rows = useAttentionRows();
   // The sheet keeps the row it opened with: a retire while it is up must not
   // pull the outcome copy out from under the reader.
   const [opened, setOpened] = useState<AttentionRow>();
-
-  useEffect(() => {
-    wire
-      .hosts()
-      .then((hosts) => Promise.all(hosts.map((h) => reconcile(wire, h.hostId).catch(() => undefined))))
-      .catch(() => undefined);
-  }, [wire]);
 
   useWireEvents(
     useCallback((ev) => {
