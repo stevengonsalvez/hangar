@@ -1,4 +1,5 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
+import { useRef } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { colors } from "../theme";
@@ -6,6 +7,8 @@ import { colors } from "../theme";
 /** QR scan of a pairing offer; hands the raw `ainb://pair#...` text up once. */
 export function Scanner({ onOffer }: { onOffer(uri: string): void }) {
   const [permission, request] = useCameraPermissions();
+  // The scanner fires on every frame; one offer is handed up, then it is done.
+  const done = useRef(false);
   if (!permission?.granted) {
     return (
       <Pressable testID="camera-permission" onPress={() => void request()} style={styles.ask}>
@@ -21,7 +24,9 @@ export function Scanner({ onOffer }: { onOffer(uri: string): void }) {
         facing="back"
         barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
         onBarcodeScanned={({ data }) => {
-          if (data.startsWith("ainb://pair#")) onOffer(data);
+          if (done.current || !data.startsWith("ainb://pair#")) return;
+          done.current = true;
+          onOffer(data);
         }}
       />
     </View>

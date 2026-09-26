@@ -23,5 +23,9 @@ npm test        # jest, always on FakeWire
   the frozen proto records (docs/contracts/v2-next.md) and becomes a re-export
   of the ubrn bindings when they land.
 - `src/wire/fake.ts`: `FakeWire`, the in-memory transport for dev and tests.
+- `src/terminal/`: xterm.js inside a locked-down webview. `postinstall`
+  bundles the engine into `src/terminal/engine/bundle.generated.ts`
+  (gitignored); with install scripts disabled run `npm run build:engine`
+  before `npm run check` or `npm test`.
 - `scripts/lint-wire.mjs`: fails `npm run check` if any file outside
   `src/wire/` parses wire JSON or names a snake_case wire field.

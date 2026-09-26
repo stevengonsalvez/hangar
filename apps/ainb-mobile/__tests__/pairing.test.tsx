@@ -20,12 +20,18 @@ beforeEach(() => {
   jest.restoreAllMocks();
 });
 
-test("a scanned offer pairs without touching the text field", async () => {
+test("a scanned offer fills the field, shows the decoded host, and pairs only on the Pair tap", async () => {
   const screen = renderRouter("./app", { initialUrl: "/pair" });
   fireEvent.press(screen.getByTestId("scan"));
   await screen.findByTestId("camera");
   cam.scan!("not-an-offer");
   cam.scan!(`ainb://pair#${HOST_C}.k1`);
+  cam.scan!(`ainb://pair#${HOST_C}.k9`); // a second frame changes nothing
+  expect((await screen.findByTestId("offer")).props.value).toBe(`ainb://pair#${HOST_C}.k1`);
+  expect(await screen.findByText(new RegExp(`host ${HOST_C} via lan`))).toBeTruthy();
+  expect(screen).toHavePathname("/pair");
+  expect((await fake.connectionLog()).some((l) => l.event === "paired")).toBe(false);
+  fireEvent.press(screen.getByTestId("pair-submit"));
   await waitFor(() => expect(screen).toHavePathname("/"));
   expect(await screen.findByText("phone")).toBeTruthy();
   expect((await fake.connectionLog()).at(-1)).toMatchObject({ hostId: HOST_C, event: "paired" });
@@ -40,10 +46,12 @@ test("a deep link prefills the offer", async () => {
 test("a second offer for the same host with a different key is refused as peer_changed", async () => {
   const screen = renderRouter("./app", { initialUrl: "/pair" });
   fireEvent.changeText(screen.getByTestId("offer"), `ainb://pair#${HOST_C}.k1`);
+  await screen.findByTestId("offer-preview");
   fireEvent.press(screen.getByTestId("pair-submit"));
   await waitFor(() => expect(screen).toHavePathname("/"));
   fireEvent.press(screen.getByTestId("pair"));
   fireEvent.changeText(await screen.findByTestId("offer"), `ainb://pair#${HOST_C}.k2`);
+  await screen.findByTestId("offer-preview");
   fireEvent.press(screen.getByTestId("pair-submit"));
   expect(await screen.findByText(/key changed/)).toBeTruthy();
   expect(screen).toHavePathname("/pair");
@@ -57,21 +65,34 @@ test("a 4403 close latches the host to re-pair; a 4503 does not", async () => {
   expect(screen.queryByTestId(`repair-${FAKE_HOST_A}`)).toBeNull();
 
   fake.closedBy(FAKE_HOST_A, 4403);
-  expect(await screen.findByText("revoked, pair again")).toBeTruthy();
+  expect(await screen.findByText("revoked or expired, pair again")).toBeTruthy();
   fireEvent.press(screen.getByTestId(`host-${FAKE_HOST_A}`));
   expect(await screen.findByTestId("repair-notice")).toBeTruthy();
   expect(screen).toHavePathname("/pair");
 
   // A fresh offer clears the latch.
   fireEvent.changeText(screen.getByTestId("offer"), `ainb://pair#${FAKE_HOST_A}`);
+  await screen.findByTestId("offer-preview");
   fireEvent.press(screen.getByTestId("pair-submit"));
   await waitFor(() => expect(screen).toHavePathname("/"));
   await waitFor(() => expect(screen.queryByTestId(`repair-${FAKE_HOST_A}`)).toBeNull());
 });
 
-test("a 4401 close after expiry reads as expired", async () => {
+test("a 4401 close latches identity re-pair", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
   await screen.findByText("mbp");
   fake.closedBy(FAKE_HOST_A, 4401);
-  expect(await screen.findByText("pairing expired, pair again")).toBeTruthy();
+  expect(await screen.findByText("host no longer accepts this device, pair again")).toBeTruthy();
+  fireEvent.press(screen.getByTestId(`host-${FAKE_HOST_A}`));
+  expect(await screen.findByText(/no longer accepts this device. Pair again/)).toBeTruthy();
+});
+
+test("4409 and an unknown close code park the host row without a re-pair latch", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByText("gcp");
+  fake.closedBy("01K5B0000000000000000BBBBB", 4409);
+  expect(await screen.findByText("update the app or the host")).toBeTruthy();
+  fake.closedBy("01K5B0000000000000000BBBBB", 4999);
+  expect(await screen.findByText("closed with an unknown code, check the host")).toBeTruthy();
+  expect(screen.queryByTestId("repair-01K5B0000000000000000BBBBB")).toBeNull();
 });

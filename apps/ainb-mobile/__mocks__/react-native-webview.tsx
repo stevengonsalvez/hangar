@@ -3,7 +3,7 @@
 import React from "react";
 import { View } from "react-native";
 
-export const bridge: { injected: string[]; engineMessage?: (raw: string) => void; reset(): void } = {
+export const bridge: { injected: string[]; props?: Record<string, unknown>; engineMessage?: (raw: string, url?: string) => void; reset(): void } = {
   injected: [],
   engineMessage: undefined,
   reset() {
@@ -13,13 +13,14 @@ export const bridge: { injected: string[]; engineMessage?: (raw: string) => void
 };
 
 export const WebView = React.forwardRef(function WebView(
-  props: { onMessage?: (e: { nativeEvent: { data: string } }) => void; testID?: string },
+  props: { onMessage?: (e: { nativeEvent: { data: string; url: string } }) => void; testID?: string } & Record<string, unknown>,
   ref: React.Ref<{ injectJavaScript(js: string): void }>,
 ) {
   React.useImperativeHandle(ref, () => ({ injectJavaScript: (js: string) => bridge.injected.push(js) }));
-  bridge.engineMessage = (raw) => props.onMessage?.({ nativeEvent: { data: raw } });
+  bridge.props = props;
+  bridge.engineMessage = (raw, url = "about:blank") => props.onMessage?.({ nativeEvent: { data: raw, url } });
   return <View testID={props.testID ?? "terminal-webview"} />;
 });
 
-export type WebViewMessageEvent = { nativeEvent: { data: string } };
+export type WebViewMessageEvent = { nativeEvent: { data: string; url: string } };
 export default WebView;

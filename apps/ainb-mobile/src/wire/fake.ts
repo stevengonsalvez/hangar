@@ -218,25 +218,29 @@ export class FakeWire implements WireClient {
     return { hostId, endpoints: [{ carrier: "lan", url: `ws://fake/${rest}` }], expiresAtMs: Date.now() + 300_000 };
   }
 
-  async pair(offer: PairingOffer, displayName: string): Promise<PairedHost> {
-    const key = offer.endpoints[0]?.url.split(".")[1] ?? "k0";
+  async pair(uri: string, displayName: string): Promise<PairedHost> {
+    const offer = await this.parseOffer(uri);
+    const key = uri.split(".")[1] ?? "k0";
     const pinned = this.pinned.get(offer.hostId);
     if (pinned !== undefined && pinned !== key) throw new Error(PEER_CHANGED);
     this.pinned.set(offer.hostId, key);
     if (!this.hosts_.has(offer.hostId)) this.addHost(offer.hostId, displayName, "reachable");
     const row = this.host(offer.hostId).row;
     delete row.repair;
+    delete row.notice;
     this.record(offer.hostId, "paired", displayName);
     this.emit({ kind: "reachability", hostId: offer.hostId, reachability: row.reachability, sinceMs: row.sinceMs });
     return { hostId: offer.hostId, deviceId: `dev-${offer.hostId.slice(-5)}`, scope: { base: "mobile", admin: false } };
   }
 
-  /** The host closed us with a peer close code (T9); 4403 and 4401 latch re-pair. */
+  /** The host closed us with a peer close code (T9); 4403 and 4401 latch re-pair, 4409 and unknown codes park the row. */
   closedBy(hostId: HostId, code: number) {
     const host = this.host(hostId);
     host.connected = false;
     if (code === 4403) host.row.repair = "revoked";
-    if (code === 4401) host.row.repair = "expired";
+    else if (code === 4401) host.row.repair = "identity";
+    else if (code === 4409) host.row.notice = "update_required";
+    else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_close";
     this.record(hostId, "close", String(code));
     this.emit({ kind: "closed", hostId, code });
   }

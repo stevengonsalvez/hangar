@@ -8,8 +8,6 @@ import { useTerminal } from "./useTerminal";
 /** The Terminal tab: read only under `mobile`, a type toggle under `mobile+type`. */
 export function WireTerminal({ hostId, sessionKey }: { hostId?: HostId; sessionKey?: SessionKey }) {
   const { state, setSink, input, setTyping, take, fit } = useTerminal(hostId, sessionKey);
-  const holder = state.floor.holder;
-  const mine = holder !== undefined && holder.streamId === state.streamId;
   return (
     <View style={styles.root}>
       <View style={styles.bar}>
@@ -44,7 +42,7 @@ export function WireTerminal({ hostId, sessionKey }: { hostId?: HostId; sessionK
           closed: {state.closed}
         </Text>
       ) : null}
-      <TerminalView testID="terminal" onReady={setSink} onInput={state.canType && state.typing ? input : undefined} onFit={mine ? fit : undefined} />
+      <TerminalView testID="terminal" onSink={setSink} onInput={state.canType && state.typing ? input : undefined} onFit={fit} />
     </View>
   );
 }

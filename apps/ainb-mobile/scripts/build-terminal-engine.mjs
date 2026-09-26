@@ -15,7 +15,11 @@ const result = await build({
 });
 const js = result.outputFiles[0].text;
 const css = readFileSync(`${root}node_modules/@xterm/xterm/css/xterm.css`, "utf8");
+// The CSP is the last line: no network, no frames, no navigation targets;
+// only the inline script and style this file writes.
+const csp = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const html = `<!doctype html><html><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>${css}
 html,body{margin:0;padding:0;height:100%;background:#191923;overflow:hidden}

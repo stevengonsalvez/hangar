@@ -7,14 +7,40 @@ import { TERMINAL_HTML } from "./engine/bundle.generated";
 import { decodeFromEngine, injection, toBase64, type ToEngine } from "./engine/protocol";
 import { ACCESSORY_KEYS, withCtrl } from "./keys";
 
+/** The inline document's own URL; nothing else may load or post. */
+export const ENGINE_URL = "about:blank";
+
+/**
+ * Terminal output is attacker-influenced (any program in the pane can print
+ * an OSC 8 link), so the webview may never leave the inline document, open
+ * a window, or read files. The engine itself is built with the link handler
+ * disabled and a CSP that allows only its inline script and style.
+ */
+export const LOCKDOWN = {
+  originWhitelist: [ENGINE_URL],
+  onShouldStartLoadWithRequest: (req: { url: string }) => req.url === ENGINE_URL,
+  setSupportMultipleWindows: false,
+  javaScriptCanOpenWindowsAutomatically: false,
+  allowFileAccess: false,
+  allowFileAccessFromFileURLs: false,
+  allowUniversalAccessFromFileURLs: false,
+  mixedContentMode: "never" as const,
+  incognito: true,
+  cacheEnabled: false,
+};
+
 export interface TerminalSink {
   write(bytes: Uint8Array): void;
   clear(): void;
 }
 
 export interface TerminalViewProps {
-  /** Called once the engine is up; returns the sink to feed bytes into. */
-  onReady(sink: TerminalSink): void;
+  /**
+   * Called on mount with the sink to feed bytes into. Writes made before the
+   * engine is up queue and inject once it reports `ready`, so a snapshot that
+   * arrives while the webview is still loading is never lost.
+   */
+  onSink(sink: TerminalSink): void;
   /** Keystrokes from the soft keyboard or the accessory bar; absent = read only. */
   onInput?(data: string): void;
   onFit?(cols: number, rows: number): void;
@@ -25,7 +51,7 @@ export interface TerminalViewProps {
  * xterm.js inside a webview. Bytes queue until the engine says `ready`, then
  * cross the bridge as base64; the engine coalesces them per frame.
  */
-export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewProps) {
+export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewProps) {
   const web = useRef<WebView>(null);
   const ready = useRef(false);
   const queue = useRef<ToEngine[]>([]);
@@ -49,10 +75,17 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
   );
 
   useEffect(() => {
+    onSink(sink);
+  }, [onSink, sink]);
+
+  useEffect(() => {
     if (ready.current) send({ t: "readonly", on: readOnly });
   }, [readOnly, send]);
 
   const onMessage = (e: WebViewMessageEvent) => {
+    // Only the inline document may talk to us. Any navigated-to page would
+    // have the same bridge, so a foreign origin is dropped before decoding.
+    if (e.nativeEvent.url !== ENGINE_URL) return;
     const msg = decodeFromEngine(e.nativeEvent.data);
     if (!msg) return;
     if (msg.t === "ready") {
@@ -60,7 +93,6 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
       send({ t: "readonly", on: readOnly });
       for (const m of queue.current) send(m);
       queue.current = [];
-      onReady(sink);
     } else if (msg.t === "fit") onFit?.(msg.cols, msg.rows);
     else if (msg.t === "input") type(msg.data);
   };
@@ -75,7 +107,6 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
     <View style={styles.root} testID={testID}>
       <WebView
         ref={web}
-        originWhitelist={["*"]}
         source={{ html: TERMINAL_HTML }}
         onMessage={onMessage}
         javaScriptEnabled
@@ -83,6 +114,7 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
         hideKeyboardAccessoryView
         style={styles.web}
         testID="terminal-webview"
+        {...LOCKDOWN}
       />
       {readOnly ? null : (
         <View style={styles.bar} testID="key-bar">
