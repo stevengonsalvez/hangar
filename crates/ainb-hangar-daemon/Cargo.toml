@@ -64,6 +64,9 @@ ainb-fleet-core = { path = "../ainb-fleet-core" }
 # Shared JSON-RPC envelope + the P4 snapshot wire row types the RPC server
 # serialises over the unix socket (P4.10). Pure data — no host deps leak in.
 ainb-hangar-proto = { path = "../ainb-hangar-proto" }
+# R1-06: the peer leg's framing, opcode registry and Noise IK responder, the
+# same crate the phone and the desktop client dial with.
+ainb-hangar-noise = { path = "../ainb-hangar-noise" }
 # The ACP client + transcript reducer + store writer the agent pool drives
 # (plan Phase 4). The pool lives HERE, not there, because only the daemon owns
 # the EventBroker and the SQLite handle; `ainb-acp` stays a pure library.
@@ -162,7 +165,7 @@ uuid = { workspace = true }
 # CancellationToken for cooperative shutdown of the inbound beads poll loop
 # (P2.4): the loop selects on `cancel.cancelled()` so the daemon's supervisor can
 # stop it within one tick.
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 # P5.3 env allowlist config: parse/serialise `~/.agents-in-a-box/hangar/env.allow.toml`
 # while preserving foreign sections (the daemon reads its `[env]` table but
 # round-trips the rest of the document untouched).

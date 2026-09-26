@@ -395,6 +395,45 @@ mod tests {
         assert_eq!(leftovers, [std::ffi::OsString::from("host_static.key")]);
     }
 
+    /// A backend that fails the test on any call, standing in for the
+    /// operator's real keychain.
+    struct Untouchable;
+
+    impl SecretBackend for Untouchable {
+        fn get(&self, _: &Scope, _: &str) -> ainb_hangar_secrets::Result<Option<SecretBytes>> {
+            panic!("the keychain was read although the key file is present")
+        }
+        fn put(&self, _: &Scope, _: &str, _: &[u8]) -> ainb_hangar_secrets::Result<()> {
+            panic!("the keychain was written although the key file is present")
+        }
+        fn delete(&self, _: &Scope, _: &str) -> ainb_hangar_secrets::Result<()> {
+            panic!("the keychain was cleared although the key file is present")
+        }
+    }
+
+    /// A seeded 0600 file wins before the keychain is asked anything, which
+    /// is what keeps a test home (and its daemon) off the operator's keychain.
+    #[test]
+    fn a_present_key_file_never_touches_the_keychain() {
+        let home = tempfile::tempdir().expect("home");
+        let file = key_file_in(home.path());
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        let secret = [0x5A; 32];
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&file)
+            .and_then(|mut f| f.write_all(&secret))
+            .expect("seed");
+
+        let loaded = load_or_mint(&Untouchable, home.path()).expect("load");
+        assert!(!loaded.minted);
+        assert_eq!(loaded.custody, Custody::File(file.clone()));
+        assert_eq!(loaded.key.secret(), &secret);
+        assert_eq!(std::fs::read(&file).expect("read"), secret);
+    }
+
     /// A keychain that answers `get` but refuses the write stores nothing, so
     /// the key goes to the file; the next boot finds the file before it asks
     /// the keychain again, and the key never changes.
