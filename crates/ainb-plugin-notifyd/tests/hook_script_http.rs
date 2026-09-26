@@ -468,39 +468,69 @@ fn a_background_job_worker_is_ignored() {
     assert!(f.seen.recv_timeout(Duration::from_millis(300)).is_err());
 }
 
-#[test]
-fn notify_sh_stands_down_when_the_transport_is_http() {
-    let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("hooks")).unwrap();
-    std::fs::write(home.path().join("hooks").join("transport"), "http\n").unwrap();
+/// Run notify.sh for `agent` with `payload`, notifyd absent and not spawned.
+fn run_notify(home: &Path, agent: &str, payload: &[u8], argv: bool) -> String {
     let notify = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../plugins/ainb-hooks/hooks/notify.sh")
         .canonicalize()
         .unwrap();
-    let mut child = Command::new("bash")
-        .arg(notify)
+    let mut cmd = Command::new("bash");
+    cmd.arg(notify);
+    if argv {
+        cmd.arg(String::from_utf8(payload.to_vec()).unwrap());
+    }
+    let mut child = cmd
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap())
-        .env("HOME", home.path())
-        .env("AINB_HANGAR_HOME", home.path())
-        .env("AINB_AGENT", "claude")
+        .env("HOME", home)
+        .env("AINB_HANGAR_HOME", home)
+        .env("AINB_AGENT", agent)
         .env("AINB_NOTIFY_DISABLE_LAZY_SPAWN", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"hook_event_name":"PermissionRequest","session_id":"s"}"#)
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "{}\n");
+    let mut stdin = child.stdin.take().unwrap();
+    if !argv {
+        stdin.write_all(payload).unwrap();
+    }
+    drop(stdin);
+    String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+}
+
+#[test]
+fn notify_sh_stands_down_for_claude_when_the_transport_is_http() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("hooks")).unwrap();
+    std::fs::write(home.path().join("hooks").join("transport"), "http\n").unwrap();
+    let out = run_notify(
+        home.path(),
+        "claude",
+        br#"{"hook_event_name":"PermissionRequest","session_id":"s"}"#,
+        false,
+    );
+    assert_eq!(out, "{}\n");
     assert!(
         !home.path().join("notify.fallback.jsonl").exists(),
         "no second copy of the event was delivered"
     );
+}
+
+#[test]
+fn notify_sh_still_delivers_other_agents_when_the_transport_is_http() {
+    // Only Claude's hooks moved to the daemon; Codex still comes through here.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("hooks")).unwrap();
+    std::fs::write(home.path().join("hooks").join("transport"), "http\n").unwrap();
+    run_notify(
+        home.path(),
+        "codex",
+        br#"{"type":"agent-turn-complete","session_id":"c1"}"#,
+        true,
+    );
+    let fallback = std::fs::read_to_string(home.path().join("notify.fallback.jsonl"))
+        .expect("the codex event was delivered (to the fallback, notifyd being absent)");
+    assert!(fallback.contains("c1"), "{fallback}");
 }
 
 #[test]
