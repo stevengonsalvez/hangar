@@ -404,6 +404,7 @@ mod tests {
         TranscriptOutcome::Page(FleetTranscriptListResult {
             chunks,
             next_after_order: next,
+            next_before_order: None,
             truncated: false,
         })
     }
