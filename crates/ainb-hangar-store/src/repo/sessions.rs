@@ -283,7 +283,7 @@ impl SessionsRepo {
              model_source = excluded.model_source, \
              codex_model = excluded.codex_model, \
              codex_thread_id = excluded.codex_thread_id, \
-             claude_session_id = excluded.claude_session_id",
+             claude_session_id = COALESCE(excluded.claude_session_id, sessions.claude_session_id)",
         )
         .bind(&session.session_id)
         .bind(&session.tmux_session_name)
