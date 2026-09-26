@@ -574,6 +574,7 @@ fn record_to_entry(
         model_source: text("model_source").unwrap_or("LegacyTyped").to_string(),
         codex_model: text("codex_model").map(str::to_string),
         codex_thread_id: text("codex_thread_id").map(str::to_string),
+        claude_session_id: text("claude_session_id").map(str::to_string),
     };
     Ok((entry, id_minted))
 }
@@ -593,5 +594,6 @@ fn entry_to_row(entry: WorkspaceSessionEntry) -> SessionRow {
         model_source: entry.model_source,
         codex_model: entry.codex_model,
         codex_thread_id: entry.codex_thread_id,
+        claude_session_id: entry.claude_session_id,
     }
 }

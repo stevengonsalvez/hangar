@@ -767,7 +767,9 @@ pub struct DeviceRow {
 }
 
 /// `device/redeem` params: the first Rpc on the peer leg, in place of hello.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::invite_secret`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRedeemParams {
     /// The invite, a ULID.
     pub invite_id: String,
@@ -780,7 +782,9 @@ pub struct DeviceRedeemParams {
 }
 
 /// `device/redeem` result. The next frame must be `auth/hello` with the token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::device_token`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceRedeemResult {
     /// The new device id.
     pub device_id: String,
@@ -814,7 +818,9 @@ pub struct DeviceInviteCreateParams {
 }
 
 /// `device/invite_create` result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::offer`]: the URI carries the invite secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInviteCreateResult {
     /// The pairing URI, `ainb://pair#…`; also the QR payload.
     pub offer: String,
@@ -822,6 +828,57 @@ pub struct DeviceInviteCreateResult {
     pub invite_id: String,
     /// Unix milliseconds the invite expires.
     pub expires_at_ms: i64,
+}
+
+impl fmt::Debug for DeviceRedeemParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            invite_id,
+            invite_secret: _,
+            display_name,
+            protocol,
+        } = self;
+        f.debug_struct("DeviceRedeemParams")
+            .field("invite_id", invite_id)
+            .field("invite_secret", &crate::Redacted)
+            .field("display_name", display_name)
+            .field("protocol", protocol)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DeviceRedeemResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            device_id,
+            device_token: _,
+            scope,
+            expires_at_ms,
+            host_id,
+        } = self;
+        f.debug_struct("DeviceRedeemResult")
+            .field("device_id", device_id)
+            .field("device_token", &crate::Redacted)
+            .field("scope", scope)
+            .field("expires_at_ms", expires_at_ms)
+            .field("host_id", host_id)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DeviceInviteCreateResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            offer: _,
+            invite_id,
+            expires_at_ms,
+        } = self;
+        f.debug_struct("DeviceInviteCreateResult")
+            .field("offer", &crate::Redacted)
+            .field("invite_id", invite_id)
+            .field("expires_at_ms", expires_at_ms)
+            .finish()
+    }
 }
 
 /// `device/list` result.

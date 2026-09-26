@@ -208,7 +208,15 @@ async fn cmd_set(key: &str, value: &str) -> Result<()> {
     let mut probe = if existing.trim().is_empty() {
         toml::Value::Table(toml::map::Map::new())
     } else {
-        existing.parse::<toml::Value>().context("Failed to parse user config")?
+        // Never `.context()` over the raw error: it quotes the broken line,
+        // which in this file can be a bridge token.
+        existing.parse::<toml::Value>().map_err(|error| {
+            crate::config::toml_error::toml_parse_error(
+                "Failed to parse user config",
+                &existing,
+                &error,
+            )
+        })?
     };
     // `[usage]` is owned by the burndown plugin. Its rows are registered and
     // validated, so without this the value passes every check and then dies
