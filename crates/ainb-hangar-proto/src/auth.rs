@@ -54,7 +54,10 @@ pub const UNAUTHORIZED: i32 = -32000;
 /// `{ token }` frame a pre-W0-wire client sends still decodes: it is read as
 /// [`ProtocolRange::legacy`] with no declared capabilities, which is exactly
 /// what that build is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::token`]: a hello is exactly the frame a connection
+/// error or a test failure prints.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
     /// The plaintext daemon token (`mdt_…`).
     pub token: String,
@@ -106,6 +109,29 @@ pub struct HelloParams {
     /// the peer's parent. Absent for every other surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<crate::connections::SurfaceHost>,
+}
+
+impl std::fmt::Debug for HelloParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token: _,
+            surface,
+            protocol,
+            capabilities,
+            device,
+            transient,
+            host,
+        } = self;
+        f.debug_struct("HelloParams")
+            .field("token", &crate::Redacted)
+            .field("surface", surface)
+            .field("protocol", protocol)
+            .field("capabilities", capabilities)
+            .field("device", device)
+            .field("transient", transient)
+            .field("host", host)
+            .finish()
+    }
 }
 
 /// The paired device presenting a per-device token (D13 / R1).

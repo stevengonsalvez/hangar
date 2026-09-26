@@ -1250,6 +1250,7 @@ pub fn sample_state(seed: &mut dyn Seed) -> AppState {
                 discovered_at: 1,
                 last_observed_at: 2,
                 lifecycle_updated_at: 2,
+                session_incarnation: Some("proc-sample".to_string()),
                 attention_updated_at: 1,
                 model: Some("claude-sonnet-4-5".to_string()),
                 reasoning_effort: Some("high".to_string()),
