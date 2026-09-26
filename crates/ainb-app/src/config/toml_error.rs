@@ -65,9 +65,9 @@ fn located(text: &str, message: &str, span: Option<Range<usize>>) -> String {
 ///   quote or backtick (`string "..."` → `string`, `` integer `5` `` →
 ///   `integer`, `map` stays `map`). The value runs to the LAST `, expected`,
 ///   so a secret that itself contains `, expected` is still covered.
-/// - ``unknown field `<name>` `` and ``unknown variant `<name>` ``: `<name>`
-///   becomes `<redacted>`; the `expected one of ...` list that follows is the
-///   schema and stays.
+/// - ``unknown field `<name>` ``, ``unknown variant `<name>` `` and
+///   ``duplicate key `<name>` in ...``: `<name>` becomes `<redacted>`; the
+///   `expected one of ...` list and the table named after `in` stay.
 fn scrub(message: &str) -> String {
     let mut out = message.to_string();
     for prefix in ["invalid type: ", "invalid value: "] {
@@ -87,20 +87,36 @@ fn scrub(message: &str) -> String {
             from = start + kind.len();
         }
     }
-    for prefix in ["unknown field `", "unknown variant `"] {
+    // A name ends at the LAST terminator in the rest of the message, never at
+    // the first backtick: a quoted TOML key may itself hold a backtick, the
+    // terminator text, or an escaped newline, and any of those would end the
+    // redaction early and print the rest of the name. Running long only
+    // over-redacts.
+    for (prefix, terminator) in NAMED_IN_MESSAGE {
         let mut from = 0;
         while let Some(found) = out[from..].find(prefix) {
             let start = from + found + prefix.len();
-            let Some(close) = out[start..].find('`') else {
-                out.replace_range(start.., "<redacted>`");
-                break;
-            };
-            out.replace_range(start..start + close, "<redacted>");
-            from = start + "<redacted>`".len();
+            match out[start..].rfind(terminator) {
+                Some(end) => out.replace_range(start..start + end, REDACTED),
+                None => out.replace_range(start.., &format!("{REDACTED}`")),
+            }
+            from = start + REDACTED.len();
         }
     }
     out
 }
+
+/// What stands in for a name the message quoted.
+const REDACTED: &str = "<redacted>";
+
+/// Messages that quote a name the input chose, and the text that follows the
+/// name's closing backtick: serde's unknown-name errors and toml's duplicate
+/// key error (``duplicate key `k` in document root``).
+const NAMED_IN_MESSAGE: [(&str, &str); 3] = [
+    ("unknown field `", "`, expected"),
+    ("unknown variant `", "`, expected"),
+    ("duplicate key `", "` in "),
+];
 
 #[cfg(test)]
 mod tests {
@@ -210,5 +226,82 @@ mod tests {
         assert!(!described.contains("s3cr3t"), "{described}");
         assert!(described.contains("invalid type: string"), "{described}");
         assert!(described.contains("(line 1)"), "{described}");
+    }
+
+    /// toml names the duplicated key; it is redacted like an unknown field,
+    /// on its own line or after another message line.
+    #[test]
+    fn a_duplicate_key_name_is_redacted() {
+        assert_eq!(
+            scrub("duplicate key `sk-s3cr3t` in document root"),
+            "duplicate key `<redacted>` in document root"
+        );
+        assert_eq!(
+            scrub("duplicate key `k` in table `fleet.bridge.slack`"),
+            "duplicate key `<redacted>` in table `fleet.bridge.slack`"
+        );
+        assert_eq!(
+            scrub("invalid table header\nduplicate key `s3cr3t` in document root"),
+            "invalid table header\nduplicate key `<redacted>` in document root"
+        );
+        assert_eq!(
+            scrub("duplicate key `s3cr3t"),
+            "duplicate key `<redacted>`",
+            "no terminator: redact to the end"
+        );
+    }
+
+    /// A backtick, the terminator text or a newline inside the name must not
+    /// end the redaction early.
+    #[test]
+    fn a_backtick_inside_a_name_does_not_end_the_redaction() {
+        let cases = [
+            (
+                "unknown field `sk`se, expected cret`, expected `name` or `mode`",
+                "unknown field `<redacted>`, expected `name` or `mode`",
+            ),
+            (
+                "unknown variant `sk`se`cret`, expected `boss` or `agent`",
+                "unknown variant `<redacted>`, expected `boss` or `agent`",
+            ),
+            (
+                "duplicate key `a`b` in c` in document root",
+                "duplicate key `<redacted>` in document root",
+            ),
+            (
+                "unknown field `line\nsecret`, expected `name`",
+                "unknown field `<redacted>`, expected `name`",
+            ),
+        ];
+        for (raw, want) in cases {
+            let got = scrub(raw);
+            assert_eq!(got, want, "{raw}");
+            for secret in ["se", "cret", "secret"] {
+                let leaked = got.replace("redacted", "").contains(secret);
+                assert!(!leaked, "{secret} survived in {got}");
+            }
+        }
+    }
+
+    /// End to end through both real parsers: a key with a backtick in it,
+    /// duplicated.
+    #[test]
+    fn a_real_duplicate_key_with_a_backtick_does_not_leak() {
+        let text = "\"sk`s3cr3t, expected x`c\" = 1\n\"sk`s3cr3t, expected x`c\" = 2\n";
+        let de = text.parse::<toml::Table>().expect_err("duplicate");
+        assert!(
+            de.message().contains("s3cr3t"),
+            "the premise: toml names the key"
+        );
+        let described = describe_toml_error(text, &de);
+        assert!(!described.contains("s3cr3t"), "{described}");
+        assert!(
+            described.contains("duplicate key `<redacted>`"),
+            "{described}"
+        );
+        let edit = text.parse::<toml_edit::DocumentMut>().expect_err("duplicate");
+        let described = describe_toml_edit_error(text, &edit);
+        assert!(!described.contains("s3cr3t"), "{described}");
+        assert!(described.contains("(line 2)"), "{described}");
     }
 }
