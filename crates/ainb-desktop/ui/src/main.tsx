@@ -155,8 +155,13 @@ function Shell() {
         focusers.get(key)?.();
       }
     });
-  /** Show `key`'s terminal; `byHost` says the host asked, not a person. */
-  const activate = (key: string | null, byHost = false) => {
+  /**
+   * Show `key`'s terminal. `byHost` says who asked: the host, answering a
+   * tab open on its own schedule, or a person, by a chord or a click. Every
+   * caller says which, since the difference decides whether the terminal may
+   * take the keyboard from a text field (`terminalMayTakeFocus`).
+   */
+  const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
       setPane("terminal");
@@ -247,7 +252,7 @@ function Shell() {
   };
   const choose = (tab: Tab) => {
     if (tab.state === "detached") openRow(rowOf(tab.target));
-    activate(tab.key);
+    activate(tab.key, false);
   };
   const onAccelerator = (shell: Accelerator) => {
     switch (shell.kind) {
@@ -258,7 +263,7 @@ function Shell() {
       }
       case "prev":
       case "next":
-        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1));
+        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1), false);
         return;
       case "close": {
         const key = active();
