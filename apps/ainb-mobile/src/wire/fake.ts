@@ -60,6 +60,7 @@ function session(hostId: HostId, key: string, name: string, state: string): Sess
     tier: "live",
     lifecycleUpdatedAt: 1_700_000_000_000,
     sessionIncarnation: `inc-${key}`,
+    version: 1,
   };
 }
 
@@ -75,7 +76,11 @@ export class FakeWire implements WireClient {
   /** Scope and capabilities hello would report; tests flip these. */
   info: HostInfo = { scope: { base: "mobile", admin: false }, capabilities: ["terminal.stream", "terminal.input"] };
   /** Every `terminal/input` call, for tests. */
-  readonly inputs: { streamId: number; floorGen?: number; data: string }[] = [];
+  readonly inputs: { streamId: number; floorGen?: number; data: string; opId: string }[] = [];
+  /** Every `terminal/floor` call, for tests. */
+  readonly floorCalls: { streamId: number; action: string; opId: string }[] = [];
+  /** Every `interrupt` call, for tests. */
+  readonly interrupts: { sessionKey: SessionKey; version: number; opId: string }[] = [];
   readonly detached: number[] = [];
   private streams = new Map<number, FakeStream>();
   private nextStream = 1;
@@ -153,7 +158,7 @@ export class FakeWire implements WireClient {
   advanceTurn(hostId: HostId, sessionKey: SessionKey) {
     const host = this.host(hostId);
     host.sessions = host.sessions.map((s) =>
-      s.sessionKey === sessionKey ? { ...s, lifecycleUpdatedAt: s.lifecycleUpdatedAt + 1 } : s,
+      s.sessionKey === sessionKey ? { ...s, lifecycleUpdatedAt: s.lifecycleUpdatedAt + 1, version: s.version + 1 } : s,
     );
   }
 
@@ -390,10 +395,11 @@ export class FakeWire implements WireClient {
     this.streams.delete(streamId);
   }
 
-  async terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string }) {
+  async terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string; opId: string }) {
     const st = this.streams.get(req.streamId);
     if (!st) throw new Error("unknown stream");
-    this.inputs.push({ streamId: req.streamId, floorGen: req.floorGen, data: req.data });
+    if (!req.opId) throw new Error("terminal/input without an op id");
+    this.inputs.push({ streamId: req.streamId, floorGen: req.floorGen, data: req.data, opId: req.opId });
     let floor = this.floors.get(st.sessionKey) ?? { floorGen: 0 };
     if (!floor.holder && req.floorGen === undefined) {
       floor = { holder: { principal: "device:fake", label: "phone", streamId: req.streamId }, floorGen: floor.floorGen + 1 };
@@ -413,9 +419,11 @@ export class FakeWire implements WireClient {
     return { outcome: "applied", cols: req.cols, rows: req.rows };
   }
 
-  async terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied> {
+  async terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take"; opId: string }): Promise<FloorState | FloorDenied> {
     const st = this.streams.get(req.streamId);
     if (!st) throw new Error("unknown stream");
+    if (!req.opId) throw new Error("terminal/floor without an op id");
+    this.floorCalls.push({ streamId: req.streamId, action: req.action, opId: req.opId });
     const cur = this.floors.get(st.sessionKey) ?? { floorGen: 0 };
     const mine: FloorHolder = { principal: "device:fake", label: "phone", streamId: req.streamId };
     let next: FloorState;
@@ -503,14 +511,17 @@ export class FakeWire implements WireClient {
     return ack;
   }
 
-  async interrupt(req: { hostId: HostId; sessionKey: SessionKey; sessionIncarnation: string; opId: string }): Promise<MutationAck> {
+  async interrupt(req: { hostId: HostId; sessionKey: SessionKey; sessionIncarnation: string; version: number; opId: string }): Promise<MutationAck> {
     const host = this.connected(req.hostId);
+    if (typeof req.version !== "number") throw new Error("interrupt without a version");
+    this.interrupts.push({ sessionKey: req.sessionKey, version: req.version, opId: req.opId });
     const seen = this.opLedger.get(req.opId);
     if (seen) return { ...seen, outcome: "replayed" };
     const s = host.sessions.find((x) => x.sessionKey === req.sessionKey);
     let ack: MutationAck;
     if (!s) ack = { outcome: "created", status: "rejected", reason: "no_target" };
     else if (s.sessionIncarnation !== req.sessionIncarnation) ack = { outcome: "created", status: "rejected", reason: "incarnation_mismatch" };
+    else if (s.version !== req.version) ack = { outcome: "created", status: "rejected", reason: "turn_advanced" };
     else ack = { outcome: "created", status: "accepted" };
     this.opLedger.set(req.opId, ack);
     return ack;
