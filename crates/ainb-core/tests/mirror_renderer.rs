@@ -291,6 +291,7 @@ fn roster_read(
         discovered_at: 1,
         last_observed_at: 2,
         lifecycle_updated_at: 2,
+        session_incarnation: None,
         attention_updated_at: 1,
         model: None,
         reasoning_effort: None,

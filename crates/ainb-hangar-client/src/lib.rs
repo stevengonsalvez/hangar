@@ -107,13 +107,11 @@ fn remember_host_id(socket: &std::path::Path, host_id: Option<&str>) {
     }
 }
 
-/// Whether `id` is a ULID: 26 characters of Crockford base32, upper case, the
-/// same alphabet migration 0100 checks.
+/// Whether `id` is a minted host id: the proto's one rule (a canonical
+/// 26-character Crockford ULID that fits 128 bits, never `local`), so the
+/// hello boundary and the peer wire accept exactly the same ids.
 fn is_host_id(id: &str) -> bool {
-    id.len() == 26
-        && id
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'))
+    ainb_hangar_proto::hosts::HostId::parse_minted(id).is_ok()
 }
 
 /// The first host id each socket named. A socket is only ever added, and a
@@ -313,11 +311,30 @@ pub fn socket_path_in(home: &std::path::Path) -> PathBuf {
 }
 
 /// Client for stateless daemon RPCs and persistent Fleet subscription.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the daemon token: the client holds it for the process's
+/// whole life, so any `{:?}` of a client (or of a struct that embeds one)
+/// would otherwise print it.
+#[derive(Clone)]
 pub struct DaemonClient {
     socket: PathBuf,
     token: String,
     surface: SurfaceInfo,
+}
+
+impl std::fmt::Debug for DaemonClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            socket,
+            token: _,
+            surface,
+        } = self;
+        f.debug_struct("DaemonClient")
+            .field("socket", socket)
+            .field("token", &ainb_hangar_proto::Redacted)
+            .field("surface", surface)
+            .finish()
+    }
 }
 
 /// Live stream of daemon connection-registry changes.
@@ -1317,6 +1334,21 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Value, Daem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client holds the daemon token for its whole life; `{:?}` of it
+    /// must not print the token.
+    #[test]
+    fn debug_redacts_the_daemon_token() {
+        let client = DaemonClient::with_parts(
+            PathBuf::from("/run/hangar-visible.sock"),
+            "mdt_s3cr3tClientToken".to_string(),
+        );
+        for rendered in [format!("{client:?}"), format!("{client:#?}")] {
+            assert!(!rendered.contains("s3cr3tClientToken"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("hangar-visible.sock"), "{rendered}");
+        }
+    }
     use ainb_hangar_proto::fleet::{FleetEvent, FleetProvenance};
     use tokio::net::UnixListener;
 
@@ -1480,6 +1512,8 @@ mod tests {
             "01K5A0000000000000000AAAAO",
             "01K5A0000000000000000AAAAU",
             "01k5a0000000000000000aaaaa",
+            // A first character above 7 overflows 128 bits.
+            "81K5A0000000000000000AAAAA",
         ] {
             assert!(!is_host_id(bad), "{bad}");
         }

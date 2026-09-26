@@ -42,8 +42,15 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+/** The Setup panel's view, as the host reads it, with nothing set up. */
+const SETUP = {
+  dependencies: [],
+  tmux_conf_present: false,
+  otel: { settings_env_present: false, alloy_installed: false },
+} as never;
+
 /** The settings page over the fixtures, with every intent it sends recorded. */
-async function open() {
+async function open(setup: unknown = null) {
   const [view, setView] = createSignal(frames());
   const sent: RendererIntent[] = [];
   const container = document.createElement("div");
@@ -59,7 +66,7 @@ async function open() {
         },
         revision: 1,
         sidecar: { kind: "connected", daemon: "local" } as never,
-        setup: null,
+        setup: setup as never,
         run: (intents: RendererIntent[]) => sent.push(...intents),
         onSetupWrite: () => undefined,
         onRefreshSetup: () => undefined,
@@ -198,4 +205,36 @@ test("an edit from a row's widget after 50 frames names that row", async () => {
     JSON.stringify(last).includes(key.split("|").at(-1) ?? key),
     `the edit named another row: ${JSON.stringify(last)} for key ${key}`,
   );
+});
+
+// The page is unmounted the moment the reducer leaves its Config screen,
+// which the answer banner's pick does on its own (#121): what was typed into
+// the OpenTelemetry setup is still there when the page comes back.
+test("the OpenTelemetry draft survives the page being closed and reopened", async () => {
+  const first = await open(SETUP);
+  const endpoint = first.container.querySelector<HTMLInputElement>('.otel input[type="url"]');
+  assert.ok(endpoint, "the OTLP endpoint field is drawn");
+  endpoint.value = "https://otlp.example.test";
+  endpoint.dispatchEvent(new window.Event("input", { bubbles: true }));
+  const token = first.container.querySelector<HTMLInputElement>('.otel input[type="password"]');
+  assert.ok(token);
+  token.value = "secret";
+  token.dispatchEvent(new window.Event("input", { bubbles: true }));
+  cleanup?.();
+  cleanup = undefined;
+  document.body.innerHTML = "";
+
+  const again = await open(SETUP);
+  assert.equal(again.container.querySelector<HTMLInputElement>('.otel input[type="url"]')?.value, "https://otlp.example.test");
+  assert.equal(again.container.querySelector<HTMLInputElement>('.otel input[type="password"]')?.value, "secret");
+
+  // Closed by its own button, the draft is discarded: the token in it is
+  // not kept for a page nobody asked to keep.
+  again.container.querySelector<HTMLButtonElement>("button.close")?.click();
+  cleanup?.();
+  cleanup = undefined;
+  document.body.innerHTML = "";
+  const third = await open(SETUP);
+  assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="url"]')?.value, "");
+  assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="password"]')?.value, "");
 });
