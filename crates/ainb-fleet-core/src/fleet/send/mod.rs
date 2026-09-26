@@ -8,7 +8,7 @@ pub mod tmux;
 pub use broker::{BrokerClient, broker_health, broker_send};
 pub use pane::{
     PaneHint, is_pane_id, only_pane, pane_id_of, pane_pid, pane_pid_of, pane_session,
-    resolve_send_target, session_started_of,
+    resolve_send_pane, resolve_send_target, session_started_of,
 };
 pub use route::{send, tmux_delivery_preferred};
 pub use tmux::{
