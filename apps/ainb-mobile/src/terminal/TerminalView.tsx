@@ -7,6 +7,28 @@ import { TERMINAL_HTML } from "./engine/bundle.generated";
 import { decodeFromEngine, injection, toBase64, type ToEngine } from "./engine/protocol";
 import { ACCESSORY_KEYS, withCtrl } from "./keys";
 
+/** The inline document's own URL; nothing else may load or post. */
+export const ENGINE_URL = "about:blank";
+
+/**
+ * Terminal output is attacker-influenced (any program in the pane can print
+ * an OSC 8 link), so the webview may never leave the inline document, open
+ * a window, or read files. The engine itself is built with the link handler
+ * disabled and a CSP that allows only its inline script and style.
+ */
+export const LOCKDOWN = {
+  originWhitelist: [ENGINE_URL],
+  onShouldStartLoadWithRequest: (req: { url: string }) => req.url === ENGINE_URL,
+  setSupportMultipleWindows: false,
+  javaScriptCanOpenWindowsAutomatically: false,
+  allowFileAccess: false,
+  allowFileAccessFromFileURLs: false,
+  allowUniversalAccessFromFileURLs: false,
+  mixedContentMode: "never" as const,
+  incognito: true,
+  cacheEnabled: false,
+};
+
 export interface TerminalSink {
   write(bytes: Uint8Array): void;
   clear(): void;
@@ -53,6 +75,9 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
   }, [readOnly, send]);
 
   const onMessage = (e: WebViewMessageEvent) => {
+    // Only the inline document may talk to us. Any navigated-to page would
+    // have the same bridge, so a foreign origin is dropped before decoding.
+    if (e.nativeEvent.url !== ENGINE_URL) return;
     const msg = decodeFromEngine(e.nativeEvent.data);
     if (!msg) return;
     if (msg.t === "ready") {
@@ -75,7 +100,6 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
     <View style={styles.root} testID={testID}>
       <WebView
         ref={web}
-        originWhitelist={["*"]}
         source={{ html: TERMINAL_HTML }}
         onMessage={onMessage}
         javaScriptEnabled
@@ -83,6 +107,7 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
         hideKeyboardAccessoryView
         style={styles.web}
         testID="terminal-webview"
+        {...LOCKDOWN}
       />
       {readOnly ? null : (
         <View style={styles.bar} testID="key-bar">
