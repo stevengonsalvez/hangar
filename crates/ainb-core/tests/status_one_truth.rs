@@ -244,6 +244,7 @@ fn local_row(session_id: &str, cwd: &str) -> ainb_fleet_core::fleet::read::needs
     ainb_fleet_core::fleet::read::needs::make_row(
         ainb_fleet_core::types::Session {
             id: session_id.to_string(),
+            provider_session_id: None,
             cwd: cwd.to_string(),
             pid: None,
             git_root: None,
