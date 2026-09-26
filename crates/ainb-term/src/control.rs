@@ -365,15 +365,21 @@ fn pause_or_continue(line: &[u8]) -> Option<Event> {
 /// Decode a top-level notification. `None` means the line is not one.
 fn notification(line: &[u8]) -> Option<Event> {
     if let Some(rest) = line.strip_prefix(b"%extended-output ") {
-        // %extended-output %<pane> <age> [more fields] : <data>. The man
-        // page leaves room for fields between the age and the colon, so
-        // the payload starts after the first ` : `.
+        // %extended-output %<pane> <age> [more fields] : <data>. Today the
+        // colon follows the age directly, and the payload may itself
+        // contain ` : `, so the normal `: ` start is checked FIRST. The man
+        // page leaves room for fields between the age and the colon; only
+        // when the field after the age is not the colon is the payload
+        // taken from after the first ` : `.
         let (pane, rest) = field(rest);
         let (age, rest) = field(rest);
-        let data = rest.windows(3).position(|w| w == b" : ").map_or_else(
-            || rest.strip_prefix(b": ").unwrap_or(rest),
-            |i| &rest[i + 3..],
-        );
+        let data = if let Some(data) = rest.strip_prefix(b": ") {
+            data
+        } else if rest == b":" {
+            &rest[1..]
+        } else {
+            rest.windows(3).position(|w| w == b" : ").map_or(rest, |i| &rest[i + 3..])
+        };
         return Some(Event::Output {
             pane: PaneId::parse(pane)?,
             age_ms: Some(parse_u64(age)?),
@@ -727,11 +733,35 @@ mod tests {
     }
 
     #[test]
-    fn extended_output_payload_starts_after_the_first_colon_field() {
-        let wire = b"%extended-output %2 5 future : a : b\n";
+    fn extended_output_payload_keeps_its_own_colon_fields() {
+        // The lead's live line: a pane printing `key : value : more`.
+        let wire = b"%extended-output %0 5 : key : value : more\n%extended-output %0 0 : \n%extended-output %0 0 :\n";
         let events = parse_all(wire, 6);
         assert_eq!(
             events,
+            vec![
+                Event::Output {
+                    pane: PaneId(0),
+                    age_ms: Some(5),
+                    data: b"key : value : more".to_vec()
+                },
+                Event::Output {
+                    pane: PaneId(0),
+                    age_ms: Some(0),
+                    data: Vec::new()
+                },
+                Event::Output {
+                    pane: PaneId(0),
+                    age_ms: Some(0),
+                    data: Vec::new()
+                },
+            ]
+        );
+        // Only when a field sits between the age and the colon does the
+        // payload start after the first ` : `.
+        let wire = b"%extended-output %2 5 future : a : b\n";
+        assert_eq!(
+            parse_all(wire, 6),
             vec![Event::Output {
                 pane: PaneId(2),
                 age_ms: Some(5),
