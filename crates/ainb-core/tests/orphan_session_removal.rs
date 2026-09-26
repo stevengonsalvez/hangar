@@ -60,6 +60,7 @@ async fn test_remove_orphaned_session_purges_store_record() -> Result<()> {
         model_source: Default::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.upsert(SessionMetadata {
         session_id: keep_id,
@@ -75,6 +76,7 @@ async fn test_remove_orphaned_session_purges_store_record() -> Result<()> {
         model_source: Default::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save()?;
     assert_eq!(SessionStore::load().sessions().len(), 2);
