@@ -176,7 +176,7 @@ impl HostRegistry {
                 .enumerate()
                 .fold((None, 0usize), |(existing, paired), (at, h)| {
                     (
-                        existing.or((h.host_id == host_id).then_some(at)),
+                        existing.or_else(|| (h.host_id == host_id).then_some(at)),
                         paired + usize::from(h.kind == HostKind::Remote),
                     )
                 });
