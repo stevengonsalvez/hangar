@@ -67,12 +67,22 @@ pub struct PairingRecord {
     /// the index lock when the session layer sees the refusal, cleared only
     /// by a successful pair. The app shows it as `HostRow.repair` and keeps
     /// no copy.
-    #[serde(default, deserialize_with = "flag")]
+    #[serde(
+        default,
+        deserialize_with = "flag",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub repair: Option<String>,
     /// A notice the app shows without a re-pair: `incompatible` (4409, one
     /// side needs an update) or `unknown_code` (a close code this build does
-    /// not know). Set and cleared like `repair`.
-    #[serde(default, deserialize_with = "flag")]
+    /// not know, in the daemon's 4xxx range; a standard WebSocket close is a
+    /// network loss and sets nothing). Set like `repair`; cleared by a
+    /// successful hello as well as by a successful pair.
+    #[serde(
+        default,
+        deserialize_with = "flag",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub notice: Option<String>,
 }
 
@@ -119,7 +129,10 @@ pub fn refusal_flags(err: &WireError) -> (Option<&'static str>, Option<&'static 
             pc::UNAUTHENTICATED => (Some(REPAIR_UNAUTHENTICATED), None),
             pc::REVOKED => (Some(REPAIR_REVOKED), None),
             pc::PROTOCOL_INCOMPATIBLE => (None, Some(NOTICE_INCOMPATIBLE)),
-            _ => (None, Some(NOTICE_UNKNOWN_CODE)),
+            // Only the daemon's own range is a code worth a notice; the
+            // session layer already treats standard codes as retryable.
+            code if code >= 4000 => (None, Some(NOTICE_UNKNOWN_CODE)),
+            _ => (None, None),
         },
         _ => (None, None),
     }
@@ -219,13 +232,43 @@ pub fn mark_refusal(custody_dir: &Path, host_id: &str, err: &WireError) -> Resul
     })
 }
 
+/// Put a refusal on the record and never let the bookkeeping replace the
+/// refusal itself: an index that cannot be written is logged by the caller's
+/// connection log through the close line, and the host's word stands.
+pub(crate) fn latch(custody_dir: &Path, host_id: &str, err: &WireError) {
+    let _ = mark_refusal(custody_dir, host_id, err);
+}
+
 /// Clear `notice` on `host_id`, under the index lock: a successful hello
 /// proves the host and this build agree again. `repair` is untouched; only
-/// a successful pair clears that.
+/// a successful pair clears that. No write when nothing is set.
 pub fn clear_notice(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {
+    if find(custody_dir, host_id)?.is_none_or(|r| r.notice.is_none()) {
+        return Ok(());
+    }
     with_index(custody_dir, |records| {
         for r in records.iter_mut().filter(|r| r.host_id == host_id) {
             r.notice = None;
+        }
+    })
+}
+
+/// Record the token expiry a hello slid, so the host list shows the live
+/// value. No write when it did not move.
+pub fn note_expiry(
+    custody_dir: &Path,
+    host_id: &str,
+    expires_at_ms: Option<i64>,
+) -> Result<(), WireError> {
+    let Some(expires_at_ms) = expires_at_ms else {
+        return Ok(());
+    };
+    if find(custody_dir, host_id)?.is_none_or(|r| r.expires_at_ms == expires_at_ms) {
+        return Ok(());
+    }
+    with_index(custody_dir, |records| {
+        for r in records.iter_mut().filter(|r| r.host_id == host_id) {
+            r.expires_at_ms = expires_at_ms;
         }
     })
 }
@@ -269,8 +312,10 @@ fn carrier_of(name: &str) -> Result<CarrierKind, WireError> {
 }
 
 /// Dial `endpoints` in order with the pinned key; the first that opens wins.
-/// A refusal that is not a dial failure (a changed key, a bad prologue) is
-/// returned at once: the next endpoint reaches the same host.
+/// An endpoint whose carrier this build does not know is skipped (a newer
+/// daemon may list one the phone cannot name in the prologue). A refusal
+/// that is not a dial failure (a changed key, a coded close) is returned at
+/// once: the next endpoint reaches the same host.
 pub(crate) async fn dial(
     endpoints: &[EndpointRecord],
     host_id: &HostId,
@@ -282,9 +327,19 @@ pub(crate) async fn dial(
         message: "the pairing has no endpoints".to_owned(),
     };
     for endpoint in endpoints {
+        let carrier = carrier_of(&endpoint.carrier)?;
+        if carrier == CarrierKind::Unknown {
+            last = WireError::Connect {
+                message: format!(
+                    "endpoint carrier {:?} is not one this build dials",
+                    endpoint.carrier
+                ),
+            };
+            continue;
+        }
         let mut config = ConnectConfig::new(
             endpoint.url.clone(),
-            carrier_of(&endpoint.carrier)?,
+            carrier,
             host_id.clone(),
             host_static_pubkey,
             key.private().to_vec(),
@@ -299,7 +354,9 @@ pub(crate) async fn dial(
     Err(last)
 }
 
-/// Redeem `uri` as `display_name`: dial, `device/redeem`, `auth/hello`, save.
+/// Redeem `uri` as `display_name`: dial, `device/redeem`, save, `auth/hello`.
+/// The pairing is saved the moment redeem succeeds (the invite is burned),
+/// so a hello that fails still leaves a pairing to connect later.
 pub(crate) async fn pair(
     uri: &str,
     display_name: &str,
@@ -347,14 +404,11 @@ pub(crate) async fn pair(
     .await
     {
         Ok(session) => session,
-        Err(e) => {
-            // The host refused the key we already pin: the existing record
-            // takes the flag. A first pair has no record and nothing to mark.
-            if pinned.is_some() {
-                mark_refusal(custody_dir, offer.host_id.as_str(), &e)?;
-            }
-            return Err(e);
-        }
+        // No latch from an offer's dial: the offer's endpoints are as
+        // unauthenticated as the offer, so a PeerChanged here may be a
+        // hostile endpoint that never was the host. `connect_host`, which
+        // dials only the stored endpoints, is where a refusal latches.
+        Err(e) => return Err(e),
     };
     let redeemed = match redeem(&session, &offer, display_name).await {
         Ok(redeemed) => redeemed,
@@ -379,22 +433,30 @@ pub(crate) async fn pair(
         repair: None,
         notice: None,
     };
-    save(custody_dir, record.clone(), &redeemed.device_token)?;
-    let hello = crate::api::hello(
+    if let Err(e) = save(custody_dir, record.clone(), &redeemed.device_token) {
+        session.close();
+        return Err(e);
+    }
+    let hello = match crate::api::hello(
         &session,
         &redeemed.device_token,
         &redeemed.device_id,
         display_name,
     )
-    .await;
+    .await
+    {
+        Ok(hello) => Ok(hello),
+        Err(e) => Err(crate::api::hello_refusal(&session, e).await),
+    };
     session.close();
     match hello {
         Ok(hello) => Ok((record, hello)),
         Err(e) => {
             // The pairing stays saved to retry; a 4401 or 4403 on the very
-            // first hello is still the host refusing this device, so the
-            // re-pair latch is set exactly as it would be on a later connect.
-            mark_refusal(custody_dir, &record.host_id, &e)?;
+            // first hello is still the host refusing this device (the peer
+            // authenticated with the pinned key), so the re-pair latch is set
+            // exactly as it would be on a later connect.
+            latch(custody_dir, &record.host_id, &e);
             Err(e)
         }
     }
