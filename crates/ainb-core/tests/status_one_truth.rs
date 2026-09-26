@@ -498,6 +498,43 @@ fn two_agents_in_one_directory_keep_their_own_identity() {
 /// And when identity cannot decide it, the row is left alone rather than
 /// guessed at. An unstamped row is visibly degraded; a wrongly stamped one is
 /// not visible at all.
+#[test]
+fn an_ambiguous_directory_leaves_the_row_unstamped() {
+    use ainb_hangar_proto::agent_status::{AgentState, AgentStatusRow, Provenance, Tier};
+    use ainb_hangar_proto::fleet::FleetProvider;
+
+    // Two daemon rows in one cwd, and a local row whose id matches neither.
+    let row = |id: &str| AgentStatusRow {
+        session_key: format!("codex:{id}"),
+        provider: FleetProvider::Codex,
+        cwd: CWD.to_string(),
+        display_name: None,
+        state: AgentState::Working,
+        provenance: Provenance::Hook,
+        tier: Tier::Hook,
+        evidence_observed_at: 1,
+        has_open_request: false,
+        pane_unbound: false,
+        pane_unbound_detail: None,
+        host_id: ainb_hangar_proto::agent_status::LOCAL_HOST_ID.to_string(),
+        turn_complete: false,
+        wait_kind: None,
+        attachment: ainb_hangar_proto::agent_status::Attachment::None,
+    };
+    let mut rows = vec![local_row("something-else", CWD)];
+    ainb::cli::fleet::needs::stamp_rows(&mut rows, &[row("x"), row("y")]);
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "neither daemon row is `waiting`, so none is added"
+    );
+    assert_eq!(
+        rows[0].session_key, None,
+        "an ambiguous cwd must not be treated as evidence of identity"
+    );
+}
+
 /// The daemon holds the cwd as the agent reported it, canonical, and the local
 /// row holds the path ainb was given, through a symlink. Counted as two
 /// directories, each side looked unique and the agent's state could stamp a
@@ -556,43 +593,6 @@ fn two_spellings_of_one_directory_count_as_one() {
     assert!(
         rows[0].session_key.is_none(),
         "two agents in the directory, spelled either way, stamp nothing"
-    );
-}
-
-#[test]
-fn an_ambiguous_directory_leaves_the_row_unstamped() {
-    use ainb_hangar_proto::agent_status::{AgentState, AgentStatusRow, Provenance, Tier};
-    use ainb_hangar_proto::fleet::FleetProvider;
-
-    // Two daemon rows in one cwd, and a local row whose id matches neither.
-    let row = |id: &str| AgentStatusRow {
-        session_key: format!("codex:{id}"),
-        provider: FleetProvider::Codex,
-        cwd: CWD.to_string(),
-        display_name: None,
-        state: AgentState::Working,
-        provenance: Provenance::Hook,
-        tier: Tier::Hook,
-        evidence_observed_at: 1,
-        has_open_request: false,
-        pane_unbound: false,
-        pane_unbound_detail: None,
-        host_id: ainb_hangar_proto::agent_status::LOCAL_HOST_ID.to_string(),
-        turn_complete: false,
-        wait_kind: None,
-        attachment: ainb_hangar_proto::agent_status::Attachment::None,
-    };
-    let mut rows = vec![local_row("something-else", CWD)];
-    ainb::cli::fleet::needs::stamp_rows(&mut rows, &[row("x"), row("y")]);
-
-    assert_eq!(
-        rows.len(),
-        1,
-        "neither daemon row is `waiting`, so none is added"
-    );
-    assert_eq!(
-        rows[0].session_key, None,
-        "an ambiguous cwd must not be treated as evidence of identity"
     );
 }
 
