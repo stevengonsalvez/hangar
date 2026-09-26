@@ -619,10 +619,14 @@ where
             } else {
                 idle_timeout
             };
-            match tokio::time::timeout(window, read_frame(&mut reader)).await {
-                Ok(frame_result) => frame_result?,
-                Err(_elapsed) => {
+            match next_request(&mut reader, &out_tx, window).await {
+                NextRequest::Frame(frame_result) => frame_result?,
+                NextRequest::Idle => {
                     tracing::debug!(subscribed, "rpc connection idle {window:?}; closing");
+                    None
+                }
+                NextRequest::WriterGone => {
+                    tracing::debug!("rpc connection writer gone; closing");
                     None
                 }
             }
@@ -1018,6 +1022,39 @@ where
             }
         }
     })
+}
+
+/// What the read loop waits for next.
+#[derive(Debug)]
+enum NextRequest {
+    /// A frame, EOF, or a read fault.
+    Frame(std::io::Result<Option<Vec<u8>>>),
+    /// The idle window passed with nothing read.
+    Idle,
+    /// The writer ended (a write fault, or the per-frame write deadline): no
+    /// reply can reach this peer any more.
+    WriterGone,
+}
+
+/// The next request, or why there is none. A subscribed peer that stops
+/// reading kills its writer at the write deadline, but may never send again;
+/// without watching the writer, the read loop would hold the connection for
+/// the whole subscribed idle window (24 h) serving nobody.
+async fn next_request<R>(
+    reader: &mut R,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    window: std::time::Duration,
+) -> NextRequest
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    tokio::select! {
+        read = tokio::time::timeout(window, read_frame(reader)) => match read {
+            Ok(frame) => NextRequest::Frame(frame),
+            Err(_elapsed) => NextRequest::Idle,
+        },
+        () = out_tx.closed() => NextRequest::WriterGone,
+    }
 }
 
 /// Outbound frame queue depth per connection (responses + pushed events).
@@ -14656,6 +14693,35 @@ mod tests {
             .expect("the client reads EOF once the server side is gone")
             .expect("reader");
         assert_eq!(total, 8 * 16 * 1024);
+    }
+
+    /// R1-06 entry condition: once the writer is gone, the read loop stops
+    /// waiting on a peer that never sends, instead of holding the connection
+    /// for the rest of its idle window.
+    #[tokio::test]
+    async fn a_dead_writer_ends_the_wait_for_a_silent_peer() {
+        let (_client, server) = tokio::io::duplex(1024);
+        let (read_half, _write_half) = tokio::io::split(server);
+        let mut reader = BufReader::new(read_half);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+
+        // Writer alive, peer silent: only the idle window ends the wait.
+        let waited = next_request(&mut reader, &out_tx, std::time::Duration::from_millis(50)).await;
+        assert!(matches!(waited, NextRequest::Idle), "{waited:?}");
+
+        // Writer gone: the wait ends at once, even with a 24 h window.
+        drop(out_rx);
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            next_request(
+                &mut reader,
+                &out_tx,
+                std::time::Duration::from_secs(24 * 3600),
+            ),
+        )
+        .await
+        .expect("a dead writer must not leave the read loop waiting");
+        assert!(matches!(waited, NextRequest::WriterGone), "{waited:?}");
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
