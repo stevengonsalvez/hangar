@@ -38,6 +38,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ainb_hangar_proto::Redacted;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
@@ -63,7 +64,7 @@ pub enum SlackListenMode {
 }
 
 /// Resolved, validated Telegram channel config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TelegramConfig {
     pub token: String,
     pub authorized_user_id: i64,
@@ -73,7 +74,7 @@ pub struct TelegramConfig {
 }
 
 /// Resolved, validated Slack channel config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SlackConfig {
     pub bot_token: String,
     pub app_token: String,
@@ -84,7 +85,7 @@ pub struct SlackConfig {
 }
 
 /// Resolved, validated Discord channel config.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscordConfig {
     /// Discord Bot token (used for both the gateway IDENTIFY and REST posts).
     pub token: String,
@@ -143,7 +144,7 @@ struct RawBridge {
     discord: Option<RawDiscord>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct RawTelegram {
     token: Option<String>,
     user_id: Option<toml::Value>,
@@ -152,7 +153,7 @@ struct RawTelegram {
     response_timeout: Option<toml::Value>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct RawSlack {
     bot_token: Option<String>,
     app_token: Option<String>,
@@ -162,13 +163,138 @@ struct RawSlack {
     response_timeout: Option<toml::Value>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 struct RawDiscord {
     token: Option<String>,
     user_id: Option<String>,
     default_target: Option<String>,
     channel_id: Option<String>,
     response_timeout: Option<toml::Value>,
+}
+
+// ── Debug without credentials ───────────────────────────────────────────────
+//
+// Every channel config holds a bot token, so these print `<redacted>` in its
+// place: a `{:?}` of a config reaches logs and error chains. Each impl
+// destructures its struct, so a new field fails to compile until someone
+// decides whether it is secret.
+
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token: _,
+            authorized_user_id,
+            default_target,
+            require_mention_in_groups,
+            response_timeout,
+        } = self;
+        f.debug_struct("TelegramConfig")
+            .field("token", &Redacted)
+            .field("authorized_user_id", authorized_user_id)
+            .field("default_target", default_target)
+            .field("require_mention_in_groups", require_mention_in_groups)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SlackConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            bot_token: _,
+            app_token: _,
+            authorized_user_id,
+            default_target,
+            listen_mode,
+            response_timeout,
+        } = self;
+        f.debug_struct("SlackConfig")
+            .field("bot_token", &Redacted)
+            .field("app_token", &Redacted)
+            .field("authorized_user_id", authorized_user_id)
+            .field("default_target", default_target)
+            .field("listen_mode", listen_mode)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for DiscordConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token: _,
+            authorized_user_id,
+            default_target,
+            channel_id,
+            response_timeout,
+        } = self;
+        f.debug_struct("DiscordConfig")
+            .field("token", &Redacted)
+            .field("authorized_user_id", authorized_user_id)
+            .field("default_target", default_target)
+            .field("channel_id", channel_id)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RawTelegram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token,
+            user_id,
+            default_target,
+            require_mention_in_groups,
+            response_timeout,
+        } = self;
+        f.debug_struct("RawTelegram")
+            .field("token", &token.as_ref().map(|_| Redacted))
+            .field("user_id", user_id)
+            .field("default_target", default_target)
+            .field("require_mention_in_groups", require_mention_in_groups)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RawSlack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            bot_token,
+            app_token,
+            user_id,
+            default_target,
+            listen_mode,
+            response_timeout,
+        } = self;
+        f.debug_struct("RawSlack")
+            .field("bot_token", &bot_token.as_ref().map(|_| Redacted))
+            .field("app_token", &app_token.as_ref().map(|_| Redacted))
+            .field("user_id", user_id)
+            .field("default_target", default_target)
+            .field("listen_mode", listen_mode)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RawDiscord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token,
+            user_id,
+            default_target,
+            channel_id,
+            response_timeout,
+        } = self;
+        f.debug_struct("RawDiscord")
+            .field("token", &token.as_ref().map(|_| Redacted))
+            .field("user_id", user_id)
+            .field("default_target", default_target)
+            .field("channel_id", channel_id)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
 }
 
 /// Resolve ainb's config.toml path, honouring `AINB_CONFIG_PATH`.
@@ -371,7 +497,11 @@ fn parse_discord(raw: RawDiscord, shared_timeout: u64) -> Result<DiscordConfig> 
 /// Build a [`BridgeConfig`] from a parsed TOML string. Split out so it can be
 /// unit-tested without touching the filesystem.
 pub fn parse_config(toml_text: &str) -> Result<BridgeConfig> {
-    let root: RawRoot = toml::from_str(toml_text).context("parsing config.toml")?;
+    let root: RawRoot = toml::from_str(toml_text).map_err(|error| {
+        // Never `.context()` over the raw error: its Display quotes the
+        // offending line, which is a bot token when that line is broken.
+        crate::config::toml_error::toml_parse_error("parsing config.toml", toml_text, &error)
+    })?;
     let bridge = root
         .fleet
         .and_then(|f| f.bridge)
@@ -759,5 +889,109 @@ mod tests {
         // `{e:#}` keeps the inner cause on the one line the operator sees.
         assert!(err.contains("listen_mode"), "{err}");
         assert!(err.contains(&path.display().to_string()), "{err}");
+    }
+
+    /// No channel config prints its bot token under `Debug`, resolved or raw,
+    /// and the non-secret fields still print.
+    #[test]
+    fn telegram_config_debug_hides_the_token() {
+        let config = TelegramConfig {
+            token: "123:s3cr3tTelegram".to_string(),
+            authorized_user_id: 42,
+            default_target: Some("target-visible".to_string()),
+            require_mention_in_groups: true,
+            response_timeout: 5,
+        };
+        assert_hidden(&config, &["s3cr3tTelegram"], "target-visible");
+    }
+
+    #[test]
+    fn slack_config_debug_hides_both_tokens() {
+        let config = SlackConfig {
+            bot_token: "xoxb-s3cr3tBot".to_string(),
+            app_token: "xapp-s3cr3tApp".to_string(),
+            authorized_user_id: "U-visible".to_string(),
+            default_target: None,
+            listen_mode: SlackListenMode::Mentions,
+            response_timeout: 5,
+        };
+        assert_hidden(&config, &["s3cr3tBot", "s3cr3tApp"], "U-visible");
+    }
+
+    #[test]
+    fn discord_config_debug_hides_the_token() {
+        let config = DiscordConfig {
+            token: "s3cr3tDiscord".to_string(),
+            authorized_user_id: "D-visible".to_string(),
+            default_target: None,
+            channel_id: None,
+            response_timeout: 5,
+        };
+        assert_hidden(&config, &["s3cr3tDiscord"], "D-visible");
+    }
+
+    #[test]
+    fn raw_channel_tables_debug_hide_their_tokens() {
+        let telegram = RawTelegram {
+            token: Some("s3cr3tRawTelegram".to_string()),
+            default_target: Some("raw-visible".to_string()),
+            ..RawTelegram::default()
+        };
+        assert_hidden(&telegram, &["s3cr3tRawTelegram"], "raw-visible");
+        let slack = RawSlack {
+            bot_token: Some("s3cr3tRawBot".to_string()),
+            app_token: Some("s3cr3tRawApp".to_string()),
+            user_id: Some("raw-visible".to_string()),
+            ..RawSlack::default()
+        };
+        assert_hidden(&slack, &["s3cr3tRawBot", "s3cr3tRawApp"], "raw-visible");
+        let discord = RawDiscord {
+            token: Some("s3cr3tRawDiscord".to_string()),
+            user_id: Some("raw-visible".to_string()),
+            ..RawDiscord::default()
+        };
+        assert_hidden(&discord, &["s3cr3tRawDiscord"], "raw-visible");
+        // An absent token stays visibly absent.
+        assert!(format!("{:?}", RawDiscord::default()).contains("token: None"));
+    }
+
+    fn assert_hidden(value: &impl std::fmt::Debug, secrets: &[&str], visible: &str) {
+        for rendered in [format!("{value:?}"), format!("{value:#?}")] {
+            for secret in secrets {
+                assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+            }
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains(visible), "{rendered}");
+        }
+    }
+
+    /// A malformed token line names the problem and the line, and never
+    /// quotes the line: toml's own `Display` would print the token under a
+    /// caret.
+    #[test]
+    fn a_malformed_token_line_errors_without_quoting_the_token() {
+        let text = "[fleet.bridge.telegram]\ntoken = \"123:s3cr3tUnterminated\nuser_id = 42\n";
+        let error = parse_config(text).expect_err("an unterminated string is a parse error");
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!rendered.contains("s3cr3t"), "token leaked: {rendered}");
+            assert!(rendered.contains("line 2"), "no line number: {rendered}");
+            assert!(rendered.contains("parsing config.toml"), "{rendered}");
+        }
+    }
+
+    /// The same holds for a token line that is well-formed TOML but the wrong
+    /// shape for the table around it.
+    #[test]
+    fn a_misplaced_token_value_errors_without_quoting_it() {
+        let text = "[fleet.bridge.slack]\nbot_token = \"xoxb-s3cr3tBot\"\nbot_token = \"xoxb-s3cr3tAgain\"\n";
+        let error = parse_config(text).expect_err("a duplicate key is a parse error");
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("s3cr3t"), "token leaked: {rendered}");
+        assert!(rendered.contains("line 3"), "{rendered}");
     }
 }

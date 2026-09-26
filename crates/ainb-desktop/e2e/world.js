@@ -2,17 +2,18 @@
 // its own tmux server, seeded with real sessions by the real `ainb` CLI.
 //
 //   <world>/home   HOME, and AINB_HANGAR_HOME under it (never the box's own)
-//   <world>/tmux   TMUX_TMPDIR, so every tmux server here is this run's
+//   <world>/tmux   TMUX_TMPDIR: the default server `ainb run` starts lives
+//                  here, and this file reaches it only by its socket path
+//                  (`tmux -S`, see tmux() below), never by name
 //   <world>/bin    first on PATH: the `claude` the seeded sessions run
 //   <world>/repo   the git repository the sessions are worktrees of
 //
-// Nothing is killed by pattern: tmux sessions go by exact name, and the daemon
-// is stopped through its own verb.
+// Nothing is killed by pattern: the world's tmux server is ended whole through
+// its own socket, and the daemon is stopped through its own verb.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { OWNER_FILE } from "./cleanup.js";
+import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { OWNER_FILE, WORLD_PARENT } from "./cleanup.js";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -86,10 +87,26 @@ export function run(command, args, options = {}) {
   });
 }
 
+/**
+ * Run tmux against this world's fixture server, by its socket path and with
+ * TMUX and TMUX_PANE removed, so no call can resolve to a server outside the
+ * world by name or follow an inherited client.
+ */
+export function tmux(args, options = {}) {
+  const { TMUX: _client, TMUX_PANE: _pane, ...clean } = env();
+  return execFileSync("tmux", ["-S", world().socket, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 180_000,
+    ...options,
+    env: clean,
+  });
+}
+
 /** What a seeded session's own tmux pane shows. */
-export function paneText(tmux) {
+export function paneText(session) {
   try {
-    return run("tmux", ["capture-pane", "-t", `=${tmux}:`, "-p"]);
+    return tmux(["capture-pane", "-t", `=${session}:`, "-p"]);
   } catch {
     return "";
   }
@@ -146,7 +163,26 @@ export function up(sessions = 2) {
   // kept here for a caller that builds a world on its own.
   freshBundle();
 
-  const root = mkdtempSync(join(tmpdir(), "ainb-e2e-"));
+  // The world is reached through a symlink, and everything in it (the repo
+  // ainb clones, the worktree it runs the agent in) is named by that path:
+  // what a person's HOME or checkout under a symlinked directory gives ainb.
+  // The agent itself reports its canonical cwd, through every link (#132).
+  // The link's name is SHORTER than the directory's, and both live under
+  // WORLD_PARENT (/tmp) rather than the OS temp directory: the daemon's and
+  // tmux's socket paths sit under a unix socket address's 103 bytes only with
+  // room to spare there, where a macOS temp directory left the daemon's two
+  // characters short of the limit.
+  const real = mkdtempSync(join(WORLD_PARENT, "ainb-e2e-"));
+  const root = join(WORLD_PARENT, `ainb-e2e-l${real.slice(-4)}`);
+  symlinkSync(real, root);
+  // Where tmux puts the default server for this world's TMUX_TMPDIR: the
+  // server `ainb run` starts, which tmux() then reaches by this path.
+  const socket = join(root, "tmux", `tmux-${process.getuid()}`, "default");
+  if (Buffer.byteLength(socket) > 103) {
+    rmSync(root, { force: true });
+    rmSync(real, { recursive: true, force: true });
+    throw new Error(`the world's tmux socket path is ${Buffer.byteLength(socket)} bytes, 103 at most: ${socket}`);
+  }
   // The run that owns this world, so a later run's cleanup leaves it alone
   // while this process lives (cleanup.js).
   writeFileSync(join(root, OWNER_FILE), String(process.pid));
@@ -170,7 +206,7 @@ export function up(sessions = 2) {
     // session and delivers nothing.
     AINB_BIN,
     PATH: `${bin}:${dirname(AINB_BIN)}:${process.env.PATH ?? ""}`,
-    [WORLD_ENV]: JSON.stringify({ root, seeded: [] }),
+    [WORLD_ENV]: JSON.stringify({ root, socket, seeded: [] }),
   });
 
   // `ainb init` is not run: the desktop reads no onboarding record, and the
@@ -217,13 +253,16 @@ export function seed() {
  * `payload` is the hook's stdin, the tool call as Claude hands it over.
  */
 export function raiseHook(session, { event, matcher, payload }) {
-  const pane = run("tmux", ["display-message", "-p", "-t", `=${session.tmux}:`, "#{pane_id}"]).trim();
+  const pane = tmux(["display-message", "-p", "-t", `=${session.tmux}:`, "#{pane_id}"]).trim();
+  // The cwd as Claude reports it: canonical, through every symlink, which is
+  // not the path ainb was given for the worktree (#132).
+  const cwd = realpathSync(session.cwd);
   return run(
     AINB_BIN,
-    ["fleet", "atc", "hook", "--event", event, "--matcher", matcher, "--session-id", session.claude, "--cwd", session.cwd],
+    ["fleet", "atc", "hook", "--event", event, "--matcher", matcher, "--session-id", session.claude, "--cwd", cwd],
     {
-      cwd: session.cwd,
-      input: JSON.stringify({ session_id: session.claude, cwd: session.cwd, hook_event_name: event, ...payload }),
+      cwd,
+      input: JSON.stringify({ session_id: session.claude, cwd, hook_event_name: event, ...payload }),
       stdio: ["pipe", "pipe", "pipe"],
       env: { TMUX_PANE: pane },
     },
@@ -258,22 +297,27 @@ export function down() {
   } catch {
     // Already gone, or never started: the world is removed either way.
   }
-  let names = [];
+  // The world's own server, reached by its socket path, ended whole: never a
+  // listing of sessions and a kill for each.
   try {
-    names = run("tmux", ["list-sessions", "-F", "#{session_name}"]).split("\n").filter(Boolean);
+    tmux(["kill-server"]);
   } catch {
-    // No server left on this world's socket directory.
-  }
-  for (const name of names) {
-    try {
-      run("tmux", ["kill-session", "-t", `=${name}`]);
-    } catch {
-      // A session that ended between the listing and here.
-    }
+    // No server was ever started, or it already exited.
   }
   // A daemon still writing can hold a directory open for a moment.
   try {
-    rmSync(world().root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    // The root is a symlink (see `up`): the link goes, and then the directory
+  // it named, which a recursive remove of the link never enters.
+  let real = null;
+  try {
+    real = realpathSync(world().root);
+  } catch {
+    // Already gone.
+  }
+  rmSync(world().root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  if (real !== null && real !== world().root) {
+    rmSync(real, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
   } catch (error) {
     console.warn(`the world at ${world().root} was left behind: ${error.message}`);
   }
