@@ -83,7 +83,7 @@ export function startTheme(): (preference: ThemePreference) => void {
   };
 }
 
-/** The xterm colours for the painted theme, read from the tokens. */
+/** The xterm colours. */
 export interface TerminalColors {
   background: string;
   foreground: string;
@@ -92,16 +92,14 @@ export interface TerminalColors {
 }
 
 /**
- * The terminal's colours, from the token values `read` returns (the computed
- * style of <html>). A token that reads empty (no stylesheet yet) falls back to
- * the dark palette, so a pane never paints unreadable text.
+ * Terminals stay on the dark palette in both themes, as Orca's do. A light
+ * background under an agent CLI's own ANSI colours (white, bright yellow)
+ * would leave text near 1:1 contrast, and those colours are the CLI's, not
+ * ours to remap.
  */
-export function terminalColors(read: (token: string) => string): TerminalColors {
-  const pick = (token: string, fallback: string) => read(token).trim() || fallback;
-  return {
-    background: pick("--background", "#0b0e14"),
-    foreground: pick("--foreground", "rgb(226, 232, 240)"),
-    cursor: pick("--primary", "rgb(96, 165, 250)"),
-    selectionBackground: pick("--accent", "#1e2636"),
-  };
-}
+export const TERMINAL_COLORS: TerminalColors = {
+  background: "#0b0e14",
+  foreground: "rgb(226, 232, 240)",
+  cursor: "rgb(96, 165, 250)",
+  selectionBackground: "#1e2636",
+};
