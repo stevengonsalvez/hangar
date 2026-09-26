@@ -34,9 +34,9 @@
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
-    REASON_ALREADY_ANSWERED_BY, REASON_EFFECTS_AMBIGUOUS, REASON_LEDGER_SATURATED,
-    REASON_NO_TARGET, REASON_NOT_DELIVERED, REASON_OP_EXPIRED, REASON_OP_ID_FOREIGN,
-    REASON_REPLY_LOST, ReceiptState,
+    REASON_ALREADY_ANSWERED_BY, REASON_EFFECTS_AMBIGUOUS, REASON_INCARNATION_MISMATCH,
+    REASON_LEDGER_SATURATED, REASON_NO_TARGET, REASON_NOT_DELIVERED, REASON_OP_EXPIRED,
+    REASON_OP_ID_FOREIGN, REASON_REPLY_LOST, REASON_TURN_ADVANCED, ReceiptState,
 };
 use ainb_hangar_proto::{RpcError, RpcRequest, methods};
 use ainb_hangar_store::repo::mutation_ledger::{
@@ -557,6 +557,24 @@ where
         }
     }
 
+    // The same holds for a fence the handler refused as an RPC error (F-1:
+    // `turn_advanced`, `incarnation_mismatch`). The fingerprint strips the
+    // fence, so recording the refusal would replay it to every retry under
+    // this op id, even one carrying a freshly read fence. Abandoned instead,
+    // before any `writing` receipt, so the retry runs for real.
+    if let Err(error) = &result {
+        if let Some(reason) = fence_refusal(error) {
+            let _ = MutationLedgerRepo::abandon(pool, &key).await;
+            return Err(with_error_ack(
+                error.clone(),
+                &MutationAck::refused(
+                    ainb_hangar_proto::mutation::MutationOutcome::Created,
+                    reason,
+                ),
+            ));
+        }
+    }
+
     match &result {
         Ok(value) => {
             let encoded = stored::encode_ok(value);
@@ -629,6 +647,16 @@ where
                 },
             ))
         }
+    }
+}
+
+/// A handler refusal that a stale FENCE caused, which must not be recorded as
+/// the op id's answer (see the abandon path in [`guard`]).
+fn fence_refusal(error: &RpcError) -> Option<&'static str> {
+    match handler_reason(error)?.as_str() {
+        REASON_TURN_ADVANCED => Some(REASON_TURN_ADVANCED),
+        REASON_INCARNATION_MISMATCH => Some(REASON_INCARNATION_MISMATCH),
+        _ => None,
     }
 }
 
