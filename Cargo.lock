@@ -831,6 +831,7 @@ dependencies = [
  "proptest",
  "tattoy-wezterm-escape-parser",
  "tattoy-wezterm-term",
+ "unicode-segmentation",
 ]
 
 [[package]]
