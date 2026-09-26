@@ -468,6 +468,28 @@ impl AskState {
         session_id: &str,
         surface: ainb_hangar_proto::connections::SurfaceKind,
     ) -> Result<(), String> {
+        self.send_to(
+            chip,
+            session_id,
+            crate::fleet::send::PaneHint::default(),
+            surface,
+        )
+    }
+
+    /// [`Self::send`], into the agent's own pane as `pane` names it: the tmux
+    /// route resolves the pane's stable id from it rather than typing into
+    /// whichever pane of the session is active.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send`].
+    pub fn send_to(
+        &mut self,
+        chip: &SessionAttention,
+        session_id: &str,
+        pane: crate::fleet::send::PaneHint,
+        surface: ainb_hangar_proto::connections::SurfaceKind,
+    ) -> Result<(), String> {
         // One outstanding send at a time. Key-repeat on Enter would otherwise
         // deliver the same answer N times into an agent's open picker, and the
         // picker would consume each one as a separate keystroke.
@@ -495,7 +517,7 @@ impl AskState {
                     crate::fleet::control::answer_via_daemon_blocking(attention_id, sent, surface)
                 }
                 Answerable::Tmux => {
-                    crate::fleet::control::answer_via_tmux_blocking(&session_id, &sent)
+                    crate::fleet::control::answer_via_tmux_blocking_at(&session_id, &pane, &sent)
                 }
                 Answerable::Broker {
                     session_id: waiter, ..
