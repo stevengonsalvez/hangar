@@ -28,11 +28,14 @@ export function Statusbar(props: Props) {
       <span class="statusbar-host" title="Host">
         {props.host ?? "no host"}
       </span>
+      {/* A live region needs text: the dot alone announces nothing. */}
       <span
         class={`statusbar-daemon-dot ${daemonDotState(props.sidecar)}`}
         role="status"
         title={props.sidecar.state}
-      />
+      >
+        <span class="visually-hidden">Daemon {props.sidecar.state}</span>
+      </span>
       <span class="statusbar-counts" aria-label="Attention">
         <Show when={props.needsYou > 0}>
           <span class="statusbar-needs">{props.needsYou} need you</span>
