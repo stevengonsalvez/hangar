@@ -66,6 +66,9 @@ pub struct InteractiveSession {
     pub headroom_enabled: bool,       // Route this session's CLI through the local Headroom proxy
     pub rtk_enabled: bool,            // RTK PreToolUse hook wired in session's worktree
     pub codex_thread_id: Option<String>, // Exact shared app-server thread for Codex sessions
+    /// The session id ainb minted for a Claude launch and handed to
+    /// `claude --session-id`, so the id its hooks report is this one exactly.
+    pub claude_session_id: Option<String>,
     /// Why this launch has no shared thread, when it has none.
     ///
     /// Transient, not persisted: it describes THIS launch, and a later one on a
@@ -121,6 +124,28 @@ pub struct SessionMetadata {
     /// Exact daemon-owned remote thread. Missing legacy values migrate lazily.
     #[serde(default)]
     pub codex_thread_id: Option<String>,
+    /// The session id ainb minted for a Claude launch and handed to
+    /// `claude --session-id`: the id the daemon files this session's hook
+    /// requests under. A session launched before this field existed has none
+    /// and its requests are placed by no one.
+    #[serde(default)]
+    pub claude_session_id: Option<String>,
+}
+
+/// The Claude session id a launch or resume names, as ainb minted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaudeSession<'a> {
+    /// The id, a UUID ainb generated for this session.
+    pub id: &'a str,
+    /// Whether Claude already holds a transcript under this id, so a resume
+    /// can name it exactly and keep it.
+    pub resumable: bool,
+}
+
+/// A fresh Claude session id for a launch.
+#[must_use]
+pub fn new_claude_session_id() -> String {
+    Uuid::new_v4().to_string()
 }
 
 /// Whether shared Codex remote control can work in this process's hangar home.
@@ -1567,6 +1592,11 @@ impl InteractiveSessionManager {
             return Err(error);
         }
 
+        // The id Claude runs under, minted here so its hooks report an id this
+        // record already holds: the daemon files every request the session
+        // raises under it, and the sessions screen places them by it exactly.
+        let claude_session_id =
+            (agent_type == SessionAgentType::Claude).then(new_claude_session_id);
         // Step 4: Start CLI in tmux session (for AI agent types)
         match agent_type {
             SessionAgentType::Claude
@@ -1589,6 +1619,10 @@ impl InteractiveSessionManager {
                         false, // resume_requested: fresh launch
                         headroom_enabled,
                         codex_remote.as_ref(),
+                        claude_session_id.as_deref().map(|id| ClaudeSession {
+                            id,
+                            resumable: false,
+                        }),
                     )
                     .await
                 {
@@ -1654,6 +1688,7 @@ impl InteractiveSessionManager {
             headroom_enabled,
             rtk_enabled,
             codex_thread_id: codex_remote.as_ref().and_then(|remote| remote.thread_id.clone()),
+            claude_session_id: claude_session_id.clone(),
             codex_degrade,
         };
 
@@ -1674,6 +1709,7 @@ impl InteractiveSessionManager {
             model_source: ModelSource::Raw,
             codex_model: None,
             codex_thread_id: codex_remote.and_then(|remote| remote.thread_id),
+            claude_session_id,
         };
         // Locked RMW so a concurrent `ainb kill` / recovery / daemon register
         // can't lost-update this upsert (pu4).
@@ -1840,6 +1876,11 @@ impl InteractiveSessionManager {
             return Err(error);
         }
 
+        // The id Claude runs under, minted here so its hooks report an id this
+        // record already holds: the daemon files every request the session
+        // raises under it, and the sessions screen places them by it exactly.
+        let claude_session_id =
+            (agent_type == SessionAgentType::Claude).then(new_claude_session_id);
         // Step 3: Start CLI in tmux session (for AI agent types)
         match agent_type {
             SessionAgentType::Claude
@@ -1862,6 +1903,10 @@ impl InteractiveSessionManager {
                         false, // resume_requested: fresh launch
                         headroom_enabled,
                         codex_remote.as_ref(),
+                        claude_session_id.as_deref().map(|id| ClaudeSession {
+                            id,
+                            resumable: false,
+                        }),
                     )
                     .await
                 {
@@ -1928,6 +1973,7 @@ impl InteractiveSessionManager {
             headroom_enabled,
             rtk_enabled,
             codex_thread_id: codex_remote.as_ref().and_then(|remote| remote.thread_id.clone()),
+            claude_session_id: claude_session_id.clone(),
             codex_degrade,
         };
 
@@ -1948,6 +1994,7 @@ impl InteractiveSessionManager {
             model_source: ModelSource::Raw,
             codex_model: None,
             codex_thread_id: codex_remote.and_then(|remote| remote.thread_id),
+            claude_session_id,
         };
         // Locked RMW (pu4): serialise against concurrent kill/recovery writers.
         if let Err(e) =
@@ -2099,6 +2146,7 @@ impl InteractiveSessionManager {
                     headroom_enabled: metadata.headroom_enabled,
                     rtk_enabled: metadata.rtk_enabled,
                     codex_thread_id: metadata.codex_thread_id.clone(),
+                    claude_session_id: metadata.claude_session_id.clone(),
                     // Rediscovery, not a launch: nothing was attempted, so
                     // there is no degrade to announce.
                     codex_degrade: None,
@@ -2156,6 +2204,7 @@ impl InteractiveSessionManager {
                     headroom_enabled: false,
                     rtk_enabled: false,
                     codex_thread_id: None,
+                    claude_session_id: None,
                     // Rediscovery, not a launch: see above.
                     codex_degrade: None,
                 });
@@ -2909,6 +2958,14 @@ impl InteractiveSessionManager {
     /// `has_history` is `true` when the caller found a prior conversation for
     /// this cwd (gates Claude's `--continue`). See `start_cli_in_tmux` for the
     /// full resume semantics.
+    ///
+    /// `claude_session` is the id ainb minted for a Claude session: a launch
+    /// runs under it (`--session-id`), a resume names it exactly (`--resume`)
+    /// when Claude holds a transcript under it, and a resume of the cwd's
+    /// latest conversation forks it under this id, because Claude refuses
+    /// `--session-id` beside `--continue` or `--resume` without
+    /// `--fork-session`. `None` is a session with no minted id, which resumes
+    /// as before.
     pub fn build_cli_cmd_parts(
         provider: &crate::config::CliProvider,
         agent_type: SessionAgentType,
@@ -2916,6 +2973,7 @@ impl InteractiveSessionManager {
         model: Option<&str>,
         resume_requested: bool,
         has_history: bool,
+        claude_session: Option<ClaudeSession<'_>>,
     ) -> Vec<String> {
         let mut cmd_parts = vec![provider.command().to_string()];
         if agent_type == SessionAgentType::Codex {
@@ -2989,8 +3047,25 @@ impl InteractiveSessionManager {
         // `--resume <jsonl path>` silently fell through to the interactive
         // picker instead of resuming - `--continue` is the correct "resume
         // latest" for a cwd-scoped session.
-        if agent_type == SessionAgentType::Claude && resume_requested && has_history {
-            cmd_parts.push("--continue".to_string());
+        if agent_type == SessionAgentType::Claude {
+            match claude_session {
+                Some(session) if resume_requested && session.resumable => {
+                    cmd_parts.push("--resume".to_string());
+                    cmd_parts.push(session.id.to_string());
+                }
+                Some(session) => {
+                    if resume_requested && has_history {
+                        cmd_parts.push("--continue".to_string());
+                        cmd_parts.push("--fork-session".to_string());
+                    }
+                    cmd_parts.push("--session-id".to_string());
+                    cmd_parts.push(session.id.to_string());
+                }
+                None if resume_requested && has_history => {
+                    cmd_parts.push("--continue".to_string());
+                }
+                None => {}
+            }
         }
 
         // Copilot resume: `--continue` re-opens the most recent copilot session.
@@ -3040,6 +3115,7 @@ impl InteractiveSessionManager {
         resume_requested: bool,
         headroom_enabled: bool,
         codex_remote: Option<&ainb_hangar_proto::fleet::CodexSessionEnsureResult>,
+        claude_session: Option<ClaudeSession<'_>>,
     ) -> Result<(), InteractiveSessionError> {
         use crate::config::CliProvider;
 
@@ -3147,6 +3223,7 @@ impl InteractiveSessionManager {
                 model.as_deref(),
                 resume_requested,
                 resume_transcript.is_some(),
+                claude_session,
             )
         };
 
@@ -3348,7 +3425,8 @@ impl InteractiveSession {
         // Codex's daemon-owned thread is the hook/session identity. Project
         // this authoritative ID so attention matches it exactly; never infer
         // one from another session sharing the worktree.
-        session.provider_session_id = self.codex_thread_id.clone();
+        session.provider_session_id =
+            self.codex_thread_id.clone().or_else(|| self.claude_session_id.clone());
 
         session
     }
@@ -3926,6 +4004,7 @@ trust_level = "trusted"
                 model_source: ModelSource::Raw,
                 codex_model: None,
                 codex_thread_id: None,
+                claude_session_id: None,
             });
         }
         store.save().expect("seed store");
@@ -4720,6 +4799,7 @@ trust_level = "trusted"
             model_source: ModelSource::Raw,
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
         assert_eq!(metadata.display_workspace_name(), "shotclubhouse");
 
@@ -4851,6 +4931,7 @@ trust_level = "trusted"
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         });
         store.save().expect("save");
 
@@ -4908,6 +4989,7 @@ trust_level = "trusted"
                 model_source: ModelSource::Raw,
                 codex_model: Some(CodexModel::Gpt55),
                 codex_thread_id: None,
+                claude_session_id: None,
             });
         })
         .expect("save");
@@ -5013,6 +5095,7 @@ trust_level = "trusted"
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         const WRITERS: usize = 12;
@@ -5144,7 +5227,128 @@ trust_level = "trusted"
             model,
             resume,
             has_history,
+            None,
         )
+    }
+
+    fn claude_parts(resume: bool, has_history: bool, session: ClaudeSession<'_>) -> Vec<String> {
+        InteractiveSessionManager::build_cli_cmd_parts(
+            &CliProvider::Claude,
+            SessionAgentType::Claude,
+            false,
+            None,
+            resume,
+            has_history,
+            Some(session),
+        )
+    }
+
+    #[test]
+    fn a_claude_sessions_minted_id_is_its_provider_session_id() {
+        let session = InteractiveSession {
+            session_id: Uuid::new_v4(),
+            worktree_path: PathBuf::from("/work/wt"),
+            source_repository: PathBuf::from("/work/repo"),
+            tmux_session_name: "tmux_wt".into(),
+            branch_name: "feat".into(),
+            workspace_name: "repo".into(),
+            created_at: Utc::now(),
+            agent_type: SessionAgentType::Claude,
+            skip_permissions: false,
+            model: None,
+            headroom_enabled: false,
+            rtk_enabled: false,
+            codex_thread_id: None,
+            claude_session_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            codex_degrade: None,
+        };
+        assert_eq!(
+            session.to_session_model().provider_session_id.as_deref(),
+            Some("11111111-2222-4333-8444-555555555555")
+        );
+    }
+
+    #[test]
+    fn claude_fresh_launch_runs_under_the_minted_session_id() {
+        let p = claude_parts(
+            false,
+            false,
+            ClaudeSession {
+                id: "11111111-2222-4333-8444-555555555555",
+                resumable: false,
+            },
+        );
+        assert_eq!(
+            p,
+            vec![
+                "claude",
+                "--session-id",
+                "11111111-2222-4333-8444-555555555555"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_resume_of_its_own_transcript_names_the_session_id_exactly() {
+        // The id stays the one the record holds, so the daemon's rows for it
+        // still land on this session after the restart.
+        let p = claude_parts(
+            true,
+            true,
+            ClaudeSession {
+                id: "11111111-2222-4333-8444-555555555555",
+                resumable: true,
+            },
+        );
+        assert_eq!(
+            p,
+            vec!["claude", "--resume", "11111111-2222-4333-8444-555555555555"]
+        );
+    }
+
+    #[test]
+    fn claude_resume_of_the_cwds_latest_conversation_forks_it_under_the_minted_id() {
+        // Claude refuses `--session-id` beside `--continue` unless the
+        // conversation is forked, so a resume that cannot name its own
+        // transcript continues the cwd's latest one under the new id.
+        let p = claude_parts(
+            true,
+            true,
+            ClaudeSession {
+                id: "11111111-2222-4333-8444-555555555555",
+                resumable: false,
+            },
+        );
+        assert_eq!(
+            p,
+            vec![
+                "claude",
+                "--continue",
+                "--fork-session",
+                "--session-id",
+                "11111111-2222-4333-8444-555555555555"
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_resume_with_no_history_launches_fresh_under_the_minted_id() {
+        let p = claude_parts(
+            true,
+            false,
+            ClaudeSession {
+                id: "11111111-2222-4333-8444-555555555555",
+                resumable: false,
+            },
+        );
+        assert_eq!(
+            p,
+            vec![
+                "claude",
+                "--session-id",
+                "11111111-2222-4333-8444-555555555555"
+            ]
+        );
     }
 
     #[test]
