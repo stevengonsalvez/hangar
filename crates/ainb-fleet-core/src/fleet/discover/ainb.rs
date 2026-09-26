@@ -60,6 +60,7 @@ pub async fn discover_from_ainb() -> Result<Vec<Session>> {
         .filter(|r| r.is_running)
         .map(|r| Session {
             id: r.session_id,
+            provider_session_id: r.provider_session_id,
             cwd: r.worktree_path.clone(),
             pid: None,
             git_root: None,

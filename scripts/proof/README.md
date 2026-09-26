@@ -12,7 +12,7 @@ run.sh ──▶ for each node: ( source lib.sh + scenarios/<node>.sh )
              ├─ world_up     private HOME, TMUX_TMPDIR, PATH stubs, ainb init
              ├─ scenario     keys in, captures out, check / observe
              ├─ write_result proof-out/<node>/result.json
-             └─ world_down   quit TUIs, kill by exact name, stop daemon, rm world
+             └─ world_down   quit TUIs, kill-server on each world socket, stop daemon, rm world
            ──▶ summarize.py  proof-out/summary.json + summary.md, exit status
 ```
 
@@ -52,11 +52,14 @@ The internal hostname is replaced by `<host>` in every capture and observation.
 ## The world each scenario runs in
 
 ```
-$PROOF_WORLD/                       mktemp -d, removed at the end
+$PROOF_WORLD/                       mktemp -d under /tmp, removed at the end
   home/                   HOME
     .agents-in-a-box/     also AINB_HANGAR_HOME
-  tmux/                   TMUX_TMPDIR: server `-L proof` hosts the harness
-                          panes; the default server holds `ainb run` sessions
+  tmux/                   TMUX_TMPDIR: the default server `ainb run` starts holds the
+                          agent sessions; the harness reaches it by its socket path,
+                          PROOF_FIXTURE_SOCK (`tmux -S`), never by name
+  tmux.sock               PROOF_TMUX_SOCK: the harness server, reached by explicit
+                          socket path (`tmux -S`), never by name; hosts the harness panes
   bin/                    first on PATH: `claude` fixture agent, `headroom` stub
   repo/                   git repository the fixture sessions are spawned from
 ```
@@ -68,7 +71,7 @@ Decisions that are easy to get wrong:
   `~/.agents-in-a-box/events.jsonl`. Split them and no hook-raised card ever
   reaches the daemon.
 - **The TUI and `ainb web` run with `TMUX` and `TMUX_PANE` unset.** Inside a
-  `-L proof` pane they would otherwise treat the harness server as their tmux.
+  harness pane they would otherwise treat the harness server as their tmux.
   The one exception is `issue-1094-own-session`, which keeps `TMUX` on purpose
   so the TUI lists the tmux session it runs in.
 - **The fixture agent** is a bash loop named `claude` that prints
@@ -84,8 +87,10 @@ Decisions that are easy to get wrong:
   JSON-RPC on the private socket with the daemon token, exactly as a surface
   does, to read `fleet/status` and to check protocol negotiation.
 - **Mouse** is SGR mouse bytes sent to the pane (`click`, `double_click`).
-- **Teardown** never kills by pattern. Sessions die by exact name; a process is
-  signalled only when its environment carries this world's
+- **Teardown** never kills by pattern. Both tmux servers are ended with
+  `kill-server` on their own socket paths, never by listing sessions and
+  killing them. A process is signalled only when its environment carries
+  this world's
   `AINB_HANGAR_HOME`. `run.sh` fails the run if any process from a proof world
   is still alive at the end.
 

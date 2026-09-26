@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use ainb_app::hosts::{
-    CarrierKind, HostCoverage, HostId, HostKind, HostListing, HostRegistry, Reachability, fold,
+    CarrierKind, HostCoverage, HostId, HostListing, HostRegistry, Reachability, fold,
     listing_from_read,
 };
 use ainb_hangar_client::DaemonClient;
@@ -111,8 +111,8 @@ async fn two_daemons_fold_into_one_census_and_a_killed_one_turns_unreachable() {
     assert_ne!(a.host_id, b.host_id, "two homes mint two hosts");
 
     let mut registry = HostRegistry::new();
-    registry.upsert(a.host_id.clone(), HostKind::Local, 1_000);
-    registry.upsert(b.host_id.clone(), HostKind::Remote, 1_000);
+    registry.set_local(a.host_id.clone(), 1_000);
+    registry.upsert_remote(b.host_id.clone(), 1_000).unwrap();
 
     // Both reachable: every row is in, under its own host.
     let la = listing_from_read(
@@ -228,7 +228,7 @@ async fn rows_from_another_host_are_never_filed_under_this_one() {
     let a = boot_box(1, "a").await;
     let expected = HostId::parse("01K5A0000000000000000ZZZZZ").unwrap();
     let mut registry = HostRegistry::new();
-    registry.upsert(expected.clone(), HostKind::Remote, 5);
+    registry.upsert_remote(expected.clone(), 5).unwrap();
     let listing = listing_from_read(
         &mut registry,
         &expected,
@@ -241,5 +241,50 @@ async fn rows_from_another_host_are_never_filed_under_this_one() {
         registry.get(&expected).unwrap().reachability,
         Reachability::Unreachable { .. }
     ));
+    a.serve.abort();
+}
+
+/// The local host must be keyed by its minted id: the daemon stamps its rows
+/// with that id, so a local host still keyed `local` refuses its own rows,
+/// and re-keying it (as a surface does once hello names the id) fixes that.
+#[tokio::test]
+async fn the_local_host_keyed_local_refuses_its_own_rows_until_re_keyed() {
+    let a = boot_box(2, "a").await;
+    let mut registry = HostRegistry::new();
+    registry.set_local(HostId::local(), 1);
+    let refused = listing_from_read(
+        &mut registry,
+        &HostId::local(),
+        a.client.fleet_roster_status().await,
+        CarrierKind::SshL,
+        2,
+    );
+    assert!(
+        matches!(refused, HostListing::Unreachable { .. }),
+        "{refused:?}"
+    );
+
+    // The order the review found: this machine was paired as a remote under
+    // its own minted id before its daemon named itself. Naming the local host
+    // must still win.
+    registry.upsert_remote(a.host_id.clone(), 2).unwrap();
+    registry.set_local(a.host_id.clone(), 3);
+    let listed = listing_from_read(
+        &mut registry,
+        &a.host_id,
+        a.client.fleet_roster_status().await,
+        CarrierKind::SshL,
+        4,
+    );
+    assert!(
+        matches!(&listed, HostListing::Fresh { rows, .. } if rows.len() == 2),
+        "{listed:?}"
+    );
+    assert_eq!(registry.local().map(|h| &h.host_id), Some(&a.host_id));
+    assert_eq!(
+        registry.len(),
+        1,
+        "the remote under the local id was dropped"
+    );
     a.serve.abort();
 }
