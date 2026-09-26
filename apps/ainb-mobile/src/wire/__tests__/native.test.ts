@@ -121,8 +121,10 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
     transcriptPage: async (_s, afterOrder, limit) => {
       const after = afterOrder === undefined ? undefined : Number(afterOrder);
       calls.transcriptPage.push({ afterOrder: after, limit });
+      // The daemon caps a page at 100 and reads forward from the cursor.
+      const cap = Math.min(limit, 100);
       const all = opts.transcript ?? [9];
-      const from = after === undefined ? all.slice(-limit) : all.filter((o) => o > after).slice(0, limit);
+      const from = after === undefined ? all.slice(-cap) : all.filter((o) => o > after).slice(0, cap);
       return { chunks: from.map(chunk), truncated: false };
     },
     subscribeTranscript: async () => 9n,
@@ -312,20 +314,36 @@ describe("native adapter", () => {
     expect(calls.interrupt).toEqual([{ version: 2, fingerprint: "fp-1", opId: "op-i" }]);
   });
 
-  test("transcript pages come decoded by the crate, and beforeSeq fetches older entries", async () => {
-    const transcript = Array.from({ length: 30 }, (_, i) => 100 + i * 3);
+  test("transcript pages come decoded by the crate; a dense session gets the newest 100 and no older page until the daemon pages backward", async () => {
+    const transcript = Array.from({ length: 300 }, (_, i) => 1000 + i);
     const { host, calls } = scriptedHost([], { transcript });
     const wire = wireOver(host);
     await wire.connect("h1");
     const newest = await wire.transcriptPage("h1", "claude:s-1");
-    expect(newest.at(-1)).toEqual({ seq: 187, role: "agent", text: "line 187", atMs: 2 });
-    expect(must(calls.transcriptPage[0], "first page call").afterOrder).toBeUndefined();
-    const older = await wire.transcriptPage("h1", "claude:s-1", 112);
-    expect(older.map((e) => e.seq)).toEqual([100, 103, 106, 109]);
-    expect(older.every((e) => e.seq < 112)).toBe(true);
-    const call = must(calls.transcriptPage[1], "older page call");
-    expect(call.afterOrder).toBeLessThan(112);
-    expect(await wire.transcriptPage("h1", "claude:s-1", 100)).toEqual([]);
+    expect(newest).toHaveLength(100);
+    expect(newest[0]).toEqual({ seq: 1200, role: "agent", text: "line 1200", atMs: 2 });
+    expect(newest.at(-1)?.seq).toBe(1299);
+    expect(calls.transcriptPage).toEqual([{ afterOrder: undefined, limit: 100 }]);
+    // An older page would come back as the session's oldest window (1000 to 1099),
+    // not the rows below 1200: the adapter answers empty instead and makes no call.
+    expect(await wire.transcriptPage("h1", "claude:s-1", 1200)).toEqual([]);
+    expect(calls.transcriptPage).toHaveLength(1);
+  });
+
+  test("a close during a dial waits for the dial, then closes the socket it produced", async () => {
+    const dials = { count: 0 };
+    const { host } = scriptedHost([]);
+    const wire = wireOver(host, { dials, slow: true });
+    const seen: WireEvent[] = [];
+    wire.onEvent((ev) => seen.push(ev));
+    const connecting = wire.connect("h1");
+    await wire.close("h1");
+    await connecting;
+    expect(dials.count).toBe(1);
+    expect(host.isClosed()).toBe(true);
+    for (let i = 0; i < 10 && !seen.some((e) => e.kind === "closed"); i++) await flush();
+    expect(seen.find((e) => e.kind === "closed")).toMatchObject({ hostId: "h1", retryable: false });
+    expect(must((await wire.hosts())[0], "host row").reachability).toBe("unreachable");
   });
 
   test("the app's own close reports retryable false, a floor refusal is a value, and terminal calls carry the app's op id", async () => {
