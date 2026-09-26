@@ -7,8 +7,20 @@ import { TERMINAL_HTML } from "./engine/bundle.generated";
 import { decodeFromEngine, injection, toBase64, type ToEngine } from "./engine/protocol";
 import { ACCESSORY_KEYS, withCtrl } from "./keys";
 
-/** The inline document's own URL; nothing else may load or post. */
-export const ENGINE_URL = "about:blank";
+/**
+ * The inline document's origin. A reserved `.invalid` name (RFC 2606) that no
+ * resolver answers, given to the webview as `baseUrl` so the page has a REAL
+ * origin: an inline page without one is opaque, and a modern Android WebView
+ * then reports every message as coming from `null` (react-native-webview
+ * delivers `postMessage` through `WebMessageListener` and puts
+ * `sourceOrigin.toString()` in `nativeEvent.url`), which the origin check
+ * below must drop. The CSP still forbids every fetch from this origin.
+ */
+export const ENGINE_ORIGIN = "https://terminal.ainb.invalid";
+/** The document URL: what iOS (`frameInfo.request.URL`) and an older Android (`getUrl()`) report. */
+export const ENGINE_URL = `${ENGINE_ORIGIN}/`;
+/** Exactly the two spellings the platforms report for this one page, nothing wider. */
+const ENGINE_SOURCES: ReadonlySet<string> = new Set([ENGINE_ORIGIN, ENGINE_URL]);
 
 /**
  * Terminal output is attacker-influenced (any program in the pane can print
@@ -17,7 +29,7 @@ export const ENGINE_URL = "about:blank";
  * disabled and a CSP that allows only its inline script and style.
  */
 export const LOCKDOWN = {
-  originWhitelist: [ENGINE_URL],
+  originWhitelist: [ENGINE_ORIGIN],
   onShouldStartLoadWithRequest: (req: { url: string }) => req.url === ENGINE_URL,
   setSupportMultipleWindows: false,
   javaScriptCanOpenWindowsAutomatically: false,
@@ -28,6 +40,12 @@ export const LOCKDOWN = {
   incognito: true,
   cacheEnabled: false,
 };
+
+/** Only the origin of a rejected sender is shown, never its path or query. */
+export function originOf(url: string): string {
+  const m = /^([a-z][a-z0-9+.-]*:\/\/[^/?#]+)/i.exec(url);
+  return m?.[1] ?? url.split(/[/?#]/)[0] ?? url;
+}
 
 export interface TerminalSink {
   write(bytes: Uint8Array): void;
@@ -44,6 +62,10 @@ export interface TerminalViewProps {
   /** Keystrokes from the soft keyboard or the accessory bar; absent = read only. */
   onInput?(data: string): void;
   onFit?(cols: number, rows: number): void;
+  /** The engine reports a link tap it refused to open. */
+  onLink?(uri: string): void;
+  /** Engine lifecycle for the status row: loading, ready, or a dropped message with its origin. */
+  onEngine?(state: string): void;
   testID?: string;
 }
 
@@ -51,7 +73,7 @@ export interface TerminalViewProps {
  * xterm.js inside a webview. Bytes queue until the engine says `ready`, then
  * cross the bridge as base64; the engine coalesces them per frame.
  */
-export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewProps) {
+export function TerminalView({ onSink, onInput, onFit, onLink, onEngine, testID }: TerminalViewProps) {
   const web = useRef<WebView>(null);
   const ready = useRef(false);
   const queue = useRef<ToEngine[]>([]);
@@ -85,7 +107,10 @@ export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewPro
   const onMessage = (e: WebViewMessageEvent) => {
     // Only the inline document may talk to us. Any navigated-to page would
     // have the same bridge, so a foreign origin is dropped before decoding.
-    if (e.nativeEvent.url !== ENGINE_URL) return;
+    if (!ENGINE_SOURCES.has(e.nativeEvent.url)) {
+      onEngine?.(`dropped message from ${originOf(e.nativeEvent.url)}`);
+      return;
+    }
     const msg = decodeFromEngine(e.nativeEvent.data);
     if (!msg) return;
     if (msg.t === "ready") {
@@ -93,8 +118,11 @@ export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewPro
       send({ t: "readonly", on: readOnly });
       for (const m of queue.current) send(m);
       queue.current = [];
+      onEngine?.("engine ready");
     } else if (msg.t === "fit") onFit?.(msg.cols, msg.rows);
     else if (msg.t === "input") type(msg.data);
+    else if (msg.t === "link") onLink?.(msg.uri);
+    else if (msg.t === "stats") onEngine?.(`engine ready, ${msg.bytes} B, ${msg.cols}x${msg.rows}`);
   };
 
   const type = (data: string) => {
@@ -107,8 +135,9 @@ export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewPro
     <View style={styles.root} testID={testID}>
       <WebView
         ref={web}
-        source={{ html: TERMINAL_HTML }}
+        source={{ html: TERMINAL_HTML, baseUrl: ENGINE_URL }}
         onMessage={onMessage}
+        onLoadStart={(e) => onEngine?.(`loading ${e.nativeEvent.url}`)}
         javaScriptEnabled
         scrollEnabled={false}
         hideKeyboardAccessoryView

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { colors } from "../theme";
@@ -5,14 +6,25 @@ import type { HostId, SessionKey } from "../wire/types";
 import { TerminalView } from "./TerminalView";
 import { useTerminal } from "./useTerminal";
 
+/** Only the host of an ignored link is shown; the rest of the URI never leaves the engine. */
+function hostOf(uri: string): string {
+  const m = /^[a-z][a-z0-9+.-]*:\/\/([^/?#]+)/i.exec(uri);
+  return m?.[1] ?? "(no host)";
+}
+
 /** The Terminal tab: read only under `mobile`, a type toggle under `mobile+type`. */
 export function WireTerminal({ hostId, sessionKey }: { hostId?: HostId; sessionKey?: SessionKey }) {
   const { state, setSink, input, setTyping, take, fit } = useTerminal(hostId, sessionKey);
+  const [engine, setEngine] = useState("engine loading");
+  const [link, setLink] = useState<string>();
   return (
     <View style={styles.root}>
       <View style={styles.bar}>
         <Text style={styles.muted} testID="terminal-size">
           {state.cols && state.rows ? `${state.cols}x${state.rows}` : ""}
+        </Text>
+        <Text style={styles.muted} testID="terminal-engine" accessibilityLabel={engine}>
+          {engine}
         </Text>
         {state.nativeClients > 0 ? (
           <Text style={styles.badge} testID="native-badge">
@@ -37,12 +49,24 @@ export function WireTerminal({ hostId, sessionKey }: { hostId?: HostId; sessionK
           </Pressable>
         </View>
       ) : null}
+      {link ? (
+        <Text style={styles.link} testID="link-ignored" accessibilityLabel={`link ignored: ${link}`}>
+          link ignored: {link}
+        </Text>
+      ) : null}
       {state.closed ? (
         <Text style={styles.closed} testID="terminal-closed">
           closed: {state.closed}
         </Text>
       ) : null}
-      <TerminalView testID="terminal" onSink={setSink} onInput={state.canType && state.typing ? input : undefined} onFit={fit} />
+      <TerminalView
+        testID="terminal"
+        onSink={setSink}
+        onInput={state.canType && state.typing ? input : undefined}
+        onFit={fit}
+        onEngine={setEngine}
+        onLink={(uri) => setLink(hostOf(uri))}
+      />
     </View>
   );
 }
@@ -61,4 +85,5 @@ const styles = StyleSheet.create({
   take: { backgroundColor: colors.gold, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 4 },
   takeText: { color: colors.bg, fontWeight: "700" },
   closed: { color: colors.red, paddingHorizontal: 8 },
+  link: { color: colors.gold, paddingHorizontal: 8 },
 });

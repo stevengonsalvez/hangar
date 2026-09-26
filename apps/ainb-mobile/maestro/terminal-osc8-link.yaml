@@ -15,21 +15,29 @@ appId: com.stevengonsalvez.ainb.mobile
     id: "tab-terminal"
 - assertVisible:
     id: "terminal-webview"
+- assertVisible:
+    text: "engine ready.*"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-before
-# the link text sits at the cursor row inside the webview; tap it twice
-# (xterm activates a link on a second tap when the first only hovers)
+# the link line is printed at the alt screen's cursor row (row 10 of the
+# fixture); on the emulator's 1080x2400 screen that is about 36 percent down.
+# Tap it twice: xterm activates a link on the second tap when the first only
+# hovers.
 - tapOn:
-    point: "20%,32%"
+    point: "40%,36%"
 - tapOn:
-    point: "20%,32%"
+    point: "40%,36%"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-after
+# the tap reached the link: the engine reported it and the host shows the
+# ignored host name; the terminal is still on screen, no page opened
+- assertVisible:
+    id: "link-ignored"
+- assertVisible:
+    text: "link ignored: example.invalid"
 - assertVisible:
     id: "terminal-webview"
 - assertVisible:
     id: "terminal-size"
-- assertNotVisible:
-    text: "example.invalid"

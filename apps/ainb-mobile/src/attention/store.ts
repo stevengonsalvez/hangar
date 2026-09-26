@@ -72,6 +72,13 @@ export function markSent(hostId: HostId, attentionId: string, sent: SentAnswer) 
   set({ ...state, sent: next });
 }
 
+/** The daemon never took the answer (no target, ambiguous): a fresh one may go out. */
+export function unpin(hostId: HostId, attentionId: string) {
+  const next = new Map(state.sent);
+  next.delete(rowKey(hostId, attentionId));
+  set({ ...state, sent: next });
+}
+
 /** Tests start from nothing. */
 export function reset() {
   set({ rows: [], notified: new Set(), sent: new Map() });

@@ -5,7 +5,7 @@ import { colors } from "../theme";
 import { useWire } from "../wire/context";
 import type { AttentionRow } from "../wire/types";
 import { outcomeCopy } from "./outcome";
-import { markSent, retire, sentFor } from "./store";
+import { markSent, retire, sentFor, unpin } from "./store";
 
 /**
  * The second tap. Options answer with their 1-based number (the picker and
@@ -36,6 +36,7 @@ export function AnswerSheet({ row, onClose }: { row: AttentionRow; onClose: () =
       const copy = outcomeCopy(reply.outcome, reply.ack);
       setStatus(copy);
       if (copy.retire) retire(row.hostId, row.id);
+      if (copy.unpin) unpin(row.hostId, row.id);
     } catch (e) {
       // Reply lost; the pinned answer goes back out under the pinned op id.
       setStatus({ text: `No reply (${e instanceof Error ? e.message : String(e)})`, final: false, lost: true });

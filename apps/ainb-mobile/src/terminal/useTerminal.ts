@@ -34,6 +34,8 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
   const lastFit = useRef<{ cols: number; rows: number } | undefined>(undefined);
   const snapshotSeq = useRef(0);
   const pendingInput = useRef<string>("");
+  /** Frames for a stream we are attaching to but have not recorded yet (they can beat the attach reply). */
+  const early = useRef<Map<number, { seq: number; frame: TerminalFrame }[]>>(new Map());
   const inputTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [state, setState] = useState<TerminalState>({ canType: false, typing: false, floor: { floorGen: 0 }, nativeClients: 0 });
   const stateRef = useRef(state);
@@ -58,30 +60,6 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
     if (id !== undefined && hostId) await wire.terminalDetach(hostId, id).catch(() => undefined);
     setState((s) => ({ ...s, streamId: undefined }));
   }, [wire, hostId]);
-
-  const attach = useCallback(async () => {
-    if (!hostId || !sessionKey || stream.current !== undefined) return;
-    const info: HostInfo = await wire.hostInfo(hostId).catch(() => ({ capabilities: [] }));
-    const canType =
-      info.scope?.base === "mobile+type" && info.capabilities.includes("terminal.stream") && info.capabilities.includes("terminal.input");
-    const wantInput = canType && stateRef.current.typing;
-    const at = await wire.terminalAttach({ hostId, sessionKey, ...lastFit.current, wantInput });
-    stream.current = at.streamId;
-    snapshotSeq.current = at.snapshotSeq;
-    patch({ streamId: at.streamId, canType, floor: at.floor, nativeClients: at.nativeClients, cols: at.cols, rows: at.rows, closed: undefined, denied: undefined });
-    await resizeIfHolder(at.floor);
-  }, [wire, hostId, sessionKey, resizeIfHolder]);
-
-  useEffect(() => {
-    void attach().catch((e: unknown) => patch({ closed: String(e instanceof Error ? e.message : e) }));
-    const offB = beforeBackground(detach);
-    const offF = afterForeground(() => attach().catch(() => undefined));
-    return () => {
-      offB();
-      offF();
-      void detach();
-    };
-  }, [attach, detach]);
 
   const onFrame = useCallback(
     (seq: number, frame: TerminalFrame) => {
@@ -125,10 +103,44 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
     [resizeIfHolder],
   );
 
+  const attach = useCallback(async () => {
+    if (!hostId || !sessionKey || stream.current !== undefined) return;
+    const info: HostInfo = await wire.hostInfo(hostId).catch(() => ({ capabilities: [] }));
+    const canType =
+      info.scope?.base === "mobile+type" && info.capabilities.includes("terminal.stream") && info.capabilities.includes("terminal.input");
+    const wantInput = canType && stateRef.current.typing;
+    const at = await wire.terminalAttach({ hostId, sessionKey, ...lastFit.current, wantInput });
+    stream.current = at.streamId;
+    snapshotSeq.current = at.snapshotSeq;
+    patch({ streamId: at.streamId, canType, floor: at.floor, nativeClients: at.nativeClients, cols: at.cols, rows: at.rows, closed: undefined, denied: undefined });
+    const queued = early.current.get(at.streamId) ?? [];
+    early.current.clear();
+    for (const q of queued) onFrame(q.seq, q.frame);
+    await resizeIfHolder(at.floor);
+  }, [wire, hostId, sessionKey, resizeIfHolder]);
+
+  useEffect(() => {
+    void attach().catch((e: unknown) => patch({ closed: String(e instanceof Error ? e.message : e) }));
+    const offB = beforeBackground(detach);
+    const offF = afterForeground(() => attach().catch(() => undefined));
+    return () => {
+      offB();
+      offF();
+      void detach();
+    };
+  }, [attach, detach]);
+
   useWireEvents(
     useCallback(
       (ev) => {
-        if (ev.kind === "terminal_frame" && ev.hostId === hostId && ev.streamId === stream.current) onFrame(ev.seq, ev.frame);
+        if (ev.kind !== "terminal_frame" || ev.hostId !== hostId) return;
+        if (ev.streamId === stream.current) onFrame(ev.seq, ev.frame);
+        else if (stream.current === undefined) {
+          // Attach in flight: keep the frame until the reply names our stream.
+          const list = early.current.get(ev.streamId) ?? [];
+          list.push({ seq: ev.seq, frame: ev.frame });
+          early.current.set(ev.streamId, list.slice(-64));
+        }
       },
       [hostId, onFrame],
     ),

@@ -6,6 +6,8 @@ export interface OutcomeCopy {
   final: boolean;
   /** The row is answered on the daemon and leaves the open list. */
   retire: boolean;
+  /** The daemon took nothing: the pinned answer is released so another may go out. */
+  unpin?: boolean;
 }
 
 /** One line of copy per outcome the daemon can hand back for an answer (D18). */
@@ -16,9 +18,9 @@ export function outcomeCopy(outcome: AnswerOutcome, ack?: MutationAck): OutcomeC
     case "already_answered":
       return { text: `Already answered by ${outcome.by}`, final: true, retire: true };
     case "ambiguous":
-      return { text: "Could not confirm, check the session", final: true, retire: false };
+      return { text: "Could not confirm, check the session", final: true, retire: false, unpin: true };
     case "no_target":
-      return { text: "No live session to answer", final: true, retire: false };
+      return { text: "No live session to answer", final: true, retire: false, unpin: true };
     case "delivery_failed":
       // The row is answered; a retry would only replay this. The person looks.
       return { text: "Answered but not delivered, check the session", final: true, retire: true };

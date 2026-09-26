@@ -25,8 +25,9 @@ const term = new Terminal({
   fontFamily: "Menlo, monospace",
   scrollback: 2000,
   theme: { background: "#191923", foreground: "#DCDCE6" },
-  // OSC 8 links in pane output never activate: the webview must not navigate.
-  linkHandler: { activate: () => undefined },
+  // OSC 8 links in pane output never navigate: the handler only reports the
+  // activation to the host, which shows it and opens nothing either.
+  linkHandler: { activate: (_event, uri) => post({ t: "link", uri }) },
 });
 term.loadAddon(new Unicode11Addon());
 term.unicode.activeVersion = "11";
@@ -41,8 +42,13 @@ term.onData((data) => {
   if (!readonly) post({ t: "input", data });
 });
 
+let bytesWritten = 0;
 const writes = makeCoalescer<Uint8Array>(
-  (batch) => term.write(concat(batch)),
+  (batch) => {
+    const data = concat(batch);
+    bytesWritten += data.length;
+    term.write(data, () => post({ t: "stats", bytes: bytesWritten, cols: term.cols, rows: term.rows }));
+  },
   (cb) => requestAnimationFrame(cb),
 );
 
