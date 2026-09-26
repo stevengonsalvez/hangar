@@ -33,15 +33,18 @@
 //! shapes and [`scrub_json`]'s object keys. What it does NOT cover, on
 //! purpose or not yet:
 //!
-//! - lower-case and camel-case names (`api_token=...`, `password: ...`,
-//!   `{"accessToken": ...}`, `{"password": ...}`): too close to ordinary code
-//!   and prose to match by name;
+//! - lower-case and camel-case names in free text (`api_token=...`,
+//!   `password: ...`): too close to ordinary code and prose to match by name.
+//!   As JSON keys, the exact list in [`is_secret_json_key`] (`password`,
+//!   `api_key`, `apiKey`, `access_token`, ...) is covered in any case; other
+//!   camel-case keys (`{"accessToken": ...}`, `{"dbPassword": ...}`) are not;
 //! - YAML and other `NAME: value` forms of an environment name
 //!   (`DB_PASSWORD: hunter2`), and a spaced `NAME = value`;
 //! - bare `PASSWORD=`, `KEY=` and `PWD=` (only the suffixed forms, and bare
 //!   `SECRET=` and `TOKEN=`);
-//! - in free text, a value under 16 characters, one with no digit, or a UUID
-//!   (a JSON field named by the rule is redacted whatever its value);
+//! - in free text, a value under 16 characters, one with no digit, a UUID or
+//!   a snake_case name; under a secret-named JSON key, a UUID or a snake_case
+//!   name (a short or digit-less value there is redacted);
 //! - a number or boolean under a secret-named JSON key.
 
 use std::sync::LazyLock;
@@ -210,6 +213,53 @@ static UUID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
         .expect("valid uuid regex")
 });
+/// A snake_case identifier: two or more lower-case words joined by `_`, each
+/// word letters then optional trailing digits (`created_at_desc`,
+/// `user_profile_v2`). A key's random body (`sk_live_51Hq...`,
+/// `whsec_4f9k...`) has a word that starts with a digit or mixes them, so it
+/// is never one.
+static SNAKE_CASE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-z]+[0-9]*(?:_[a-z]+[0-9]*)+$").expect("valid snake case regex")
+});
+/// A real environment reference, whole: `$VAR` or `${VAR}` with an
+/// upper-case name, the environment's convention. A `${VAR:-x}` default, a
+/// password that happens to start with `$` (`$ecretP4ss` is valid shell but
+/// not a name anyone exports), or any other text is not one.
+static ENV_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\$(?:[A-Z_][A-Z0-9_]*|\{[A-Z_][A-Z0-9_]*\})$").expect("valid env reference regex")
+});
+
+/// JSON object keys that name a credential, compared whole and ignoring
+/// case. JSON only: in free text these words are ordinary prose and code
+/// (`password: ...` in a docstring, `api_key = config.get(...)`), but as an
+/// object key they are what the value is.
+const SECRET_JSON_KEYS: [&str; 11] = [
+    "password",
+    "passwd",
+    "secret",
+    "client_secret",
+    "api_key",
+    "apikey",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "private_key",
+    "auth_token",
+];
+
+/// Whether a JSON object key names a credential: [`is_secret_name`], or one
+/// of [`SECRET_JSON_KEYS`] in any case (`password`, `Password`, `apiKey`).
+#[must_use]
+pub fn is_secret_json_key(key: &str) -> bool {
+    is_secret_name(key) || SECRET_JSON_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+}
+
+/// Whether a value is an identifier rather than a credential: a UUID or a
+/// snake_case name. The guard both the free-text shapes and a secret-named
+/// JSON key apply to what follows the name.
+fn is_identifier(value: &str) -> bool {
+    UUID.is_match(value) || SNAKE_CASE.is_match(value)
+}
 
 /// Whether `name` (a header, a variable or a JSON key, whole) names a
 /// credential: it matches [`SECRET_HEADER_NAME`] or [`SECRET_ENV_NAME`] and
@@ -221,10 +271,11 @@ pub fn is_secret_name(name: &str) -> bool {
 }
 
 /// Whether free text after a secret name looks like a credential rather than
-/// prose or an identifier: it carries a digit and is not a UUID. The shapes
-/// that use it already require 16 or more token characters.
+/// prose or an identifier: it carries a digit and is not an identifier
+/// ([`is_identifier`]). The shapes that use it already require 16 or more
+/// token characters.
 fn is_opaque_value(value: &str) -> bool {
-    value.bytes().any(|b| b.is_ascii_digit()) && !UUID.is_match(value)
+    value.bytes().any(|b| b.is_ascii_digit()) && !is_identifier(value)
 }
 
 /// An API key in a header named by [`SECRET_HEADER_NAME`], as a curl flag, a
@@ -411,9 +462,10 @@ pub fn scrub_lines_from<S: AsRef<str>>(lines: &[S], in_key: &mut bool) -> Vec<St
 /// (`content`, `rawInput`), not operator text, and rewriting one would change
 /// the shape every reader parses against.
 ///
-/// Keys are also read: a field whose key [`is_secret_name`] (`X-Api-Key`,
-/// `CLIENT_SECRET`, `DB_PASSWORD`, the same rule the text shapes use) has
-/// every string under it replaced, whatever it looks like, because a bare
+/// Keys are also read: a field whose key [`is_secret_json_key`]
+/// (`X-Api-Key`, `CLIENT_SECRET`, `DB_PASSWORD` by the rule the text shapes
+/// use, and `password`, `api_key`, `access_token` and the rest of the JSON
+/// key list in any case) has the strings under it replaced, because a bare
 /// value in a headers or env map (`{"CLIENT_SECRET": "..."}`) carries no
 /// `NAME=` or `Name:` for a text shape to find.
 pub fn scrub_json(value: &mut serde_json::Value) {
@@ -426,7 +478,7 @@ pub fn scrub_json(value: &mut serde_json::Value) {
         serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
         serde_json::Value::Object(fields) => {
             for (key, field) in fields.iter_mut() {
-                if is_secret_name(key) {
+                if is_secret_json_key(key) {
                     redact_every_string(field);
                 } else {
                     scrub_json(field);
@@ -437,18 +489,22 @@ pub fn scrub_json(value: &mut serde_json::Value) {
     }
 }
 
-/// Replace every string under a field whose key [`is_secret_name`] with
-/// [`REDACTED`]. The key already says what the value is, so none of the
-/// free-text guards apply: a short password or one with no digit goes too.
-/// Only an empty string, a `$VAR` or `${VAR}` reference and a `<placeholder>`
-/// are kept, since none of them is the credential itself.
+/// Replace the strings under a field whose key [`is_secret_json_key`] with
+/// [`REDACTED`]. The key already says what the value is, so a short password
+/// or one with no digit goes too. Kept, since none is the credential itself:
+/// an empty string, a whole `$VAR` or `${VAR}` reference, a `<placeholder>`,
+/// and an identifier ([`is_identifier`]: a UUID or a snake_case name, the
+/// same guard the text shapes apply). A value holding a known credential
+/// shape is redacted whatever else it looks like.
 fn redact_every_string(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
-            let reference = text.is_empty()
-                || text.starts_with('$')
-                || (text.starts_with('<') && text.ends_with('>'));
-            if !reference {
+            let kept = find_secret(text).is_none()
+                && (text.is_empty()
+                    || ENV_REFERENCE.is_match(text)
+                    || (text.starts_with('<') && text.ends_with('>'))
+                    || is_identifier(text));
+            if !kept {
                 *text = REDACTED.to_string();
             }
         }
@@ -859,6 +915,98 @@ mod tests {
         let first = value.clone();
         scrub_json(&mut value);
         assert_eq!(value, first, "a second pass changes nothing");
+    }
+
+    /// The JSON-only key list, matched whole and in any case: lower-case
+    /// payloads (`{"password": ...}`, an OAuth token response) name their
+    /// credentials this way. Near misses stay: a longer key, a camel-case
+    /// key outside the list, and a count.
+    #[test]
+    fn scrub_json_redacts_lower_case_credential_keys() {
+        let mut value = serde_json::json!({
+            "password": "hunter",
+            "Passwd": "tr0ub4dor",
+            "secret": "abc",
+            "client_secret": "s3cr3t-client-value",
+            "apiKey": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "API_KEY": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "oauth": {
+                "access_token": "ya29.a0AfH6SMBx",
+                "refresh_token": "1//0gL9-Zq",
+                "id_token": "opaque-id-token-value",
+                "token_type": "Bearer",
+                "expires_in": 3599,
+            },
+            "private_key": "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+            "auth_token": "t0k3n",
+            "password_hint": "the usual",
+            "accessToken": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "secret_count": "3",
+        });
+        scrub_json(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "password": REDACTED,
+                "Passwd": REDACTED,
+                "secret": REDACTED,
+                "client_secret": REDACTED,
+                "apiKey": REDACTED,
+                "API_KEY": REDACTED,
+                "oauth": {
+                    "access_token": REDACTED,
+                    "refresh_token": REDACTED,
+                    "id_token": REDACTED,
+                    "token_type": "Bearer",
+                    "expires_in": 3599,
+                },
+                "private_key": REDACTED,
+                "auth_token": REDACTED,
+                "password_hint": "the usual",
+                "accessToken": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+                "secret_count": "3",
+            })
+        );
+    }
+
+    /// Under a secret-named key, only a whole `$VAR` or `${VAR}` is a
+    /// reference; text that merely starts with `$`, or a `${VAR:-default}`
+    /// whose default is a literal, is the credential. A UUID or a snake_case
+    /// name is an identifier and stays, as it does in free text, unless the
+    /// value also holds a known credential shape.
+    #[test]
+    fn under_a_secret_key_only_real_references_and_identifiers_stay() {
+        let github = fake("ghp_", 'C', 36);
+        let cases = [
+            ("$DB_PASSWORD", true),
+            ("${DB_PASSWORD}", true),
+            ("$ecretP4ss", false),
+            ("$", false),
+            ("${DB_PASSWORD:-hunter2}", false),
+            ("${DB_PASSWORD}x", false),
+            ("$(cat /run/secrets/db)", false),
+            ("3f2504e0-4f89-11d3-9a0c-0305e82c3301", true),
+            ("client_credentials", true),
+            ("user_profile_v2", true),
+            ("sk_live_51Hq4Zp9Wd2Lx7Tn5", false),
+            ("whsec_4f9kq2_zx8lm1", false),
+            ("hunter", false),
+            (github.as_str(), false),
+        ];
+        for (text, kept) in cases {
+            let mut value = serde_json::json!({ "DB_PASSWORD": text });
+            scrub_json(&mut value);
+            let expected = if kept { text } else { REDACTED };
+            assert_eq!(value["DB_PASSWORD"], expected, "{text}");
+        }
+        assert_eq!(
+            scrub("SORT_KEY=created_at_desc_v2_by_name"),
+            "SORT_KEY=created_at_desc_v2_by_name"
+        );
+        assert_eq!(
+            scrub("TENANT_KEY=3f2504e0-4f89-11d3-9a0c-0305e82c3301"),
+            "TENANT_KEY=3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+        );
     }
 
     /// One rule names a credential for both the text shapes and JSON keys.
