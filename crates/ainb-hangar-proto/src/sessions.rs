@@ -38,6 +38,10 @@ pub struct WorkspaceSessionEntry {
     /// Shared Codex app-server remote thread ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_thread_id: Option<String>,
+    /// The session id ainb minted for a Claude launch (`claude --session-id`),
+    /// the id the daemon files the session's hook requests under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_session_id: Option<String>,
 }
 
 fn default_model_source() -> String {
@@ -232,6 +236,9 @@ impl WorkspaceSessionEntry {
         if let Some(thread) = &self.codex_thread_id {
             check_len("codex_thread_id", thread, THREAD_ID_MAX_LEN)?;
         }
+        if let Some(id) = &self.claude_session_id {
+            check_len("claude_session_id", id, THREAD_ID_MAX_LEN)?;
+        }
         Ok(())
     }
 }
@@ -255,6 +262,7 @@ mod tests {
             model_source: "LegacyTyped".to_string(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         }
     }
 

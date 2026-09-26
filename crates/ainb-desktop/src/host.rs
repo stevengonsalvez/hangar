@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ainb_app::app::RendererHost;
 use ainb_app::app::intent::{Btn, Pos};
-use ainb_app::app::keymap::{HostAction, active_contexts};
+use ainb_app::app::keymap::{HostAction, active_contexts, judge_command};
 use ainb_app::app::state::WorkspaceRescan;
 use ainb_app::config::AppConfig;
 use ainb_app::fleet::agent_status_reader::{AgentStatusReader, Dialer};
@@ -112,6 +112,23 @@ pub fn inbox_dialer() -> InboxDialer {
 
 /// The home sidebar's `select` row, the one Enter runs on a focused item.
 const HOME_SIDEBAR_SELECT: &str = "home.sidebar.select";
+/// The row that leaves any screen for the home screen; always active.
+const GLOBAL_GO_HOME: &str = "global.go_home";
+/// The home sidebar's row that opens the session list.
+const HOME_SESSIONS: &str = "home.sessions";
+
+/// The page's own back row, which is how its close button leaves it: the
+/// inbox's and the settings' save what the page holds (the settings tree's
+/// expansion among it) on the way out.
+fn page_back(screen: &str) -> &'static str {
+    use ainb_app::app::screens::ids;
+    match screen {
+        ids::INBOX => "inbox.back",
+        ids::CONFIG => "config.back",
+        ids::GIT_VIEW => "git_view.back",
+        _ => GLOBAL_GO_HOME,
+    }
+}
 
 /// One `AppState` hosted for the desktop renderer.
 pub struct DesktopHost<S: FrameSink> {
@@ -437,6 +454,34 @@ impl<S: FrameSink> DesktopHost<S> {
         );
     }
 
+    /// Put the reducer on the session list for the answer banner's rows.
+    ///
+    /// The banner is drawn over every page, but its rows (the Ask tab, the
+    /// pick, the composer) are the session list's, and from the inbox, the
+    /// settings or the git view the reducer refuses them as off screen: the
+    /// answer went nowhere (#121). The banner asks for this before it sends,
+    /// and the decision is the reducer's own screen, not the frame the window
+    /// last drew. The page is left by its own back row, as its close button
+    /// leaves it, so what the page holds is saved on the way out; then the
+    /// session list is opened from home. Nothing moves the reducer for a
+    /// row sent off screen without this ask.
+    pub fn answer_home(&mut self, executor: &mut impl Executor) {
+        use ainb_app::app::screens::ids;
+        let command = |id: &str| Intent::Command(CommandId::new(id), serde_json::Value::Null);
+        let screen = self.state.shell.current_screen.clone();
+        if screen == ids::SESSION_LIST {
+            return;
+        }
+        self.run(command(page_back(&screen)), executor);
+        if self.state.shell.current_screen == ids::SESSION_LIST {
+            return;
+        }
+        if self.state.shell.current_screen != ids::HOME {
+            self.run(command(GLOBAL_GO_HOME), executor);
+        }
+        self.run(command(HOME_SESSIONS), executor);
+    }
+
     /// Every command the palette may offer, in the keymap's own order.
     ///
     /// Built from [`crate::intent::refused_from_webview`], the list the
@@ -494,20 +539,31 @@ impl<S: FrameSink> DesktopHost<S> {
                 };
                 (id, row.action.clone())
             }
-            // Judged with its payload: a pointer row's action is what the
-            // arguments name (the settings row a `config.set_row` edits,
-            // #1224), not the placeholder the table wrote. A payload the row
-            // cannot parse is refused here, closed, rather than judged on the
-            // placeholder and left for the reducer to drop.
+            // The reducer's own judgement, asked before the dispatch so the
+            // window hears every reason the reducer would drop the name for:
+            // no such row, a key-only row, a payload that does not fit, what
+            // the row would write (judged with its payload, #1224), and last
+            // the screen gate. A name the reducer dropped was logged here as
+            // dispatched (#121).
             Intent::Command(id, args) => {
-                let row = self.keymap.command(id)?;
-                let Some(action) = row.action.with_args(args) else {
-                    return Some(Refusal {
+                use ainb_app::app::keymap::CommandRefusal;
+                return match judge_command(&self.state, &self.keymap, id, args) {
+                    Ok(_) => None,
+                    // An onboarding write has a path of its own in this shell
+                    // (#1175): a row refused for what it writes points at it.
+                    // A row refused for its screen, its payload or its name
+                    // keeps that reason: the path is not why it did not run.
+                    Err(refusal @ (CommandRefusal::KeyOnly | CommandRefusal::Remote(_))) => {
+                        Some(Refusal {
+                            reason: crate::setup::desktop_path(id).unwrap_or(refusal.reason()),
+                            command: id.clone(),
+                        })
+                    }
+                    Err(refusal) => Some(Refusal {
+                        reason: refusal.reason(),
                         command: id.clone(),
-                        reason: "its payload does not fit the row",
-                    });
+                    }),
                 };
-                (id.clone(), action)
             }
             _ => return None,
         };
