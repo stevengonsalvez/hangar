@@ -1,5 +1,6 @@
 import { createMemo, createSignal, For, Show } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
+import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
 import { isSelected, label, ringFor, rowStatus } from "./sessions.ts";
 import {
@@ -18,8 +19,15 @@ interface Props {
   stale: boolean;
   /** The host is loading workspaces (the WorkspaceLoad section). */
   loading: boolean;
+  /** A worktree the composer is creating into a project, or `null`: drawn as
+   * a working card at the top of that project's group until the request
+   * settles. `main.tsx` holds it, not this component, so it survives the
+   * composer's own view closing (Cancel keeps the create running). */
+  pending: PendingWorktree | null;
   /** A row was chosen: open its session's terminal tab. */
   onOpen(sessionId: string): void;
+  /** Mod+N, or the button: open the new-worktree composer. */
+  onNew(): void;
   /** The sidebar element, for Esc Esc to return focus to. */
   ref(element: HTMLElement): void;
 }
@@ -68,10 +76,18 @@ export function Sidebar(props: Props) {
     writeCollapsed(safeStorage(), next);
   };
 
+  /** The pending card belongs to `group` when the composer's project matches
+   * it; the object itself (not just a boolean) so the card can label itself. */
+  const pendingIn = (group: ProjectGroup): PendingWorktree | null =>
+    props.pending && props.pending.projectPath === group.path ? props.pending : null;
+
   return (
     <aside class="sidebar" aria-label="Sessions" tabIndex={-1} ref={props.ref}>
       <div class="sidebar-head">
         <span class="sidebar-title">Projects</span>
+        <button type="button" class="sidebar-new" onClick={props.onNew}>
+          + New
+        </button>
         <Show when={props.stale}>
           <span class="stale">stale</span>
         </Show>
@@ -99,6 +115,19 @@ export function Sidebar(props: Props) {
                       <span class="workspace-count">{g().sessionCount}</span>
                     </summary>
                     <ul class="worktree-cards">
+                      {/* The composer's own card while it creates into this
+                          project: ahead of every real card, so the person who
+                          just asked for it sees it land where they look. */}
+                      <Show when={pendingIn(g())}>
+                        {(pending) => (
+                          <li class="worktree-card" data-pending="true">
+                            <div class="worktree-card-title">
+                              <span class="spinner" aria-hidden="true" />
+                              {label(pending().name)}
+                            </div>
+                          </li>
+                        )}
+                      </Show>
                       {/* One card per worktree path; several sessions in it are
                           the card's inline agent rows, never separate cards. */}
                       <For each={cardKeys()}>
