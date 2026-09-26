@@ -11,6 +11,7 @@ import { afterEach, test } from "node:test";
 import { createComponent, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import type { Session_Serialize, SessionsView_Serialize } from "../../../../ainb-app/bindings/AppState";
+import type { PendingWorktree } from "../../src/composer.ts";
 import { Sidebar } from "../../src/sidebar.tsx";
 
 function session(id: string, workspacePath: string, over: Partial<Session_Serialize> = {}): Session_Serialize {
@@ -76,8 +77,13 @@ afterEach(() => {
 });
 
 /** Mount the sidebar the way `main.tsx` does: a fresh frame per read. */
-async function open(first: SessionsView_Serialize = frame(), onOpen: (id: string) => void = () => undefined) {
+async function open(
+  first: SessionsView_Serialize = frame(),
+  onOpen: (id: string) => void = () => undefined,
+  pending: PendingWorktree | null = null,
+) {
   const [held, setHeld] = createSignal(first);
+  const [held_pending, setPending] = createSignal(pending);
   const container = document.createElement("div");
   document.body.appendChild(container);
   cleanup = render(
@@ -88,7 +94,14 @@ async function open(first: SessionsView_Serialize = frame(), onOpen: (id: string
         },
         stale: false,
         loading: false,
+        get pending() {
+          return held_pending();
+        },
         onOpen,
+        onNew() {
+          // The composer itself is `main.tsx`'s own test; this only proves
+          // the button is wired to whatever the caller passed.
+        },
         ref() {
           // The sidebar element itself, unused here: `main.tsx` uses it for
           // Esc Esc, which is that module's own test.
@@ -97,7 +110,7 @@ async function open(first: SessionsView_Serialize = frame(), onOpen: (id: string
     container,
   );
   await settle();
-  return { setHeld };
+  return { setHeld, setPending };
 }
 
 test("two sessions in one worktree render one card with two agent rows", async () => {
@@ -125,6 +138,55 @@ test("the selected session's row carries aria-current; the others do not", async
   await open(frame({ selected_session_id: "shell-1" }));
   assert.equal(document.querySelector('.session-row[data-session="shell-1"]')?.getAttribute("aria-current"), "true");
   assert.equal(document.querySelector('.session-row[data-session="claude-1"]')?.getAttribute("aria-current"), null);
+});
+
+test("a pending create draws a working card ahead of its project's real cards", async () => {
+  const { setPending } = await open(frame(), () => undefined, { projectPath: "/repo", name: "fix login" });
+  const cards = [...document.querySelectorAll("li.worktree-card")];
+  assert.equal(cards.length, 2, "the pending card plus the one real card");
+  assert.equal(cards[0].getAttribute("data-pending"), "true");
+  assert.equal(cards[0].textContent?.trim(), "fix login");
+  assert.ok(cards[0].querySelector(".spinner"), "the pending card shows a working spinner");
+  assert.equal(cards[1].hasAttribute("data-pending"), false, "the real card is not marked pending");
+
+  // The request settles: the card leaves, the real cards are unaffected.
+  setPending(null);
+  await settle();
+  assert.equal(document.querySelectorAll("li.worktree-card").length, 1);
+});
+
+test("a pending create for another project draws no card here", async () => {
+  await open(frame(), () => undefined, { projectPath: "/somewhere-else", name: "fix login" });
+  assert.equal(document.querySelector('li.worktree-card[data-pending="true"]'), null);
+});
+
+test("the sidebar's new-worktree button calls onNew", async () => {
+  let opened = 0;
+  const [held] = createSignal(frame());
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  cleanup = render(
+    () =>
+      createComponent(Sidebar, {
+        get sessions() {
+          return held();
+        },
+        stale: false,
+        loading: false,
+        pending: null,
+        onOpen: () => undefined,
+        onNew: () => {
+          opened += 1;
+        },
+        ref() {
+          // Unused here.
+        },
+      }),
+    container,
+  );
+  await settle();
+  document.querySelector<HTMLButtonElement>(".sidebar-new")?.click();
+  assert.equal(opened, 1);
 });
 
 test("collapsing a project persists across a relaunch", async () => {
