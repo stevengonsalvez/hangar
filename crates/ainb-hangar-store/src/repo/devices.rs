@@ -28,6 +28,10 @@ pub const MAX_INVITE_ATTEMPTS: i64 = 5;
 /// A device token expires this long after the device was last seen. Every
 /// accepted hello slides it; there is no refresh RPC.
 pub const IDLE_EXPIRY_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+/// The longest display name the registry stores, in characters. The CHECK in
+/// migration 0103 enforces it (with non-blank and no line breaks), because the
+/// redeeming device, not the operator, chooses the name.
+pub const DISPLAY_NAME_MAX_CHARS: usize = 64;
 /// A revoked device stays listed this long, then [`DeviceRepo::prune`]
 /// removes it.
 pub const REVOKED_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
@@ -907,6 +911,69 @@ mod tests {
         assert_eq!(
             DeviceRepo::revoke(pool, &id(4242), None, T0).await.expect("revoke"),
             Fenced::NotFound
+        );
+    }
+
+    /// The redeeming device chooses its name, so storage bounds it: an
+    /// over-long, blank or multi-line name is refused, and the refused redeem
+    /// leaves the invite unspent for a well-formed retry.
+    #[tokio::test]
+    async fn a_device_name_is_bounded_and_a_refused_redeem_spends_nothing() {
+        let (_home, store) = store().await;
+        let pool = store.pool();
+        invite(pool, 1, PHONE).await;
+        let redeem_named = |name: String| async move {
+            DeviceRepo::redeem(
+                pool,
+                &Redeem {
+                    invite_id: &id(1),
+                    secret_sha256: &sha256_hex("secret-1"),
+                    device_id: &id(10),
+                    display_name: &name,
+                    token_sha256: &sha256_hex("mdd_token-10"),
+                    static_pubkey: &PHONE_KEY,
+                    now_ms: T0,
+                },
+            )
+            .await
+        };
+
+        for bad in [
+            "x".repeat(DISPLAY_NAME_MAX_CHARS + 1),
+            String::new(),
+            "   ".to_string(),
+            "two\nlines".to_string(),
+            "carriage\rreturn".to_string(),
+        ] {
+            assert!(
+                redeem_named(bad.clone()).await.is_err(),
+                "{bad:?} must not store"
+            );
+        }
+        // Characters, not bytes: 64 two-byte characters still fit.
+        let longest = "\u{00e9}".repeat(DISPLAY_NAME_MAX_CHARS);
+        assert!(matches!(
+            redeem_named(longest).await.expect("64 characters store"),
+            RedeemOutcome::Redeemed(_)
+        ));
+
+        let invite_id = id(2);
+        let too_long = "y".repeat(DISPLAY_NAME_MAX_CHARS + 1);
+        let refused = DeviceRepo::create_invite(
+            pool,
+            &NewInvite {
+                invite_id: &invite_id,
+                secret_sha256: &sha256_hex("secret-2"),
+                scope: PHONE,
+                display_name: Some(&too_long),
+                created_at: T0,
+                expires_at: T0 + FIVE_MIN_MS,
+            },
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "the operator's suggested name is bounded too"
         );
     }
 
