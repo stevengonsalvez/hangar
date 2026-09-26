@@ -1,0 +1,43 @@
+# #81 lockdown, driven: the pane output carries an OSC 8 hyperlink (the fake
+# stream appends one after the snapshot, at the cursor row 10 of the alt
+# screen). Tapping it must open nothing: no browser, no navigation inside the
+# webview, the terminal still on screen with its size row.
+#   HOST_ID, SESSION_KEY: see README.md
+appId: com.stevengonsalvez.ainb.mobile
+---
+- launchApp:
+    clearState: true
+- tapOn:
+    id: "host-${HOST_ID}"
+- tapOn:
+    id: "session-${SESSION_KEY}"
+- tapOn:
+    id: "tab-terminal"
+- assertVisible:
+    id: "terminal-webview"
+- assertVisible:
+    text: "engine ready.*"
+- waitForAnimationToEnd:
+    timeout: 2000
+- takeScreenshot: terminal-osc8-before
+# the link line is printed at the alt screen's cursor row (row 10 of the
+# fixture); on the emulator's 1080x2400 screen that is about 36 percent down.
+# Tap it twice: xterm activates a link on the second tap when the first only
+# hovers.
+- tapOn:
+    point: "40%,36%"
+- tapOn:
+    point: "40%,36%"
+- waitForAnimationToEnd:
+    timeout: 2000
+- takeScreenshot: terminal-osc8-after
+# the tap reached the link: the engine reported it and the host shows the
+# ignored host name; the terminal is still on screen, no page opened
+- assertVisible:
+    id: "link-ignored"
+- assertVisible:
+    text: "link ignored: example.invalid"
+- assertVisible:
+    id: "terminal-webview"
+- assertVisible:
+    id: "terminal-size"

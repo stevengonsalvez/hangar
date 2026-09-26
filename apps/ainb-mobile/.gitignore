@@ -1,0 +1,8 @@
+node_modules/
+.expo/
+expo-env.d.ts
+android/
+ios/
+dist/
+*.log
+bundle.generated.ts
