@@ -40,6 +40,8 @@ pub const MAX_FRAME_PAYLOAD: usize = MAX_NOISE_MESSAGE - NOISE_TAG_LEN - HEADER_
 const EVENT_QUEUE: usize = 1024;
 /// The default request timeout.
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(10);
+/// The default dial-plus-handshake timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The heartbeat period, from the frozen wire.
 pub const HEARTBEAT: Duration = Duration::from_secs(PING_INTERVAL_SECS);
 /// The shortest reconnect delay.
@@ -64,6 +66,8 @@ pub struct ConnectConfig {
     pub heartbeat: Option<Duration>,
     /// How long a request waits for its reply.
     pub rpc_timeout: Duration,
+    /// How long the dial and the handshake together may take.
+    pub connect_timeout: Duration,
     /// The connection log, when the app keeps one.
     pub log: Option<Arc<ConnLog>>,
 }
@@ -86,6 +90,7 @@ impl ConnectConfig {
             device_private_key,
             heartbeat: Some(HEARTBEAT),
             rpc_timeout: RPC_TIMEOUT,
+            connect_timeout: CONNECT_TIMEOUT,
             log: None,
         }
     }
@@ -129,13 +134,38 @@ impl Closed {
     /// The error a call on this closed session gets.
     #[must_use]
     pub fn error(&self) -> WireError {
+        let retry_after_ms = self
+            .reason
+            .strip_prefix(peer_close::RETRY_AFTER_PREFIX)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|secs| secs.saturating_mul(1000));
         match self.code {
             Some(peer_close::UNAUTHENTICATED) => WireError::Unauthenticated,
             Some(peer_close::REVOKED) => WireError::Revoked,
+            Some(peer_close::PROTOCOL_INCOMPATIBLE) => WireError::Incompatible,
+            Some(peer_close::RATE_LIMITED) => WireError::RateLimited { retry_after_ms },
+            Some(peer_close::OVER_CAPACITY) => WireError::OverCapacity { retry_after_ms },
+            Some(peer_close::DRAINING) => WireError::Draining,
             code => WireError::Closed {
                 code,
                 reason: self.reason.clone(),
             },
+        }
+    }
+
+    /// The error for a close that arrived before Noise message 2, classified
+    /// by its code: only an identity refusal (4401, the daemon's word for a
+    /// Noise failure) is [`WireError::PeerChanged`]; a revocation, an
+    /// incompatible protocol, a busy or draining host keep their meaning; a
+    /// close with no code is a network loss and retryable.
+    #[must_use]
+    pub fn handshake_error(&self) -> WireError {
+        match self.code {
+            Some(peer_close::UNAUTHENTICATED) => WireError::PeerChanged,
+            None => WireError::Connect {
+                message: format!("closed before the handshake reply: {}", self.reason),
+            },
+            _ => self.error(),
         }
     }
 }
@@ -335,7 +365,17 @@ impl Session {
             carrier: config.carrier.as_str().to_owned(),
             host_id: config.host_id.as_str().to_owned(),
         });
-        let session = Self::connect_inner(&config).await;
+        let session = match tokio::time::timeout(
+            config.connect_timeout,
+            Self::connect_inner(&config),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(_) => Err(WireError::Connect {
+                message: format!("no handshake within {} s", config.connect_timeout.as_secs()),
+            }),
+        };
         match &session {
             Ok(s) => note(Event::Handshake {
                 host_key_digest: digest(&config.host_static_pubkey),
@@ -378,9 +418,20 @@ impl Session {
             match stream.next().await {
                 Some(Ok(Message::Binary(b))) => break b,
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
-                // Closed before message 2: the responder could not open
-                // message 1, which is what a key or prologue mismatch does.
-                Some(Ok(Message::Close(_))) | None => return Err(WireError::PeerChanged),
+                // Closed before message 2: classified by the code the host
+                // sent. Only 4401 (a Noise failure) is an identity failure.
+                Some(Ok(Message::Close(frame))) => {
+                    let closed = Closed {
+                        code: frame.as_ref().map(|f| u16::from(f.code)),
+                        reason: frame.map(|f| f.reason.into_owned()).unwrap_or_default(),
+                    };
+                    return Err(closed.handshake_error());
+                }
+                None => {
+                    return Err(WireError::Connect {
+                        message: "connection lost before the handshake reply".to_owned(),
+                    });
+                }
                 Some(Ok(other)) => {
                     return Err(handshake_error(format!("unexpected {other:?}")));
                 }
@@ -760,6 +811,15 @@ impl Session {
             close_code: closed.as_ref().and_then(|c| c.code),
             close_reason: closed.map(|c| c.reason),
         }
+    }
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("closed", &self.closed())
+            .field("pings_sent", &self.pings_sent.load(Ordering::SeqCst))
+            .finish_non_exhaustive()
     }
 }
 
