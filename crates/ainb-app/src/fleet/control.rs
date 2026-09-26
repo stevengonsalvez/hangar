@@ -436,6 +436,24 @@ pub fn chat_confirm_answer_blocking(
     })
 }
 
+/// The discovered session an answer for `session_id` goes to: the one whose
+/// id, or whose agent's own session id (the Claude id ainb minted, a Codex
+/// thread), is `session_id`, exactly. Nothing else: the cwd is no fallback,
+/// since two agents can share one and the path the agent reports is not the
+/// path ainb was given (#132).
+#[must_use]
+pub fn exact_target<'a>(
+    merged: &'a [crate::fleet::types::Session],
+    session_id: &str,
+) -> Option<&'a crate::fleet::types::Session> {
+    if session_id.is_empty() {
+        return None;
+    }
+    merged
+        .iter()
+        .find(|s| s.id == session_id || s.provider_session_id.as_deref() == Some(session_id))
+}
+
 /// [`resolve_and_send`], with success and failure told apart.
 ///
 /// The string form is what a status line wants; a surface that has to decide
@@ -444,7 +462,6 @@ pub fn chat_confirm_answer_blocking(
 /// description, `Err` the reason nothing was delivered.
 async fn resolve_and_send_typed(
     session_id: &str,
-    cwd: &str,
     text: &str,
     is_answer: bool,
 ) -> Result<String, String> {
@@ -461,44 +478,18 @@ async fn resolve_and_send_typed(
     let (ainb, peers_join) = tokio::join!(ainb_fut, peers_fut);
     let ainb: Vec<Session> = ainb.unwrap_or_default();
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
-
-    // Count raw (pre-merge) sessions sharing the target cwd across BOTH sources,
-    // so two distinct claude sessions in the same dir register as ambiguous even
-    // though `merge_sessions` would coalesce them onto one cwd-keyed row.
-    let raw_cwd_count = if cwd.is_empty() {
-        0
-    } else {
-        ainb.iter().chain(peers.iter()).filter(|s| s.cwd == cwd).count()
-    };
-
     let merged = merge_sessions(vec![ainb, peers]);
-
-    // 1. Exact session-id match is always unambiguous — send it.
-    if let Some(session) = merged.iter().find(|s| s.id == session_id) {
-        return outcome_result(send(session, text).await);
-    }
-
-    // 2. No exact match → cwd correlation, guarded by ambiguity.
-    let Some(by_cwd) = merged.iter().find(|s| !cwd.is_empty() && s.cwd == cwd) else {
-        return Err("no live session matched (target may have exited)".to_string());
-    };
-
-    // Ambiguous when >1 raw session shared the cwd, OR the merged session for
-    // the cwd aggregated 2+ sources (we can't tell which underlying agent it is).
-    let ambiguous = raw_cwd_count > 1 || by_cwd.sources.len() > 1;
-    if ambiguous {
+    let Some(session) = exact_target(&merged, session_id) else {
         let label = if is_answer {
             "cannot safely answer"
         } else {
             "refusing to send"
         };
         return Err(format!(
-            "ambiguous target — {label} ({} sessions in this cwd)",
-            raw_cwd_count.max(by_cwd.sources.len())
+            "no live session runs under this id — {label} (target may have exited)"
         ));
-    }
-
-    outcome_result(send(by_cwd, text).await)
+    };
+    outcome_result(send(session, text).await)
 }
 
 /// Map a `send()` result to a verdict plus its description.
@@ -526,7 +517,7 @@ fn outcome_result(
 /// # Errors
 ///
 /// Returns the reason nothing was delivered.
-pub fn answer_via_tmux_blocking(session_id: &str, cwd: &str, text: &str) -> Result<String, String> {
+pub fn answer_via_tmux_blocking(session_id: &str, text: &str) -> Result<String, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -534,7 +525,7 @@ pub fn answer_via_tmux_blocking(session_id: &str, cwd: &str, text: &str) -> Resu
     // `is_answer` is always true here: this path exists only for answers, and
     // an answer routed to the wrong agent by a cwd guess is the failure the
     // guard exists to prevent.
-    runtime.block_on(resolve_and_send_typed(session_id, cwd, text, true))
+    runtime.block_on(resolve_and_send_typed(session_id, text, true))
 }
 
 /// Answer one parked permission request through notifyd's approve broker.
@@ -866,6 +857,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::fleet::discover::merge_sessions;
     use crate::fleet::types::{Session, SessionSource};
 
     /// The two refusals a REAL daemon sends when it wants `provider` named,
@@ -1001,6 +993,7 @@ mod tests {
     fn session(id: &str, cwd: &str, src: SessionSource) -> Session {
         Session {
             id: id.to_string(),
+            provider_session_id: None,
             cwd: cwd.to_string(),
             pid: None,
             git_root: None,
@@ -1016,101 +1009,42 @@ mod tests {
         }
     }
 
-    /// The C1 resolution decision, isolated from the actual `send()` I/O so it is
-    /// deterministically unit-testable: given the discovered roster, what target
-    /// does an answer resolve to — or does it refuse?
-    #[derive(Debug, PartialEq)]
-    enum Target {
-        Exact(String),
-        Cwd(String),
-        Refuse,
-        NoMatch,
-    }
-
-    /// Mirror of `resolve_and_send`'s resolution logic (steps 1+2 + the C1
-    /// ambiguity guard) WITHOUT the send. `raw` is the pre-merge roster (both
-    /// sources concatenated); `merged` is `merge_sessions` applied to it.
-    fn resolve_target(raw: &[Session], session_id: &str, cwd: &str) -> Target {
-        let merged = crate::fleet::discover::merge_sessions(vec![raw.to_vec()]);
-        if let Some(s) = merged.iter().find(|s| s.id == session_id) {
-            return Target::Exact(s.id.clone());
-        }
-        let raw_cwd_count = if cwd.is_empty() {
-            0
-        } else {
-            raw.iter().filter(|s| s.cwd == cwd).count()
-        };
-        let Some(by_cwd) = merged.iter().find(|s| !cwd.is_empty() && s.cwd == cwd) else {
-            return Target::NoMatch;
-        };
-        if raw_cwd_count > 1 || by_cwd.sources.len() > 1 {
-            return Target::Refuse;
-        }
-        Target::Cwd(by_cwd.id.clone())
-    }
-
     #[test]
     fn exact_session_id_match_sends() {
-        // The hook session id exactly matches a discovered session → send to it,
-        // even if another session shares the cwd.
-        let raw = vec![
+        let merged = merge_sessions(vec![vec![
             session("hook-sid", "/work/x", SessionSource::Ainb),
             session("other", "/work/x", SessionSource::Peers),
-        ];
-        // (These two share /work/x, so merge would coalesce — but the exact id
-        // wins before any cwd logic.)
+        ]]);
         assert_eq!(
-            resolve_target(&raw, "hook-sid", "/work/x"),
-            Target::Exact("hook-sid".to_string())
+            exact_target(&merged, "hook-sid").map(|s| s.id.as_str()),
+            Some("hook-sid")
         );
     }
 
+    /// The id the agent runs under, stored on the ainb record, delivers to
+    /// that ainb session (#132).
     #[test]
-    fn unambiguous_cwd_match_sends() {
-        // No exact id match, exactly one session in the cwd, single source → safe
-        // to correlate by cwd.
-        let raw = vec![session("discovered-id", "/work/x", SessionSource::Ainb)];
+    fn the_agents_own_session_id_sends_to_the_ainb_session() {
+        let mut ainb = session("ainb-row", "/work/x", SessionSource::Ainb);
+        ainb.provider_session_id = Some("claude-uuid".to_string());
+        let merged = merge_sessions(vec![vec![ainb]]);
         assert_eq!(
-            resolve_target(&raw, "hook-session-differs", "/work/x"),
-            Target::Cwd("discovered-id".to_string())
+            exact_target(&merged, "claude-uuid").map(|s| s.id.as_str()),
+            Some("ainb-row")
         );
     }
 
+    /// The cwd is no fallback: alone in the directory or not, a session that
+    /// does not run under the id is not the target, and an empty id names
+    /// nothing.
     #[test]
-    fn ambiguous_cwd_two_raw_sessions_refuses() {
-        // Two DISTINCT sessions share the cwd (different ids, both pre-merge).
-        // `merge_sessions` coalesces them onto one cwd row, but the raw count is
-        // 2 → ambiguous → refuse rather than answer the wrong agent.
-        let raw = vec![
-            session("a", "/work/x", SessionSource::Ainb),
-            session("b", "/work/x", SessionSource::Ainb),
-        ];
-        assert_eq!(resolve_target(&raw, "hook-sid", "/work/x"), Target::Refuse);
-    }
-
-    #[test]
-    fn ambiguous_cwd_multi_source_merge_refuses() {
-        // One cwd, but the merged session aggregated 2+ sources (ainb + peers) —
-        // we can't tell which underlying agent it is → refuse.
-        let raw = vec![
-            session("a", "/work/x", SessionSource::Ainb),
-            session("a", "/work/x", SessionSource::Peers),
-        ];
-        // raw count is 2 here too, but the multi-source guard is the independent
-        // signal; assert refuse.
-        assert_eq!(resolve_target(&raw, "hook-sid", "/work/x"), Target::Refuse);
-    }
-
-    #[test]
-    fn no_session_in_cwd_is_no_match_not_refuse() {
-        let raw = vec![session("a", "/other", SessionSource::Ainb)];
-        assert_eq!(resolve_target(&raw, "hook-sid", "/work/x"), Target::NoMatch);
-    }
-
-    #[test]
-    fn empty_cwd_without_exact_match_is_no_match() {
-        // An empty cwd never correlates (it would collapse distinct sessions).
-        let raw = vec![session("a", "", SessionSource::Ainb)];
-        assert_eq!(resolve_target(&raw, "hook-sid", ""), Target::NoMatch);
+    fn a_session_in_the_cwd_without_the_id_is_no_target() {
+        let merged = merge_sessions(vec![vec![session(
+            "discovered-id",
+            "/work/x",
+            SessionSource::Ainb,
+        )]]);
+        assert!(exact_target(&merged, "hook-session-differs").is_none());
+        assert!(exact_target(&merged, "").is_none());
     }
 }
