@@ -11,8 +11,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use ainb_hangar_proto::hooks::{
-    render_headers_file, HookEndpoint, ENDPOINT_FILE_NAME, HEADERS_FILE_NAME,
-    HOOK_ENDPOINT_VERSION,
+    ENDPOINT_FILE_NAME, HEADERS_FILE_NAME, HOOK_ENDPOINT_VERSION, HookEndpoint, render_headers_file,
 };
 
 /// The published files; removing them is the `Drop`.
@@ -138,8 +137,6 @@ mod tests {
         let fresh = EndpointFiles::publish(home.path(), 2222, "new").unwrap();
         let text = std::fs::read_to_string(fresh.endpoint_path()).unwrap();
         assert!(text.contains("AINB_HOOK_PORT=2222"));
-        assert!(std::fs::read_to_string(fresh.headers_path())
-            .unwrap()
-            .contains("new"));
+        assert!(std::fs::read_to_string(fresh.headers_path()).unwrap().contains("new"));
     }
 }
