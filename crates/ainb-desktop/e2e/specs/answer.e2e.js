@@ -137,16 +137,18 @@ describe("answering from the window", () => {
     const sentBefore = intentsSent().length;
     await click(`.answer-banner .answer-option[data-option="${PICK}"]`);
     let phase = "";
+    let phaseLine = "";
     await settle(
       async () => {
-        phase = await browser.execute(
-          (id) => document.querySelector(`.answer-banner[data-request="${id}"] .answer-phase`)?.dataset.phase ?? "",
-          request,
-        );
+        [phase, phaseLine] = await browser.execute((id) => {
+          const line = document.querySelector(`.answer-banner[data-request="${id}"] .answer-phase`);
+          return [line?.dataset.phase ?? "", line?.textContent ?? ""];
+        }, request);
         return phase === "delivered";
       },
       60_000,
-      () => `the banner never read delivered (last phase: ${phase || "none"}; pane: ${paneText(target.tmux).trim().split("\n").slice(-3).join(" / ")})\n${desktopLog()}`,
+      () =>
+        `the banner never read delivered (last phase: ${phase || "none"}: ${JSON.stringify(phaseLine)}; pane: ${paneText(target.tmux).trim().split("\n").slice(-3).join(" / ")})\n${desktopLog()}`,
     );
 
     // What the window sent for that pick, from the host's own log: the
