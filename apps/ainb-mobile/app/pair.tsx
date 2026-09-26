@@ -64,7 +64,9 @@ export default function Pair() {
             ? "This device was revoked or its pairing expired. Pair again with a new offer."
             : repair === "peer_changed"
               ? "This host's key changed. Ask the operator for a fresh offer and pair again."
-              : "This host no longer accepts this device. Pair again with a new offer."}
+              : repair === "identity"
+                ? "This host no longer accepts this device. Pair again with a new offer."
+                : `This pairing needs redoing (${repair}). Pair again with a new offer.`}
         </Text>
       ) : null}
       {scanning ? (
