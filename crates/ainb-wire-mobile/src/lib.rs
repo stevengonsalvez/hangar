@@ -26,6 +26,7 @@ pub mod custody;
 pub mod pairing;
 pub mod records;
 pub mod session;
+pub mod terminal;
 
 pub use api::MobileHost;
 pub use records::WireError;
