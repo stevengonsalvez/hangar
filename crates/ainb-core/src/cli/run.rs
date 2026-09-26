@@ -618,8 +618,13 @@ fn build_agent_command(args: &RunArgs, claude_session_id: Option<&str>) -> Strin
     // A fresh launch runs under the id ainb minted for it, so the id Claude's
     // hooks report is the one the session record holds.
     if let (CliProvider::Claude, Some(id)) = (&provider, claude_session_id) {
-        cmd_parts.push("--session-id".to_string());
-        cmd_parts.push(id.to_string());
+        // Only the canonical UUID form ainb mints goes into the command.
+        if crate::interactive::session_manager::is_canonical_claude_session_id(id) {
+            cmd_parts.push("--session-id".to_string());
+            cmd_parts.push(id.to_string());
+        } else {
+            warn!("refusing a Claude session id that is not a canonical UUID");
+        }
     }
 
     match provider {
@@ -1145,6 +1150,14 @@ mod tests {
         assert_eq!(
             cmd,
             "claude --session-id 11111111-2222-4333-8444-555555555555"
+        );
+        let cmd = build_agent_command(
+            &args,
+            Some("11111111-2222-4333-8444-555555555555; rm -rf /"),
+        );
+        assert_eq!(
+            cmd, "claude",
+            "a non-canonical id never reaches the command"
         );
     }
 
