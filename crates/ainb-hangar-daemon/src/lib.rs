@@ -778,6 +778,44 @@ fn spawn_parent_watchdog() {
     });
 }
 
+/// Bind the peer leg (R1-06a) once its host key is loaded: only with a
+/// minted host id and an address [`peer_listener::listen_config`] accepts.
+/// Every failure is logged and leaves the leg unbound; the daemon runs on.
+async fn start_peer_leg(
+    pool: &sqlx::SqlitePool,
+    loaded: &crate::host_key::Loaded,
+    shutdown: crate::shutdown::Handle,
+) {
+    let host_id =
+        match ainb_hangar_store::repo::daemon_identity::DaemonIdentityRepo::read(pool).await {
+            Ok(Some(identity)) => identity.host_id,
+            Ok(None) => {
+                tracing::error!("peer leg not bound: this daemon has no minted host id");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "peer leg not bound: the host id could not be read");
+                return;
+            }
+        };
+    let Ok(host_id) = ainb_hangar_proto::hosts::HostId::parse_minted(&host_id) else {
+        tracing::error!("peer leg not bound: the host id is not a minted id");
+        return;
+    };
+    let value = std::env::var(peer_listener::LISTEN_ENV).unwrap_or_default();
+    let config = match peer_listener::listen_config(&value) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "peer leg not bound");
+            return;
+        }
+    };
+    let host = peer_listener::PeerHost::new(host_id, loaded.key.secret());
+    if let Err(error) = peer_listener::start(config, host, shutdown).await {
+        tracing::error!(%error, addr = %config.addr, "peer leg bind failed");
+    }
+}
+
 /// Boot the daemon: open the persistence layer and run the claim loop.
 ///
 /// Resolves the database directory the same way every Hangar consumer does
@@ -924,11 +962,16 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         if crate::peer_listener::switched_on() {
             let secrets = crate::claude_cred::default_backend();
             match crate::host_key::ensure(store.pool(), secrets.as_ref(), &dir).await {
-                Ok(loaded) => tracing::info!(
-                    custody = ?loaded.custody,
-                    minted = loaded.minted,
-                    "peer leg host key"
-                ),
+                Ok(loaded) => {
+                    tracing::info!(
+                        custody = ?loaded.custody,
+                        minted = loaded.minted,
+                        "peer leg host key"
+                    );
+                    start_peer_leg(store.pool(), &loaded, shutdown.clone()).await;
+                }
+                // No key, no bind: the leg never listens without the key
+                // devices pin.
                 Err(error) => tracing::error!(%error, "could not load the peer leg host key"),
             }
         }
