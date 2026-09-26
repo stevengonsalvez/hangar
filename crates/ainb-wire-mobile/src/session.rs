@@ -691,6 +691,7 @@ impl Session {
                 code: e.code,
                 message: e.message,
                 reason: error_reason(e.data.as_ref()),
+                data: e.data.map(|d| d.to_string()),
             }),
             (Some(result), None) => Ok(result),
             (None, None) => Ok(serde_json::Value::Null),
