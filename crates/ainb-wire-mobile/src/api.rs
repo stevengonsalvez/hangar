@@ -30,7 +30,7 @@ use ainb_hangar_proto::snapshots::{
 use tokio::runtime::Runtime;
 
 use crate::connlog::{ConnLog, Entry, Event};
-use crate::custody::DeviceKey;
+use crate::custody::{CustodyReport, DeviceKey};
 use crate::records::{
     AnswerReply, AttentionRecord, FleetSubscribeSummary, HelloSummary, InterruptReply,
     MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptPage, WireError, WireEvent,
@@ -136,6 +136,13 @@ pub fn read_connection_log(log_dir: String, limit: u32) -> Result<Vec<ConnLogEnt
 #[allow(clippy::needless_pass_by_value)]
 pub fn device_key_fingerprint(custody_dir: String) -> Result<String, WireError> {
     DeviceKey::load_or_create(Path::new(&custody_dir)).map(|k| k.fingerprint())
+}
+
+/// Which backend holds the device key on this target, and whether that is
+/// the degraded (file) one.
+#[uniffi::export]
+pub fn custody_report() -> CustodyReport {
+    CustodyReport::for_target()
 }
 
 /// One endpoint of a pairing offer.
