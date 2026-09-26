@@ -202,6 +202,8 @@ export class FakeWire implements WireClient {
     this.frame(streamId, { kind: "snapshot_start", cols: st.cols, rows: st.rows, epoch: st.epoch, chunks: 1 });
     this.frame(streamId, { kind: "snapshot_chunk", data: fromBase64(FIXTURES["f1-altscreen"]) });
     this.frame(streamId, { kind: "snapshot_end" });
+    // A hyperlink in the pane output, the way any program can print one.
+    this.frame(streamId, { kind: "output", data: fromBase64(FIXTURES["f4-osc8"]) });
   }
 
   private denied(sessionKey: SessionKey): FloorDenied {
