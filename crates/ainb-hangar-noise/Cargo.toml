@@ -16,13 +16,17 @@ path = "src/lib.rs"
 # Kept small on purpose: the daemon, the desktop client and the phone crate all
 # link this, and it must `cargo check` for aarch64-apple-ios,
 # aarch64-apple-ios-sim, x86_64-apple-ios, aarch64-linux-android and
-# x86_64-linux-android. No tokio, no std::net, no C. `snow` arrives with the
-# IK handshake (R1-01), not here.
+# x86_64-linux-android. No tokio, no std::net, no C.
 [dependencies]
 ainb-hangar-proto = { path = "../ainb-hangar-proto" }
 base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The IK handshake and transport ciphers (R1-01). The default resolver is pure
+# Rust (x25519 via curve25519-dalek, ChaChaPoly, BLAKE2s), the same dependency
+# set spike 5/6 built for the phone targets. Declared here, not in the root
+# `[workspace.dependencies]`, so no other lane's file changes.
+snow = "0.9"
 
 # Local lint config, mirroring ainb-hangar-proto (the workspace-level lint
 # groups share a priority with specific lints, which rustc rejects).

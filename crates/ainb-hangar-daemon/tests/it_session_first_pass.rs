@@ -65,6 +65,7 @@ fn row(id: &str, tmux: &str) -> SessionRow {
         model_source: "LegacyTyped".to_string(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
@@ -107,6 +108,7 @@ fn entry(id: &str, tmux: &str) -> ainb_hangar_client::WorkspaceSessionEntry {
         model_source: r.model_source,
         codex_model: r.codex_model,
         codex_thread_id: r.codex_thread_id,
+        claude_session_id: r.claude_session_id,
     }
 }
 

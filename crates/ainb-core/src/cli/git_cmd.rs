@@ -469,6 +469,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         }
     }
 
