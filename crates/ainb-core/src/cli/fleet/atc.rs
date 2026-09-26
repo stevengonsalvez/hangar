@@ -198,13 +198,13 @@ be removed ({e}); `ainb fleet atc repair {}` re-asserts a single scheduler",
                 &home,
                 &script,
                 plumbing::hooks::HookTransport::Legacy,
+                &home.join(".agents-in-a-box"),
             ) {
                 Ok(_) => {
                     hooks_installed = true;
-                    if let Some(hangar_home) = hook_hangar_home() {
-                        let _ = plumbing::settings::record_transport(
-                            &hangar_home,
-                            plumbing::hooks::HookTransport::Legacy,
+                    if let Err(e) = clear_transport_marker() {
+                        eprintln!(
+                            "warning: legacy hooks installed, but the http transport marker could not be cleared, so notify.sh may keep standing down for Claude: {e:#}"
                         );
                     }
                 }
@@ -463,7 +463,16 @@ async fn teardown(matches: &clap::ArgMatches, format: OutputFormat) -> Result<()
     if none_left {
         if let Some(home) = dirs::home_dir() {
             match plumbing::settings::uninstall_claude_hooks(&home) {
-                Ok(()) => hooks_uninstalled = true,
+                Ok(()) => {
+                    hooks_uninstalled = true;
+                    // With the managed hooks gone, an `http` marker would keep
+                    // every notify.sh standing down for Claude forever.
+                    if let Err(e) = clear_transport_marker() {
+                        eprintln!(
+                            "warning: hooks removed, but the http transport marker could not be cleared: {e:#}"
+                        );
+                    }
+                }
                 Err(e) => tracing::warn!("failed to uninstall lifecycle hooks: {e}"),
             }
         }
@@ -2764,6 +2773,19 @@ fn hook_hangar_home() -> Option<std::path::PathBuf> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".agents-in-a-box")))
 }
 
+/// The ainb home `notify.sh` reads the transport marker under:
+/// `$AINB_HANGAR_HOME`, else `$AINB_HOME`, else `~/.agents-in-a-box` (notifyd's
+/// own resolution, which notify.sh mirrors).
+fn notify_home() -> anyhow::Result<std::path::PathBuf> {
+    Ok(ainb_plugin_notifyd::paths::Paths::from_home()?.base)
+}
+
+/// Remove the `http` transport marker where notify.sh reads it.
+fn clear_transport_marker() -> anyhow::Result<()> {
+    plumbing::settings::record_transport(&notify_home()?, plumbing::hooks::HookTransport::Legacy)?;
+    Ok(())
+}
+
 /// `atc setup --hooks=http`: point the managed Claude hooks at `ainb-hook.sh`.
 ///
 /// Refuses unless the hangar daemon is publishing its hook endpoint (started
@@ -2796,8 +2818,30 @@ fn install_http_hooks() -> anyhow::Result<()> {
         &home,
         &script,
         plumbing::hooks::HookTransport::Http,
+        &hangar_home,
     )?;
-    plumbing::settings::record_transport(&hangar_home, plumbing::hooks::HookTransport::Http)?;
+    // Without the marker the plugin's notify.sh would put a second waiter on
+    // every PermissionRequest beside the daemon's hold. Never leave http hooks
+    // installed without it: put the legacy set back and report.
+    let marked = notify_home().and_then(|base| {
+        plumbing::settings::record_transport(&base, plumbing::hooks::HookTransport::Http)
+    });
+    if let Err(e) = marked {
+        let legacy_home = home.join(".agents-in-a-box");
+        let legacy = ainb_plugin_notifyd::install::canonical_hook_script(
+            &ainb_plugin_notifyd::paths::Paths::under(&legacy_home),
+        );
+        let rollback = plumbing::settings::install_claude_hooks_for(
+            &home,
+            &legacy,
+            plumbing::hooks::HookTransport::Legacy,
+            &legacy_home,
+        );
+        return Err(e.context(match rollback {
+            Ok(_) => "could not write the http transport marker; the legacy hooks were put back",
+            Err(_) => "could not write the http transport marker, and putting the legacy hooks back failed",
+        }));
+    }
     Ok(())
 }
 
