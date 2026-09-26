@@ -167,15 +167,41 @@ static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}").expect("valid bearer token regex")
 });
+/// An API key in a header of its own rather than `Authorization`:
+/// `X-Api-Key`, `X-Auth-Token`, any `X-...-Key`, `-Token` or `-Secret`, and
+/// the bare `api-key`, `api-token`, `auth-token`, `access-token`,
+/// `private-token` (GitLab) and lower-case `apikey`. Group 1 keeps the header
+/// name. The value is 16 or more token characters, so "x-api-key: required"
+/// and a placeholder are left alone; the names carry a hyphen (or are the
+/// lower-case `apikey`), so a camel-case `apiKey: SomeType` in code is too.
+static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\b((?:(?i:x-[a-z0-9-]*(?:key|token|secret))|(?i:api-key|api-token|auth-token|access-token|private-token)|apikey)["']?\s*:\s*["']?)[A-Za-z0-9._~+/=-]{16,}"#,
+    )
+    .expect("valid api key header regex")
+});
+/// A credential in an environment assignment: `NAME_TOKEN=`, `NAME_SECRET=`
+/// or `NAME_KEY=` as a shell line, an `env` prefix or a `.env` file writes
+/// it, with an opaque value. Group 1 keeps the name. Upper-case names and no
+/// space around `=`, the shell's own form, so a code assignment such as
+/// `SECRET_KEY = load_secret()` is left alone. The value is 16 or more token
+/// characters and does not start with `/`, `~`, `.`, `$` or `<`, so a key
+/// file's path, a `$VAR` or `${VAR:-...}` expansion and a placeholder stay.
+static SECRET_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"\b((?:export\s+)?[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|KEY)=["']?)[A-Za-z0-9+_-][A-Za-z0-9._~+/=:@-]{15,}"#,
+    )
+    .expect("valid secret env assignment regex")
+});
 
 /// Every credential shape [`scrub`] removes, by name, in the order it runs.
 ///
 /// PEM runs first so a key block is removed whole before a narrower pattern
 /// eats a line of its body, and the Anthropic shape runs before the `sk-` one
-/// so an `sk-ant-` key is named for what it is. The header and bearer shapes
-/// run last, after every named token shape, so a known token inside a header
-/// is still named for what it is.
-fn shapes() -> [(&'static str, &'static Regex); 22] {
+/// so an `sk-ant-` key is named for what it is. The header, bearer and
+/// environment shapes run last, after every named token shape, so a known
+/// token inside a header or an assignment is still named for what it is.
+fn shapes() -> [(&'static str, &'static Regex); 24] {
     [
         ("pem private key", &PEM_PRIVATE_KEY),
         ("telegram bot token", &TELEGRAM_TOKEN),
@@ -199,6 +225,8 @@ fn shapes() -> [(&'static str, &'static Regex); 22] {
         ("url userinfo", &URL_USERINFO),
         ("authorization header", &AUTHORIZATION_HEADER),
         ("bearer token", &BEARER_TOKEN),
+        ("api key header", &API_KEY_HEADER),
+        ("secret env assignment", &SECRET_ENV_ASSIGNMENT),
     ]
 }
 
@@ -320,7 +348,11 @@ fn scrub_shapes(input: &str) -> String {
             re.replace_all(&out, format!("${{1}}{REDACTED}@").as_str()).into_owned()
         } else if matches!(
             name,
-            "aws secret key" | "authorization header" | "bearer token"
+            "aws secret key"
+                | "authorization header"
+                | "bearer token"
+                | "api key header"
+                | "secret env assignment"
         ) {
             re.replace_all(&out, format!("${{1}}{REDACTED}").as_str()).into_owned()
         } else {
@@ -512,6 +544,8 @@ mod tests {
             ),
             fake("Authorization: Bearer ", 'o', 40),
             fake("Bearer ", 'b', 32),
+            fake("X-Api-Key: ", 'k', 32),
+            fake("SERVICE_TOKEN=", 'v', 32),
         ];
         for shape in &shapes {
             let text = format!("before {shape} after");
@@ -572,6 +606,67 @@ mod tests {
             "a bearer instrument",
         ] {
             assert_eq!(scrub(prose), prose);
+        }
+    }
+
+    /// An opaque key in its own header, or in a `NAME_TOKEN=` / `NAME_SECRET=`
+    /// / `NAME_KEY=` assignment, matches no named shape. The value goes in each
+    /// spelling a curl flag, a header dump, a JSON field, a shell line or a
+    /// `.env` file carries; the header or variable name stays.
+    #[test]
+    fn scrubs_api_key_headers_and_secret_env_assignments() {
+        let opaque = "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6";
+        for (text, kept) in [
+            (
+                format!("curl -H 'X-Api-Key: {opaque}' https://api.example"),
+                "curl -H 'X-Api-Key: <redacted>' https://api.example",
+            ),
+            (format!("x-auth-token:{opaque}"), "x-auth-token:<redacted>"),
+            (
+                format!(r#"{{"X-Goog-Api-Key": "{opaque}"}}"#),
+                r#"{"X-Goog-Api-Key": "<redacted>"}"#,
+            ),
+            (
+                format!("PRIVATE-TOKEN: {opaque}"),
+                "PRIVATE-TOKEN: <redacted>",
+            ),
+            (format!("apikey: {opaque}"), "apikey: <redacted>"),
+            (
+                format!("SERVICE_TOKEN={opaque}"),
+                "SERVICE_TOKEN=<redacted>",
+            ),
+            (
+                format!("export CLIENT_SECRET=\"{opaque}\""),
+                "export CLIENT_SECRET=\"<redacted>\"",
+            ),
+            (
+                format!("env DEPLOY_API_KEY='{opaque}' ./deploy.sh"),
+                "env DEPLOY_API_KEY='<redacted>' ./deploy.sh",
+            ),
+            (
+                format!("DB_KEY={opaque}\nOTHER=1"),
+                "DB_KEY=<redacted>\nOTHER=1",
+            ),
+        ] {
+            assert_eq!(scrub(&text), kept, "{text}");
+            assert!(find_secret(&text).is_some(), "{text}");
+        }
+        for prose in [
+            "x-api-key: required",
+            "X-Api-Key: <your key>",
+            "the api key: see the docs for how to mint one",
+            "apiKey: ApiKeyCredentialProvider",
+            "GITHUB_TOKEN=$GITHUB_TOKEN",
+            "echo SECRET_KEY=${SECRET_KEY:-<absent>}",
+            "API_KEY=<your key here>",
+            "SSH_KEY=/home/dev/.ssh/id_ed25519",
+            "SSH_KEY=~/.ssh/id_ed25519_signing",
+            "SORT_KEY=created_at",
+            "SECRET_KEY = load_secret_from_vault()",
+            "set the NPM_TOKEN= variable before publishing",
+        ] {
+            assert_eq!(scrub(prose), prose);
+            assert_eq!(find_secret(prose), None, "{prose}");
         }
     }
 
