@@ -18,3 +18,13 @@ path = "src/lib.rs"
 
 [dependencies]
 wezterm-term = { workspace = true }
+# The parser the emulator itself uses, pinned to the exact version the fork
+# depends on (see Cargo.lock), so the mode tracker and the grid see the same
+# actions. Already in the lock file through wezterm-term: no new lock entry.
+wezterm-escape-parser = { package = "tattoy-wezterm-escape-parser", version = "=0.1.0-1" }
+# Grapheme boundaries for the held trailing cluster. Already in the lock file
+# through the fork's dependencies: no new lock entry.
+unicode-segmentation = "1"
+
+[dev-dependencies]
+proptest = { workspace = true }

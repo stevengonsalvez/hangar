@@ -439,7 +439,20 @@ pub struct FleetSession {
     /// Last accepted observation time in epoch milliseconds.
     pub last_observed_at: i64,
     /// Last lifecycle observation time in epoch milliseconds.
+    ///
+    /// Also the `fleet/message_send` fence: a client sends the value it read
+    /// as `fence: {kind: "lifecycle_updated_at", ..}`.
     pub lifecycle_updated_at: i64,
+    /// The incarnation of the process that owns this session name, as the
+    /// daemon's status identity recorded it (F-1).
+    ///
+    /// The `fleet/action` fence: a client sends the value it read as
+    /// `fence: {kind: "session_incarnation", ..}`, and a different process
+    /// owning the name is refused `incarnation_mismatch`. Absent when never
+    /// observed; additive, so an older peer ignores it and an older daemon's
+    /// row decodes with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_incarnation: Option<String>,
     /// Last attention observation time in epoch milliseconds.
     pub attention_updated_at: i64,
     /// Provider-reported model id, verbatim. Absent means never observed, which
@@ -2534,6 +2547,7 @@ mod tests {
             discovered_at: 1,
             last_observed_at: 2,
             lifecycle_updated_at: 2,
+            session_incarnation: None,
             attention_updated_at: 1,
             model: None,
             reasoning_effort: None,
@@ -2604,6 +2618,29 @@ mod tests {
         assert_eq!(decoded.model, None);
         assert_eq!(decoded.reasoning_effort, None);
         assert_eq!(decoded.model_updated_at, 0);
+    }
+
+    /// F-1: the incarnation a client fences `fleet/action` on is additive.
+    /// Absent when unobserved, carried verbatim when observed, and a row from
+    /// a daemon that predates it decodes as `None`.
+    #[test]
+    fn fleet_session_carries_the_incarnation_additively() {
+        let bare = serde_json::to_value(session_without_model()).unwrap();
+        assert!(
+            bare.get("session_incarnation").is_none(),
+            "an unobserved incarnation must be absent, not null: {bare}"
+        );
+        let decoded: FleetSession = serde_json::from_value(bare).unwrap();
+        assert_eq!(decoded.session_incarnation, None);
+
+        let session = FleetSession {
+            session_incarnation: Some("proc-a".to_string()),
+            ..session_without_model()
+        };
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert_eq!(encoded["session_incarnation"], "proc-a");
+        let decoded: FleetSession = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, session);
     }
 
     #[test]

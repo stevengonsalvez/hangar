@@ -75,7 +75,7 @@ async function settle(condition, timeout, explain) {
   try {
     await browser.waitUntil(condition, { timeout, interval: 100 });
   } catch {
-    throw new Error(explain());
+    throw new Error(await explain());
   }
 }
 
@@ -220,5 +220,64 @@ describe("answering from the window", () => {
       timeout: 30_000,
       timeoutMsg: "the agent's card left the board",
     });
+  });
+
+  it("answers from the banner over the inbox page, and the pick walks the reducer back", async () => {
+    // The banner is drawn over the inbox page, but its rows are the session
+    // list's, and the reducer refused them while it was on its Inbox screen:
+    // the pick went nowhere and the window logged it as dispatched (#121).
+    const target = seeded()[0];
+    const chosen = 2;
+    const readBefore = paneText(target.tmux).split(`agent read: ${OPTIONS[chosen]}`).length - 1;
+
+    await click(".inbox-button");
+    await $(".inbox").waitForExist({ timeout: 60_000 });
+    raiseHook(target, ASK);
+    await click(`.session-row[data-session="${target.id}"]`);
+    // The question just raised, not the one the case before answered, whose
+    // banner lingers as delivered.
+    let phase = "";
+    await settle(
+      async () => {
+        phase = await browser.execute(() => document.querySelector(".answer-banner[data-request] .answer-phase")?.dataset.phase ?? "");
+        return phase === "none";
+      },
+      60_000,
+      () => `no unanswered question came up over the inbox (last phase: ${phase || "no banner"})\n${desktopLog()}`,
+    );
+    const request = await $(".answer-banner[data-request]").getAttribute("data-request");
+    assert.ok(await $(".inbox").isExisting(), "the inbox page is still up under the banner");
+
+    const sentBefore = intentsSent().length;
+    await click(`.answer-banner .answer-option[data-option="${chosen}"]`);
+    await settle(
+      async () => {
+        phase = await browser.execute(
+          (id) => document.querySelector(`.answer-banner[data-request="${id}"] .answer-phase`)?.dataset.phase ?? "",
+          request,
+        );
+        return phase === "delivered";
+      },
+      60_000,
+      async () =>
+        `the pick over the inbox never read delivered (last phase: ${phase || "none"}; toasts: ${JSON.stringify(
+          await browser.execute(() => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent)),
+        )}; screen: ${await browser.execute(() => document.querySelector(".inbox") ? "inbox" : "not inbox")})\n${desktopLog()}`,
+    );
+    const sent = intentsSent().slice(sentBefore);
+    const shown = sent.map(({ command, outcome }) => `${command}:${outcome}`).join(", ");
+    assert.deepEqual(
+      sent.filter(({ outcome }) => outcome !== "dispatched"),
+      [],
+      `the host applied every intent of the pick: ${shown}`,
+    );
+    assert.equal(sent.at(-1)?.command, "session_list.ask.pick", `the pick is the last thing sent: ${shown}`);
+    await $(".inbox").waitForExist({ timeout: 30_000, reverse: true });
+
+    // The last mile, once more: the label reached the agent in the pane.
+    await browser.waitUntil(
+      () => paneText(target.tmux).split(`agent read: ${OPTIONS[chosen]}`).length - 1 > readBefore,
+      { timeout: 30_000, timeoutMsg: `the answer never reached the agent in ${target.tmux}` },
+    );
   });
 });
