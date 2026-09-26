@@ -80,6 +80,64 @@ async fn call(params: serde_json::Value) -> serde_json::Value {
     serde_json::to_value(response).unwrap()
 }
 
+/// A home whose config registers `<home>/code`, with a git repository at
+/// `<home>/code/app`, set as `$HOME` for the daemon's root lookup. The
+/// daemon only creates from a registered folder's repository top.
+struct Registered {
+    home: tempfile::TempDir,
+}
+
+impl Registered {
+    fn new() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("code/app");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [
+            &["init", "-q", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ][..],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .is_ok_and(|o| o.status.success());
+            assert!(ok, "git {args:?}");
+        }
+        let config = home.path().join(".agents-in-a-box/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            format!(
+                "[workspace_defaults]\nworkspace_scan_paths = [\"{}\"]\n",
+                home.path().join("code").display()
+            ),
+        )
+        .unwrap();
+        std::env::set_var("HOME", home.path());
+        Self { home }
+    }
+
+    fn repo(&self) -> String {
+        std::fs::canonicalize(self.home.path().join("code/app"))
+            .unwrap()
+            .display()
+            .to_string()
+    }
+}
+
 fn switch_on(bin: &Path) {
     // Edition 2021: set_var is safe. Held under SERIAL for the whole test.
     std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "1");
@@ -90,11 +148,11 @@ fn switch_on(bin: &Path) {
 async fn a_create_runs_ainb_run_with_the_request_and_returns_its_session() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tools = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
     switch_on(&fake_ainb(tools.path(), true));
 
     let response = call(serde_json::json!({
-        "repo_path": repo.path().display().to_string(),
+        "repo_path": repo.repo(),
         "agent": "claude",
         "branch": "feat/x",
         "base": "origin/main",
@@ -116,28 +174,86 @@ async fn a_create_runs_ainb_run_with_the_request_and_returns_its_session() {
         "{argv:?}"
     );
     let pairs: Vec<(&str, &str)> = argv.windows(2).map(|w| (w[0], w[1])).collect();
-    let repo_arg = repo.path().display().to_string();
+    let repo_arg = repo.repo();
     for pair in [
         ("--repo", repo_arg.as_str()),
         ("--tool", "claude"),
         ("--create-branch", "feat/x"),
         ("--base", "origin/main"),
-        ("--model", "opus"),
     ] {
         assert!(pairs.contains(&pair), "missing {pair:?} in {argv:?}");
     }
+    assert!(argv.contains(&"--model=opus"), "{argv:?}");
     assert_eq!(argv.last(), Some(&"--prompt=-y fix it"));
+}
+
+#[tokio::test]
+async fn an_existing_branch_is_refused_before_ainb_runs() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    let ok = std::process::Command::new("git")
+        .args(["branch", "taken"])
+        .current_dir(repo.repo())
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(ok);
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let response = call(serde_json::json!({
+        "repo_path": repo.repo(),
+        "agent": "claude",
+        "branch": "taken",
+        "base": "main",
+    }))
+    .await;
+
+    assert_eq!(
+        response["error"]["code"].as_i64(),
+        Some(-32602),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already exists"),
+        "{response}"
+    );
+    assert!(!tools.path().join("argv.txt").exists(), "nothing ran");
+}
+
+#[tokio::test]
+async fn a_repo_outside_every_registered_folder_is_refused() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let _registered = Registered::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let response = call(serde_json::json!({
+        "repo_path": elsewhere.path().display().to_string(),
+        "agent": "claude",
+    }))
+    .await;
+
+    assert_eq!(
+        response["error"]["code"].as_i64(),
+        Some(-32602),
+        "{response}"
+    );
+    assert!(!tools.path().join("argv.txt").exists(), "nothing ran");
 }
 
 #[tokio::test]
 async fn a_failed_run_is_an_internal_error_with_the_cli_message() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tools = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
     switch_on(&fake_ainb(tools.path(), false));
 
     let response = call(serde_json::json!({
-        "repo_path": repo.path().display().to_string(),
+        "repo_path": repo.repo(),
         "agent": "codex",
     }))
     .await;
