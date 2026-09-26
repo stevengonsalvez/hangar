@@ -1,9 +1,17 @@
 //! Device key custody: the Noise static keypair never leaves this crate.
 //!
-//! The app gets a fingerprint and nothing else. M1-02 ships the file backend
-//! (an app-private `0600` file), which is also the Android fallback; M1-08
-//! adds the iOS Keychain and Android Keystore backends behind the same
-//! [`DeviceKey::load_or_create`].
+//! The app gets a fingerprint and nothing else. One entry point,
+//! [`DeviceKey::load_or_create`], picks the backend for the target:
+//!
+//! | target  | backend                                              | degraded |
+//! |---------|------------------------------------------------------|----------|
+//! | iOS     | Keychain, `AfterFirstUnlockThisDeviceOnly`, ungated | no       |
+//! | Android | app-private `0600` file (Keystore via JNI pending)   | yes      |
+//! | other   | app-private `0600` file (tests, desktop)             | no       |
+//!
+//! `degraded` means the key is at rest in the app sandbox rather than in
+//! hardware-backed storage; the app shows it on the Log screen so the owner
+//! knows which phones carry a file key.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -11,6 +19,52 @@ use std::path::{Path, PathBuf};
 use ainb_hangar_noise::NOISE_PATTERN;
 
 use crate::records::WireError;
+
+#[cfg(target_os = "ios")]
+mod ios;
+
+/// The bytes a backend stores: private key then public key.
+pub type KeyBytes = Vec<u8>;
+
+/// Which backend holds the key on this target, for the Log screen.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CustodyReport {
+    /// `keychain` or `file`.
+    pub backend: String,
+    /// Whether the key is at rest in the app sandbox rather than in
+    /// hardware-backed storage.
+    pub degraded: bool,
+    /// Why, when degraded.
+    pub detail: Option<String>,
+}
+
+impl CustodyReport {
+    /// The report for this target.
+    #[must_use]
+    pub fn for_target() -> Self {
+        if cfg!(target_os = "ios") {
+            Self {
+                backend: "keychain".to_owned(),
+                degraded: false,
+                detail: None,
+            }
+        } else if cfg!(target_os = "android") {
+            Self {
+                backend: "file".to_owned(),
+                degraded: true,
+                detail: Some(
+                    "android keystore backend pending; key in an app-private 0600 file".to_owned(),
+                ),
+            }
+        } else {
+            Self {
+                backend: "file".to_owned(),
+                degraded: false,
+                detail: None,
+            }
+        }
+    }
+}
 
 /// The file the file backend keeps the keypair in, under the custody dir.
 pub const KEY_FILE: &str = "device.key";
@@ -32,7 +86,7 @@ impl std::fmt::Debug for DeviceKey {
     }
 }
 
-fn custody_error(e: impl std::fmt::Display) -> WireError {
+pub(crate) fn custody_error(e: impl std::fmt::Display) -> WireError {
     WireError::Custody {
         message: e.to_string(),
     }
@@ -50,8 +104,31 @@ impl DeviceKey {
         })
     }
 
-    /// The keypair kept under `dir`, minted on first use.
+    /// The keypair for this device, minted on first use: the Keychain on iOS,
+    /// the `0600` file under `dir` elsewhere.
     pub fn load_or_create(dir: &Path) -> Result<Self, WireError> {
+        #[cfg(target_os = "ios")]
+        {
+            let _ = dir;
+            if let Some(bytes) = ios::load()? {
+                return Self::from_file_bytes(&bytes);
+            }
+            let key = Self::generate()?;
+            ios::store(&key.bytes())?;
+            return Ok(key);
+        }
+        #[cfg(not(target_os = "ios"))]
+        Self::load_or_create_file(dir)
+    }
+
+    fn bytes(&self) -> KeyBytes {
+        let mut bytes = self.private.clone();
+        bytes.extend_from_slice(&self.public);
+        bytes
+    }
+
+    /// The file backend: `<dir>/device.key`, created `0600`.
+    pub fn load_or_create_file(dir: &Path) -> Result<Self, WireError> {
         let path = dir.join(KEY_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => Self::from_file_bytes(&bytes),
@@ -82,8 +159,7 @@ impl DeviceKey {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(custody_error)?;
         }
-        let mut bytes = self.private.clone();
-        bytes.extend_from_slice(&self.public);
+        let bytes = self.bytes();
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -144,5 +220,20 @@ mod tests {
         assert!(!format!("{first:?}").contains("private"));
         let other = DeviceKey::load_or_create(&dir.path().join("other")).unwrap();
         assert_ne!(other.public(), first.public());
+    }
+
+    #[test]
+    fn the_host_report_is_the_file_backend_and_only_android_is_degraded() {
+        let report = CustodyReport::for_target();
+        assert_eq!(
+            report.backend,
+            if cfg!(target_os = "ios") {
+                "keychain"
+            } else {
+                "file"
+            }
+        );
+        assert_eq!(report.degraded, cfg!(target_os = "android"));
+        assert_eq!(report.detail.is_some(), report.degraded);
     }
 }
