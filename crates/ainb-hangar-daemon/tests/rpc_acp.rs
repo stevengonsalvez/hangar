@@ -2404,3 +2404,61 @@ async fn a_session_left_live_by_a_dead_daemon_is_retired_at_boot() {
 
     harness.finish().await;
 }
+
+/// Review follow-up A, end to end through the pool: a paired device's
+/// `fleet/action` SendPrompt on an ACP session is enqueued on the chat bus as
+/// `device:<id>`, the sender its caller passes down explicitly, never
+/// `operator`. A device cannot reach the unix socket (its leg is R1-06), so the
+/// real dispatch path is driven with the device caller against the same store
+/// and installed pool the socket serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_send_prompt_on_acp_is_enqueued_as_the_device() {
+    let harness = Harness::start(&[("FAKE_ACP_CHUNKS", "1")], |_| {}).await;
+    let mut client = harness.client().await;
+    let (session_key, _scope) = harness.create_session(&mut client, None).await;
+    let (version,): (i64,) =
+        sqlx::query_as("SELECT version FROM fleet_session WHERE session_key = ?")
+            .bind(&session_key)
+            .fetch_one(harness.store.pool())
+            .await
+            .expect("session row");
+
+    let laptop = rpc::auth::Caller::Device {
+        device_id: "01J0LAPTOP".to_string(),
+        scope: ainb_hangar_proto::devices::DeviceScope::DESKTOP,
+    };
+    let health = DaemonHealth {
+        socket_path: harness.socket.to_string_lossy().into_owned(),
+        pid: std::process::id(),
+        started_at: Instant::now(),
+        version: "0.1.0".to_string(),
+        stats: Arc::new(ainb_hangar_daemon::health_stats::HealthStats::default()),
+    };
+    let sent = rpc::dispatch_as(
+        harness.store.pool(),
+        &RpcRequest {
+            jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+            id: RpcId::Number(1),
+            method: methods::FLEET_ACTION.to_string(),
+            params: serde_json::json!({
+                "session_key": session_key,
+                "expected_version": version,
+                "request_id": "req-device-prompt",
+                "action": {"action": "send_prompt", "text": "from the laptop"},
+            }),
+        },
+        &health,
+        &EventBroker::new().sink(),
+        &laptop,
+    )
+    .await;
+    assert!(sent.error.is_none(), "{:?}", sent.error);
+    let (sender,): (String,) =
+        sqlx::query_as("SELECT sender FROM fleet_message WHERE body = 'from the laptop'")
+            .fetch_one(harness.store.pool())
+            .await
+            .expect("the prompt is on the bus");
+    assert_eq!(sender, "device:01J0LAPTOP");
+
+    harness.finish().await;
+}

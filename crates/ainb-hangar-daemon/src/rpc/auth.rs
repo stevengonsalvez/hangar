@@ -30,13 +30,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
+use ainb_hangar_core::actor::{ActorKind, ActorRef};
 use ainb_hangar_core::clock::{HangarClock, SystemClock};
 use ainb_hangar_core::token::{TokenKind, mint, sha256_hex};
 use ainb_hangar_proto::auth::{DeviceInfo, HelloParams, HelloResult, UNAUTHORIZED};
 use ainb_hangar_proto::connections::{SurfaceHost, SurfaceInfo};
+use ainb_hangar_proto::devices::{CallParams, DeviceScope, EventFamily, Grantor};
+use ainb_hangar_proto::fleet::FleetActionParams;
 use ainb_hangar_proto::protocol::{
     PROTOCOL_INCOMPATIBLE, ProtocolRange, catalogue_strings, negotiate,
 };
+use ainb_hangar_proto::terminal::TerminalAttachParams;
 use ainb_hangar_proto::{RpcError, RpcId, RpcRequest, RpcResponse, methods};
 use ainb_hangar_store::repo::token::SocketTokenRepo;
 use sqlx::SqlitePool;
@@ -64,6 +68,20 @@ pub enum Caller {
         /// cards here, so a card's `scope_key` names the conversation the call
         /// actually came from.
         scope_key: String,
+    },
+    /// A paired device on the off-box peer leg (R1, spec D13).
+    ///
+    /// Constructed ONLY by the peer leg, from the device's token row after the
+    /// Noise session proved the bound key: both fields come from the
+    /// credential, never from the request. A unix-leg hello that carries
+    /// `HelloParams.device` is still [`Caller::Operator`] or [`Caller::Pal`]
+    /// and gains no identity from it.
+    Device {
+        /// The registry id, which is also the ledger principal
+        /// `device:<device_id>` and the `answered_by` / `actor` stamp.
+        device_id: String,
+        /// The scope granted at pairing, read from the row at hello.
+        scope: DeviceScope,
     },
 }
 
@@ -126,11 +144,21 @@ impl Caller {
     /// build-time gate over a static const array — it says what the daemon
     /// serves, never who may ask for it.
     ///
+    /// A device is checked against the frozen scope table
+    /// ([`ainb_hangar_proto::devices::method_allowed`]), which classifies
+    /// every method with no default. The two params rules (`fleet/action`
+    /// interrupt-only, `terminal/attach` watch-only) read the TYPED params:
+    /// `params` is parsed into the method's own params struct, the one its
+    /// handler parses, so a parser differential cannot smuggle `kill` past an
+    /// interrupt-only grant. Params that do not parse earn only a plain
+    /// `allow`, never a params rule.
+    ///
     /// # Errors
     ///
     /// [`UNAUTHORIZED`] when a Pal connection asks for a method outside
-    /// [`PAL_METHODS`].
-    pub fn authorize(&self, method: &str) -> Result<(), RpcError> {
+    /// [`PAL_METHODS`], or a device for a method (or params) its scope does
+    /// not grant.
+    pub fn authorize(&self, method: &str, params: &serde_json::Value) -> Result<(), RpcError> {
         match self {
             Self::Operator => Ok(()),
             Self::Pal { .. } if PAL_METHODS.contains(&method) => Ok(()),
@@ -139,6 +167,90 @@ impl Caller {
                 message: format!("the Pal credential may not call {method}"),
                 data: None,
             }),
+            Self::Device { scope, .. } => {
+                let allowed = match method {
+                    methods::FLEET_ACTION => {
+                        match serde_json::from_value::<FleetActionParams>(params.clone()) {
+                            Ok(typed) => ainb_hangar_proto::devices::method_allowed(
+                                scope,
+                                method,
+                                &CallParams::FleetAction(&typed.action),
+                            ),
+                            Err(_) => ainb_hangar_proto::devices::method_allowed(
+                                scope,
+                                method,
+                                &CallParams::Untyped,
+                            ),
+                        }
+                    }
+                    methods::TERMINAL_ATTACH => {
+                        match serde_json::from_value::<TerminalAttachParams>(params.clone()) {
+                            Ok(typed) => ainb_hangar_proto::devices::method_allowed(
+                                scope,
+                                method,
+                                &CallParams::TerminalAttach(&typed),
+                            ),
+                            Err(_) => ainb_hangar_proto::devices::method_allowed(
+                                scope,
+                                method,
+                                &CallParams::Untyped,
+                            ),
+                        }
+                    }
+                    _ => ainb_hangar_proto::devices::method_allowed(
+                        scope,
+                        method,
+                        &CallParams::Untyped,
+                    ),
+                };
+                if allowed {
+                    Ok(())
+                } else {
+                    Err(RpcError {
+                        code: UNAUTHORIZED,
+                        message: format!(
+                            "a device with scope {} may not call {method} with these params",
+                            scope.base().as_str()
+                        ),
+                        data: None,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Whether this caller receives events of `family` on a stream it may
+    /// subscribe to. The operator and Pal receive every family their
+    /// subscriptions carry; a device only what its scope's row grants.
+    #[must_use]
+    pub fn receives(&self, family: EventFamily) -> bool {
+        match self {
+            Self::Operator | Self::Pal { .. } => true,
+            Self::Device { scope, .. } => ainb_hangar_proto::devices::event_allowed(scope, family),
+        }
+    }
+
+    /// Whether this caller may give a device `target`, by invite or rescope.
+    ///
+    /// `subject` is the scope the device being rescoped holds now, `None` for
+    /// a new device. On top of the frozen [`Grantor::may_grant`]:
+    /// - a device grants only when it is itself `admin`; the scope table
+    ///   already refuses `device/*` to non-admins, and this keeps the rule true
+    ///   if a row ever changes;
+    /// - no device may change the scope of an `admin` device, so one admin
+    ///   desktop cannot demote another. Only the operator can.
+    ///
+    /// Pal grants nothing.
+    #[must_use]
+    pub fn may_grant(&self, target: DeviceScope, subject: Option<DeviceScope>) -> bool {
+        match self {
+            Self::Operator => Grantor::Operator.may_grant(target),
+            Self::Pal { .. } => false,
+            Self::Device { scope, .. } => {
+                scope.admin()
+                    && !subject.is_some_and(DeviceScope::admin)
+                    && Grantor::Device(*scope).may_grant(target)
+            }
         }
     }
 
@@ -146,10 +258,132 @@ impl Caller {
     #[must_use]
     pub fn pal_scope(&self) -> Option<&str> {
         match self {
-            Self::Operator => None,
+            Self::Operator | Self::Device { .. } => None,
             Self::Pal { scope_key } => Some(scope_key),
         }
     }
+
+    /// The actor a write from this caller is authored as, in a typed
+    /// [`ActorRef`] column (security review follow-up A).
+    ///
+    /// - The operator: `claimed`, else the local member. Unchanged, because
+    ///   the operator token is shared by the local surfaces and by the agents
+    ///   the operator runs, which author as themselves.
+    /// - A device: `member:device:<device_id>`, whatever it claimed. Pinned,
+    ///   not validated, so a phone never comments as the operator or as an
+    ///   agent. The canonical spelling is `device:<id>` ([`Caller::sender`]);
+    ///   `member:device:` exists only because `ActorKind` is member|agent and
+    ///   the typed actor columns CHECK the same two kinds. Member ids starting
+    ///   `device:` are refused wherever a member is accepted, so the two
+    ///   spellings cannot collide, and [`device_principal`] reads both as one.
+    ///   An `ActorKind::Device` and the table rebuilds are a post-tag
+    ///   follow-up.
+    /// - Pal: `agent:<PAL_ACTOR>`. Pal reaches none of these methods today
+    ///   ([`PAL_METHODS`]); this is the safe answer if one is ever added.
+    #[must_use]
+    pub fn stamp(&self, claimed: Option<ActorRef>) -> ActorRef {
+        match self {
+            Self::Operator => claimed.unwrap_or_else(ainb_hangar_core::actor::local_member),
+            Self::Device { device_id, .. } => {
+                ActorRef::new(ActorKind::Member, format!("device:{device_id}"))
+                    .expect("a device id is never empty")
+            }
+            Self::Pal { .. } => ActorRef::new(ActorKind::Agent, crate::pal::PAL_ACTOR)
+                .expect("PAL_ACTOR is a non-empty constant"),
+        }
+    }
+
+    /// Whether `actor` is this caller's own device stamp. A device's stamp has
+    /// no `member` row, and it is the daemon's own value, so the workspace
+    /// membership gate for caller-named actors does not apply to it.
+    #[must_use]
+    pub fn is_own_device_stamp(&self, actor: &ActorRef) -> bool {
+        matches!(self, Self::Device { .. }) && *actor == self.stamp(None)
+    }
+
+    /// Who acts for an attributed write: the operator's `claimed` value
+    /// stands (`None` is its legacy "unattributed"); anyone else is ALWAYS
+    /// `own(self)`, never `None` and never what it claimed. The one rule every
+    /// acting-actor site uses, typed (`Caller::stamp`) or text
+    /// (`Caller::sender`).
+    pub fn acting<T>(&self, claimed: Option<T>, own: impl FnOnce(&Self) -> T) -> Option<T> {
+        match self {
+            Self::Operator => claimed,
+            Self::Device { .. } | Self::Pal { .. } => Some(own(self)),
+        }
+    }
+
+    /// The canonical string principal: `operator`, `device:<id>`, or Pal's
+    /// actor. Used for every text field (chat-bus sender, `checked_by`), and
+    /// the spelling [`device_principal`] normalises to.
+    #[must_use]
+    pub fn sender(&self) -> String {
+        match self {
+            Self::Operator => "operator".to_string(),
+            Self::Device { device_id, .. } => format!("device:{device_id}"),
+            Self::Pal { .. } => crate::pal::PAL_ACTOR.to_string(),
+        }
+    }
+
+    /// The paired device this connection is, if any.
+    #[must_use]
+    pub fn device_id(&self) -> Option<&str> {
+        match self {
+            Self::Operator | Self::Pal { .. } => None,
+            Self::Device { device_id, .. } => Some(device_id),
+        }
+    }
+}
+
+/// The prefix of a device principal, `device:<device_id>`.
+pub const DEVICE_PRINCIPAL_PREFIX: &str = "device:";
+
+/// The device id a principal names, reading BOTH spellings as one principal:
+/// the canonical `device:<id>` and the typed-column form `member:device:<id>`.
+/// `None` for any other principal. The single reader every renderer and the
+/// revoke view use, so the split spelling never shows as two identities.
+#[must_use]
+pub fn device_principal(principal: &str) -> Option<&str> {
+    let principal = principal.strip_prefix("member:").unwrap_or(principal);
+    principal.strip_prefix(DEVICE_PRINCIPAL_PREFIX).filter(|id| !id.is_empty())
+}
+
+/// Refuse a member id that a client could use to pass as a device: every
+/// member id starting `device:` is reserved for [`Caller::stamp`].
+///
+/// # Errors
+///
+/// `INVALID_PARAMS` naming the reserved prefix.
+pub fn refuse_reserved_member(actor: &ActorRef) -> Result<(), RpcError> {
+    if actor.kind() == ActorKind::Member && actor.id().starts_with(DEVICE_PRINCIPAL_PREFIX) {
+        return Err(RpcError {
+            code: super::INVALID_PARAMS,
+            message: format!(
+                "member ids starting `{DEVICE_PRINCIPAL_PREFIX}` are reserved for paired devices: {actor}"
+            ),
+            data: None,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a claimed TEXT principal that reads as a device in either spelling
+/// (`device:<id>`, `member:device:<id>`): only [`Caller::sender`] writes one.
+///
+/// # Errors
+///
+/// `INVALID_PARAMS` naming the reserved prefix.
+pub fn refuse_reserved_text(claimed: &str) -> Result<(), RpcError> {
+    if device_principal(claimed.trim()).is_some() {
+        return Err(RpcError {
+            code: super::INVALID_PARAMS,
+            message: format!(
+                "principals starting `{DEVICE_PRINCIPAL_PREFIX}` are reserved for paired devices: {claimed}"
+            ),
+            data: None,
+        });
+    }
+    Ok(())
 }
 
 /// Live Pal credentials: `sha256(plaintext) -> scope_key`.
@@ -784,7 +1018,7 @@ mod tests {
         };
         for allowed in PAL_METHODS {
             assert!(
-                pal.authorize(allowed).is_ok(),
+                pal.authorize(allowed, &serde_json::Value::Null).is_ok(),
                 "{allowed} must be reachable"
             );
         }
@@ -796,10 +1030,12 @@ mod tests {
             methods::FLEET_CHANNEL_CREATE,
             methods::FLEET_ACTION,
         ] {
-            let error = pal.authorize(refused).expect_err("{refused} must be refused");
+            let error = pal
+                .authorize(refused, &serde_json::Value::Null)
+                .expect_err("{refused} must be refused");
             assert_eq!(error.code, UNAUTHORIZED, "{refused}: {error:?}");
             // The operator's own surfaces are unaffected.
-            assert!(Caller::Operator.authorize(refused).is_ok());
+            assert!(Caller::Operator.authorize(refused, &serde_json::Value::Null).is_ok());
         }
     }
 
@@ -819,5 +1055,305 @@ mod tests {
         assert_ne!(first, second, "a lost plaintext must rotate the digest");
         let plaintext = std::fs::read_to_string(&path).unwrap().trim().to_string();
         assert!(SocketTokenRepo::verify(store.pool(), &plaintext).await.unwrap());
+    }
+
+    fn device(scope: DeviceScope) -> Caller {
+        Caller::Device {
+            device_id: "01J0DEVICE0000000000000000".to_string(),
+            scope,
+        }
+    }
+
+    const DEVICE_SCOPES: [DeviceScope; 4] = [
+        DeviceScope::MOBILE,
+        DeviceScope::MOBILE_TYPE,
+        DeviceScope::DESKTOP,
+        DeviceScope::DESKTOP_ADMIN,
+    ];
+
+    /// R1-04's table test: for EVERY method const and every device scope, the
+    /// daemon's gate says exactly what the frozen scope table says. No method
+    /// falls through to a default, and the operator is still refused nothing.
+    #[test]
+    fn every_method_is_decided_by_the_scope_table_for_every_device_scope() {
+        use ainb_hangar_proto::devices::method_allowed;
+        for method in methods::ALL_METHODS {
+            assert!(Caller::Operator.authorize(method, &serde_json::Value::Null).is_ok());
+            for scope in DEVICE_SCOPES {
+                let expected = method_allowed(&scope, method, &CallParams::Untyped);
+                let got = device(scope).authorize(method, &serde_json::Value::Null);
+                assert_eq!(
+                    got.is_ok(),
+                    expected,
+                    "{method} for {scope:?}: gate {got:?}, table {expected}"
+                );
+                if let Err(refusal) = got {
+                    assert_eq!(refusal.code, UNAUTHORIZED);
+                }
+            }
+        }
+    }
+
+    /// RECONCILED S4: a phone may send `fleet/action` only as an interrupt,
+    /// judged on the TYPED action. A kill, or params that do not parse as
+    /// `FleetActionParams`, never earn the interrupt-only grant.
+    #[test]
+    fn a_phone_may_only_interrupt_and_only_on_typed_params() {
+        let action = |action: serde_json::Value| {
+            let mut params = serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": "r1",
+            });
+            params.as_object_mut().unwrap().extend(action.as_object().unwrap().clone());
+            params
+        };
+        // The action is nested: `FleetActionParams.action` is a
+        // `ControlAction` internally tagged on its own `action` field.
+        let interrupt = action(serde_json::json!({"action": {"action": "interrupt"}}));
+        let kill = action(serde_json::json!({"action": {"action": "kill"}}));
+        // The flat spelling a raw-JSON check would have read as an interrupt.
+        let untyped = action(serde_json::json!({"action": "interrupt"}));
+
+        for phone in [DeviceScope::MOBILE, DeviceScope::MOBILE_TYPE] {
+            let phone = device(phone);
+            assert!(phone.authorize(methods::FLEET_ACTION, &interrupt).is_ok());
+            assert!(phone.authorize(methods::FLEET_ACTION, &kill).is_err());
+            assert!(
+                phone.authorize(methods::FLEET_ACTION, &untyped).is_err(),
+                "params that do not parse earn no params rule"
+            );
+        }
+        let desktop = device(DeviceScope::DESKTOP);
+        assert!(desktop.authorize(methods::FLEET_ACTION, &kill).is_ok());
+    }
+
+    /// RECONCILED S5: `terminal/attach` with `want_input` needs `mobile+type`.
+    #[test]
+    fn a_read_only_phone_attaches_to_watch_and_never_to_type() {
+        let attach = |want_input: bool| {
+            serde_json::json!({
+                "session": {"host_id": "local", "session_key": "s1"},
+                "want_input": want_input,
+            })
+        };
+        let mobile = device(DeviceScope::MOBILE);
+        assert!(mobile.authorize(methods::TERMINAL_ATTACH, &attach(false)).is_ok());
+        assert!(mobile.authorize(methods::TERMINAL_ATTACH, &attach(true)).is_err());
+        let typing = device(DeviceScope::MOBILE_TYPE);
+        assert!(typing.authorize(methods::TERMINAL_ATTACH, &attach(true)).is_ok());
+    }
+
+    /// RECONCILED C6: `ConnectionsChanged` rides the attention stream, and
+    /// only an admin (or the local operator) receives that family.
+    #[test]
+    fn only_admins_receive_the_connections_family() {
+        assert!(Caller::Operator.receives(EventFamily::Connections));
+        assert!(device(DeviceScope::DESKTOP_ADMIN).receives(EventFamily::Connections));
+        for scope in [
+            DeviceScope::DESKTOP,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::MOBILE,
+        ] {
+            assert!(
+                !device(scope).receives(EventFamily::Connections),
+                "{scope:?}"
+            );
+            assert!(device(scope).receives(EventFamily::Attention), "{scope:?}");
+        }
+    }
+
+    /// A subscribe method a scope may call must never open a stream whose
+    /// family that scope may not receive; otherwise the event filter, not the
+    /// method table, would be the only thing between a phone and the events.
+    #[test]
+    fn every_subscribe_a_scope_may_call_carries_families_it_receives() {
+        let streams: [(&str, &[EventFamily]); 5] = [
+            (
+                methods::WORKSPACE_SUBSCRIBE,
+                &[EventFamily::Workspace, EventFamily::TaskStream],
+            ),
+            (methods::ATTENTION_SUBSCRIBE, &[EventFamily::Attention]),
+            (methods::FLEET_SUBSCRIBE, &[EventFamily::Fleet]),
+            (
+                methods::FLEET_MESSAGE_SUBSCRIBE,
+                &[EventFamily::Message, EventFamily::Notification],
+            ),
+            (
+                methods::FLEET_TRANSCRIPT_SUBSCRIBE,
+                &[EventFamily::Transcript],
+            ),
+        ];
+        for scope in DEVICE_SCOPES {
+            let caller = device(scope);
+            for (method, families) in streams {
+                if caller.authorize(method, &serde_json::Value::Null).is_ok() {
+                    for family in families {
+                        assert!(
+                            caller.receives(*family),
+                            "{scope:?} may call {method} but not receive {family:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// DECISIONS (PR-0 follow-up): a device grants only when it is admin, on
+    /// top of `Grantor::may_grant`, and no device may change an admin device's
+    /// scope, so one admin desktop cannot demote another. The operator can.
+    #[test]
+    fn only_an_admin_grants_and_no_device_rescopes_an_admin() {
+        let admin = device(DeviceScope::DESKTOP_ADMIN);
+        let phone = Some(DeviceScope::MOBILE_TYPE);
+        assert!(admin.may_grant(DeviceScope::MOBILE, phone));
+        assert!(admin.may_grant(DeviceScope::MOBILE_TYPE, None));
+        assert!(
+            !admin.may_grant(DeviceScope::DESKTOP, None),
+            "DV5: desktop is operator-only"
+        );
+        assert!(!admin.may_grant(DeviceScope::DESKTOP_ADMIN, None));
+        assert!(
+            !admin.may_grant(DeviceScope::MOBILE, Some(DeviceScope::DESKTOP_ADMIN)),
+            "an admin desktop may not demote another admin"
+        );
+
+        for scope in [
+            DeviceScope::DESKTOP,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::MOBILE,
+        ] {
+            assert!(
+                !device(scope).may_grant(DeviceScope::MOBILE, phone),
+                "{scope:?} is not admin and grants nothing"
+            );
+        }
+        assert!(
+            !Caller::Pal {
+                scope_key: "channel:x".into()
+            }
+            .may_grant(DeviceScope::MOBILE, None)
+        );
+        for target in DEVICE_SCOPES {
+            assert!(Caller::Operator.may_grant(target, Some(DeviceScope::DESKTOP_ADMIN)));
+        }
+    }
+
+    /// RECONCILED S3: a unix-leg hello that carries `device` is still the
+    /// operator. The claimed device id names no principal, no answer stamp and
+    /// no actor.
+    #[tokio::test]
+    async fn a_unix_hello_that_claims_a_device_gains_no_device_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let path = ensure_socket_token(store.pool(), dir.path()).await.unwrap();
+        let token = std::fs::read_to_string(&path).unwrap().trim().to_string();
+        let hello = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": methods::AUTH_HELLO,
+            "params": {
+                "token": token,
+                "device": {"device_id": "01J0IMPOSTOR00000000000000", "display_name": "phone"}
+            }
+        }))
+        .unwrap();
+        let (_, authenticated) = authenticate_first_frame(store.pool(), &hello)
+            .await
+            .expect("the operator token authenticates");
+        assert_eq!(authenticated.caller, Caller::Operator);
+        assert_eq!(authenticated.caller.device_id(), None);
+        assert_eq!(
+            crate::rpc::mutation::principal_of(&authenticated.caller),
+            "local"
+        );
+        assert_eq!(
+            crate::answer::answered_by_caller(&authenticated.caller, None),
+            None
+        );
+    }
+
+    /// Review follow-up A: the stamp. The operator keeps its claim or the
+    /// local member; a device is always itself; the sender string matches.
+    #[tokio::test]
+    async fn the_stamp_pins_a_device_and_leaves_the_operator_alone() {
+        let agent: ActorRef = "agent:agent-1".parse().unwrap();
+        assert_eq!(Caller::Operator.stamp(Some(agent.clone())), agent);
+        assert_eq!(
+            Caller::Operator.stamp(None),
+            ainb_hangar_core::actor::local_member()
+        );
+        let laptop = device(DeviceScope::DESKTOP);
+        assert_eq!(
+            laptop.stamp(Some(agent)).to_string(),
+            "member:device:01J0DEVICE0000000000000000"
+        );
+        assert!(laptop.is_own_device_stamp(&laptop.stamp(None)));
+        assert!(!Caller::Operator.is_own_device_stamp(&Caller::Operator.stamp(None)));
+        assert_eq!(laptop.sender(), "device:01J0DEVICE0000000000000000");
+        assert_eq!(Caller::Operator.sender(), "operator");
+
+        // `acting`: the operator's claim stands, including "unattributed";
+        // anyone else is always itself.
+        assert_eq!(Caller::Operator.acting(Some(1), |_| 9), Some(1));
+        assert_eq!(Caller::Operator.acting(None, |_| 9), None);
+        assert_eq!(laptop.acting(Some(1), |_| 9), Some(9));
+        assert_eq!(laptop.acting(None, |_| 9), Some(9));
+    }
+
+    /// Lead condition (b): one reader, both spellings, one principal.
+    #[test]
+    fn both_device_spellings_read_as_one_principal() {
+        let laptop = device(DeviceScope::DESKTOP);
+        let typed = laptop.stamp(None).to_string();
+        let canonical = laptop.sender();
+        assert_eq!(device_principal(&typed), Some("01J0DEVICE0000000000000000"));
+        assert_eq!(device_principal(&typed), device_principal(&canonical));
+        for other in [
+            "operator",
+            "member:me",
+            "agent:device:x",
+            "device:",
+            "member:device:",
+        ] {
+            assert_eq!(device_principal(other), None, "{other}");
+        }
+    }
+
+    /// Lead condition (a): a member id starting `device:` is refused, so no
+    /// client-named member can collide with a device's typed stamp.
+    #[test]
+    fn a_member_id_starting_device_is_reserved() {
+        let reserved: ActorRef = "member:device:01J0LAPTOP".parse().unwrap();
+        let refused = refuse_reserved_member(&reserved).expect_err("reserved");
+        assert_eq!(refused.code, super::super::INVALID_PARAMS);
+        for fine in [
+            "member:me",
+            "member:user-1",
+            "agent:device:x",
+            "member:devices",
+        ] {
+            let actor: ActorRef = fine.parse().unwrap();
+            assert!(refuse_reserved_member(&actor).is_ok(), "{fine}");
+        }
+    }
+
+    /// Text principals too: neither spelling of a device may be claimed.
+    #[test]
+    fn a_text_principal_reading_as_a_device_is_reserved() {
+        for reserved in [
+            "device:01J0LAPTOP",
+            "member:device:01J0LAPTOP",
+            " device:x ",
+        ] {
+            assert!(refuse_reserved_text(reserved).is_err(), "{reserved}");
+        }
+        for fine in [
+            "operator",
+            "copilot",
+            "member:me",
+            "agent:device:x",
+            "device:",
+        ] {
+            assert!(refuse_reserved_text(fine).is_ok(), "{fine}");
+        }
     }
 }

@@ -77,7 +77,7 @@ use tokio::sync::{broadcast, mpsc};
 /// JSON-RPC "method not found" code (spec-reserved).
 const METHOD_NOT_FOUND: i32 = -32601;
 /// JSON-RPC "invalid params" code (spec-reserved).
-const INVALID_PARAMS: i32 = -32602;
+pub(crate) const INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC "internal error" code (spec-reserved) — used for store faults.
 const INTERNAL_ERROR: i32 = -32603;
 /// Application-defined "forbidden": the caller is well-formed and the target
@@ -754,8 +754,12 @@ where
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    subscriptions.attention =
-                        Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
+                    subscriptions.attention = Some(spawn_attention_forwarder(
+                        rx,
+                        filter,
+                        authenticated.caller.clone(),
+                        out_tx.clone(),
+                    ));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
                     if let Some(old) = subscriptions.fleet.take() {
                         old.abort();
@@ -995,6 +999,7 @@ fn attention_subscribe_filter(req: &RpcRequest) -> Option<String> {
 fn spawn_attention_forwarder(
     mut rx: broadcast::Receiver<ainb_hangar_proto::events::HangarEvent>,
     filter: Option<String>,
+    caller: auth::Caller,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     use ainb_hangar_proto::events::HangarEvent;
@@ -1002,6 +1007,13 @@ fn spawn_attention_forwarder(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // The attention stream is two families: the inbox, and the
+                    // live surface registry riding it. A device receives only
+                    // the families its scope grants, so `ConnectionsChanged`
+                    // never reaches a non-admin (RECONCILED C6).
+                    if !caller.receives(attention_stream_family(&event)) {
+                        continue;
+                    }
                     // Optional workspace narrowing: applies only to the
                     // workspace-bearing AttentionRaised. A `None`-workspace (host)
                     // event never matches a filter, so a narrowed subscription
@@ -1024,6 +1036,18 @@ fn spawn_attention_forwarder(
             }
         }
     })
+}
+
+/// The event family of one event on the attention stream.
+fn attention_stream_family(
+    event: &ainb_hangar_proto::events::HangarEvent,
+) -> ainb_hangar_proto::devices::EventFamily {
+    use ainb_hangar_proto::devices::EventFamily;
+    use ainb_hangar_proto::events::HangarEvent;
+    match event {
+        HangarEvent::ConnectionsChanged { .. } => EventFamily::Connections,
+        _ => EventFamily::Attention,
+    }
 }
 
 /// Spawn a gapless durable Fleet revision forwarder.
@@ -1426,7 +1450,7 @@ async fn dispatch_as_connection(
     connection: Option<&ConnectionRow>,
     registry: Option<&connections::ConnectionRegistry>,
 ) -> RpcResponse {
-    let result = match caller.authorize(&req.method) {
+    let result = match caller.authorize(&req.method, &req.params) {
         // Every mutation goes through the ledger guard, so "generic dedupe at
         // dispatch for every mutation" (D18) is a property of THIS line rather
         // than of ~96 hand-written transactions. A read, or a mutation whose
@@ -1561,18 +1585,22 @@ async fn handle(
         | methods::HANGAR_AUTOPILOT_COLLABORATORS
         | methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD
         | methods::HANGAR_AUTOPILOT_SUBSCRIBER_REMOVE
-        | methods::HANGAR_AUTOPILOT_SUBSCRIBERS => handle_autopilot(pool, req, events).await,
+        | methods::HANGAR_AUTOPILOT_SUBSCRIBERS => {
+            handle_autopilot(pool, req, events, caller).await
+        }
         methods::HANGAR_TASKS_LIST => handle_tasks_list(pool, req).await,
         methods::HANGAR_TASK_TRANSITION => handle_task_transition(pool, req, events).await,
         methods::HANGAR_TASK_RETRY => handle_task_retry(pool, req, events).await,
-        methods::HANGAR_ISSUE_CREATE => handle_issue_create(pool, req, events).await,
+        methods::HANGAR_ISSUE_CREATE => handle_issue_create(pool, req, events, caller).await,
         methods::HANGAR_ISSUE_DELETE => handle_issue_delete(pool, req, events).await,
         methods::HANGAR_ISSUE_CANCEL_ACTIVE => handle_issue_cancel_active(pool, req, events).await,
-        methods::HANGAR_ISSUE_UPDATE => handle_issue_update(pool, req, events).await,
+        methods::HANGAR_ISSUE_UPDATE => handle_issue_update(pool, req, events, caller).await,
         methods::HANGAR_ISSUES_BATCH_UPDATE => handle_issues_batch_update(pool, req, events).await,
         methods::HANGAR_ISSUE_LABEL_ATTACH => handle_issue_label(pool, req, events, true).await,
         methods::HANGAR_ISSUE_LABEL_DETACH => handle_issue_label(pool, req, events, false).await,
-        methods::HANGAR_ISSUE_CRITERION_SET => handle_issue_criterion_set(pool, req, events).await,
+        methods::HANGAR_ISSUE_CRITERION_SET => {
+            handle_issue_criterion_set(pool, req, events, caller).await
+        }
         // Custom property catalog + issue metadata (multica parity #17).
         methods::HANGAR_PROPERTIES_LIST => handle_properties_list(pool, req).await,
         methods::HANGAR_PROPERTY_DEFINE => handle_property_define(pool, req).await,
@@ -1590,8 +1618,10 @@ async fn handle(
         methods::HANGAR_ISSUE_METADATA_DELETE => {
             handle_issue_metadata(pool, req, events, MetaOp::Delete).await
         }
-        methods::HANGAR_COMMENT_ADD => handle_comment_add(pool, req, events).await,
-        methods::HANGAR_COMMENT_MENTION_PREVIEW => handle_comment_mention_preview(pool, req).await,
+        methods::HANGAR_COMMENT_ADD => handle_comment_add(pool, req, events, caller).await,
+        methods::HANGAR_COMMENT_MENTION_PREVIEW => {
+            handle_comment_mention_preview(pool, req, caller).await
+        }
         methods::HANGAR_AGENT_CREATE => handle_agent_create(pool, req).await,
         methods::HANGAR_AGENT_DELETE => handle_agent_delete(pool, req).await,
         methods::HANGAR_AGENT_UPDATE => handle_agent_update(pool, req).await,
@@ -1607,11 +1637,11 @@ async fn handle(
         methods::HANGAR_SQUAD_CREATE => handle_squad_create(pool, req).await,
         methods::HANGAR_SQUAD_MEMBER_ADD => handle_squad_member(pool, req, true).await,
         methods::HANGAR_SQUAD_MEMBER_REMOVE => handle_squad_member(pool, req, false).await,
-        methods::HANGAR_SQUAD_ASSIGN => handle_squad_assign(pool, req).await,
+        methods::HANGAR_SQUAD_ASSIGN => handle_squad_assign(pool, req, caller).await,
         methods::HANGAR_SQUAD_ARCHIVE => handle_squad_archive(pool, req).await,
         methods::HANGAR_SQUAD_MEMBER_ROLE_SET => handle_squad_member_role(pool, req).await,
         methods::HANGAR_SQUAD_INSTRUCTIONS_SET => handle_squad_instructions(pool, req).await,
-        methods::HANGAR_SQUAD_FANOUT => handle_squad_fanout(pool, req).await,
+        methods::HANGAR_SQUAD_FANOUT => handle_squad_fanout(pool, req, caller).await,
         methods::HANGAR_HEALTH => to_value(&health.snapshot(true)),
         methods::HANGAR_DAEMON_HEALTH => handle_daemon_health(pool, req, health).await,
         methods::HANGAR_USAGE_ROLLUP => handle_usage_rollup(pool, req).await,
@@ -1629,9 +1659,11 @@ async fn handle(
         methods::HANGAR_BOARD_COLUMN_REORDER => handle_board_column_reorder(pool, req).await,
         methods::HANGAR_BOARD_CARD_ADD => handle_board_card(pool, req, true).await,
         methods::HANGAR_BOARD_CARD_MOVE => handle_board_card(pool, req, false).await,
-        methods::HANGAR_BOARD_CARD_CREATE => handle_board_card_create(pool, req, events).await,
-        methods::HANGAR_BOARD_CARD_RUN => handle_board_card_run(pool, req).await,
-        methods::HANGAR_ISSUE_RUN => handle_issue_run(pool, req).await,
+        methods::HANGAR_BOARD_CARD_CREATE => {
+            handle_board_card_create(pool, req, events, caller).await
+        }
+        methods::HANGAR_BOARD_CARD_RUN => handle_board_card_run(pool, req, caller).await,
+        methods::HANGAR_ISSUE_RUN => handle_issue_run(pool, req, caller).await,
         methods::HANGAR_BOARD_CARD_CANCEL => handle_board_card_cancel(pool, req, events).await,
         methods::HANGAR_BOARD_CARD_REORDER => handle_board_card_reorder(pool, req).await,
         methods::HANGAR_BOARD_CARD_REMOVE => handle_board_card_remove(pool, req).await,
@@ -1642,11 +1674,13 @@ async fn handle(
         methods::HANGAR_ISSUE_LINK_ADD => handle_issue_link(pool, req, true).await,
         methods::HANGAR_ISSUE_LINK_REMOVE => handle_issue_link(pool, req, false).await,
         methods::HANGAR_ISSUE_LINKS => handle_issue_links(pool, req).await,
-        methods::HANGAR_ISSUE_SUBSCRIBE => handle_issue_subscribe(pool, req, true).await,
-        methods::HANGAR_ISSUE_UNSUBSCRIBE => handle_issue_subscribe(pool, req, false).await,
+        methods::HANGAR_ISSUE_SUBSCRIBE => handle_issue_subscribe(pool, req, caller, true).await,
+        methods::HANGAR_ISSUE_UNSUBSCRIBE => handle_issue_subscribe(pool, req, caller, false).await,
         methods::HANGAR_ISSUE_SUBSCRIBERS => handle_issue_subscribers(pool, req).await,
-        methods::HANGAR_ISSUE_REACTION_ADD => handle_issue_reaction(pool, req, true).await,
-        methods::HANGAR_ISSUE_REACTION_REMOVE => handle_issue_reaction(pool, req, false).await,
+        methods::HANGAR_ISSUE_REACTION_ADD => handle_issue_reaction(pool, req, caller, true).await,
+        methods::HANGAR_ISSUE_REACTION_REMOVE => {
+            handle_issue_reaction(pool, req, caller, false).await
+        }
         methods::HANGAR_DISPATCH_ATTEMPTS_LIST => handle_dispatch_attempts_list(pool, req).await,
         methods::HANGAR_ISSUE_TIMELINE => handle_issue_timeline(pool, req).await,
         methods::HANGAR_BOARD_CARD_SET_AUTO_RUN => handle_board_card_set_auto_run(pool, req).await,
@@ -1659,8 +1693,8 @@ async fn handle(
         // read. The ack carries its exact head, then the forwarder drains rows
         // committed after that head before waiting for live wakeups.
         methods::FLEET_SUBSCRIBE => handle_fleet_subscribe(pool, req).await,
-        methods::FLEET_ACTION => handle_fleet_action(pool, req, events).await,
-        methods::FLEET_BROADCAST => handle_fleet_broadcast(pool, req, events).await,
+        methods::FLEET_ACTION => handle_fleet_action(pool, req, events, caller).await,
+        methods::FLEET_BROADCAST => handle_fleet_broadcast(pool, req, events, caller).await,
         methods::FLEET_RECEIPT_LIST => handle_fleet_receipt_list(pool, req).await,
         methods::FLEET_RECEIPT_GET => handle_fleet_receipt_get(pool, req).await,
         methods::FLEET_START => handle_fleet_start(pool, req, events).await,
@@ -1701,7 +1735,9 @@ async fn handle(
         // `attention/subscribe` acks with the current OPEN snapshot; the live
         // fleet-wide forwarder is the stream side (see `serve_conn`).
         methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req).await,
-        methods::ATTENTION_ANSWER => handle_attention_answer(pool, req, events, connection).await,
+        methods::ATTENTION_ANSWER => {
+            handle_attention_answer(pool, req, events, caller, connection).await
+        }
         methods::ATC_REGISTER => handle_atc_register(pool, req).await,
         methods::ATC_LIST => handle_atc_list(pool).await,
         methods::ATC_RETRY_LIST => handle_atc_retry_list(pool, req).await,
@@ -1821,6 +1857,7 @@ async fn handle_fleet_action(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::fleet::FleetActionParams =
         parse_params(req, "{ session_key, expected_version, request_id, action }")?;
@@ -1838,7 +1875,8 @@ async fn handle_fleet_action(
         now_ms,
     )
     .await;
-    let receipt = match execute_fleet_action(pool, params, None, events).await {
+    let receipt = match execute_fleet_action_as(pool, params, None, events, &caller.sender()).await
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             mutation::mark_active_receipt(
@@ -2295,6 +2333,15 @@ async fn handle_fleet_message_send(
             }
         }
     }
+    // A paired device is pinned the same way, to the id its credential names
+    // (RECONCILED T12, S2): a phone that could write `actor: "operator"` would
+    // post as the human. Pinned, not validated: whatever it sent is replaced.
+    // Anyone else may not claim a device principal in either spelling.
+    if let Some(device_id) = caller.device_id() {
+        params.actor = Some(format!("device:{device_id}"));
+    } else if let Some(claimed) = params.actor.as_deref() {
+        auth::refuse_reserved_text(claimed)?;
+    }
     let span = tracing::info_span!(
         "fleet.message.send",
         request_id = %params.request_id,
@@ -2551,7 +2598,7 @@ async fn message_send_inner(
                 .origin_message_id
                 .as_deref()
                 .map(|origin| origin.trim().to_string()),
-            sender,
+            sender: sender.clone(),
             kind: "user".to_string(),
             body: params.text.clone(),
             created_at: SystemClock.now_ms(),
@@ -2620,6 +2667,7 @@ async fn message_send_inner(
             session_key,
             &params.text,
             events,
+            &sender,
         )
         .await;
         // A store fault while recording the outcome downgrades THIS leg to
@@ -2710,6 +2758,7 @@ async fn deliver_message_leg(
     session_key: &str,
     text: &str,
     events: &EventSink,
+    sender: &str,
 ) -> (
     ainb_hangar_proto::fleet::ActionReceiptStatus,
     Option<String>,
@@ -2773,7 +2822,7 @@ async fn deliver_message_leg(
             return (status, detail);
         }
         let sent_version = session.version;
-        let receipt = execute_fleet_action(
+        let receipt = execute_fleet_action_as(
             pool,
             FleetActionParams {
                 session_key: session_key.to_string(),
@@ -2786,6 +2835,7 @@ async fn deliver_message_leg(
             },
             None,
             events,
+            sender,
         )
         .await;
         match receipt {
@@ -4455,6 +4505,7 @@ async fn handle_fleet_broadcast(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use std::collections::HashSet;
     use tokio::sync::Semaphore;
@@ -4482,6 +4533,7 @@ async fn handle_fleet_broadcast(
         let idempotency_key = params.idempotency_key.clone();
         let limit = limit.clone();
         let events = events.clone();
+        let sender = caller.sender();
         tasks.push(async move {
             let request_id = format!(
                 "broadcast:{}",
@@ -4517,7 +4569,7 @@ async fn handle_fleet_broadcast(
                     .await
                 {
                     Ok(Some(session)) => {
-                        execute_fleet_action(
+                        execute_fleet_action_as(
                             &pool,
                             ainb_hangar_proto::fleet::FleetActionParams {
                                 session_key,
@@ -4530,6 +4582,7 @@ async fn handle_fleet_broadcast(
                             },
                             Some(idempotency_key),
                             &events,
+                            &sender,
                         )
                         .await
                     }
@@ -4608,11 +4661,30 @@ async fn rejected_broadcast_receipt(
 /// `pub(crate)` for the daemon's own senders (the message bus legs, the retry
 /// sweep). Every guard above lives here, so a second send path inside the
 /// daemon is a second, weaker set of guards.
+/// The sender of a prompt the daemon sends on its own account (the retry
+/// sweep's `continue`): no request and no caller stand behind it.
+const DAEMON_SENDER: &str = "operator";
+
+/// [`execute_fleet_action_as`] for the daemon's OWN actions only (the retry
+/// sweep). Every RPC entry point calls `execute_fleet_action_as` with its
+/// caller's sender instead, so a device's prompt is never attributed here.
 pub(crate) async fn execute_fleet_action(
     pool: &SqlitePool,
     params: ainb_hangar_proto::fleet::FleetActionParams,
     idempotency_key: Option<String>,
     events: &EventSink,
+) -> Result<ainb_hangar_proto::fleet::FleetActionReceipt, RpcError> {
+    execute_fleet_action_as(pool, params, idempotency_key, events, DAEMON_SENDER).await
+}
+
+/// Execute one fleet action as `sender`, the identity an ACP prompt is
+/// enqueued under.
+pub(crate) async fn execute_fleet_action_as(
+    pool: &SqlitePool,
+    params: ainb_hangar_proto::fleet::FleetActionParams,
+    idempotency_key: Option<String>,
+    events: &EventSink,
+    sender: &str,
 ) -> Result<ainb_hangar_proto::fleet::FleetActionReceipt, RpcError> {
     use ainb_hangar_proto::fleet::{ActionReceiptStatus, ControlAction};
     use ainb_hangar_store::repo::fleet::{FleetRepo, NewActionReceipt};
@@ -4802,7 +4874,7 @@ pub(crate) async fn execute_fleet_action(
         // Without this arm a `SendPrompt` would fall into `verified_tmux_send`
         // and report "exact tmux process identity is unavailable" for a session
         // that has no tmux pane by design.
-        execute_acp_action(pool, &session, &params.action).await
+        execute_acp_action(pool, &session, &params.action, sender).await
     } else {
         if session.provider == "codex" {
             match crate::fleet_provider::codex_manager::active_handle().await {
@@ -6811,6 +6883,7 @@ async fn execute_acp_action(
     pool: &SqlitePool,
     session: &ainb_hangar_store::repo::fleet::FleetSessionRow,
     action: &ainb_hangar_proto::fleet::ControlAction,
+    sender: &str,
 ) -> (
     ainb_hangar_proto::fleet::ActionReceiptStatus,
     Option<String>,
@@ -6833,7 +6906,9 @@ async fn execute_acp_action(
             // An operator prompt joins the SAME bus a chat message does, so it
             // gets a message row, a delivery leg, and a threaded reply rather
             // than a turn nothing can correlate afterwards.
-            match crate::acp_session::enqueue(pool, &session.session_key, "operator", text).await {
+            // The prompt's sender is whoever asked for it, passed down from
+            // the caller by every entry point (no fallback).
+            match crate::acp_session::enqueue(pool, &session.session_key, sender, text).await {
                 Ok(message_id) => {
                     let outcome = acp.submit_prompt(&session.session_key, &message_id, text).await;
                     match outcome {
@@ -7686,11 +7761,10 @@ async fn handle_issue_create(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_proto::events::HangarEvent;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::IssueCreateParams = parse_params(
         req,
@@ -7702,11 +7776,7 @@ async fn handle_issue_create(
     if params.title.trim().is_empty() {
         return Err(invalid_params("issue title must not be empty"));
     }
-    let creator = ActorRef::from_str(&params.creator).map_err(|e| {
-        invalid_params(&format!(
-            "creator must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let creator = caller.stamp(Some(parse_actor(&params.creator, "creator")?));
     // 0043: an upstream link is optional; a blank one links nothing (stored NULL).
     let external_ref = params.external_ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // 0046: an optional parent makes the new issue a sub-issue. Validate the parent
@@ -8187,6 +8257,7 @@ async fn handle_issue_update(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_proto::events::HangarEvent;
 
@@ -8300,7 +8371,7 @@ async fn handle_issue_update(
                 .await
                 .map_err(|e| store_err(&e))?
         {
-            let actor = acting_actor(pool).await;
+            let actor = activity_actor(pool, caller).await;
             ActivityService::record_issue_diff(
                 pool,
                 &SystemIdGen,
@@ -8410,19 +8481,13 @@ async fn handle_issue_update(
 fn issue_field_update_from_params(
     params: &ainb_hangar_proto::snapshots::IssueUpdateParams,
 ) -> Result<ainb_hangar_store::repo::issue::IssueFieldUpdate, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_proto::snapshots::FieldUpdate;
-    use std::str::FromStr as _;
 
     let assignee = match &params.assignee {
         FieldUpdate::Keep => None,
         FieldUpdate::Clear => Some(None),
         FieldUpdate::Set(raw) => {
-            let actor = ActorRef::from_str(raw).map_err(|e| {
-                invalid_params(&format!(
-                    "assignee must be `agent:<id>` or `member:<id>`: {e}"
-                ))
-            })?;
+            let actor = parse_actor(raw, "assignee")?;
             Some(Some(actor))
         }
     };
@@ -8520,6 +8585,7 @@ async fn handle_issue_criterion_set(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::clock::{HangarClock as _, SystemClock};
     use ainb_hangar_core::idgen::SystemIdGen;
@@ -8533,6 +8599,12 @@ async fn handle_issue_criterion_set(
     if params.criterion.trim().is_empty() {
         return Err(invalid_params("criterion must not be empty"));
     }
+    // `checked_by` is free text: the operator's value stands, a device is its
+    // canonical `device:<id>`.
+    if let Some(claimed) = params.actor.as_deref() {
+        auth::refuse_reserved_text(claimed)?;
+    }
+    let checked_by = caller.acting(params.actor.clone(), auth::Caller::sender);
     let row = snapshots::issue_criterion_set(
         pool,
         &SystemIdGen,
@@ -8541,7 +8613,7 @@ async fn handle_issue_criterion_set(
         params.criterion.trim(),
         params.checked,
         SystemClock.now_ms(),
-        params.actor.as_deref(),
+        checked_by.as_deref(),
     )
     .await
     .map_err(|e| criterion_repo_err(&e))?;
@@ -8602,11 +8674,10 @@ async fn handle_comment_add(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_proto::events::HangarEvent;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::CommentAddParams =
         parse_params(req, "{ workspace_id, issue_id, author, body }")?;
@@ -8616,11 +8687,7 @@ async fn handle_comment_add(
     if params.body.trim().is_empty() {
         return Err(invalid_params("comment body must not be empty"));
     }
-    let author = ActorRef::from_str(&params.author).map_err(|e| {
-        invalid_params(&format!(
-            "author must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let author = caller.stamp(Some(parse_actor(&params.author, "author")?));
     let row = snapshots::comment_add(
         pool,
         &SystemIdGen,
@@ -8711,10 +8778,9 @@ async fn handle_comment_add(
 async fn handle_comment_mention_preview(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::SystemIdGen;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::CommentMentionPreviewParams =
         parse_params(req, "{ workspace_id, issue_id, author, body, parent_id? }")?;
@@ -8722,11 +8788,7 @@ async fn handle_comment_mention_preview(
     if params.body.trim().is_empty() {
         return Err(invalid_params("comment body must not be empty"));
     }
-    let author = ActorRef::from_str(&params.author).map_err(|e| {
-        invalid_params(&format!(
-            "author must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let author = caller.stamp(Some(parse_actor(&params.author, "author")?));
     let mention_outcomes = snapshots::route_comment_mentions(
         pool,
         &SystemIdGen,
@@ -9359,10 +9421,8 @@ async fn handle_squad_create(
     pool: &SqlitePool,
     req: &RpcRequest,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::{IdGen, SystemIdGen};
     use ainb_hangar_store::repo::squad::SquadRepo;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::SquadCreateParams =
         parse_params(req, "{ workspace_id, name, leader }")?;
@@ -9372,11 +9432,7 @@ async fn handle_squad_create(
     if params.name.trim().is_empty() {
         return Err(invalid_params("squad name must not be empty"));
     }
-    let leader = ActorRef::from_str(&params.leader).map_err(|e| {
-        invalid_params(&format!(
-            "leader must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let leader = parse_actor(&params.leader, "leader")?;
     let id = SystemIdGen.new_ulid();
     SquadRepo::create(pool, &ws, &id, &params.name, &leader, SystemClock.now_ms())
         .await
@@ -9407,18 +9463,12 @@ async fn handle_squad_member(
     req: &RpcRequest,
     add: bool,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_store::repo::squad::SquadRepo;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::SquadMemberParams =
         parse_params(req, "{ workspace_id, squad_id, member }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let member = ActorRef::from_str(&params.member).map_err(|e| {
-        invalid_params(&format!(
-            "member must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let member = parse_actor(&params.member, "member")?;
     let outcome = if add {
         // An explicit role is explicit intent, so it OVERWRITES on a re-add
         // (parity #25). An omitted / empty role keeps today's exact behavior for
@@ -9483,18 +9533,12 @@ async fn handle_squad_member_role(
     pool: &SqlitePool,
     req: &RpcRequest,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_store::repo::squad::SquadRepo;
-    use std::str::FromStr as _;
 
     let params: ainb_hangar_proto::snapshots::SquadMemberRoleParams =
         parse_params(req, "{ workspace_id, squad_id, member, role }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let member = ActorRef::from_str(&params.member).map_err(|e| {
-        invalid_params(&format!(
-            "member must be `agent:<id>` or `member:<id>`: {e}"
-        ))
-    })?;
+    let member = parse_actor(&params.member, "member")?;
     let updated = SquadRepo::set_member_role(pool, &ws, &params.squad_id, &member, &params.role)
         .await
         .map_err(|e| squad_repo_err(&e))?;
@@ -9583,6 +9627,7 @@ async fn squad_assign_generation(
 async fn handle_squad_assign(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_store::service::squad_assign::{
@@ -9598,7 +9643,8 @@ async fn handle_squad_assign(
     // gap #8: an optional invoker identity. Omitted (`None`) defaults to the
     // workspace owner inside the service — the ordinary single-operator assign,
     // which the gate always admits.
-    let invoker = params.invoker_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let invoker = acting_user_id(caller, params.invoker_user_id.as_deref())?;
+    let invoker = invoker.as_deref();
     let request = SquadAssignRequest {
         issue_id: params.issue_id.as_deref(),
         work_dir: params.work_dir.as_deref(),
@@ -9644,6 +9690,7 @@ async fn handle_squad_assign(
 async fn handle_squad_fanout(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_store::service::squad_assign::{
@@ -9659,7 +9706,8 @@ async fn handle_squad_fanout(
     // gap #8: an optional invoker identity. Omitted (`None`) defaults to the
     // workspace owner inside the service — the ordinary single-operator assign,
     // which the gate always admits.
-    let invoker = params.invoker_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let invoker = acting_user_id(caller, params.invoker_user_id.as_deref())?;
+    let invoker = invoker.as_deref();
     let request = SquadAssignRequest {
         issue_id: params.issue_id.as_deref(),
         work_dir: params.work_dir.as_deref(),
@@ -10040,8 +10088,8 @@ async fn handle_board_card_create(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::{ActorKind, ActorRef};
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_proto::events::HangarEvent;
     use ainb_hangar_store::repo::board::BoardRepo;
@@ -10078,9 +10126,9 @@ async fn handle_board_card_create(
         }
     }
 
-    // The TUI user owns cards it creates — mirror the plugin's `SELF_AUTHOR_REF`.
-    let creator = ActorRef::new(ActorKind::Member, "me")
-        .map_err(|e| internal(&format!("build creator ref: {e}")))?;
+    // The TUI user owns cards it creates (the plugin's `SELF_AUTHOR_REF`,
+    // `member:me`); a paired device owns the cards IT creates.
+    let creator = caller.stamp(None);
     // Mint the issue through the SAME helper `issue_create` uses, so a card-made
     // issue gets the workspace's issue prefix, its `manual` origin stamp and the
     // same row shape `issue_create` answers and pushes (the `Created` activity
@@ -10236,6 +10284,7 @@ async fn resolve_card_repo_ref(ainb_dir: &Path, repo_ref: &str) -> Result<String
 async fn handle_board_card_run(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::agent_kind::AgentKind;
     use ainb_hangar_store::repo::issue::IssueRepo;
@@ -10286,7 +10335,7 @@ async fn handle_board_card_run(
         // gap #8: an optional invoker identity, parsed exactly as `handle_issue_run`
         // does. Omitted (`None`) defaults to the workspace owner inside `run_card` —
         // the ordinary single-operator TUI Run, which the gate always admits.
-        params.invoker_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        acting_user_id(caller, params.invoker_user_id.as_deref())?.as_deref(),
         DispatchSource::Manual,
     )
     .await
@@ -10346,6 +10395,7 @@ async fn handle_board_card_run(
 async fn handle_issue_run(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::agent_kind::AgentKind;
     use ainb_hangar_store::repo::issue::IssueRepo;
@@ -10410,12 +10460,15 @@ async fn handle_issue_run(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<ainb_hangar_core::actor::ActorRef>().ok());
+        .and_then(|s| s.parse::<ainb_hangar_core::actor::ActorRef>().ok())
+        .map(|actor| auth::refuse_reserved_member(&actor).map(|()| actor))
+        .transpose()?;
     // gap #8: an optional invoker identity. Omitted (`None`) defaults to the
     // workspace owner inside `run_card` — the ordinary single-operator Run, which
     // the gate always admits. A multi-user caller (or a test) can name a non-owner
     // member here to be gated against the agent's allow-list.
-    let invoker = params.invoker_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let invoker = acting_user_id(caller, params.invoker_user_id.as_deref())?;
+    let invoker = invoker.as_deref();
     let outcome = run_card(
         pool,
         &ws,
@@ -11358,9 +11411,66 @@ async fn issue_links_value(
 fn resolve_actor_param(raw: Option<&str>) -> Result<ActorRef, RpcError> {
     match raw {
         None => Ok(ainb_hangar_core::actor::local_member()),
-        Some(token) => ActorRef::from_str(token)
-            .map_err(|e| invalid_params(&format!("bad actor `{token}`: {e}"))),
+        Some(token) => {
+            let actor = ActorRef::from_str(token)
+                .map_err(|e| invalid_params(&format!("bad actor `{token}`: {e}")))?;
+            auth::refuse_reserved_member(&actor)?;
+            Ok(actor)
+        }
     }
+}
+
+/// Parse a client-named actor ref, refusing a member id reserved for paired
+/// devices ([`auth::refuse_reserved_member`]). The one parser for every
+/// `creator`, `author`, `assignee`, `leader` and `member` a request names.
+fn parse_actor(raw: &str, what: &str) -> Result<ActorRef, RpcError> {
+    let actor = ActorRef::from_str(raw).map_err(|e| {
+        invalid_params(&format!(
+            "{what} must be `agent:<id>` or `member:<id>`: {e}"
+        ))
+    })?;
+    auth::refuse_reserved_member(&actor)?;
+    Ok(actor)
+}
+
+/// The acting actor of an attributed write: whom an autopilot write gate
+/// checks and whom a fire records. The operator's claimed `actor_user_id`
+/// stands (`None` stays its legacy "unattributed"); a paired device is ALWAYS
+/// itself, never `None` and never the claim, so it can neither pose as the
+/// rule owner nor slip through the gate's unattributed allow.
+fn acting_actor(
+    caller: &auth::Caller,
+    actor_user_id: Option<&str>,
+) -> Result<Option<ActorRef>, RpcError> {
+    Ok(caller.acting(member_actor(actor_user_id)?, |c| c.stamp(None)))
+}
+
+/// The same rule for a bare user id (`invoker_user_id`, which the agent
+/// allow-list gate reads and which defaults to the workspace owner when
+/// omitted): the operator's trimmed claim, else the device's stamped id.
+fn acting_user_id(
+    caller: &auth::Caller,
+    claimed: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let claimed = claimed.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(id) = claimed {
+        if id.starts_with(auth::DEVICE_PRINCIPAL_PREFIX) {
+            return Err(invalid_params(&format!(
+                "user ids starting `{}` are reserved for paired devices",
+                auth::DEVICE_PRINCIPAL_PREFIX
+            )));
+        }
+    }
+    Ok(caller.acting(claimed.map(ToString::to_string), |c| {
+        c.stamp(None).id().to_string()
+    }))
+}
+
+/// [`resolve_actor_param`] through the caller's stamp: the operator's named
+/// (or defaulted) actor stands; a device always acts as itself.
+fn stamped_actor_param(caller: &auth::Caller, raw: Option<&str>) -> Result<ActorRef, RpcError> {
+    let claimed = resolve_actor_param(raw)?;
+    Ok(caller.stamp(Some(claimed)))
 }
 
 /// The reference's `isWorkspaceEntity` gate (its `403`): the target must belong
@@ -11415,6 +11525,7 @@ async fn reject_actor_outside_workspace(
 async fn handle_issue_subscribe(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: bool,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::issue_subscriber::{IssueSubscriberRepo, SubscribeReason};
@@ -11422,8 +11533,10 @@ async fn handle_issue_subscribe(
     let params: ainb_hangar_proto::snapshots::IssueSubscribeParams =
         parse_params(req, "{ workspace_id, issue_id, actor? }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let actor = resolve_actor_param(params.actor.as_deref())?;
-    reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    let actor = stamped_actor_param(caller, params.actor.as_deref())?;
+    if !caller.is_own_device_stamp(&actor) {
+        reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    }
 
     let already = IssueSubscriberRepo::is_subscribed(pool, &params.issue_id, &actor)
         .await
@@ -11481,6 +11594,7 @@ async fn handle_issue_subscribers(
 async fn handle_issue_reaction(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: bool,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::issue_reaction::{IssueReactionError, IssueReactionRepo};
@@ -11488,8 +11602,10 @@ async fn handle_issue_reaction(
     let params: ainb_hangar_proto::snapshots::IssueReactionParams =
         parse_params(req, "{ workspace_id, issue_id, emoji, actor? }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let actor = resolve_actor_param(params.actor.as_deref())?;
-    reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    let actor = stamped_actor_param(caller, params.actor.as_deref())?;
+    if !caller.is_own_device_stamp(&actor) {
+        reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    }
     if !issue_in_workspace(pool, ws.as_str(), &params.issue_id).await? {
         return Err(invalid_params(&format!(
             "no issue `{}` in this workspace",
@@ -11623,9 +11739,16 @@ async fn handle_dispatch_attempts_list(
 /// faults) the row is a `system` fact rather than a fabricated member. When
 /// per-request actor identity lands (parity #1's member work), swap this body —
 /// no call site changes.
-async fn acting_actor(pool: &SqlitePool) -> ainb_hangar_core::activity::ActivityActor {
-    let owner = ainb_hangar_store::bootstrap::default_owner_id(pool).await.ok().flatten();
-    ainb_hangar_core::activity::ActivityActor::member_or_system(owner.as_deref())
+async fn activity_actor(
+    pool: &SqlitePool,
+    caller: &auth::Caller,
+) -> ainb_hangar_core::activity::ActivityActor {
+    if matches!(caller, auth::Caller::Operator) {
+        let owner = ainb_hangar_store::bootstrap::default_owner_id(pool).await.ok().flatten();
+        return ainb_hangar_core::activity::ActivityActor::member_or_system(owner.as_deref());
+    }
+    // Anyone else is recorded as themselves, never as the workspace owner.
+    ainb_hangar_core::activity::ActivityActor::Actor(caller.stamp(None))
 }
 
 /// `hangar/issue_timeline` (multica parity #13): one card's merged activity +
@@ -12368,6 +12491,7 @@ async fn handle_autopilot(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
         methods::HANGAR_AUTOPILOTS_LIST => {
@@ -12398,7 +12522,7 @@ async fn handle_autopilot(
                 parse_params(req, "{ workspace_id, autopilot_id }")?;
             let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
             let id = autopilot_id(&params.autopilot_id)?;
-            let actor = member_actor(params.actor_user_id.as_deref());
+            let actor = acting_actor(caller, params.actor_user_id.as_deref())?;
             let fired = snapshots::autopilot_fire_now(pool, &SystemClock, &ws, &id, actor.as_ref())
                 .await
                 .map_err(|e| internal(&format!("autopilot fire: {e}")))?;
@@ -12419,7 +12543,7 @@ async fn handle_autopilot(
                 parse_params(req, "{ workspace_id, autopilot_id, enabled }")?;
             let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
             let id = autopilot_id(&params.autopilot_id)?;
-            let actor = member_actor(params.actor_user_id.as_deref());
+            let actor = acting_actor(caller, params.actor_user_id.as_deref())?;
             // multica parity #27: the restricted-mode write gate, at the
             // request seam, after the tenant guard + actor resolution and
             // BEFORE the repo seam.
@@ -12514,7 +12638,7 @@ async fn handle_autopilot(
                 parse_params(req, "{ workspace_id, autopilot_id, enabled }")?;
             let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
             let id = autopilot_id(&params.autopilot_id)?;
-            let actor = member_actor(params.actor_user_id.as_deref());
+            let actor = acting_actor(caller, params.actor_user_id.as_deref())?;
             // multica parity #27: the restricted-mode write gate, at the
             // request seam, after the tenant guard + actor resolution and
             // BEFORE the repo seam.
@@ -12548,7 +12672,7 @@ async fn handle_autopilot(
                 parse_params(req, "{ workspace_id, autopilot_id, ...editable fields }")?;
             let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
             let id = autopilot_id(&params.autopilot_id)?;
-            let actor = member_actor(params.actor_user_id.as_deref());
+            let actor = acting_actor(caller, params.actor_user_id.as_deref())?;
             // multica parity #27: the restricted-mode write gate, at the
             // request seam, after the tenant guard + actor resolution and
             // BEFORE the repo seam.
@@ -12652,7 +12776,7 @@ async fn handle_autopilot(
                 parse_params(req, "{ workspace_id, autopilot_id, access_mode }")?;
             let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
             let id = autopilot_id(&params.autopilot_id)?;
-            let actor = member_actor(params.actor_user_id.as_deref());
+            let actor = acting_actor(caller, params.actor_user_id.as_deref())?;
             // A typo must never quietly leave a rule world-writable, so this
             // one token is validated rather than tolerantly coerced.
             let mode = match params.access_mode.as_str() {
@@ -12705,21 +12829,23 @@ async fn handle_autopilot(
             to_value(&result)
         }
         methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD => {
-            handle_autopilot_collaborator(pool, req, Some(true)).await
+            handle_autopilot_collaborator(pool, req, caller, Some(true)).await
         }
         methods::HANGAR_AUTOPILOT_COLLABORATOR_REMOVE => {
-            handle_autopilot_collaborator(pool, req, Some(false)).await
+            handle_autopilot_collaborator(pool, req, caller, Some(false)).await
         }
         methods::HANGAR_AUTOPILOT_COLLABORATORS => {
-            handle_autopilot_collaborator(pool, req, None).await
+            handle_autopilot_collaborator(pool, req, caller, None).await
         }
         methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD => {
-            handle_autopilot_subscriber(pool, req, Some(true)).await
+            handle_autopilot_subscriber(pool, req, caller, Some(true)).await
         }
         methods::HANGAR_AUTOPILOT_SUBSCRIBER_REMOVE => {
-            handle_autopilot_subscriber(pool, req, Some(false)).await
+            handle_autopilot_subscriber(pool, req, caller, Some(false)).await
         }
-        methods::HANGAR_AUTOPILOT_SUBSCRIBERS => handle_autopilot_subscriber(pool, req, None).await,
+        methods::HANGAR_AUTOPILOT_SUBSCRIBERS => {
+            handle_autopilot_subscriber(pool, req, caller, None).await
+        }
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown autopilot method: {other}"),
@@ -12779,6 +12905,7 @@ async fn autopilot_write_gate(
 async fn autopilot_actor_target(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<(WorkspaceId, AutopilotId, ActorRef, Option<ActorRef>), RpcError> {
     let params: ainb_hangar_proto::snapshots::AutopilotActorParams = parse_params(
         req,
@@ -12797,7 +12924,10 @@ async fn autopilot_actor_target(
         )));
     }
     let target = resolve_actor_param(params.actor.as_deref())?;
-    let acting = member_actor(params.actor_user_id.as_deref());
+    // The acting actor is who the write gate checks. The operator's claimed
+    // `actor_user_id` stands (unchanged); a device is always itself, so it can
+    // never pass the gate as a collaborator it is not.
+    let acting = acting_actor(caller, params.actor_user_id.as_deref())?;
     Ok((ws, id, target, acting))
 }
 
@@ -12810,11 +12940,12 @@ async fn autopilot_actor_target(
 async fn handle_autopilot_collaborator(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: Option<bool>,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::autopilot_access::{AutopilotCollaboratorRepo, CollaboratorRole};
 
-    let (ws, id, target, acting) = autopilot_actor_target(pool, req).await?;
+    let (ws, id, target, acting) = autopilot_actor_target(pool, req, caller).await?;
     if let Some(add) = add {
         autopilot_write_gate(pool, &ws, &id, acting.as_ref()).await?;
         let params: ainb_hangar_proto::snapshots::AutopilotActorParams =
@@ -12859,11 +12990,12 @@ async fn handle_autopilot_collaborator(
 async fn handle_autopilot_subscriber(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: Option<bool>,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::autopilot_access::AutopilotSubscriberRepo;
 
-    let (ws, id, target, acting) = autopilot_actor_target(pool, req).await?;
+    let (ws, id, target, acting) = autopilot_actor_target(pool, req, caller).await?;
     if let Some(add) = add {
         autopilot_write_gate(pool, &ws, &id, acting.as_ref()).await?;
         if add {
@@ -12924,10 +13056,18 @@ async fn autopilot_subscribers_value(
 /// Trims and empty-filters exactly like the `invoker_user_id` handling, so a
 /// caller sending `""` is treated as "no actor" rather than minting a bogus
 /// ref. `None` means UNATTRIBUTED — an honest unknown, never a fabricated human.
-fn member_actor(user_id: Option<&str>) -> Option<ainb_hangar_core::actor::ActorRef> {
-    user_id.map(str::trim).filter(|s| !s.is_empty()).and_then(|id| {
+///
+/// An id starting `device:` is reserved for paired devices and refused.
+fn member_actor(
+    user_id: Option<&str>,
+) -> Result<Option<ainb_hangar_core::actor::ActorRef>, RpcError> {
+    let actor = user_id.map(str::trim).filter(|s| !s.is_empty()).and_then(|id| {
         ainb_hangar_core::actor::ActorRef::new(ainb_hangar_core::actor::ActorKind::Member, id).ok()
-    })
+    });
+    if let Some(actor) = &actor {
+        auth::refuse_reserved_member(actor)?;
+    }
+    Ok(actor)
 }
 
 /// Dispatch `hangar/daemon_health` (P8.5).
@@ -12957,11 +13097,15 @@ async fn handle_daemon_health(
 fn inbox_recipient(param: Option<&str>) -> Result<ActorRef, RpcError> {
     match param {
         None => Ok(local_member()),
-        Some(raw) => raw.parse::<ActorRef>().map_err(|e| {
-            invalid_params(&format!(
-                "recipient must be 'member:<id>' or 'agent:<id>': {e}"
-            ))
-        }),
+        Some(raw) => {
+            let actor = raw.parse::<ActorRef>().map_err(|e| {
+                invalid_params(&format!(
+                    "recipient must be 'member:<id>' or 'agent:<id>': {e}"
+                ))
+            })?;
+            auth::refuse_reserved_member(&actor)?;
+            Ok(actor)
+        }
     }
 }
 
@@ -13080,12 +13224,13 @@ async fn handle_attention_answer(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
     connection: Option<&ConnectionRow>,
 ) -> Result<serde_json::Value, RpcError> {
     let mut params: ainb_hangar_proto::snapshots::AnswerParams =
         parse_params(req, "{ attention_id, answer, answered_by, is_answer? }")?;
-    if let Some(connection) = connection {
-        params.answered_by = crate::answer::answered_by(connection);
+    if let Some(stamp) = crate::answer::answered_by_caller(caller, connection) {
+        params.answered_by = stamp;
     }
     let result = crate::answer::answer(pool, events, &params, SystemClock.now_ms())
         .await
@@ -14234,6 +14379,843 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    /// RECONCILED C6: `ConnectionsChanged` rides the attention stream, so the
+    /// attention forwarder drops it for a device without the Connections
+    /// family and still forwards the inbox events around it. An admin gets it.
+    #[tokio::test]
+    async fn connections_changed_never_reaches_a_non_admin_device() {
+        use ainb_hangar_proto::devices::DeviceScope;
+        use ainb_hangar_proto::events::HangarEvent;
+
+        async fn forwarded(scope: DeviceScope) -> Vec<String> {
+            let (tx, rx) = broadcast::channel(8);
+            let (out_tx, mut out_rx) = mpsc::channel(8);
+            let caller = auth::Caller::Device {
+                device_id: "01J0DEVICE".to_string(),
+                scope,
+            };
+            let forwarder = spawn_attention_forwarder(rx, None, caller, out_tx);
+            tx.send(HangarEvent::ConnectionsChanged {
+                connections: Vec::new(),
+            })
+            .unwrap();
+            tx.send(HangarEvent::AttentionAnswered {
+                attention_id: "a1".to_string(),
+                by: "tui@host".to_string(),
+            })
+            .unwrap();
+            drop(tx);
+            let mut kinds = Vec::new();
+            while let Some(frame) = out_rx.recv().await {
+                let text = String::from_utf8(frame).unwrap();
+                let body = &text[text.find("\r\n\r\n").unwrap() + 4..];
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                kinds.push(value["params"]["event"].as_str().unwrap().to_string());
+            }
+            forwarder.await.unwrap();
+            kinds
+        }
+
+        for scope in [
+            DeviceScope::DESKTOP,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::MOBILE,
+        ] {
+            assert_eq!(forwarded(scope).await, ["attention_answered"], "{scope:?}");
+        }
+        assert_eq!(
+            forwarded(DeviceScope::DESKTOP_ADMIN).await,
+            ["connections_changed", "attention_answered"]
+        );
+    }
+
+    /// RECONCILED T12/S2: a device's `fleet/message_send` is written as
+    /// `device:<id>`, whatever `actor` it sent, the operator's name included.
+    #[tokio::test]
+    async fn a_device_message_is_pinned_to_its_own_actor() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let sent = dispatch_as(
+            store.pool(),
+            &req(
+                methods::FLEET_MESSAGE_SEND,
+                serde_json::json!({
+                    "actor": "operator",
+                    "targets": ["s1"],
+                    "text": "status?",
+                    "request_id": "req-phone",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &phone,
+        )
+        .await;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let message_id = sent.result.as_ref().unwrap()["message_id"].as_str().unwrap().to_string();
+        let sender: String = sqlx::query_scalar("SELECT sender FROM fleet_message WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sender, "device:01J0PHONE");
+    }
+
+    /// The proto field names that say WHO acts, which a request could fill in
+    /// for itself.
+    const ACTOR_FIELD_NAMES: &[&str] = &[
+        "actor",
+        "author",
+        "creator",
+        "actor_user_id",
+        "created_by",
+        "invoker_user_id",
+        "answered_by",
+        "sender",
+        "by",
+        "checked_by",
+        "user_id",
+        "recipient",
+        "leader",
+        "member",
+        "assignee",
+    ];
+
+    /// How the daemon treats one actor-named proto field.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ActorField {
+        /// A row or entry the daemon writes and returns: never client input.
+        Output,
+        /// WHOM the call is about (a subscriber to add, a collaborator), not
+        /// who is acting; a client choice, but a reserved `device:` member is
+        /// refused.
+        Target,
+        /// Accepted on the wire and never read by the handler.
+        Unread,
+        /// Who acts, driven through these methods as a device.
+        Acting(&'static [&'static str]),
+        /// A bare user id the agent allow-list gate reads; stamped through
+        /// `acting_user_id` (proved in `acting_user_id_pins_a_device`).
+        InvokerGate,
+        /// Overwritten by the named daemon helper before any write, whatever
+        /// the client sent; the helper's own test proves the device arm.
+        Pinned(&'static str),
+    }
+
+    /// Every actor-named proto field, classified. NO default:
+    /// `every_actor_named_proto_field_is_classified` fails until a new one is
+    /// added here, so a new method cannot slip past the stamp.
+    const ACTOR_FIELDS: &[(&str, &str, ActorField)] = &[
+        ("IssueRow", "creator", ActorField::Output),
+        ("IssueSubscriberRow", "actor", ActorField::Output),
+        ("CommentRow", "author", ActorField::Output),
+        ("AutopilotCollaboratorEntry", "actor", ActorField::Output),
+        (
+            "AutopilotCollaboratorEntry",
+            "created_by",
+            ActorField::Output,
+        ),
+        ("AutopilotSubscriberEntry", "actor", ActorField::Output),
+        ("AutopilotSubscriberEntry", "created_by", ActorField::Output),
+        ("AutopilotActorParams", "actor", ActorField::Target),
+        ("IssueRow", "assignee", ActorField::Output),
+        ("InboxEntryRow", "recipient", ActorField::Output),
+        ("FleetMessage", "sender", ActorField::Output),
+        ("CorpusRow", "sender", ActorField::Output),
+        ("MemberWireRow", "user_id", ActorField::Output),
+        ("SquadWireRow", "leader", ActorField::Output),
+        ("SquadMemberWireRow", "member", ActorField::Output),
+        ("SquadFanoutResult", "leader", ActorField::Output),
+        ("HangarEvent::AttentionAnswered", "by", ActorField::Output),
+        ("AnswerResult::AlreadyAnswered", "by", ActorField::Output),
+        ("InboxScopedParams", "recipient", ActorField::Target),
+        ("IssueUpdateParams", "assignee", ActorField::Target),
+        ("IssueRunParams", "assignee", ActorField::Target),
+        ("MemberSetRoleParams", "user_id", ActorField::Target),
+        ("MemberRemoveParams", "user_id", ActorField::Target),
+        ("SquadCreateParams", "leader", ActorField::Target),
+        ("SquadMemberParams", "member", ActorField::Target),
+        ("SquadMemberRoleParams", "member", ActorField::Target),
+        (
+            "AnswerParams",
+            "answered_by",
+            ActorField::Pinned(
+                "answer::answered_by_caller (answer::tests::a_device_answer_is_stamped_from_its_credential)",
+            ),
+        ),
+        (
+            "AutopilotTriggerApiParams",
+            "actor_user_id",
+            ActorField::Unread,
+        ),
+        (
+            "SquadAssignParams",
+            "invoker_user_id",
+            ActorField::InvokerGate,
+        ),
+        ("IssueRunParams", "invoker_user_id", ActorField::InvokerGate),
+        (
+            "BoardCardRunParams",
+            "invoker_user_id",
+            ActorField::InvokerGate,
+        ),
+        (
+            "FleetMessageSendParams",
+            "actor",
+            ActorField::Acting(&[methods::FLEET_MESSAGE_SEND]),
+        ),
+        (
+            "IssueCreateParams",
+            "creator",
+            ActorField::Acting(&[methods::HANGAR_ISSUE_CREATE]),
+        ),
+        (
+            "CommentAddParams",
+            "author",
+            ActorField::Acting(&[methods::HANGAR_COMMENT_ADD]),
+        ),
+        (
+            "CommentMentionPreviewParams",
+            "author",
+            ActorField::Acting(&[methods::HANGAR_COMMENT_MENTION_PREVIEW]),
+        ),
+        (
+            "IssueSubscribeParams",
+            "actor",
+            ActorField::Acting(&[methods::HANGAR_ISSUE_SUBSCRIBE]),
+        ),
+        (
+            "IssueReactionParams",
+            "actor",
+            ActorField::Acting(&[methods::HANGAR_ISSUE_REACTION_ADD]),
+        ),
+        (
+            "IssueCriterionSetParams",
+            "actor",
+            ActorField::Acting(&[methods::HANGAR_ISSUE_CRITERION_SET]),
+        ),
+        (
+            "AutopilotActorParams",
+            "actor_user_id",
+            ActorField::Acting(&[
+                methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD,
+                methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD,
+            ]),
+        ),
+        (
+            "AutopilotUpdateParams",
+            "actor_user_id",
+            ActorField::Acting(&[methods::HANGAR_AUTOPILOT_UPDATE]),
+        ),
+        (
+            "AutopilotSetEnabledParams",
+            "actor_user_id",
+            ActorField::Acting(&[methods::HANGAR_AUTOPILOT_SET_ENABLED]),
+        ),
+        (
+            "AutopilotSetApiTriggerParams",
+            "actor_user_id",
+            ActorField::Acting(&[methods::HANGAR_AUTOPILOT_SET_API_TRIGGER]),
+        ),
+        (
+            "AutopilotSetAccessModeParams",
+            "actor_user_id",
+            ActorField::Acting(&[methods::HANGAR_AUTOPILOT_SET_ACCESS_MODE]),
+        ),
+        (
+            "AutopilotFireNowParams",
+            "actor_user_id",
+            ActorField::Acting(&[methods::HANGAR_AUTOPILOT_FIRE_NOW]),
+        ),
+    ];
+
+    /// `(struct, field)` for every actor-named field in the proto sources.
+    fn proto_actor_fields() -> std::collections::BTreeSet<(String, String)> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("proto src") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../ainb-hangar-proto/src"),
+            &mut files,
+        );
+        let mut found = std::collections::BTreeSet::new();
+        for file in files {
+            // `pub struct S`: its `pub` fields. `pub enum E`: the named fields
+            // of each struct-like variant, as `E::Variant` (they carry no
+            // `pub`). Test modules are skipped: their struct literals would
+            // read as fields.
+            let mut current: Option<String> = None;
+            let mut in_enum: Option<(String, i32)> = None;
+            let mut variant: Option<String> = None;
+            for line in std::fs::read_to_string(&file).expect("read proto").lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                if let Some((name, depth)) = in_enum.as_mut() {
+                    let before = *depth;
+                    *depth += i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+                    *depth -= i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+                    if *depth <= 0 {
+                        in_enum = None;
+                        variant = None;
+                        continue;
+                    }
+                    if before == 1 && trimmed.ends_with('{') {
+                        variant = trimmed
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .map(ToString::to_string);
+                    } else if before == 2 {
+                        if let (Some(v), Some((field, _))) = (&variant, trimmed.split_once(':')) {
+                            let field = field.trim();
+                            if ACTOR_FIELD_NAMES.contains(&field) {
+                                found.insert((format!("{name}::{v}"), field.to_string()));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = trimmed.strip_prefix("pub enum ") {
+                    let name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let depth = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+                    in_enum = Some((name, depth));
+                    current = None;
+                } else if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+                    current = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .map(ToString::to_string);
+                } else if let (Some(owner), Some(rest)) = (&current, trimmed.strip_prefix("pub ")) {
+                    if let Some((name, _)) = rest.split_once(':') {
+                        if ACTOR_FIELD_NAMES.contains(&name.trim()) {
+                            found.insert((owner.clone(), name.trim().to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Review follow-up A, derived: the classification above is exactly the
+    /// set of actor-named fields the proto declares, in both directions.
+    #[test]
+    fn every_actor_named_proto_field_is_classified() {
+        let declared = proto_actor_fields();
+        let classified: std::collections::BTreeSet<(String, String)> = ACTOR_FIELDS
+            .iter()
+            .map(|(owner, field, _)| ((*owner).to_string(), (*field).to_string()))
+            .collect();
+        let unclassified: Vec<_> = declared.difference(&classified).collect();
+        let stale: Vec<_> = classified.difference(&declared).collect();
+        assert!(
+            unclassified.is_empty(),
+            "classify these in ACTOR_FIELDS (and stamp them if they say who acts): {unclassified:?}"
+        );
+        assert!(stale.is_empty(), "no longer in the proto: {stale:?}");
+    }
+
+    /// The `invoker_user_id` rule: the operator's trimmed claim stands, a
+    /// device is always its stamped id, and a claimed `device:` id is refused.
+    #[test]
+    fn acting_user_id_pins_a_device() {
+        let laptop = auth::Caller::Device {
+            device_id: "01J0LAPTOP".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::DESKTOP,
+        };
+        assert_eq!(
+            acting_user_id(&auth::Caller::Operator, Some(" user-1 ")).unwrap(),
+            Some("user-1".to_string())
+        );
+        assert_eq!(acting_user_id(&auth::Caller::Operator, None).unwrap(), None);
+        for claim in [Some("user-1"), None] {
+            assert_eq!(
+                acting_user_id(&laptop, claim).unwrap().as_deref(),
+                Some("device:01J0LAPTOP"),
+                "{claim:?}"
+            );
+        }
+        assert!(acting_user_id(&auth::Caller::Operator, Some("device:01J0LAPTOP")).is_err());
+    }
+
+    /// Review follow-up A, driven: every `Acting` field above, as a desktop
+    /// device claiming someone else (the owner, an agent, or nobody). Each
+    /// write records the device, and each gate that used to trust the claim
+    /// (or its absence) now refuses the device on a restricted rule.
+    #[tokio::test]
+    async fn every_acting_field_is_stamped_for_a_device() {
+        use ainb_hangar_proto::devices::DeviceScope;
+
+        const DEVICE: &str = "01J0LAPTOP";
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        crate::seed::seed_p4_fixture(store.pool()).await.expect("seed workspace");
+        let pool = store.pool();
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(pool)
+        .await
+        .expect("seed session");
+        let new_rule = |name: &'static str| async move {
+            ainb_hangar_store::repo::autopilot::AutopilotRepo::create_as(
+                pool,
+                &SystemClock,
+                &ainb_hangar_store::repo::autopilot::NewAutopilot {
+                    workspace_id: WorkspaceId::from_str(crate::seed::WS_ID).unwrap(),
+                    agent_id: AgentId::from_str("agent-1").unwrap(),
+                    name: name.to_string(),
+                    instructions: None,
+                    cron_expr: "0 9 * * *".to_string(),
+                    max_concurrent_runs: 1,
+                    execution_mode: ainb_hangar_store::repo::autopilot::ExecutionMode::RunOnly,
+                    concurrency_policy:
+                        ainb_hangar_store::repo::autopilot::ConcurrencyPolicy::Queue,
+                    api_trigger_enabled: false,
+                },
+                Some(&ActorRef::new(ActorKind::Member, "user-1").unwrap()),
+            )
+            .await
+            .expect("create autopilot")
+            .to_string()
+        };
+        let open_rule = new_rule("open").await;
+        let restricted_rule = new_rule("restricted").await;
+        sqlx::query("UPDATE autopilot SET access_mode = 'restricted' WHERE id = ?")
+            .bind(&restricted_rule)
+            .execute(pool)
+            .await
+            .expect("restrict");
+        let laptop = auth::Caller::Device {
+            device_id: DEVICE.to_string(),
+            scope: DeviceScope::DESKTOP,
+        };
+        let call = |method: &str, params: serde_json::Value| {
+            let request = req(method, params);
+            let laptop = laptop.clone();
+            async move { dispatch_as(pool, &request, &health(), &sink(), &laptop).await }
+        };
+        let ok = |method: &str, response: &RpcResponse| {
+            assert!(response.error.is_none(), "{method}: {:?}", response.error);
+        };
+        let is_device = |raw: &str| auth::device_principal(raw) == Some(DEVICE);
+        let typed_pair = |sql: &'static str, bind: String| async move {
+            let (kind, id): (String, String) =
+                sqlx::query_as(sql).bind(bind).fetch_one(pool).await.expect(sql);
+            format!("{kind}:{id}")
+        };
+
+        let mut driven = Vec::new();
+        for (_, _, class) in ACTOR_FIELDS {
+            let ActorField::Acting(methods_for_field) = class else {
+                continue;
+            };
+            for method in *methods_for_field {
+                driven.push(*method);
+                match *method {
+                    methods::FLEET_MESSAGE_SEND => {
+                        let sent = call(
+                            method,
+                            serde_json::json!({
+                                "actor": "operator",
+                                "targets": ["s1"],
+                                "text": "status?",
+                                "request_id": "req-walk",
+                            }),
+                        )
+                        .await;
+                        ok(method, &sent);
+                        let id = sent.result.as_ref().unwrap()["message_id"].as_str().unwrap();
+                        let sender: String =
+                            sqlx::query_scalar("SELECT sender FROM fleet_message WHERE id = ?")
+                                .bind(id)
+                                .fetch_one(pool)
+                                .await
+                                .unwrap();
+                        assert_eq!(sender, format!("device:{DEVICE}"), "canonical spelling");
+                    }
+                    methods::HANGAR_ISSUE_CREATE => {
+                        let created = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "title": "from the laptop",
+                                "creator": "member:me",
+                                "acceptance_criteria": ["ships"],
+                            }),
+                        )
+                        .await;
+                        ok(method, &created);
+                        let creator = typed_pair(
+                            "SELECT creator_type, creator_id FROM issue WHERE title = ?",
+                            "from the laptop".to_string(),
+                        )
+                        .await;
+                        assert!(is_device(&creator), "{method}: {creator}");
+                    }
+                    methods::HANGAR_COMMENT_ADD => {
+                        let added = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "issue_id": "issue-1",
+                                "author": "agent:agent-1",
+                                "body": "claimed to be an agent",
+                            }),
+                        )
+                        .await;
+                        ok(method, &added);
+                        let author = typed_pair(
+                            "SELECT author_type, author_id FROM comment WHERE body = ?",
+                            "claimed to be an agent".to_string(),
+                        )
+                        .await;
+                        assert!(is_device(&author), "{method}: {author}");
+                    }
+                    methods::HANGAR_COMMENT_MENTION_PREVIEW => {
+                        // A dry run that writes nothing: the device's claim is
+                        // replaced before routing, so the preview answers for
+                        // the device (it may mention nobody) and never errors
+                        // on the claimed agent.
+                        let previewed = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "issue_id": "issue-1",
+                                "author": "agent:agent-1",
+                                "body": "no mentions here",
+                            }),
+                        )
+                        .await;
+                        ok(method, &previewed);
+                    }
+                    methods::HANGAR_ISSUE_SUBSCRIBE => {
+                        let subscribed = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "issue_id": "issue-3",
+                                "actor": "member:me",
+                            }),
+                        )
+                        .await;
+                        ok(method, &subscribed);
+                        let rows: Vec<(String, String)> = sqlx::query_as(
+                            "SELECT actor_type, actor_id FROM issue_subscriber WHERE issue_id = 'issue-3'",
+                        )
+                        .fetch_all(pool)
+                        .await
+                        .unwrap();
+                        assert!(
+                            rows.iter().any(|(k, i)| is_device(&format!("{k}:{i}"))),
+                            "{method}: {rows:?}"
+                        );
+                        assert!(
+                            !rows.iter().any(|(k, i)| k == "member" && i == "me"),
+                            "{method}: the claimed member was subscribed"
+                        );
+                    }
+                    methods::HANGAR_ISSUE_REACTION_ADD => {
+                        let reacted = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "issue_id": "issue-3",
+                                "emoji": "+1",
+                                "actor": "member:me",
+                            }),
+                        )
+                        .await;
+                        ok(method, &reacted);
+                        let reactor = typed_pair(
+                            "SELECT actor_type, actor_id FROM issue_reaction WHERE issue_id = ?",
+                            "issue-3".to_string(),
+                        )
+                        .await;
+                        assert!(is_device(&reactor), "{method}: {reactor}");
+                    }
+                    methods::HANGAR_ISSUE_CRITERION_SET => {
+                        let issue_id: String = sqlx::query_scalar(
+                            "SELECT id FROM issue WHERE title = 'from the laptop'",
+                        )
+                        .fetch_one(pool)
+                        .await
+                        .expect("issue created above");
+                        let checked = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_SLUG,
+                                "issue_id": issue_id,
+                                // The first criterion, by 1-based ordinal.
+                                "criterion": "1",
+                                "checked": true,
+                                "actor": "member:me",
+                            }),
+                        )
+                        .await;
+                        ok(method, &checked);
+                        let criteria: String = sqlx::query_scalar(
+                            "SELECT acceptance_criteria FROM issue WHERE id = ?",
+                        )
+                        .bind(&issue_id)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                        assert!(
+                            criteria.contains(&format!("\"checked_by\":\"device:{DEVICE}\"")),
+                            "{method}: {criteria}"
+                        );
+                    }
+                    methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD
+                    | methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD => {
+                        let table = if *method == methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD {
+                            "autopilot_collaborator"
+                        } else {
+                            "autopilot_subscriber"
+                        };
+                        let added = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_ID,
+                                "autopilot_id": open_rule,
+                                "actor": "member:user-1",
+                                "actor_user_id": "user-1",
+                            }),
+                        )
+                        .await;
+                        ok(method, &added);
+                        let created_by: Option<String> = sqlx::query_scalar(&format!(
+                            "SELECT created_by FROM {table} WHERE autopilot_id = ?"
+                        ))
+                        .bind(&open_rule)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                        let created_by = created_by.expect("attributed");
+                        assert!(is_device(&created_by), "{method}: {created_by}");
+                        // On a restricted rule, claiming the owner does not pass.
+                        let refused = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_ID,
+                                "autopilot_id": restricted_rule,
+                                "actor": "member:user-1",
+                                "actor_user_id": "user-1",
+                            }),
+                        )
+                        .await;
+                        assert_eq!(
+                            refused.error.as_ref().map(|e| e.code),
+                            Some(PERMISSION_DENIED)
+                        );
+                    }
+                    methods::HANGAR_AUTOPILOT_UPDATE
+                    | methods::HANGAR_AUTOPILOT_SET_ENABLED
+                    | methods::HANGAR_AUTOPILOT_SET_API_TRIGGER
+                    | methods::HANGAR_AUTOPILOT_SET_ACCESS_MODE => {
+                        let body = |claim: Option<&str>| {
+                            let mut params = serde_json::json!({
+                                "workspace_id": crate::seed::WS_ID,
+                                "autopilot_id": restricted_rule,
+                                "name": "renamed",
+                                "enabled": false,
+                                "access_mode": "open",
+                            });
+                            if let Some(claim) = claim {
+                                params["actor_user_id"] = serde_json::json!(claim);
+                            }
+                            params
+                        };
+                        // Claiming the owner, and claiming nobody, both used to
+                        // pass the restricted gate.
+                        for claim in [Some("user-1"), None] {
+                            let refused = call(method, body(claim)).await;
+                            assert_eq!(
+                                refused.error.as_ref().map(|e| e.code),
+                                Some(PERMISSION_DENIED),
+                                "{method} claiming {claim:?}: {refused:?}"
+                            );
+                        }
+                    }
+                    methods::HANGAR_AUTOPILOT_FIRE_NOW => {
+                        let fired = call(
+                            method,
+                            serde_json::json!({
+                                "workspace_id": crate::seed::WS_ID,
+                                "autopilot_id": open_rule,
+                                "actor_user_id": "user-1",
+                            }),
+                        )
+                        .await;
+                        ok(method, &fired);
+                        let accountable: Option<String> = sqlx::query_scalar(
+                            "SELECT accountable_actor FROM autopilot_run WHERE autopilot_id = ? \
+                             ORDER BY started_at DESC LIMIT 1",
+                        )
+                        .bind(&open_rule)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                        let accountable = accountable.expect("attributed");
+                        assert!(is_device(&accountable), "{method}: {accountable}");
+                    }
+                    other => panic!("{other} is classified Acting but not driven here"),
+                }
+            }
+        }
+        assert!(!driven.is_empty());
+
+        // A creator with NO wire field: `board_card_create` authored every card
+        // as `member:me`. A device's card is the device's.
+        let board = dispatch_as(
+            pool,
+            &req(
+                methods::HANGAR_BOARD_CREATE,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "name": "laptop board"}),
+            ),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await;
+        ok(methods::HANGAR_BOARD_CREATE, &board);
+        let board_id: String =
+            sqlx::query_scalar("SELECT id FROM board WHERE name = 'laptop board'")
+                .fetch_one(pool)
+                .await
+                .expect("board id");
+        let card = call(
+            methods::HANGAR_BOARD_CARD_CREATE,
+            serde_json::json!({
+                "workspace_id": crate::seed::WS_SLUG,
+                "board_id": board_id,
+                "title": "a card from the laptop",
+            }),
+        )
+        .await;
+        ok(methods::HANGAR_BOARD_CARD_CREATE, &card);
+        let creator = typed_pair(
+            "SELECT creator_type, creator_id FROM issue WHERE title = ?",
+            "a card from the laptop".to_string(),
+        )
+        .await;
+        assert!(is_device(&creator), "board_card_create: {creator}");
+
+        // The restricted rule survived every attempt: still restricted.
+        let mode: String = sqlx::query_scalar("SELECT access_mode FROM autopilot WHERE id = ?")
+            .bind(&restricted_rule)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            mode, "restricted",
+            "a device must not open a restricted rule"
+        );
+
+        // Lead condition (a) at the RPC boundary: an operator request naming a
+        // member id reserved for devices is refused wherever members are
+        // accepted.
+        for (method, params) in [
+            (
+                methods::HANGAR_COMMENT_ADD,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "issue_id": "issue-1",
+                    "author": "member:device:01J0FORGED", "body": "forged"}),
+            ),
+            (
+                methods::HANGAR_ISSUE_CREATE,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "title": "forged",
+                    "creator": "member:device:01J0FORGED"}),
+            ),
+            (
+                methods::HANGAR_ISSUE_SUBSCRIBE,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "issue_id": "issue-1",
+                    "actor": "member:device:01J0FORGED"}),
+            ),
+            (
+                methods::HANGAR_AUTOPILOT_SET_ENABLED,
+                serde_json::json!({"workspace_id": crate::seed::WS_ID, "autopilot_id": open_rule,
+                    "enabled": true, "actor_user_id": "device:01J0FORGED"}),
+            ),
+            // Text principals, in both spellings.
+            (
+                methods::FLEET_MESSAGE_SEND,
+                serde_json::json!({"targets": ["s1"], "text": "forged", "request_id": "req-forged",
+                    "actor": "device:01J0FORGED"}),
+            ),
+            (
+                methods::HANGAR_ISSUE_CRITERION_SET,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "issue_id": "issue-1",
+                    "criterion": "1", "checked": true, "actor": "member:device:01J0FORGED"}),
+            ),
+        ] {
+            let refused = dispatch_as(
+                pool,
+                &req(method, params),
+                &health(),
+                &sink(),
+                &auth::Caller::Operator,
+            )
+            .await;
+            assert_eq!(
+                refused.error.as_ref().map(|e| e.code),
+                Some(INVALID_PARAMS),
+                "{method}: {refused:?}"
+            );
+        }
+
+        // The operator is unchanged: a local agent authoring as itself stands.
+        let operator = dispatch_as(
+            pool,
+            &req(
+                methods::HANGAR_COMMENT_ADD,
+                serde_json::json!({
+                    "workspace_id": crate::seed::WS_SLUG,
+                    "issue_id": "issue-1",
+                    "author": "agent:agent-1",
+                    "body": "an agent on the operator token",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await;
+        ok(methods::HANGAR_COMMENT_ADD, &operator);
+        let author = typed_pair(
+            "SELECT author_type, author_id FROM comment WHERE body = ?",
+            "an agent on the operator token".to_string(),
+        )
+        .await;
+        assert_eq!(author, "agent:agent-1");
     }
 
     /// The request loop is transport-generic: an in-memory duplex stream, with
