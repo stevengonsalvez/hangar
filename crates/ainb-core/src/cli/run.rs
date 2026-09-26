@@ -177,6 +177,12 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         None
     };
 
+    // The id Claude runs under, minted here so the id its hooks report is
+    // one the session record already holds: the daemon files every request
+    // the session raises under it, and the sessions screen places them by it
+    // exactly, never by worktree.
+    let claude_session_id = (args.tool.to_cli_provider() == CliProvider::Claude)
+        .then(crate::interactive::session_manager::new_claude_session_id);
     let claude_cmd = if provider == CliProvider::Codex {
         // Pre-launch, at the launch site rather than inside the builders: a
         // directory Codex has not seen shows a blocking trust modal, and no CLI
@@ -199,7 +205,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
             None => codex_local_command(model.as_deref(), args.dangerously_skip_permissions),
         }
     } else {
-        build_agent_command(&args)
+        build_agent_command(&args, claude_session_id.as_deref())
     };
 
     // Step 6b: Parent linkage (event-driven plumbing). When spawned with
@@ -312,6 +318,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         model_source: ModelSource::Raw,
         codex_model: None,
         codex_thread_id: codex_thread_id.clone(),
+        claude_session_id: claude_session_id.clone(),
     };
 
     // Locked RMW (pu4): another `ainb run`/`kill` or a daemon register racing
@@ -332,6 +339,9 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     println!();
     println!("Session created successfully!");
     println!("  Session ID:   {session_id}");
+    if let Some(claude_session_id) = &claude_session_id {
+        println!("  Claude Session: {claude_session_id}");
+    }
     println!("  Tmux Session: {tmux_name}");
     println!("  Working Dir:  {}", work_dir.display());
     println!("  Branch:       {branch_name}");
@@ -602,9 +612,20 @@ fn validate_provider_installed(provider: &CliProvider) -> Result<()> {
 ///     unchanged. Provider CLI owns model validation and future model IDs.
 ///   * Gemini / Copilot: never emit `--model` (those CLIs don't accept it
 ///     in this codebase).
-fn build_agent_command(args: &RunArgs) -> String {
+fn build_agent_command(args: &RunArgs, claude_session_id: Option<&str>) -> String {
     let provider = args.tool.to_cli_provider();
     let mut cmd_parts = vec![provider.command().to_string()];
+    // A fresh launch runs under the id ainb minted for it, so the id Claude's
+    // hooks report is the one the session record holds.
+    if let (CliProvider::Claude, Some(id)) = (&provider, claude_session_id) {
+        // Only the canonical UUID form ainb mints goes into the command.
+        if crate::interactive::session_manager::is_canonical_claude_session_id(id) {
+            cmd_parts.push("--session-id".to_string());
+            cmd_parts.push(id.to_string());
+        } else {
+            warn!("refusing a Claude session id that is not a canonical UUID");
+        }
+    }
 
     match provider {
         CliProvider::Claude | CliProvider::Codex | CliProvider::Antigravity => {
@@ -676,6 +697,7 @@ fn codex_local_command(model: Option<&str>, skip_permissions: bool) -> String {
         // Claude's `--continue` only.
         false,
         false,
+        None,
     ))
 }
 
@@ -1099,13 +1121,44 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.contains("claude"));
         assert!(
             cmd.contains("--model sonnet"),
             "AINB must pass Claude's raw model value through, got: {cmd}"
         );
         assert!(cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn a_claude_launch_runs_under_the_minted_session_id() {
+        let args = RunArgs {
+            remote_repo: None,
+            repo: None,
+            create_branch: None,
+            worktree: false,
+            tool: Tool::Claude,
+            model: None,
+            prompt: None,
+            attach: false,
+            dangerously_skip_permissions: false,
+            name: None,
+            interactive: false,
+            parent: None,
+        };
+        let cmd = build_agent_command(&args, Some("11111111-2222-4333-8444-555555555555"));
+        assert_eq!(
+            cmd,
+            "claude --session-id 11111111-2222-4333-8444-555555555555"
+        );
+        let cmd = build_agent_command(
+            &args,
+            Some("11111111-2222-4333-8444-555555555555; rm -rf /"),
+        );
+        assert_eq!(
+            cmd, "claude",
+            "a non-canonical id never reaches the command"
+        );
     }
 
     /// The CLI path now shares the TUI's builder, so it also carries
@@ -1202,7 +1255,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model claude-next-9"),
             "AINB must not reject future Claude model IDs, got: {cmd}"
@@ -1226,7 +1279,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.contains("claude"));
         assert!(cmd.contains("--model opus"));
         assert!(!cmd.contains("--dangerously-skip-permissions"));
@@ -1249,7 +1302,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.starts_with("claude"));
         assert!(
             !cmd.contains("--model"),
@@ -1275,7 +1328,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(!cmd.contains("--model"));
     }
 
@@ -1300,7 +1353,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("codex"),
             "Command should start with codex, got: {}",
@@ -1332,7 +1385,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.starts_with("codex"));
         assert!(
             cmd.contains("--model gpt-5.6-terra"),
@@ -1365,7 +1418,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model"),
             "the flag must still be emitted, got: {cmd}"
@@ -1393,7 +1446,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model gpt-5.6-luna"),
             "AINB must not reject future Codex model IDs, got: {cmd}"
@@ -1417,7 +1470,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("codex"),
             "Command should start with codex, got: {}",
@@ -1451,7 +1504,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("gemini"),
             "Command should start with gemini, got: {}",
@@ -1480,7 +1533,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("copilot"),
             "Command should start with copilot, got: {}",
@@ -1505,7 +1558,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert_eq!(
             cmd, "copilot",
             "Copilot with no flags should just be 'copilot'"
