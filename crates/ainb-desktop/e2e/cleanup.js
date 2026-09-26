@@ -64,6 +64,7 @@ export function removeStaleWorlds(dir = WORLD_PARENT, now = Date.now()) {
       }
     }
     if (!stale) continue;
+    endTmuxServer(world);
     try {
       rmSync(world, { recursive: true, force: true });
       removed.push(world);
@@ -74,6 +75,28 @@ export function removeStaleWorlds(dir = WORLD_PARENT, now = Date.now()) {
     }
   }
   return removed;
+}
+
+/**
+ * End the tmux server a world's sessions ran on, through that world's own
+ * socket path and with TMUX and TMUX_PANE removed, before the world is removed:
+ * a run that died left it serving from a directory about to disappear. The
+ * socket is the default server tmux makes under the world's TMUX_TMPDIR
+ * (world.js), so only that world's server can be reached; none is a no-op.
+ */
+function endTmuxServer(world) {
+  const socket = join(world, "tmux", `tmux-${process.getuid()}`, "default");
+  try {
+    lstatSync(socket);
+  } catch {
+    return;
+  }
+  const { TMUX: _client, TMUX_PANE: _pane, ...env } = process.env;
+  try {
+    execFileSync("tmux", ["-S", socket, "kill-server"], { stdio: "ignore", timeout: 10_000, env });
+  } catch {
+    // No server on that socket any more: the file is only left over.
+  }
 }
 
 /**
