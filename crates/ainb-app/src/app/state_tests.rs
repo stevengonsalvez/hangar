@@ -524,6 +524,44 @@ mod tests {
         assert!(result.is_some(), "dotted worktree transcript must resolve");
     }
 
+    /// With `CLAUDE_CONFIG_DIR` set, Claude keeps its transcripts under that
+    /// directory, and both probes read it there: a resume that read the
+    /// default would relaunch under an id Claude already holds, and the pane
+    /// would die on "already in use".
+    #[test]
+    fn transcript_probes_honour_claude_config_dir() {
+        use std::fs;
+        use std::path::PathBuf;
+        let config_dir = tempfile::tempdir().unwrap();
+        let worktree = PathBuf::from("/Users/stevie/.agents-in-a-box/worktrees/by-name/repo--cfg");
+        let project_dir = config_dir
+            .path()
+            .join("projects")
+            .join("-Users-stevie--agents-in-a-box-worktrees-by-name-repo--cfg");
+        fs::create_dir_all(&project_dir).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        fs::write(project_dir.join(format!("{id}.jsonl")), "x").unwrap();
+
+        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::set_var("CLAUDE_CONFIG_DIR", config_dir.path());
+        let exists = AppState::claude_transcript_exists(&worktree, id);
+        let other =
+            AppState::claude_transcript_exists(&worktree, "22222222-2222-4333-8444-555555555555");
+        let latest = AppState::find_latest_transcript(&worktree);
+        match previous {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        assert!(exists, "the transcript under CLAUDE_CONFIG_DIR is found");
+        assert!(!other, "and only for its own id");
+        assert_eq!(
+            latest.as_deref(),
+            Some(project_dir.join(format!("{id}.jsonl")).as_path()),
+            "the history probe reads the same directory"
+        );
+    }
+
     /// The probe canonicalizes the worktree path before encoding: a symlinked
     /// path component (e.g. macOS `/tmp` → `/private/tmp`) must still resolve
     /// to the project dir of the PHYSICAL path, because that is what Claude
