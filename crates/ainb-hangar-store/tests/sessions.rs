@@ -50,6 +50,40 @@ async fn sessions_round_trip_all_thirteen_fields() {
     assert_eq!(all[0], s1);
 }
 
+/// A writer that omits the Claude session id, a registry mirror or an older
+/// peer, must not erase the one the launch stored: the row keeps it.
+#[tokio::test]
+async fn an_upsert_without_a_claude_session_id_keeps_the_stored_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in(dir.path()).await.unwrap();
+    let pool = store.pool();
+
+    let mut launched = test_session(
+        "00000000-0000-0000-0000-000000000009",
+        "ainb-claude",
+        "workspace-a",
+        1000,
+    );
+    launched.claude_session_id = Some("11111111-2222-4333-8444-555555555555".to_string());
+    SessionsRepo::upsert(pool, &launched).await.unwrap();
+
+    let mut mirrored = launched.clone();
+    mirrored.claude_session_id = None;
+    mirrored.model = Some("claude-opus-4".to_string());
+    SessionsRepo::upsert(pool, &mirrored).await.unwrap();
+
+    let row = SessionsRepo::get_by_id(pool, &launched.session_id).await.unwrap().unwrap();
+    assert_eq!(
+        row.claude_session_id.as_deref(),
+        Some("11111111-2222-4333-8444-555555555555")
+    );
+    assert_eq!(
+        row.model.as_deref(),
+        Some("claude-opus-4"),
+        "the other columns still take the write"
+    );
+}
+
 #[tokio::test]
 async fn sessions_list_filtering_and_ordering() {
     let dir = tempfile::tempdir().unwrap();
