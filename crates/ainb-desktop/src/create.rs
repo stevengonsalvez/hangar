@@ -29,14 +29,13 @@ pub struct CreateWorktreeArgs {
     pub branch: Option<String>,
     /// Ref the branch starts from; the repository's default branch when absent.
     pub base: Option<String>,
-    /// `claude`, `codex`, `gemini`, `copilot` or `antigravity`.
-    pub agent: String,
+    /// The agent CLI: the daemon's own `SpawnAgent`, so the list of agents is
+    /// written once, in the proto, and generated into TypeScript.
+    pub agent: SpawnAgent,
     /// Provider model id, passed through unchanged.
     pub model: Option<String>,
     /// First prompt for the agent.
     pub prompt: Option<String>,
-    /// Tmux session name; the daemon picks one when absent.
-    pub name: Option<String>,
 }
 
 /// What the window needs back: the session to attach and to show.
@@ -64,43 +63,38 @@ impl From<WorktreeCreateResult> for CreatedWorktree {
     }
 }
 
-fn agent(name: &str) -> Result<SpawnAgent, String> {
-    match name {
-        "claude" => Ok(SpawnAgent::Claude),
-        "codex" => Ok(SpawnAgent::Codex),
-        "gemini" => Ok(SpawnAgent::Gemini),
-        "copilot" => Ok(SpawnAgent::Copilot),
-        "antigravity" => Ok(SpawnAgent::Antigravity),
-        other => Err(format!("unknown agent: {other}")),
-    }
-}
-
 /// Blank optional text is "not given", so an empty field in the composer
 /// never reaches the daemon as an empty branch or model.
 fn given(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-/// The daemon params for `args`. Permission prompts are never skipped from
-/// the window: that stays a deliberate CLI flag.
-///
-/// # Errors
-/// An unknown agent name, as text for the composer.
-pub fn params(
-    args: CreateWorktreeArgs,
-    op_id: Option<OpId>,
-) -> Result<WorktreeCreateParams, String> {
-    Ok(WorktreeCreateParams {
+/// The daemon params for `args`, deduplicated by `op_id`. Permission
+/// prompts are never skipped from the window: that stays a deliberate CLI
+/// flag.
+#[must_use]
+pub fn params(args: CreateWorktreeArgs, op_id: OpId) -> WorktreeCreateParams {
+    WorktreeCreateParams {
         repo_path: args.repo_path.trim().to_string(),
         branch: given(args.branch),
         base: given(args.base),
-        agent: agent(args.agent.trim())?,
+        agent: args.agent,
         model: given(args.model),
         prompt: args.prompt.filter(|p| !p.trim().is_empty()),
         skip_permissions: false,
-        name: given(args.name),
-        mutation: MutationEnvelope { op_id, fence: None },
-    })
+        mutation: MutationEnvelope {
+            op_id: Some(op_id),
+            fence: None,
+        },
+    }
+}
+
+/// A fresh op id for one submit: a retry of the same submit reuses it, a new
+/// submit mints another.
+#[must_use]
+pub fn mint_op_id() -> OpId {
+    OpId::parse(format!("desktop-create-{}", uuid::Uuid::new_v4().simple()))
+        .expect("a uuid op id is always well formed")
 }
 
 /// A daemon error as the sentence the composer shows.
@@ -115,7 +109,8 @@ pub fn refusal_text(error: &DaemonError) -> String {
         }
         DaemonError::Rpc { message, .. } => format!("Creating the worktree failed: {message}"),
         DaemonError::Timeout(_) => {
-            "Creating the worktree took too long; check the daemon log.".into()
+            "The daemon did not answer in time: the worktree may still be creating; check the sidebar."
+                .into()
         }
         other => format!("The daemon is not reachable: {other}"),
     }
@@ -130,7 +125,7 @@ pub async fn request(
     client: &DaemonClient,
     args: CreateWorktreeArgs,
 ) -> Result<CreatedWorktree, String> {
-    let params = params(args, None)?;
+    let params = params(args, mint_op_id());
     client
         .worktree_create(&params)
         .await
@@ -147,16 +142,15 @@ mod tests {
             repo_path: " /repos/app ".into(),
             branch: Some(" feat/x ".into()),
             base: Some(String::new()),
-            agent: "codex".into(),
+            agent: SpawnAgent::Codex,
             model: Some("   ".into()),
             prompt: Some("fix it".into()),
-            name: None,
         }
     }
 
     #[test]
     fn blank_fields_are_not_given_and_values_are_trimmed() {
-        let p = params(args(), None).expect("valid");
+        let p = params(args(), mint_op_id());
         assert_eq!(p.repo_path, "/repos/app");
         assert_eq!(p.branch.as_deref(), Some("feat/x"));
         assert_eq!(p.base, None);
@@ -167,16 +161,24 @@ mod tests {
 
     #[test]
     fn the_window_never_skips_permission_prompts() {
-        assert!(!params(args(), None).expect("valid").skip_permissions);
+        assert!(!params(args(), mint_op_id()).skip_permissions);
     }
 
     #[test]
-    fn an_unknown_agent_is_refused_before_the_daemon() {
-        let bad = CreateWorktreeArgs {
-            agent: "vim".into(),
-            ..args()
-        };
-        assert_eq!(params(bad, None).unwrap_err(), "unknown agent: vim");
+    fn every_submit_carries_its_own_op_id() {
+        let first = params(args(), mint_op_id()).mutation.op_id;
+        let second = params(args(), mint_op_id()).mutation.op_id;
+        assert!(first.is_some() && second.is_some());
+        assert_ne!(first, second, "two submits never share an op id");
+    }
+
+    #[test]
+    fn an_unknown_agent_is_refused_at_the_seam() {
+        let raw = serde_json::json!({
+            "repo_path": "/r", "branch": null, "base": null,
+            "agent": "vim", "model": null, "prompt": null
+        });
+        assert!(serde_json::from_value::<CreateWorktreeArgs>(raw).is_err());
     }
 
     #[test]
@@ -196,5 +198,7 @@ mod tests {
             message: "`ainb run` failed: branch exists".into(),
         };
         assert!(refusal_text(&failed).starts_with("Creating the worktree failed"));
+        let slow = DaemonError::Timeout(std::time::Duration::from_secs(150));
+        assert!(refusal_text(&slow).contains("may still be creating; check the sidebar"));
     }
 }
