@@ -76,6 +76,7 @@ fn seed(tmux: &str, home: &std::path::Path) {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 }

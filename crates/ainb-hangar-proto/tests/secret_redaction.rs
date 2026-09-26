@@ -53,7 +53,14 @@ fn hello_params_redacts_the_token() {
     assert_redacted(&params, DAEMON_TOKEN, "dev-visible");
     let request = ainb_hangar_proto::auth::hello_request(1, DAEMON_TOKEN);
     let params: HelloParams = serde_json::from_value(request.params).unwrap();
-    assert_redacted(&params, DAEMON_TOKEN, "capabilities");
+    // A capability VALUE, not a field name: debug_struct prints every field
+    // name whatever the redaction does, so only a value proves it is not a
+    // blank.
+    assert_redacted(
+        &params,
+        DAEMON_TOKEN,
+        ainb_hangar_proto::protocol::CAP_AUTH_HELLO_NEGOTIATED,
+    );
 }
 
 #[test]

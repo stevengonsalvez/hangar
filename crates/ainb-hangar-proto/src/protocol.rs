@@ -392,6 +392,9 @@ pub const CAPABILITY_CATALOGUE: &[&str] = &[
     // `capabilities.catalogue` is a prefix of this array in order, so a
     // removal cannot hide as a move.
     CAP_WORKSPACE_SESSIONS,
+    // `fleet/transcript_list { before_order }`: a phone pages back only when
+    // the daemon says it can.
+    crate::fleet::FLEET_CAPABILITY_TRANSCRIPT_PAGE_BACK,
 ];
 
 /// Whether this build advertises `id`.
@@ -461,11 +464,12 @@ mod tests {
         }
         assert_eq!(
             crate::fleet::FLEET_PROTOCOL_CAPABILITY_IDS.len(),
-            27,
+            28,
             "D17 names 26 fleet ids; the append rule is written against that count. \
-             Bumping this is the conscious act the guard exists to require: 27 is \
+             Bumping this is the conscious act the guard exists to require: 28 is \
              25 plus `fleet.status.read`, the D14 status derivation, plus \
-             `fleet.roster_status.read`, its joined read (#1015)"
+             `fleet.roster_status.read`, its joined read (#1015), plus \
+             `fleet.transcript.page_back`, the backward transcript page"
         );
     }
 

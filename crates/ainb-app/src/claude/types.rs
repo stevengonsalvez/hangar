@@ -226,7 +226,8 @@ impl std::fmt::Debug for ClaudeAuth {
         f.debug_struct("ClaudeAuth")
             .field("api_key", &api_key.as_ref().map(|_| Redacted))
             .field("oauth_token", &oauth_token.as_ref().map(|_| Redacted))
-            .field("base_url", base_url)
+            // A proxy or gateway URL can carry `user:password@`.
+            .field("base_url", &ainb_hangar_core::redact::scrub(base_url))
             .finish()
     }
 }
@@ -291,5 +292,18 @@ mod debug_redaction_tests {
             assert!(rendered.contains("<redacted>"), "{rendered}");
             assert!(rendered.contains("base-visible"), "{rendered}");
         }
+    }
+
+    /// A base URL with credentials in its userinfo prints without them.
+    #[test]
+    fn claude_auth_debug_hides_base_url_userinfo() {
+        let auth = ClaudeAuth {
+            api_key: None,
+            oauth_token: None,
+            base_url: "https://proxyuser:s3cr3tProxyPass@gateway-visible.example".to_string(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("s3cr3tProxyPass"), "{rendered}");
+        assert!(rendered.contains("gateway-visible.example"), "{rendered}");
     }
 }
