@@ -2747,6 +2747,7 @@ mod tests {
         // and a literal here would have to be edited every time one lands.
         crate::fleet::read::needs::make_row(
             Session {
+                provider_session_id: None,
                 id: session_id.into(),
                 cwd: format!("/tmp/{session_id}"),
                 pid: None,
