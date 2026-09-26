@@ -27,6 +27,7 @@ pub mod session_defaults;
 pub mod session_store_worker;
 pub mod settings_model;
 pub mod ssh_display_names;
+pub mod toml_error;
 pub mod tunables;
 
 pub use container::{ContainerTemplate, ContainerTemplateConfig};
@@ -1281,13 +1282,22 @@ fn merge_config_tables_at(lower: &mut toml::Table, higher: toml::Table, path: &[
     }
 }
 
+/// Why a save refuses a file it cannot parse. Reported with the parser's
+/// message and line, never the offending line itself.
+const REFUSE_UNPARSEABLE: &str =
+    "refusing to save over a config.toml that does not parse; fix the syntax error first";
+
 /// Parse one config file into a layer table ready for [`merge_config_tables`].
 ///
 /// Drops the keys a file is not allowed to speak for. Everything else is
 /// carried through verbatim — including sections `AppConfig` does not model —
 /// so the merge stays ignorant of the schema.
 fn parse_config_layer(content: &str) -> Result<toml::Table> {
-    let mut layer: toml::Table = content.parse()?;
+    // Never `?` the raw error: its Display quotes the offending line, and the
+    // user file holds bridge tokens and API keys.
+    let mut layer: toml::Table = content
+        .parse()
+        .map_err(|error| toml_error::toml_parse_error("config does not parse", content, &error))?;
 
     // `version` names the schema the running binary implements, not a user
     // preference. The old field-by-field merge expressed this by having no arm
@@ -1489,9 +1499,9 @@ fn remove_key_from_unlocked(path: &Path, key: &str) -> Result<()> {
     {
         anyhow::bail!("'{key}' is in a section ainb-core must not write");
     }
-    let mut doc = existing.parse::<toml_edit::DocumentMut>().context(
-        "refusing to save over a config.toml that does not parse — fix the syntax error first",
-    )?;
+    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        toml_error::toml_edit_parse_error(REFUSE_UNPARSEABLE, &existing, &error)
+    })?;
     remove_document_key(&mut doc, key);
     write_atomic(path, &doc.to_string())?;
     Ok(())
@@ -1549,9 +1559,9 @@ fn write_keys_into_unlocked(path: &Path, edits: &[(String, toml::Value)]) -> Res
     // every line — and this writer runs on a settings edit, not on an explicit
     // "rewrite my config". `config/presets.rs` uses toml_edit for the same
     // reason.
-    let mut doc = existing.parse::<toml_edit::DocumentMut>().context(
-        "refusing to save over a config.toml that does not parse — fix the syntax error first",
-    )?;
+    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|error| {
+        toml_error::toml_edit_parse_error(REFUSE_UNPARSEABLE, &existing, &error)
+    })?;
 
     for (key, value) in edits {
         let section = key.split('.').next().unwrap_or_default();
@@ -1825,6 +1835,10 @@ fn migrate_stray_user_config(canonical: &Path) {
         Ok(text) => match text.parse::<toml::Table>() {
             Ok(table) => table,
             Err(err) => {
+                // The parser's own Display quotes the broken line, which is a
+                // bridge token or an API key often enough to matter, and this
+                // runs at every startup.
+                let err = toml_error::describe_toml_error(&text, &err);
                 tracing::warn!(
                     path = %canonical.display(),
                     %err,
@@ -2051,9 +2065,9 @@ impl AppConfig {
         let mut table = if existing.trim().is_empty() {
             toml::Table::new()
         } else {
-            let table = existing.parse::<toml::Table>().context(
-                "refusing to save over a config.toml that does not parse — fix the syntax error first",
-            )?;
+            let table = existing.parse::<toml::Table>().map_err(|error| {
+                toml_error::toml_parse_error(REFUSE_UNPARSEABLE, existing, &error)
+            })?;
             // Second gate, and the one that matters in practice. A file can
             // tokenize perfectly and still fail serde (`timeout = "60"`, a
             // `Vec<String>` holding an int). `AppConfig::load` returns Err on
@@ -2570,7 +2584,9 @@ impl ProjectConfig {
         }
 
         let content = fs::read_to_string(&config_path)?;
-        let config: ProjectConfig = toml::from_str(&content)?;
+        let config: Self = toml::from_str(&content).map_err(|error| {
+            toml_error::toml_parse_error("project.toml does not parse", &content, &error)
+        })?;
         Ok(Some(config))
     }
 
