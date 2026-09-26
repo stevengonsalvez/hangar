@@ -3290,12 +3290,6 @@ impl InteractiveSessionManager {
         // belt-and-braces: if a pane ever came from elsewhere, Codex would open
         // on the wrong tree silently.
         let working_dir = working_dir.to_string_lossy().into_owned();
-        // The pane the agent will run in, handed to it as AINB_PANE_KEY: the
-        // hook carries it on every line, and an answer is typed into that
-        // pane exactly, whatever the session's active pane is by then. The
-        // id outlives the respawn; an index would not outlive a lower pane
-        // closing.
-        let pane_env = pane_id_of_target(&target).await.map(pane_key_env);
         let output = if env_setup.trim().is_empty() {
             // Pure argv path — fastest, no shell.
             let mut tmux_args: Vec<String> = vec![
@@ -3306,10 +3300,6 @@ impl InteractiveSessionManager {
                 "-t".to_string(),
                 target.clone(),
             ];
-            if let Some(env) = &pane_env {
-                tmux_args.push("-e".to_string());
-                tmux_args.push(env.clone());
-            }
             tmux_args.extend(cmd_parts.iter().cloned());
             Command::new("tmux").args(&tmux_args).output().await?
         } else {
@@ -3329,10 +3319,6 @@ impl InteractiveSessionManager {
                 "-t".to_string(),
                 target.clone(),
             ];
-            if let Some(env) = &pane_env {
-                tmux_args.push("-e".to_string());
-                tmux_args.push(env.clone());
-            }
             tmux_args.extend(["sh".to_string(), "-c".to_string(), full_line]);
             Command::new("tmux").args(&tmux_args).output().await?
         };
@@ -3561,39 +3547,8 @@ fn wire_rtk_project_hook_with_cmd(worktree: &std::path::Path, cmd: &str) -> anyh
     Ok(())
 }
 
-/// The variable ainb sets on every agent it launches: the tmux pane id
-/// (`%N`) the agent runs in. `ainb fleet atc hook` reads it and carries it on
-/// every line.
-pub const PANE_KEY_ENV: &str = "AINB_PANE_KEY";
-
-/// The `-e` argument that hands `pane_id` to the agent.
-#[must_use]
-pub fn pane_key_env(pane_id: String) -> String {
-    format!("{PANE_KEY_ENV}={pane_id}")
-}
-
-/// The stable id (`%N`) of the pane `target` names now, or `None` when tmux
-/// cannot say; the launch goes on without the key then.
-async fn pane_id_of_target(target: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(["display-message", "-p", "-t", target, "#{pane_id}"])
-        .output()
-        .await
-        .ok()?;
-    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && id.starts_with('%') && id.len() > 1).then_some(id)
-}
-
 #[cfg(test)]
 mod tests {
-    /// The agent is handed its pane's stable id under the one name the hook
-    /// reads.
-    #[test]
-    fn the_pane_key_env_names_the_pane_id_under_ainb_pane_key() {
-        assert_eq!(pane_key_env("%7".to_string()), "AINB_PANE_KEY=%7");
-        assert_eq!(PANE_KEY_ENV, "AINB_PANE_KEY");
-    }
-
     /// `capture_failed_launch_pane` itself must return the program's output.
     ///
     /// Deliberately calls the FUNCTION rather than re-issuing its tmux command:
