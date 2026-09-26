@@ -159,8 +159,13 @@ function Shell() {
         focusers.get(key)?.();
       }
     });
-  /** Show `key`'s terminal; `byHost` says the host asked, not a person. */
-  const activate = (key: string | null, byHost = false) => {
+  /**
+   * Show `key`'s terminal. `byHost` says who asked: the host, answering a
+   * tab open on its own schedule, or a person, by a chord or a click. Every
+   * caller says which, since the difference decides whether the terminal may
+   * take the keyboard from a text field (`terminalMayTakeFocus`).
+   */
+  const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
       setPane("terminal");
@@ -169,7 +174,19 @@ function Shell() {
       focusTab(key, byHost);
     }
   };
+  /**
+   * How many tab-strip answers the host has given so far, and which tab the
+   * last one focused, on the strip as `data-host-answers` and
+   * `data-host-focus`: the host answers a tab open on its own schedule, and
+   * a driven run that must act after that answer (not before, not a guessed
+   * second later, not on a strip tidy-up that focused nothing) has nothing
+   * else to read it from.
+   */
+  const [hostAnswers, setHostAnswers] = createSignal(0);
+  const [hostFocus, setHostFocus] = createSignal("");
   const showTabs = (view: TabsView) => {
+    setHostAnswers((n) => n + 1);
+    setHostFocus(view.focus ?? "");
     setTabs(view.tabs);
     for (const key of focusers.keys()) {
       if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
@@ -262,7 +279,7 @@ function Shell() {
   };
   const choose = (tab: Tab) => {
     if (tab.state === "detached") openRow(rowOf(tab.target));
-    activate(tab.key);
+    activate(tab.key, false);
   };
   const onAccelerator = (shell: Accelerator) => {
     switch (shell.kind) {
@@ -273,7 +290,7 @@ function Shell() {
       }
       case "prev":
       case "next":
-        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1));
+        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1), false);
         return;
       case "close": {
         const key = active();
@@ -521,7 +538,7 @@ function Shell() {
           ref={(element) => (sidebar = element)}
         />
         <section class="workarea">
-          <nav class="tabs" aria-label="Board and terminals">
+          <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
             <span class="tab board-tab" classList={{ active: showing("board") }}>
               <button
                 type="button"
