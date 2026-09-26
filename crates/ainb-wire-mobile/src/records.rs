@@ -547,10 +547,49 @@ pub struct TranscriptChunkRecord {
     pub session_key: String,
     /// `acp.<kind>`.
     pub event_type: String,
-    /// The chunk body as JSON text.
+    /// Who spoke, from the kind: `user` (`acp.user_message`), `agent`
+    /// (`acp.message`, `acp.thought`), `tool` (`acp.tool_call`), else
+    /// `system` (plan, permission, usage, lifecycle).
+    pub role: String,
+    /// The line to show, decoded here: the body's `text`, else `content`
+    /// (a string, or the joined `text` of its parts), else `message`.
+    /// Absent when the body has none, which the app renders as the kind.
+    pub text: Option<String>,
+    /// The chunk body as JSON text, for the log; the app renders `text`.
     pub payload: String,
     /// Observation time, epoch ms.
     pub observed_at: i64,
+}
+
+/// The role an `acp.<kind>` event type names.
+fn transcript_role(event_type: &str) -> &'static str {
+    match event_type {
+        "acp.user_message" => "user",
+        "acp.message" | "acp.thought" => "agent",
+        "acp.tool_call" => "tool",
+        _ => "system",
+    }
+}
+
+/// The line a transcript body carries, if it carries one.
+fn transcript_text(payload: &serde_json::Value) -> Option<String> {
+    if let Some(t) = payload.get("text").and_then(serde_json::Value::as_str) {
+        return Some(t.to_owned());
+    }
+    match payload.get("content") {
+        Some(serde_json::Value::String(s)) => return Some(s.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let joined: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                .collect();
+            if !joined.is_empty() {
+                return Some(joined.join(""));
+            }
+        }
+        _ => {}
+    }
+    payload.get("message").and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
 impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
@@ -559,6 +598,8 @@ impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
             ingest_order: c.ingest_order,
             event_id: c.event_id,
             session_key: c.session_key,
+            role: transcript_role(&c.event_type).to_owned(),
+            text: transcript_text(&c.payload),
             event_type: c.event_type,
             payload: c.payload.to_string(),
             observed_at: c.observed_at,
@@ -749,6 +790,39 @@ mod tests {
             AttentionPayload::parse(&json!({"options": many}).to_string()).options.len(),
             MAX_PAYLOAD_OPTIONS
         );
+    }
+
+    #[test]
+    fn transcript_chunks_decode_role_and_text_in_the_crate() {
+        let chunk = |event_type: &str, payload: serde_json::Value| {
+            TranscriptChunkRecord::from(
+                serde_json::from_value::<FleetTranscriptChunk>(json!({
+                    "ingest_order": 9, "event_id": "e9", "session_key": "acp:one",
+                    "event_type": event_type, "payload": payload, "observed_at": 2
+                }))
+                .unwrap(),
+            )
+        };
+        let m = chunk("acp.message", json!({"text": "hi"}));
+        assert_eq!((m.role.as_str(), m.text.as_deref()), ("agent", Some("hi")));
+        let u = chunk("acp.user_message", json!({"content": "do it"}));
+        assert_eq!(
+            (u.role.as_str(), u.text.as_deref()),
+            ("user", Some("do it"))
+        );
+        let parts = chunk(
+            "acp.thought",
+            json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}),
+        );
+        assert_eq!(parts.text.as_deref(), Some("ab"));
+        let t = chunk("acp.tool_call", json!({"message": "ran ls"}));
+        assert_eq!(
+            (t.role.as_str(), t.text.as_deref()),
+            ("tool", Some("ran ls"))
+        );
+        let l = chunk("acp.turn_completed", json!({"usage": 1}));
+        assert_eq!((l.role.as_str(), l.text), ("system", None));
+        assert!(l.payload.contains("usage"));
     }
 
     #[test]
