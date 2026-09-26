@@ -1,0 +1,74 @@
+import { act, fireEvent, render } from "@testing-library/react-native";
+import * as webview from "react-native-webview";
+
+import { concat, makeCoalescer } from "../src/terminal/engine/coalesce";
+import { decodeFromEngine, decodeInjection, encode, fromBase64, toBase64 } from "../src/terminal/engine/protocol";
+import { FIXTURES } from "../src/terminal/fixtures";
+import { withCtrl } from "../src/terminal/keys";
+import { TerminalView, type TerminalSink } from "../src/terminal/TerminalView";
+
+// The native webview is the shared jest mock (__mocks__/react-native-webview.tsx, jest.setup.ts).
+const { bridge } = webview as unknown as typeof import("../__mocks__/react-native-webview");
+
+beforeEach(() => bridge.reset());
+
+function injectedWrites(): string[] {
+  return bridge.injected.map(decodeInjection).flatMap((m) => (m?.t === "write" ? [m.b64] : []));
+}
+
+test("the coalescer flushes one batch per tick and concat joins the chunks", () => {
+  const ticks: (() => void)[] = [];
+  const flushed: Uint8Array[][] = [];
+  const c = makeCoalescer<Uint8Array>((b) => flushed.push(b), (cb) => ticks.push(cb));
+  c.push(new Uint8Array([1]));
+  c.push(new Uint8Array([2, 3]));
+  c.push(new Uint8Array([4]));
+  expect(ticks).toHaveLength(1);
+  expect(flushed).toHaveLength(0);
+  ticks[0]!();
+  expect(flushed).toHaveLength(1);
+  expect([...concat(flushed[0]!)]).toEqual([1, 2, 3, 4]);
+  c.push(new Uint8Array([5]));
+  expect(ticks).toHaveLength(2);
+});
+
+test("bridge messages round-trip and unknown ones are dropped", () => {
+  expect(decodeFromEngine(encode({ t: "fit", cols: 40, rows: 20 }))).toEqual({ t: "fit", cols: 40, rows: 20 });
+  expect(decodeFromEngine(encode({ t: "input", data: "\x1b[A" }))).toEqual({ t: "input", data: "\x1b[A" });
+  expect(decodeFromEngine('{"t":"bell"}')).toBeUndefined();
+  expect(decodeFromEngine("nope")).toBeUndefined();
+  const bytes = fromBase64(FIXTURES["f3-widechars"]);
+  expect(bytes).toHaveLength(276);
+  expect(toBase64(bytes)).toBe(FIXTURES["f3-widechars"]);
+  expect(fromBase64(FIXTURES["f1-altscreen"])).toHaveLength(2284);
+});
+
+test("ctrl turns a letter into its control byte", () => {
+  expect(withCtrl("c")).toBe("\x03");
+  expect(withCtrl("C")).toBe("\x03");
+  expect(withCtrl("[")).toBe("\x1b");
+  expect(withCtrl("\x1b[A")).toBe("\x1b[A");
+});
+
+test("bytes written before ready are injected once the engine is up, and keys reach onInput", async () => {
+  const input: string[] = [];
+  let sink: TerminalSink | undefined;
+  const screen = render(<TerminalView onReady={(s) => (sink = s)} onInput={(d) => input.push(d)} onFit={() => undefined} />);
+  expect(sink).toBeUndefined();
+  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
+  expect(sink).toBeDefined();
+  sink!.write(new Uint8Array([104, 105]));
+  expect(injectedWrites()).toEqual([toBase64(new Uint8Array([104, 105]))]);
+
+  fireEvent.press(screen.getByTestId("key-ctrl"));
+  await act(async () => bridge.engineMessage!(encode({ t: "input", data: "c" })));
+  fireEvent.press(screen.getByTestId("key-esc"));
+  fireEvent.press(screen.getByTestId("key-↑"));
+  expect(input).toEqual(["\x03", "\x1b", "\x1b[A"]);
+});
+
+test("a read-only terminal has no key bar", () => {
+  const screen = render(<TerminalView onReady={() => undefined} />);
+  expect(screen.queryByTestId("key-bar")).toBeNull();
+  expect(screen.getByTestId("terminal-webview")).toBeTruthy();
+});
