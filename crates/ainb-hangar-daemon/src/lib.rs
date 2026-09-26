@@ -201,6 +201,10 @@ pub mod observability;
 /// parking, the expiry, the activity feed and Pal's authorship live
 /// here, because only the daemon owns the store and the event broker.
 pub mod pal;
+/// A minimal HTTP/1.1 reader and writer shared by the loopback listeners
+/// (webhook ingress, hook ingress). Split head and body reads so a listener
+/// authenticates on the head before reading the body.
+mod local_http;
 /// Daemon-side pane binding for hook-sourced Fleet rows (D14, issue #916).
 ///
 /// A provider whose hooks run from a long-lived shared daemon (Codex 0.154)
