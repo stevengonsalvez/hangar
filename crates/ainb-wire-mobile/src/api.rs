@@ -2,7 +2,9 @@
 //!
 //! Every method here maps a proto request to a [`crate::records`] record. The
 //! op id of every mutation is minted here from the crate's CSPRNG, and a retry
-//! passes the same id back so the ledger deduplicates it.
+//! passes the same id back so the ledger deduplicates it. No token and no key
+//! crosses this boundary: pairing keeps them in custody and `connect_host`
+//! takes a host id.
 //!
 //! Async methods hop onto the crate's own tokio runtime, because a uniffi
 //! future is polled by the foreign executor and `tokio::spawn` needs a
@@ -19,7 +21,7 @@ use ainb_hangar_proto::fleet::{
     FleetMessageSendResult, FleetSubscribeParams, FleetSubscribeResult, FleetTranscriptListParams,
     FleetTranscriptListResult, FleetTranscriptSubscribeParams, FleetTranscriptSubscribeResult,
 };
-use ainb_hangar_proto::hosts::{CarrierKind, HostId};
+use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
 use ainb_hangar_proto::mutation::{ACK_KEY, Fence, MutationAck, MutationEnvelope, OpId};
 use ainb_hangar_proto::protocol::{ProtocolRange, catalogue_strings};
@@ -31,11 +33,12 @@ use tokio::runtime::Runtime;
 
 use crate::connlog::{ConnLog, Entry, Event};
 use crate::custody::{CustodyReport, DeviceKey};
+use crate::pairing::{self, EndpointRecord, PairingRecord};
 use crate::records::{
     AnswerReply, AttentionRecord, FleetSubscribeSummary, HelloSummary, InterruptReply,
     MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptPage, WireError, WireEvent,
 };
-use crate::session::{ConnectConfig, Session, SessionEvent, SessionStats, backoff_delay};
+use crate::session::{Session, SessionEvent, SessionStats, backoff_delay};
 
 fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -70,6 +73,10 @@ fn split_ack<R: serde::de::DeserializeOwned>(
         .map(MutationReceipt::from);
     let typed = serde_json::from_value(value).map_err(WireError::protocol)?;
     Ok((typed, ack))
+}
+
+fn open_log(log_dir: &str) -> Result<Arc<ConnLog>, WireError> {
+    ConnLog::open(Path::new(log_dir)).map(Arc::new)
 }
 
 /// The version string, for the log.
@@ -138,20 +145,11 @@ pub fn device_key_fingerprint(custody_dir: String) -> Result<String, WireError> 
     DeviceKey::load_or_create(Path::new(&custody_dir)).map(|k| k.fingerprint())
 }
 
-/// Which backend holds the device key on this target, and whether that is
-/// the degraded (file) one.
+/// Which backend holds the device secrets on this target, and whether that
+/// is the degraded (file) one.
 #[uniffi::export]
 pub fn custody_report() -> CustodyReport {
     CustodyReport::for_target()
-}
-
-/// One endpoint of a pairing offer.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct EndpointRecord {
-    /// `tailnet`, `lan` or `ssh-l`.
-    pub carrier: String,
-    /// `ws://host:port/peer`.
-    pub url: String,
 }
 
 /// What a pairing offer says, for the pair screen.
@@ -190,57 +188,52 @@ pub fn parse_offer(uri: String) -> Result<OfferSummary, WireError> {
     })
 }
 
-/// What `connect_host` needs: the pairing record plus where the device key
-/// lives.
+/// Redeem an offer as `display_name`: dial, `device/redeem`, `auth/hello`,
+/// then save the pairing (token in custody). The session is closed; the app
+/// calls `connect_host` with the returned host id.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn pair(
+    uri: String,
+    display_name: String,
+    custody_dir: String,
+    log_dir: String,
+) -> Result<PairingRecord, WireError> {
+    rt().spawn(async move {
+        let log = open_log(&log_dir)?;
+        let (record, _hello) =
+            pairing::pair(&uri, &display_name, Path::new(&custody_dir), Some(log)).await?;
+        Ok(record)
+    })
+    .await
+    .map_err(WireError::protocol)?
+}
+
+/// Every paired host, oldest first.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)]
+pub fn list_pairings(custody_dir: String) -> Result<Vec<PairingRecord>, WireError> {
+    pairing::list(Path::new(&custody_dir))
+}
+
+/// Forget a pairing: the token and the record. What the app does after a
+/// 4403 or when the owner removes a host.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)]
+pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireError> {
+    pairing::forget(Path::new(&custody_dir), &host_id)
+}
+
+/// What `connect_host` needs: which pairing, and where the secrets and the
+/// log live.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ConnectParams {
-    /// `ws://host:port/peer`.
-    pub url: String,
-    /// The carrier of `url`: `tailnet`, `lan` or `ssh-l`.
-    pub carrier: String,
-    /// The host id pinned at pairing.
+    /// The paired host.
     pub host_id: String,
-    /// The host static key pinned at pairing, 32 bytes.
-    pub host_static_pubkey: Vec<u8>,
-    /// The directory the device key is kept under.
+    /// The directory the device secrets are kept under.
     pub custody_dir: String,
     /// The directory the connection log is kept under.
     pub log_dir: String,
-    /// The device token from redeem (`mdd_…`).
-    pub device_token: String,
-    /// The device id from redeem.
-    pub device_id: String,
-    /// The name this device shows as.
-    pub display_name: String,
-}
-
-/// Build the session config from the params and the custody key.
-pub(crate) fn connect_config(params: &ConnectParams) -> Result<ConnectConfig, WireError> {
-    let key = DeviceKey::load_or_create(Path::new(&params.custody_dir))?;
-    let carrier: CarrierKind =
-        serde_json::from_value(serde_json::Value::String(params.carrier.clone()))
-            .map_err(WireError::protocol)?;
-    let host_id = HostId::parse_minted(&params.host_id).map_err(|e| WireError::Protocol {
-        message: e.to_string(),
-    })?;
-    let host_static_pubkey =
-        <[u8; 32]>::try_from(params.host_static_pubkey.as_slice()).map_err(|_| {
-            WireError::Protocol {
-                message: format!(
-                    "host static key is {} bytes, expected 32",
-                    params.host_static_pubkey.len()
-                ),
-            }
-        })?;
-    let mut config = ConnectConfig::new(
-        params.url.clone(),
-        carrier,
-        host_id,
-        host_static_pubkey,
-        key.private().to_vec(),
-    );
-    config.log = Some(Arc::new(ConnLog::open(Path::new(&params.log_dir))?));
-    Ok(config)
 }
 
 /// `auth/hello` on an open session, as a paired device.
@@ -285,26 +278,6 @@ pub struct MobileHost {
     hello: HelloSummary,
 }
 
-/// Dial the host, handshake, and `auth/hello` as the paired device.
-#[uniffi::export]
-pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, WireError> {
-    rt().spawn(async move {
-        let config = connect_config(&params)?;
-        let session = Session::connect(config).await?;
-        let hello = hello(
-            &session,
-            &params.device_token,
-            &params.device_id,
-            &params.display_name,
-        )
-        .await
-        .inspect_err(|_| session.close())?;
-        Ok(Arc::new(MobileHost { session, hello }))
-    })
-    .await
-    .map_err(WireError::protocol)?
-}
-
 impl std::fmt::Debug for MobileHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MobileHost")
@@ -312,6 +285,47 @@ impl std::fmt::Debug for MobileHost {
             .field("closed", &self.session.is_closed())
             .finish_non_exhaustive()
     }
+}
+
+/// Dial the paired host, handshake with its pinned key, and `auth/hello` as
+/// the paired device. A revoked device comes back as `Revoked`: the app
+/// forgets the pairing and shows "re-pair".
+#[uniffi::export]
+pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, WireError> {
+    rt().spawn(async move {
+        let custody_dir = Path::new(&params.custody_dir);
+        let not_paired = || WireError::NotPaired {
+            host_id: params.host_id.clone(),
+        };
+        let record = pairing::find(custody_dir, &params.host_id)?.ok_or_else(not_paired)?;
+        let token = pairing::token(custody_dir, &params.host_id)?.ok_or_else(not_paired)?;
+        let host_id = HostId::parse_minted(&record.host_id).map_err(|e| WireError::Protocol {
+            message: e.to_string(),
+        })?;
+        let host_static_pubkey = <[u8; 32]>::try_from(record.host_static_pubkey.as_slice())
+            .map_err(|_| WireError::Protocol {
+                message: format!(
+                    "pinned host key is {} bytes, expected 32",
+                    record.host_static_pubkey.len()
+                ),
+            })?;
+        let key = DeviceKey::load_or_create(custody_dir)?;
+        let log = open_log(&params.log_dir)?;
+        let session = pairing::dial(
+            &record.endpoints,
+            &host_id,
+            host_static_pubkey,
+            &key,
+            Some(log),
+        )
+        .await?;
+        let hello = hello(&session, &token, &record.device_id, &record.display_name)
+            .await
+            .inspect_err(|_| session.close())?;
+        Ok(Arc::new(MobileHost { session, hello }))
+    })
+    .await
+    .map_err(WireError::protocol)?
 }
 
 impl MobileHost {
