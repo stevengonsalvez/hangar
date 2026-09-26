@@ -1,4 +1,4 @@
--- Hangar v1 schema, migration 0103: the paired-device registry (R1-03, spec D13).
+-- Hangar v1 schema, migration 0104: the paired-device registry (R1-03, spec D13).
 --
 -- Three tables, all empty until a device pairs, and nothing reads them until
 -- the peer leg is switched on (`AINB_HANGAR_PEER_LISTEN`):
@@ -42,9 +42,12 @@ CREATE TABLE device_invite (
     display_name   TEXT CHECK (
         display_name IS NULL OR (
             length(display_name) BETWEEN 1 AND 64
-            AND trim(display_name) <> ''
-            AND instr(display_name, char(10)) = 0
-            AND instr(display_name, char(13)) = 0
+            AND length(CAST(display_name AS BLOB)) <= 256
+            AND instr(CAST(display_name AS BLOB), X'00') = 0
+            AND trim(display_name, ' ' || char(9) || char(160) || char(12288)) <> ''
+            AND display_name NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+            AND display_name NOT GLOB
+                ('*[' || char(8234) || '-' || char(8238) || char(8294) || '-' || char(8297) || ']*')
         )
     ),
     -- Unix milliseconds.
@@ -69,9 +72,12 @@ CREATE TABLE device (
     ),
     display_name   TEXT NOT NULL CHECK (
         length(display_name) BETWEEN 1 AND 64
-        AND trim(display_name) <> ''
-        AND instr(display_name, char(10)) = 0
-        AND instr(display_name, char(13)) = 0
+        AND length(CAST(display_name AS BLOB)) <= 256
+        AND instr(CAST(display_name AS BLOB), X'00') = 0
+        AND trim(display_name, ' ' || char(9) || char(160) || char(12288)) <> ''
+        AND display_name NOT GLOB ('*[' || char(1) || '-' || char(31) || char(127) || ']*')
+        AND display_name NOT GLOB
+            ('*[' || char(8234) || '-' || char(8238) || char(8294) || '-' || char(8297) || ']*')
     ),
     scope_base     TEXT NOT NULL CHECK (scope_base IN ('desktop', 'mobile', 'mobile+type')),
     scope_admin    INTEGER NOT NULL DEFAULT 0 CHECK (
