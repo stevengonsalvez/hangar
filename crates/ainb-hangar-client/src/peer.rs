@@ -186,15 +186,13 @@ impl ResyncGate {
             );
             receiver
         };
-        match receiver.await {
-            Ok(permit) => permit,
-            // The gate is shared by `Arc`, so a sender outlives this wait
-            // unless the gate itself is gone; there is then no budget to keep.
-            Err(_) => ResyncPermit {
-                gate: None,
-                host_id: HostId::local(),
-            },
-        }
+        // `self` holds the gate for the whole wait, and only `release` takes
+        // an entry out of the queue, sending on it as it does. A dropped
+        // sender is a broken invariant: fail loudly rather than hand out an
+        // uncounted permit labelled with the wrong host.
+        receiver.await.unwrap_or_else(|_| {
+            unreachable!("a resync waiter lost its sender while the gate lives")
+        })
     }
 
     /// Resyncs holding a slot now.
@@ -210,6 +208,12 @@ impl ResyncGate {
     }
 
     /// A slot came free: hand it to the best waiter still listening.
+    // The lock is held for the whole hand-out on purpose: releasing it
+    // between waiters would let a new `acquire` jump the queue.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the lock is held across the hand-out so no acquire jumps the queue"
+    )]
     fn release(&self) {
         let mut state = self.lock();
         state.running = state.running.saturating_sub(1);
