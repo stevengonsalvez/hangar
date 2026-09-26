@@ -175,6 +175,12 @@ impl HookTransport {
     }
 }
 
+/// Claude's `timeout` for the two HTTP events that may hold for a human
+/// (`PermissionRequest`, and `PreToolUse` on `AskUserQuestion`). Just above
+/// `ainb-hook.sh`'s own 610s curl budget, so the script always answers `{}`
+/// before Claude would kill it.
+const HTTP_HOLD_HOOK_TIMEOUT: u64 = 620;
+
 /// Build the HTTP-transport managed entry for `event`, pointing at
 /// `hook_script` (`ainb-hook.sh`). Keeps `AINB_MANAGED=atc` in the command and
 /// the bool [`ATC_MANAGED_KEY`], so every older strip rule still matches it.
@@ -183,12 +189,16 @@ pub fn http_managed_entry(event: &str, hook_script: &str) -> Value {
     let hook_script = shell_quote(hook_script);
     let command =
         format!("AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc {hook_script}");
+    let timeout = match event {
+        "PermissionRequest" | "PreToolUse" => HTTP_HOLD_HOOK_TIMEOUT,
+        _ => DEFAULT_HOOK_TIMEOUT,
+    };
     json!({
         ATC_MANAGED_KEY: true,
         HOOK_TRANSPORT_KEY: HookTransport::Http.as_str(),
         "matcher": "",
         "hooks": [
-            { "type": "command", "command": command, "timeout": timeout_for(event) }
+            { "type": "command", "command": command, "timeout": timeout }
         ]
     })
 }
@@ -646,7 +656,7 @@ mod tests {
         for event in ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS {
             let entry = &http["hooks"][event][0];
             let want = if matches!(event, "PermissionRequest" | "PreToolUse") {
-                660
+                620
             } else {
                 10
             };
