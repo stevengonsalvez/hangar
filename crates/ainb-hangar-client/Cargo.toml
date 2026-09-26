@@ -37,6 +37,9 @@ ainb-hangar-noise = { path = "../ainb-hangar-noise" }
 ainb-hangar-secrets = { path = "../ainb-hangar-secrets" }
 # The `peers.json` key encoding, the same base64url as the pairing offer.
 base64 = "0.22"
+# Zeroes the temporaries that hold pairing secrets (the stored form, a file
+# read, a decoded key) when they drop.
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # The fake-socket tests bind a `UnixListener` in a temporary directory.
