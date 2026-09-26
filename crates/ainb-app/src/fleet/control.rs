@@ -517,15 +517,6 @@ fn outcome_result(
 /// # Errors
 ///
 /// Returns the reason nothing was delivered.
-pub fn answer_via_tmux_blocking(session_id: &str, text: &str) -> Result<String, String> {
-    answer_via_tmux_blocking_at(session_id, &crate::fleet::send::PaneHint::default(), text)
-}
-
-/// [`answer_via_tmux_blocking`], into the agent's own pane as `pane` names it.
-///
-/// # Errors
-///
-/// Returns the reason nothing was delivered.
 pub fn answer_via_tmux_blocking_at(
     session_id: &str,
     pane: &crate::fleet::send::PaneHint,
