@@ -41,6 +41,7 @@ test("bridge messages round-trip and unknown ones are dropped", () => {
   expect(bytes).toHaveLength(276);
   expect(toBase64(bytes)).toBe(FIXTURES["f3-widechars"]);
   expect(fromBase64(FIXTURES["f1-altscreen"])).toHaveLength(2284);
+  expect(new TextDecoder().decode(fromBase64(FIXTURES["f4-osc8"]))).toContain("\x1b]8;;https://example.invalid/never\x1b\\");
 });
 
 test("ctrl turns a letter into its control byte", () => {
