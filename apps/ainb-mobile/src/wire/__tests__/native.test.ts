@@ -220,6 +220,18 @@ describe("native adapter", () => {
     expect(busy.retryAfterMs).toBe(7000);
   });
 
+  test("a call on a host that is not connected is not_connected, never not_paired", async () => {
+    const { host } = scriptedHost([]);
+    const wire = wireOver(host);
+    await expect(wire.rosterStatus("h1")).rejects.toMatchObject({ kind: "not_connected", retryable: true });
+    await wire.connect("h1");
+    await wire.close("h1");
+    for (let i = 0; i < 10 && !host.isClosed(); i++) await flush();
+    await expect(wire.hostInfo("h1")).rejects.toMatchObject({ kind: "not_connected" });
+    // The crate's own not_paired (no record) still maps to not_paired.
+    expect(toPeerCloseError({ tag: "NotPaired", inner: { hostId: "h9" } }).kind).toBe("not_paired");
+  });
+
   test("concurrent connects share one dial: one socket, one promise", async () => {
     const dials = { count: 0 };
     const wire = wireOver(scriptedHost([]).host, { dials, slow: true });
