@@ -922,6 +922,10 @@ struct ConnectionTeardown {
     registry: connections::ConnectionRegistry,
     events: EventSink,
     armed: bool,
+    /// The row is removed but its `ConnectionsChanged` has not gone out yet.
+    /// A second removal would find nothing and announce nothing, so a `Drop`
+    /// in this window must only announce.
+    announce: bool,
 }
 
 impl ConnectionTeardown {
@@ -932,16 +936,23 @@ impl ConnectionTeardown {
             registry,
             events,
             armed: true,
+            announce: false,
         }
     }
 
     /// The normal end: run the teardown now, and disarm the `Drop` path only
-    /// once the row is gone. An abort during the removal's await therefore
-    /// still reaches `Drop`, which retries it; a repeated removal is a no-op
-    /// that announces nothing.
+    /// once the row is gone and announced. An abort during the removal's
+    /// await still reaches `Drop`, which retries it; an abort after the row
+    /// went but before its announcement reaches `Drop` with `announce` set,
+    /// which then only announces.
     async fn finish(mut self) {
         std::mem::take(&mut self.subscriptions).abort_all();
-        release_registry_row(&self.registry, self.conn_id, &self.events).await;
+        if self.registry.remove(self.conn_id).await {
+            // Set with no await in between, so no abort can land between the
+            // removal and the flag.
+            self.announce = true;
+            emit_connections_changed(&self.events, &self.registry).await;
+        }
         self.armed = false;
     }
 }
@@ -961,8 +972,13 @@ impl Drop for ConnectionTeardown {
         let registry = self.registry.clone();
         let events = self.events.clone();
         let conn_id = self.conn_id;
+        let announce_only = self.announce;
         runtime.spawn(async move {
-            release_registry_row(&registry, conn_id, &events).await;
+            if announce_only {
+                emit_connections_changed(&events, &registry).await;
+            } else {
+                release_registry_row(&registry, conn_id, &events).await;
+            }
         });
     }
 }
@@ -14901,6 +14917,29 @@ mod tests {
         }
     }
 
+    /// #100 review: a teardown dropped after its row was removed but before
+    /// the removal was announced still announces it. A second removal finds
+    /// nothing, so without the flag the announcement would be lost for good.
+    #[tokio::test]
+    async fn a_teardown_dropped_between_removal_and_announcement_still_announces() {
+        use ainb_hangar_proto::events::HangarEvent;
+
+        let registry = connections::ConnectionRegistry::new();
+        let broker = EventBroker::new();
+        let mut announcements = broker.subscribe_attention();
+        let mut teardown = ConnectionTeardown::new(7, registry.clone(), broker.sink());
+        teardown.announce = true;
+        drop(teardown);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), announcements.recv())
+            .await
+            .expect("the spawned announcement runs")
+            .expect("event");
+        assert!(
+            matches!(event, HangarEvent::ConnectionsChanged { .. }),
+            "{event:?}"
+        );
+    }
+
     /// Review follow-up C: a peer that never reads cannot pin the writer. The
     /// socket buffer fills, the one frame in flight misses the deadline, the
     /// writer ends, and the next queued frame fails, which is what ends the
@@ -14935,7 +14974,10 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
-        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_millis(200));
+        // Per frame, and well above scheduler jitter on a loaded runner: the
+        // property is that a reading peer is never cut off, not how tight the
+        // bound is.
+        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_secs(2));
         let reader = tokio::spawn(async move {
             let mut total = 0usize;
             let mut buf = [0u8; 4096];
