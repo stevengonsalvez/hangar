@@ -1,10 +1,12 @@
 // ABOUTME: Send-side fleet primitives: broker HTTP, tmux send-keys, route.
 
 pub mod broker;
+pub mod pane;
 pub mod route;
 pub mod tmux;
 
 pub use broker::{BrokerClient, broker_health, broker_send};
+pub use pane::{PaneHint, only_pane, pane_id_of, resolve_send_target};
 pub use route::{send, tmux_delivery_preferred};
 pub use tmux::{
     SendError, SendFailure, pane_has_unsubmitted_input, tmux_press_enter, tmux_send,
