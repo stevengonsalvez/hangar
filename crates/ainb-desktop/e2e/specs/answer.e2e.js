@@ -104,12 +104,13 @@ describe("answering from the window", () => {
     // Raised while the window is open, by a process that is not the window.
     raiseHook(target, ASK);
 
-    // The board: the agent the id names sits in the waiting column.
+    // The board: the agent the id names sits in the needs-you column (P4:
+    // Orca's own buckets replaced the raw AgentState columns).
     await click(".board-tab .tab-title");
-    const card = `.board-column[data-state="waiting"] .board-card[data-card="claude:${provider}"]`;
+    const card = `.board-column[data-state="needs"] .board-card[data-card="claude:${provider}"]`;
     await $(card).waitForExist({
       timeout: 60_000,
-      timeoutMsg: `no waiting card for claude:${provider} on the board`,
+      timeoutMsg: `no needs-you card for claude:${provider} on the board`,
     });
 
     // The banner: the session's row carries the question, and selecting it
