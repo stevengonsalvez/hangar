@@ -174,7 +174,7 @@ async fn serve(listener: TcpListener, judge: Arc<Judge>, sink: Arc<dyn HookSink>
 }
 
 async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> std::io::Result<()> {
-    let head = match tokio::time::timeout(HEAD_DEADLINE, read_head(stream, MAX_HEAD)).await {
+    let mut head = match tokio::time::timeout(HEAD_DEADLINE, read_head(stream, MAX_HEAD)).await {
         Err(_) => return write_response(stream, 408, "text/plain", b"timeout").await,
         Ok(r) => match r? {
             Some(head) => head,
@@ -212,13 +212,16 @@ async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> s
         .get(&PARENT_HEADER.to_ascii_lowercase())
         .filter(|v| !v.is_empty() && v.len() <= 256)
         .cloned();
-    let body = match tokio::time::timeout(BODY_DEADLINE, read_body(stream, head, MAX_BODY)).await {
-        Err(_) => return write_response(stream, 408, "text/plain", b"timeout").await,
-        Ok(r) => match r? {
-            Some(body) => body,
-            None => return write_response(stream, 413, "text/plain", b"payload too large").await,
-        },
-    };
+    // The judge already refused a declared length over MAX_BODY (413), so a
+    // `None` here is a peer that closed before sending the body it declared.
+    let body =
+        match tokio::time::timeout(BODY_DEADLINE, read_body(stream, &mut head, MAX_BODY)).await {
+            Err(_) => return write_response(stream, 408, "text/plain", b"timeout").await,
+            Ok(r) => match r? {
+                Some(body) => body,
+                None => return write_response(stream, 400, "text/plain", b"short body").await,
+            },
+        };
     let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(v) if v.is_object() => v,
         _ => return write_response(stream, 400, "text/plain", b"body is not a JSON object").await,
