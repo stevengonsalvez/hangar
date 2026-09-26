@@ -1,6 +1,10 @@
 //! M1-13: the terminal on the wire against a peer speaking C-R2-1 to C-R2-9.
 
-#![allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+#![allow(
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    clippy::cast_possible_truncation
+)]
 
 mod common;
 
@@ -362,6 +366,48 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
     ));
     assert!(Arc::clone(&host).terminal_floor(7, "steal".into(), None).await.is_err());
     host.close();
+}
+
+#[tokio::test]
+async fn a_refused_ack_still_delivers_the_frame_and_is_logged_separately() {
+    let peer = spawn(
+        hello_then("mobile+type", |method, _p| match method {
+            "terminal/attach" => Reply::Result(json!({
+                "stream_id": 7, "epoch": 1, "snapshot_seq": 0, "cols": 40, "rows": 20,
+                "floor": {"floor_gen": 0}, "native_clients": 0
+            })),
+            "terminal/ack" => Reply::Error {
+                code: -32000,
+                message: "ack refused".into(),
+                data: None,
+            },
+            other => method_not_found(other),
+        }),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let host = connect_host(params_for(&peer, dir.path())).await.unwrap();
+    Arc::clone(&host)
+        .terminal_attach("claude:s-1".into(), Some(40), Some(20), true, None)
+        .await
+        .unwrap();
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let chunk = vec![b'y'; ACK_EVERY_BYTES as usize];
+    peer.notify
+        .send(frame(7, 1, json!({"kind": "output", "data": b64(&chunk)})))
+        .unwrap();
+    let got = Arc::clone(&host).next_event().await;
+    assert!(
+        matches!(got, WireEvent::TerminalFrame { stream_id: 7, ref frame, .. }
+            if *frame == TerminalFrameRecord::Output { data: chunk.clone() }),
+        "the frame that triggered the refused ack is still delivered: {got:?}"
+    );
+    assert_eq!(host.terminal_acks_failed(), 1);
+    let log = host.connection_log(50);
+    let failed = log.iter().find(|e| e.event == "ack_failed").expect("ack_failed logged");
+    assert!(failed.detail.contains("ack refused"), "{}", failed.detail);
+    assert_eq!(peer.params_of("terminal/ack").len(), 1);
 }
 
 #[tokio::test]
