@@ -188,7 +188,8 @@ async fn launched_command(
         resume_requested,
         false, // headroom_enabled (keep the env prefix off the critical path)
         None,  // codex_session (this test resumes through the transcript, not a
-               // pre-ensured codex session)
+        // pre-ensured codex session)
+        None, // claude_session (a record with no minted id resumes as before)
     )
     .await
     .expect("start_cli_in_tmux");

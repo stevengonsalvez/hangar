@@ -10359,6 +10359,14 @@ impl AppState {
                     true, // resume_requested — Enter/r on a Stopped session
                     metadata.headroom_enabled,
                     codex_remote.as_ref(),
+                    // The id the record holds, kept across the resume: named
+                    // exactly when Claude holds a transcript under it.
+                    metadata.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&metadata.worktree_path, id),
+                        }
+                    }),
                 )
                 .await?;
 
@@ -10487,8 +10495,64 @@ impl AppState {
     /// Returns `None` when the project directory is missing or contains no
     /// transcripts.
     pub fn find_latest_transcript(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
-        let home = dirs::home_dir()?;
-        Self::find_latest_transcript_in(&home, worktree_path)
+        Self::find_latest_transcript_under(&Self::claude_projects_dir()?, worktree_path)
+    }
+
+    /// Where Claude keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects` when
+    /// that variable is set, as `models::usage` reads it, else
+    /// `~/.claude/projects`. A resume that read the default while Claude
+    /// wrote elsewhere would relaunch under an id Claude already holds, and
+    /// the pane would die on "already in use".
+    fn claude_projects_dir() -> Option<std::path::PathBuf> {
+        Self::claude_projects_dir_from(
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// Pure half of [`Self::claude_projects_dir`]: `config_dir` is the
+    /// `CLAUDE_CONFIG_DIR` value, `home` the home directory.
+    pub(crate) fn claude_projects_dir_from(
+        config_dir: Option<&std::ffi::OsStr>,
+        home: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        config_dir
+            .map(|dir| std::path::PathBuf::from(dir).join("projects"))
+            .or_else(|| home.map(|home| home.join(".claude").join("projects")))
+    }
+
+    /// Whether Claude holds a transcript for `session_id` in `worktree_path`'s
+    /// project directory, which is what a `--resume <session_id>` needs: the
+    /// transcript is named by the session id.
+    pub fn claude_transcript_exists(worktree_path: &std::path::Path, session_id: &str) -> bool {
+        Self::claude_projects_dir().is_some_and(|projects| {
+            Self::claude_transcript_exists_under(&projects, worktree_path, session_id)
+        })
+    }
+
+    /// Test-friendly variant of [`Self::claude_transcript_exists`]: `home` is
+    /// the home directory whose `.claude/projects` is read.
+    pub(crate) fn claude_transcript_exists_in(
+        home: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        Self::claude_transcript_exists_under(
+            &home.join(".claude").join("projects"),
+            worktree_path,
+            session_id,
+        )
+    }
+
+    pub(crate) fn claude_transcript_exists_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        projects
+            .join(Self::claude_project_dir_name(worktree_path))
+            .join(format!("{session_id}.jsonl"))
+            .is_file()
     }
 
     /// Test-friendly variant: caller supplies the home directory so unit tests
@@ -10502,10 +10566,14 @@ impl AppState {
         home: &std::path::Path,
         worktree_path: &std::path::Path,
     ) -> Option<std::path::PathBuf> {
-        let project_dir = home
-            .join(".claude")
-            .join("projects")
-            .join(Self::claude_project_dir_name(worktree_path));
+        Self::find_latest_transcript_under(&home.join(".claude").join("projects"), worktree_path)
+    }
+
+    pub(crate) fn find_latest_transcript_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let project_dir = projects.join(Self::claude_project_dir_name(worktree_path));
 
         let read = std::fs::read_dir(&project_dir).ok()?;
         let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -13544,6 +13612,14 @@ impl AppState {
                 true,
                 headroom_enabled,
                 codex_remote.as_ref(),
+                metadata.and_then(|m| {
+                    m.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&m.worktree_path, id),
+                        }
+                    })
+                }),
             )
             .await?;
 
@@ -13636,7 +13712,7 @@ impl AppState {
         // held here. The write is the `Persist::SessionHeadroom` effect below,
         // a compare-and-set the resolver runs under its own lock, so a value
         // that moved between this read and that write is never overwritten.
-        let (skip_permissions, model, has_history) = {
+        let (skip_permissions, model, has_history, claude_session_id) = {
             let store = match crate::cli::util::load_session_store_async().await {
                 Ok(store) => store,
                 Err(e) => {
@@ -13664,6 +13740,13 @@ impl AppState {
                     meta.launch_model().or(session_model),
                     agent_type == SessionAgentType::Claude
                         && Self::find_latest_transcript(&meta.worktree_path).is_some(),
+                    // The id the record holds, kept across the respawn: a
+                    // resume names it exactly when Claude holds a transcript
+                    // under it, so the daemon's rows for it still land here.
+                    meta.claude_session_id.clone().map(|id| {
+                        let resumable = Self::claude_transcript_exists(&meta.worktree_path, &id);
+                        (id, resumable)
+                    }),
                 ),
             };
 
@@ -13692,6 +13775,12 @@ impl AppState {
                 model.as_deref(),
                 true,
                 has_history,
+                claude_session_id.as_ref().map(|(id, resumable)| {
+                    crate::interactive::session_manager::ClaudeSession {
+                        id,
+                        resumable: *resumable,
+                    }
+                }),
             );
         let cli_cmd = cmd_parts
             .iter()
@@ -15214,6 +15303,7 @@ mod codex_degrade_notice_tests {
             headroom_enabled: false,
             rtk_enabled: false,
             codex_thread_id: None,
+            claude_session_id: None,
             codex_degrade: degrade,
         }
     }

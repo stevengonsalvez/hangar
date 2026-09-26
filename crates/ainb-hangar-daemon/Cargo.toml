@@ -145,6 +145,12 @@ nix = { workspace = true, features = ["signal", "user"] }
 # e38.1 socket-auth: the CSPRNG behind the boot-time daemon-token mint
 # (`rpc::auth::ensure_socket_token` passes `OsRng` into the core mint seam).
 rand = "0.8"
+# R1-02: the peer leg's Noise IK static key. X25519 public halves come from the
+# clamped base-point multiply, the same one the Noise DH uses, and the secret
+# half is zeroed on drop. Both crates are already in the lock through
+# `ed25519-dalek`.
+curve25519-dalek = "4.1"
+zeroize = "1"
 # Resolves the `bd` binary on PATH (or validates an explicit path) so the
 # adapter can fail fast with `BdNotInstalled` instead of an opaque exec error
 # when the issue tracker is absent. Used by `BdClient::new`.
