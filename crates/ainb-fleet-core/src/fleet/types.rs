@@ -224,6 +224,12 @@ pub struct FleetSession {
     pub version: u64,
 }
 
+/// Why an answer found nothing to deliver to: no discovered session runs under
+/// the id the request names. A session started before ainb minted and stored
+/// the agent's id is the usual case, and a new session is the way to a row
+/// that can be answered here. One wording for the daemon and the app.
+pub const NO_LIVE_TARGET: &str = "no live session runs under this id (started before the upgrade): start a new session to answer here";
+
 /// Unified session identity. May be backed by 1+ sources after merge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
