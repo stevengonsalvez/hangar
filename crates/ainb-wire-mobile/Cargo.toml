@@ -1,0 +1,79 @@
+[package]
+name = "ainb-wire-mobile"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/stevengonsalvez/hangar"
+publish = false
+description = "The phone side of the Hangar peer wire (M1): a Noise IK session over WebSocket carrying the daemon's JSON-RPC, exported to the Expo app through uniffi. No JSON and no key material cross into JavaScript."
+
+# Its own workspace, excluded from the root one on purpose (root Cargo.toml
+# `exclude`): uniffi and the phone toolchains are outside the required CI's
+# disk budget, so this crate builds in `.github/workflows/mobile.yml` only and
+# is never linked by `ainb` or `ainb-hangar-daemon`.
+[workspace]
+
+[lib]
+name = "ainb_wire_mobile"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+# The frozen wire (PR-0): frame header, opcodes, prologue, offer codec.
+ainb-hangar-noise = { path = "../ainb-hangar-noise" }
+# The real RPC types: the crate stops compiling the moment a contract moves.
+ainb-hangar-proto = { path = "../ainb-hangar-proto" }
+# The IK handshake. R1-01 lifts the builders into ainb-hangar-noise; until
+# then the phone builds its initiator here against the frozen prologue.
+snow = "0.9.6"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+# No TLS: the peer leg is Noise over plain `ws://` (tailnet, LAN or ssh -L).
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+uniffi = "0.31"
+
+# iOS only: the Keychain backend. `cargo check` for the iOS targets covers it
+# from any host; a run needs a simulator or a phone.
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+# `release` is what the app builds with, so the size tuning lives there:
+# smallest code, fat whole-program LTO, one codegen unit, symbols stripped
+# (uniffi's exported symbols are dynamic and survive). Panics stay `unwind`:
+# uniffi catches a panic at the boundary and turns it into an error, which
+# `abort` would make a crash.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+# The untuned baseline the size job measures first (`--profile untuned`):
+# cargo's own release defaults, so every "before" is honest.
+[profile.untuned]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+strip = false
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
