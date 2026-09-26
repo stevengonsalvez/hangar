@@ -564,7 +564,21 @@ where
     // before any `writing` receipt, so the retry runs for real.
     if let Err(error) = &result {
         if let Some(reason) = fence_refusal(error) {
-            let _ = MutationLedgerRepo::abandon(pool, &key).await;
+            match MutationLedgerRepo::abandon(pool, &key).await {
+                Ok(0) => tracing::warn!(
+                    op_id = %key.op_id,
+                    method = %req.method,
+                    reason,
+                    "a refusal to retry abandoned no ledger row; the op id may replay it"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    op_id = %key.op_id,
+                    method = %req.method,
+                    %error,
+                    "a refusal to retry could not abandon its ledger row"
+                ),
+            }
             return Err(with_error_ack(
                 error.clone(),
                 &MutationAck::refused(
@@ -650,8 +664,11 @@ where
     }
 }
 
-/// A handler refusal that a stale FENCE caused, which must not be recorded as
-/// the op id's answer (see the abandon path in [`guard`]).
+/// A handler refusal the client cures by re-reading and resending under the
+/// SAME op id: a stale fence (`turn_advanced`, `incarnation_mismatch`) or a
+/// stale fleet session version (`conflict`). It must not be recorded as the
+/// op id's answer, because the body fingerprint ignores both the fence and
+/// the retry's fresh read; see the abandon path in [`guard`].
 fn fence_refusal(error: &RpcError) -> Option<&'static str> {
     match handler_reason(error)?.as_str() {
         REASON_TURN_ADVANCED => Some(REASON_TURN_ADVANCED),
