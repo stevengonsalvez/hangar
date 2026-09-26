@@ -468,6 +468,25 @@ impl FleetProviderEventRepo {
         max_rows: i64,
         max_payload_bytes: usize,
     ) -> Result<(Vec<FleetProviderEventRow>, bool), sqlx::Error> {
+        Self::list_by_session_tail_before(pool, session_key, None, max_rows, max_payload_bytes)
+            .await
+    }
+
+    /// [`Self::list_by_session_tail`], ending strictly before `before_order`
+    /// when given: the newest page OLDER than a row the caller already holds,
+    /// oldest first, bounded the same way. `truncated` means older rows
+    /// remain, so the caller pages back again from this page's first row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the query fails.
+    pub async fn list_by_session_tail_before(
+        pool: &SqlitePool,
+        session_key: &str,
+        before_order: Option<i64>,
+        max_rows: i64,
+        max_payload_bytes: usize,
+    ) -> Result<(Vec<FleetProviderEventRow>, bool), sqlx::Error> {
         let max_rows = max_rows.max(1);
         // One row MORE than the cap, so "was there anything older" is answered by
         // this query rather than by a second one. A session holding exactly
@@ -475,10 +494,11 @@ impl FleetProviderEventRepo {
         // only thing that distinguishes the two.
         let rows = sqlx::query(
             "SELECT ingest_order, event_id, provider, source, session_key, provider_session_id, observed_at, received_at, event_type, raw_payload, raw_blake3, projection_revision \
-             FROM fleet_provider_event WHERE session_key = ? \
+             FROM fleet_provider_event WHERE session_key = ? AND ingest_order < ? \
              ORDER BY ingest_order DESC LIMIT ?",
         )
         .bind(session_key)
+        .bind(before_order.unwrap_or(i64::MAX))
         .bind(max_rows.saturating_add(1))
         .fetch_all(pool)
         .await?;
