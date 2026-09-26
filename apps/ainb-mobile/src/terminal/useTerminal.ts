@@ -120,8 +120,9 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
   /** One fresh snapshot per overflow; a second overflow in a row is reported, not retried forever. */
   const overflowRetried = useRef(false);
 
-  const attach = useCallback(async (): Promise<void> => {
+  const attach = useCallback(async (retryAfterOverflow = false): Promise<void> => {
     if (!hostId || !sessionKey || stream.current !== undefined) return;
+    if (!retryAfterOverflow) overflowRetried.current = false; // a new cycle gets its own one retry
     resetEarly();
     let at;
     try {
@@ -148,9 +149,8 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
         return;
       }
       overflowRetried.current = true;
-      return attach();
+      return attach(true);
     }
-    overflowRetried.current = false;
     for (const q of held.frames) onFrame(q.seq, q.frame);
     await resizeIfHolder(at.floor);
   }, [wire, hostId, sessionKey, resizeIfHolder, detach]);
