@@ -23,7 +23,11 @@ export default function Hosts() {
               <Text style={styles.name}>{item.displayName}</Text>
               {item.repair ? (
                 <Text style={styles.repair} testID={`repair-${item.hostId}`}>
-                  {item.repair === "revoked" ? "revoked, pair again" : "pairing expired, pair again"}
+                  {item.repair === "revoked" ? "revoked or expired, pair again" : "host no longer accepts this device, pair again"}
+                </Text>
+              ) : item.notice ? (
+                <Text style={styles.repair} testID={`notice-${item.hostId}`}>
+                  {item.notice === "update_required" ? "update the app or the host" : "closed with an unknown code, check the host"}
                 </Text>
               ) : (
                 <Text style={item.reachability === "reachable" ? styles.up : styles.down}>
