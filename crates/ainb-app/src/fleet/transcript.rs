@@ -289,6 +289,7 @@ fn read_page(session_key: String, after: Option<i64>) -> TranscriptOutcome {
             .transcript_list(FleetTranscriptListParams {
                 session_key,
                 after_order: after,
+                before_order: None,
                 limit: PAGE,
             })
             .await
@@ -403,6 +404,7 @@ mod tests {
         TranscriptOutcome::Page(FleetTranscriptListResult {
             chunks,
             next_after_order: next,
+            next_before_order: None,
             truncated: false,
         })
     }

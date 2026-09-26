@@ -34,6 +34,8 @@ import { Review } from "./review.tsx";
 import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
 import { Sidebar } from "./sidebar.tsx";
+import { Titlebar } from "./titlebar.tsx";
+import { Statusbar } from "./statusbar.tsx";
 import { SettingsPage } from "./settings.tsx";
 import { CLOSE_SETTINGS, OPEN_SETTINGS } from "./settings.ts";
 import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar.ts";
@@ -43,6 +45,7 @@ import {
   openRowIntent,
   rowOf,
   stepTab,
+  terminalMayTakeFocus,
   type Accelerator,
   type RendererIntent,
   type RowId,
@@ -50,17 +53,22 @@ import {
   type TabsView,
 } from "./tabs.ts";
 import { TerminalView } from "./terminal.tsx";
+import "@fontsource-variable/geist";
+import "@fontsource-variable/geist-mono";
+import "./theme/tokens.css";
 import "./shell.css";
+import { startTheme } from "./theme/theme.ts";
 
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
-/** The header's counts, in the order it draws them. */
-const HEADER_COUNTS = [
-  [ROOT_SELECTORS.askCount, "ASK"],
-  [ROOT_SELECTORS.approveCount, "APPROVE"],
-  [ROOT_SELECTORS.waitCount, "WAIT"],
-  [ROOT_SELECTORS.errCount, "ERR"],
+/** The selectors summed into the status bar's one "N need you" count, in the
+ * order the old header drew them as separate badges (D2). */
+const ATTENTION_SELECTORS = [
+  ROOT_SELECTORS.askCount,
+  ROOT_SELECTORS.approveCount,
+  ROOT_SELECTORS.waitCount,
+  ROOT_SELECTORS.errCount,
 ] as const;
 
 /** How long a toast stays up. */
@@ -136,28 +144,64 @@ function Shell() {
   );
   let sidebar: HTMLElement | undefined;
 
-  const activate = (key: string | null) => {
+  /**
+   * Give the keyboard to `key`'s terminal, on the next frame so a tab that
+   * was just listed has mounted, when `terminalMayTakeFocus` allows it: never
+   * under the open palette, and not for the host's own answer while a text
+   * field such as the answer banner's composer has the keyboard. The host
+   * answers a tab open on its own schedule, so its focus can land after the
+   * chord that opened the palette or the click that put the cursor in the
+   * composer, and the keystrokes meant for that field, Escape among them,
+   * would go to the agent's pane (#47). A person's own tab chord or click
+   * moves the keyboard as asked. The palette gives the keyboard back to the
+   * active tab when it closes.
+   */
+  const focusTab = (key: string, byHost: boolean) =>
+    requestAnimationFrame(() => {
+      if (terminalMayTakeFocus({ palette: palette(), byHost, active: document.activeElement })) {
+        focusers.get(key)?.();
+      }
+    });
+  /**
+   * Show `key`'s terminal. `byHost` says who asked: the host, answering a
+   * tab open on its own schedule, or a person, by a chord or a click. Every
+   * caller says which, since the difference decides whether the terminal may
+   * take the keyboard from a text field (`terminalMayTakeFocus`).
+   */
+  const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
       setPane("terminal");
       closeTranscript();
       closeSettings();
+      focusTab(key, byHost);
     }
-    if (key !== null) requestAnimationFrame(() => focusers.get(key)?.());
   };
+  /**
+   * How many tab-strip answers the host has given so far, and which tab the
+   * last one focused, on the strip as `data-host-answers` and
+   * `data-host-focus`: the host answers a tab open on its own schedule, and
+   * a driven run that must act after that answer (not before, not a guessed
+   * second later, not on a strip tidy-up that focused nothing) has nothing
+   * else to read it from.
+   */
+  const [hostAnswers, setHostAnswers] = createSignal(0);
+  const [hostFocus, setHostFocus] = createSignal("");
   const showTabs = (view: TabsView) => {
+    setHostAnswers((n) => n + 1);
+    setHostFocus(view.focus ?? "");
     setTabs(view.tabs);
     for (const key of focusers.keys()) {
       if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
     }
-    if (view.focus !== null) activate(view.focus);
+    if (view.focus !== null) activate(view.focus, true);
     else if (!view.tabs.some((tab) => tab.key === active())) {
       // The shown tab ended (an unrelated tmux session died, say): point at
       // the next one WITHOUT leaving the board. `activate` means a person chose
       // a terminal; this is the strip tidying up after itself.
       const next = view.tabs[0]?.key ?? null;
       setActive(next);
-      if (next !== null && pane() === "terminal") requestAnimationFrame(() => focusers.get(next)?.());
+      if (next !== null && pane() === "terminal") focusTab(next, true);
     }
   };
   // A refused intent comes back with the row and the reason: say so, or a
@@ -210,6 +254,17 @@ function Shell() {
     if (!inboxOpen()) return;
     void run(CLOSE_INBOX);
   };
+  /**
+   * The answer banner's sends. Its rows are the session list's, and the
+   * banner is drawn over every page: the host is asked to put the reducer on
+   * the session list first, by the reducer's own screen (#121), and then the
+   * rows go as before.
+   */
+  const answer = async (intents: RendererIntent[]) => {
+    if (intents.length === 0) return;
+    await invoke("answer_home");
+    await run(intents);
+  };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
     void invoke<boolean>("setup_write", { write }).then((ran) => {
@@ -227,7 +282,14 @@ function Shell() {
   };
   const choose = (tab: Tab) => {
     if (tab.state === "detached") openRow(rowOf(tab.target));
-    activate(tab.key);
+    activate(tab.key, false);
+  };
+  /** Open the palette, or close it the way Esc does: the titlebar's search
+   * button and the Cmd/Ctrl+Shift+K accelerator both send exactly this, so
+   * there is one place that decides which way a press or a click goes. */
+  const togglePalette = () => {
+    if (palette()) closePalette();
+    else setPalette(true);
   };
   const onAccelerator = (shell: Accelerator) => {
     switch (shell.kind) {
@@ -238,7 +300,7 @@ function Shell() {
       }
       case "prev":
       case "next":
-        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1));
+        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1), false);
         return;
       case "close": {
         const key = active();
@@ -255,10 +317,7 @@ function Shell() {
       case "paste":
         return;
       case "palette":
-        // The second press closes it the way Esc does, so focus goes back to
-        // the pane or the sidebar rather than to the body.
-        if (palette()) closePalette();
-        else setPalette(true);
+        togglePalette();
         return;
     }
   };
@@ -341,10 +400,11 @@ function Shell() {
   const gitView = () => shellGitView(store, host());
   const usage = () => shellUsage(store, host());
   const usageStale = createMemo(() => ROOT_SELECTORS.usageStale(store, host()));
-  const counts = HEADER_COUNTS.map(([select, label]) => ({
-    label,
-    count: createMemo(() => select(store, host())),
-  }));
+  /** ASK + APPROVE + WAIT + ERR: the status bar's one "N need you" amber
+   * count. Each selector is its own memo first, so a drain that only moves
+   * one of the four still wakes just that one before the sum recomputes. */
+  const attentionCounts = ATTENTION_SELECTORS.map((select) => createMemo(() => select(store, host())));
+  const needsYou = createMemo(() => attentionCounts.reduce((sum, count) => sum + count(), 0));
   const idle = createMemo(() => ROOT_SELECTORS.idleCount(store, host()));
   const sessionsStale = createMemo(() => ROOT_SELECTORS.sessionsStale(store, host()));
   const gitViewStale = createMemo(() => ROOT_SELECTORS.gitViewStale(store, host()));
@@ -402,50 +462,16 @@ function Shell() {
 
   return (
     <main class="shell">
-      <header class="header">
-        <span class="host" title="Host">
-          host: {host() ?? "none"}
-        </span>
-        <span class="counts" aria-label="Attention">
-          <For each={counts}>
-            {(entry) => (
-              <Show when={entry.count() > 0}>
-                <span class="count attention">
-                  {entry.count()} {entry.label}
-                </span>
-              </Show>
-            )}
-          </For>
-          <span class="count">{idle()} IDLE</span>
-          {/* A development build shows frames the store refused (#1132). */}
-          <Show when={import.meta.env.DEV && store.framesIgnored() > 0}>
-            <span class="count ignored" title="Frames the store ignored">
-              {store.framesIgnored()} ignored
-            </span>
-          </Show>
-        </span>
-        <button
-          type="button"
-          class="inbox-button"
-          title="Inbox"
-          aria-pressed={inboxOpen()}
-          onClick={() => (inboxOpen() ? closeInbox() : openInbox())}
-        >
-          Inbox
-          <Show when={inboxUnread() > 0}>
-            <span class="inbox-unread">{inboxUnread()}</span>
-          </Show>
-        </button>
-        <button
-          type="button"
-          class="settings"
-          title="Settings"
-          aria-pressed={settings()}
-          onClick={() => (settings() ? closeSettings() : openSettings())}
-        >
-          ⚙
-        </button>
-      </header>
+      <Titlebar
+        mac={MAC}
+        searchOpen={palette()}
+        onSearch={togglePalette}
+        inboxOpen={inboxOpen()}
+        inboxUnread={inboxUnread()}
+        onInbox={() => (inboxOpen() ? closeInbox() : openInbox())}
+        settingsOpen={settings()}
+        onSettings={() => (settings() ? closeSettings() : openSettings())}
+      />
       <Show when={sidecar().state !== "connected"}>
         <div class={`banner ${sidecar().state}`} role="status">
           <span>{banner()}</span>
@@ -486,7 +512,7 @@ function Shell() {
           ref={(element) => (sidebar = element)}
         />
         <section class="workarea">
-          <nav class="tabs" aria-label="Board and terminals">
+          <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
             <span class="tab board-tab" classList={{ active: showing("board") }}>
               <button
                 type="button"
@@ -590,7 +616,7 @@ function Shell() {
           </nav>
           {/* One banner per open request, latched for a short grace across
               frames that carry none (#1266): `AnswerSlot`. */}
-          <AnswerSlot question={question()} ask={ask()} run={run} />
+          <AnswerSlot question={question()} ask={ask()} run={answer} />
           <Show when={transcriptKey()}>
             {(key) => (
               <AcpCard
@@ -672,6 +698,14 @@ function Shell() {
           </For>
         </section>
       </div>
+      <Statusbar
+        host={host()}
+        sidecar={sidecar()}
+        needsYou={needsYou()}
+        idle={idle()}
+        // A development build shows frames the store refused (#1132).
+        framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
+      />
       <Show when={palette()}>
         <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
       </Show>
@@ -683,4 +717,5 @@ function Shell() {
   );
 }
 
+startTheme();
 render(() => <Shell />, document.getElementById("root")!);

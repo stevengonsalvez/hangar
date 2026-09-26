@@ -47,6 +47,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // Step 0: Validate provider CLI is installed
     let provider = args.tool.to_cli_provider();
     validate_provider_installed(&provider)?;
+    validate_run_flags(&args)?;
 
     // Step 1: Resolve repository path
     let repo_path = resolve_repo_path(&args).await?;
@@ -81,17 +82,30 @@ pub async fn execute(args: RunArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("ainb/session-{}", &session_id.to_string()[..8]));
 
+        // A branch that already exists keeps its own history: git checks it
+        // out as it is, and a --base would be silently ignored. Refuse the
+        // pair before anything is created instead of starting the session
+        // somewhere the caller did not ask for.
+        if args.base.is_some() && local_branch_exists(&repo_path, &branch) {
+            anyhow::bail!(
+                "--base cannot apply: branch '{branch}' already exists, and an existing branch keeps its own history. Pick a new --create-branch name, or drop --base."
+            );
+        }
+
         info!("Creating worktree for branch: {}", branch);
 
         let worktree_info = manager
-            .create_worktree(session_id, &repo_path, &branch, None)
+            .create_worktree(session_id, &repo_path, &branch, args.base.as_deref())
             .context("Failed to create worktree")?;
 
         work_dir = worktree_info.path;
         branch_name = branch;
         worktree_manager = Some(manager);
 
-        println!("Created worktree at: {}", work_dir.display());
+        human(
+            args.json,
+            format_args!("Created worktree at: {}", work_dir.display()),
+        );
     } else {
         worktree_manager = None;
         work_dir = repo_path.clone();
@@ -137,7 +151,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // .mcp.json so pooled servers point at the `ainb mcp proxy` shim.
     // Any failure falls back to today's per-session behavior.
     if matches!(args.tool.to_cli_provider(), CliProvider::Claude) {
-        setup_mcp_pool(&work_dir, &session_name);
+        setup_mcp_pool(&work_dir, &session_name, args.json);
     }
 
     // Step 6: Allocate the daemon-owned remote thread before tmux starts.
@@ -177,6 +191,12 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         None
     };
 
+    // The id Claude runs under, minted here so the id its hooks report is
+    // one the session record already holds: the daemon files every request
+    // the session raises under it, and the sessions screen places them by it
+    // exactly, never by worktree.
+    let claude_session_id = (args.tool.to_cli_provider() == CliProvider::Claude)
+        .then(crate::interactive::session_manager::new_claude_session_id);
     let claude_cmd = if provider == CliProvider::Codex {
         // Pre-launch, at the launch site rather than inside the builders: a
         // directory Codex has not seen shows a blocking trust modal, and no CLI
@@ -199,7 +219,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
             None => codex_local_command(model.as_deref(), args.dangerously_skip_permissions),
         }
     } else {
-        build_agent_command(&args)
+        build_agent_command(&args, claude_session_id.as_deref())
     };
 
     // Step 6b: Parent linkage (event-driven plumbing). When spawned with
@@ -312,6 +332,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         model_source: ModelSource::Raw,
         codex_model: None,
         codex_thread_id: codex_thread_id.clone(),
+        claude_session_id: claude_session_id.clone(),
     };
 
     // Locked RMW (pu4): another `ainb run`/`kill` or a daemon register racing
@@ -328,29 +349,48 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 
     info!("Saved session metadata for TUI discovery");
 
-    // Step 10: Print session info
-    println!();
-    println!("Session created successfully!");
-    println!("  Session ID:   {session_id}");
-    println!("  Tmux Session: {tmux_name}");
-    println!("  Working Dir:  {}", work_dir.display());
-    println!("  Branch:       {branch_name}");
-    println!(
-        "  Model:        {}",
-        model.as_deref().unwrap_or("system default")
-    );
-    println!();
-    println!("To attach to this session:");
-    println!("  tmux attach -t {tmux_name}");
-    println!();
-    // Print an id prefix, NOT `session_name`. `--name` only renames the tmux
-    // session; `ainb attach|status|kill` resolve their argument as a session
-    // id, an id prefix, or the *workspace* name (repo-directory derived), so
-    // echoing `session_name` here hands the user a handle that does not
-    // resolve whenever they passed `--name`.
-    println!("Or use:");
-    println!("  ainb attach {}", &session_id.to_string()[..8]);
-    println!();
+    // Step 10: Print session info. Under `--format json` stdout carries exactly one
+    // JSON object and nothing else, so a subprocess caller can parse it.
+    if args.json {
+        let created = CreatedSession {
+            session_id,
+            tmux_session_name: &tmux_name,
+            worktree_path: work_dir.to_string_lossy(),
+            branch: &branch_name,
+            claude_session_id: claude_session_id.as_deref(),
+            model: model.as_deref(),
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&created).expect("text fields always serialize")
+        );
+    } else {
+        println!();
+        println!("Session created successfully!");
+        println!("  Session ID:   {session_id}");
+        if let Some(claude_session_id) = &claude_session_id {
+            println!("  Claude Session: {claude_session_id}");
+        }
+        println!("  Tmux Session: {tmux_name}");
+        println!("  Working Dir:  {}", work_dir.display());
+        println!("  Branch:       {branch_name}");
+        println!(
+            "  Model:        {}",
+            model.as_deref().unwrap_or("system default")
+        );
+        println!();
+        println!("To attach to this session:");
+        println!("  tmux attach -t {tmux_name}");
+        println!();
+        // Print an id prefix, NOT `session_name`. `--name` only renames the tmux
+        // session; `ainb attach|status|kill` resolve their argument as a session
+        // id, an id prefix, or the *workspace* name (repo-directory derived), so
+        // echoing `session_name` here hands the user a handle that does not
+        // resolve whenever they passed `--name`.
+        println!("Or use:");
+        println!("  ainb attach {}", &session_id.to_string()[..8]);
+        println!();
+    }
 
     // Repeat the no-isolation warning as the LAST thing before attaching.
     //
@@ -385,11 +425,83 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// What `ainb --format json run` prints on stdout: the one line a subprocess caller
+/// (the hangar daemon's `worktree/create`) parses to find the session it made.
+///
+/// Field names are a wire contract with that caller. Add fields; never rename
+/// or remove one.
+///
+/// Every field is text, so serializing cannot fail: a failure here would come
+/// after the session exists and leave it running with nothing reported.
+#[derive(Debug, serde::Serialize)]
+struct CreatedSession<'a> {
+    session_id: Uuid,
+    tmux_session_name: &'a str,
+    /// A non-UTF-8 directory is reported lossily; the tmux session name is
+    /// the handle a caller attaches by.
+    worktree_path: std::borrow::Cow<'a, str>,
+    branch: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+}
+
+/// A human-readable progress line: stdout normally, stderr under `--format json` so
+/// stdout carries only the one JSON object.
+fn human(json: bool, line: std::fmt::Arguments<'_>) {
+    if json {
+        eprintln!("{line}");
+    } else {
+        println!("{line}");
+    }
+}
+
+/// Whether `branch` is already a local branch of the repository at `repo`.
+fn local_branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Flag combinations refused before anything is created.
+///
+/// `--base` picks where a NEW branch starts, so without a worktree it would
+/// silently run in the checkout at whatever is checked out. `--format json`
+/// reports a worktree it created, and promises one JSON object on stdout,
+/// which attaching would hand to tmux.
+fn validate_run_flags(args: &RunArgs) -> Result<()> {
+    if args.base.is_some() && !args.worktree && args.create_branch.is_none() {
+        anyhow::bail!(
+            "--base needs --worktree or --create-branch: it picks where the new branch starts"
+        );
+    }
+    if args.json && !args.worktree && args.create_branch.is_none() {
+        anyhow::bail!(
+            "--format json needs --worktree or --create-branch: it reports a worktree it created"
+        );
+    }
+    if args.json && (args.attach || args.interactive) {
+        anyhow::bail!("--format json cannot --attach or --interactive: stdout carries the result");
+    }
+    Ok(())
+}
+
 /// Best-effort shared-MCP-pool setup for a new session. Pool disabled, no
 /// eligible servers, daemon spawn failure, or .mcp.json write failure all
 /// degrade to per-session MCP spawning — a session must never fail to start
 /// because of the pool.
-fn setup_mcp_pool(work_dir: &std::path::Path, session_name: &str) {
+fn setup_mcp_pool(work_dir: &std::path::Path, session_name: &str, json: bool) {
     use crate::config::AppConfig;
     use crate::mcp_pool;
 
@@ -434,10 +546,13 @@ fn setup_mcp_pool(work_dir: &std::path::Path, session_name: &str) {
     }
     match mcp_pool::mcp_json::write_session_mcp_json(work_dir, &pooled, Some(session_name)) {
         Ok(wired) if !wired.is_empty() => {
-            println!(
-                "MCP pool: shared servers wired via {}: {}",
-                work_dir.join(".mcp.json").display(),
-                wired.join(", ")
+            human(
+                json,
+                format_args!(
+                    "MCP pool: shared servers wired via {}: {}",
+                    work_dir.join(".mcp.json").display(),
+                    wired.join(", ")
+                ),
             );
         }
         Ok(_) => {}
@@ -464,7 +579,7 @@ async fn resolve_repo_path(args: &RunArgs) -> Result<PathBuf> {
 
     if let Some(ref remote) = args.remote_repo {
         // Clone or fetch remote repository
-        return clone_remote_repo(remote).await;
+        return clone_remote_repo(remote, args.json).await;
     }
 
     // Use current directory
@@ -522,7 +637,7 @@ fn parse_remote_repo(remote: &str) -> Result<(crate::git::RepoSource, crate::git
 /// groups on a session's source repository path, so the same repo rendered as
 /// two identically-named rows depending on whether the session was spawned
 /// from the CLI or the TUI.
-async fn clone_remote_repo(remote: &str) -> Result<PathBuf> {
+async fn clone_remote_repo(remote: &str, json: bool) -> Result<PathBuf> {
     let (source, parsed) = parse_remote_repo(remote)?;
     let manager = crate::git::RemoteRepoManager::new()?;
 
@@ -530,7 +645,7 @@ async fn clone_remote_repo(remote: &str) -> Result<PathBuf> {
     // print, so say something before a transfer that can take minutes. Phrased
     // for both outcomes rather than probing `is_cached` for a better verb: the
     // probe would race a concurrent publish and `clone_repo` re-checks anyway.
-    println!("Preparing {}...", source.to_clone_url());
+    human(json, format_args!("Preparing {}...", source.to_clone_url()));
 
     // `RemoteRepoManager` shells out synchronously, and this replaced a
     // `tokio::process::Command::output().await`, so hand it to a blocking
@@ -602,9 +717,20 @@ fn validate_provider_installed(provider: &CliProvider) -> Result<()> {
 ///     unchanged. Provider CLI owns model validation and future model IDs.
 ///   * Gemini / Copilot: never emit `--model` (those CLIs don't accept it
 ///     in this codebase).
-fn build_agent_command(args: &RunArgs) -> String {
+fn build_agent_command(args: &RunArgs, claude_session_id: Option<&str>) -> String {
     let provider = args.tool.to_cli_provider();
     let mut cmd_parts = vec![provider.command().to_string()];
+    // A fresh launch runs under the id ainb minted for it, so the id Claude's
+    // hooks report is the one the session record holds.
+    if let (CliProvider::Claude, Some(id)) = (&provider, claude_session_id) {
+        // Only the canonical UUID form ainb mints goes into the command.
+        if crate::interactive::session_manager::is_canonical_claude_session_id(id) {
+            cmd_parts.push("--session-id".to_string());
+            cmd_parts.push(id.to_string());
+        } else {
+            warn!("refusing a Claude session id that is not a canonical UUID");
+        }
+    }
 
     match provider {
         CliProvider::Claude | CliProvider::Codex | CliProvider::Antigravity => {
@@ -676,6 +802,7 @@ fn codex_local_command(model: Option<&str>, skip_permissions: bool) -> String {
         // Claude's `--continue` only.
         false,
         false,
+        None,
     ))
 }
 
@@ -1089,6 +1216,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Claude,
             model: Some("sonnet".to_string()),
             prompt: None,
@@ -1099,13 +1228,46 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.contains("claude"));
         assert!(
             cmd.contains("--model sonnet"),
             "AINB must pass Claude's raw model value through, got: {cmd}"
         );
         assert!(cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn a_claude_launch_runs_under_the_minted_session_id() {
+        let args = RunArgs {
+            remote_repo: None,
+            repo: None,
+            create_branch: None,
+            worktree: false,
+            base: None,
+            json: false,
+            tool: Tool::Claude,
+            model: None,
+            prompt: None,
+            attach: false,
+            dangerously_skip_permissions: false,
+            name: None,
+            interactive: false,
+            parent: None,
+        };
+        let cmd = build_agent_command(&args, Some("11111111-2222-4333-8444-555555555555"));
+        assert_eq!(
+            cmd,
+            "claude --session-id 11111111-2222-4333-8444-555555555555"
+        );
+        let cmd = build_agent_command(
+            &args,
+            Some("11111111-2222-4333-8444-555555555555; rm -rf /"),
+        );
+        assert_eq!(
+            cmd, "claude",
+            "a non-canonical id never reaches the command"
+        );
     }
 
     /// The CLI path now shares the TUI's builder, so it also carries
@@ -1192,6 +1354,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Claude,
             model: Some("claude-next-9".to_string()),
             prompt: None,
@@ -1202,7 +1366,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model claude-next-9"),
             "AINB must not reject future Claude model IDs, got: {cmd}"
@@ -1216,6 +1380,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Claude,
             model: Some("opus".to_string()),
             prompt: None,
@@ -1226,7 +1392,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.contains("claude"));
         assert!(cmd.contains("--model opus"));
         assert!(!cmd.contains("--dangerously-skip-permissions"));
@@ -1239,6 +1405,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Claude,
             model: Some(String::new()),
             prompt: None,
@@ -1249,7 +1417,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.starts_with("claude"));
         assert!(
             !cmd.contains("--model"),
@@ -1265,6 +1433,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Claude,
             model: None,
             prompt: None,
@@ -1275,7 +1445,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(!cmd.contains("--model"));
     }
 
@@ -1290,6 +1460,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Codex,
             model: None,
             prompt: None,
@@ -1300,7 +1472,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("codex"),
             "Command should start with codex, got: {}",
@@ -1322,6 +1494,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Codex,
             model: Some("gpt-5.6-terra".to_string()),
             prompt: None,
@@ -1332,7 +1506,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(cmd.starts_with("codex"));
         assert!(
             cmd.contains("--model gpt-5.6-terra"),
@@ -1355,6 +1529,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Codex,
             model: Some("gpt-5.4".to_string()),
             prompt: None,
@@ -1365,7 +1541,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model"),
             "the flag must still be emitted, got: {cmd}"
@@ -1383,6 +1559,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Codex,
             model: Some("gpt-5.6-luna".to_string()),
             prompt: None,
@@ -1393,7 +1571,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.contains("--model gpt-5.6-luna"),
             "AINB must not reject future Codex model IDs, got: {cmd}"
@@ -1407,6 +1585,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Codex,
             model: None,
             prompt: None,
@@ -1417,7 +1597,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("codex"),
             "Command should start with codex, got: {}",
@@ -1441,6 +1621,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Gemini,
             model: Some("sonnet".to_string()),
             prompt: None,
@@ -1451,7 +1633,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("gemini"),
             "Command should start with gemini, got: {}",
@@ -1470,6 +1652,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Copilot,
             model: Some("sonnet".to_string()),
             prompt: None,
@@ -1480,7 +1664,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert!(
             cmd.starts_with("copilot"),
             "Command should start with copilot, got: {}",
@@ -1495,6 +1679,8 @@ mod tests {
             repo: None,
             create_branch: None,
             worktree: false,
+            base: None,
+            json: false,
             tool: Tool::Copilot,
             model: Some("sonnet".to_string()),
             prompt: None,
@@ -1505,7 +1691,7 @@ mod tests {
             parent: None,
         };
 
-        let cmd = build_agent_command(&args);
+        let cmd = build_agent_command(&args, None);
         assert_eq!(
             cmd, "copilot",
             "Copilot with no flags should just be 'copilot'"
@@ -1612,5 +1798,115 @@ mod tests {
                 err
             );
         }
+    }
+
+    fn run_args() -> RunArgs {
+        RunArgs {
+            remote_repo: None,
+            repo: None,
+            create_branch: None,
+            worktree: false,
+            base: None,
+            json: false,
+            tool: Tool::Claude,
+            model: None,
+            prompt: None,
+            attach: false,
+            dangerously_skip_permissions: false,
+            name: None,
+            interactive: false,
+            parent: None,
+        }
+    }
+
+    /// `--base` alone would run in the checkout at whatever is checked out,
+    /// silently ignoring the ref the caller asked for. Refused instead.
+    #[test]
+    fn base_without_a_worktree_is_refused() {
+        let args = RunArgs {
+            base: Some("origin/main".into()),
+            ..run_args()
+        };
+        let err = validate_run_flags(&args).expect_err("--base alone must be refused");
+        assert!(err.to_string().contains("--worktree"), "got: {err}");
+    }
+
+    #[test]
+    fn base_with_a_worktree_or_a_new_branch_is_accepted() {
+        let worktree = RunArgs {
+            base: Some("main".into()),
+            worktree: true,
+            ..run_args()
+        };
+        assert!(validate_run_flags(&worktree).is_ok());
+        let branch = RunArgs {
+            base: Some("main".into()),
+            create_branch: Some("b".into()),
+            ..run_args()
+        };
+        assert!(validate_run_flags(&branch).is_ok());
+        assert!(
+            validate_run_flags(&run_args()).is_ok(),
+            "no --base is always fine"
+        );
+    }
+
+    /// Attaching hands stdout to tmux, so a `--format json` caller would
+    /// never get its line. Refused before anything is created.
+    #[test]
+    fn json_refuses_attach_and_interactive() {
+        for (attach, interactive) in [(true, false), (false, true)] {
+            let args = RunArgs {
+                json: true,
+                worktree: true,
+                attach,
+                interactive,
+                ..run_args()
+            };
+            let err = validate_run_flags(&args).expect_err("json + attach must be refused");
+            assert!(err.to_string().contains("--attach"), "got: {err}");
+        }
+        let ok = RunArgs {
+            json: true,
+            worktree: true,
+            base: Some("main".into()),
+            ..run_args()
+        };
+        assert!(validate_run_flags(&ok).is_ok());
+    }
+
+    /// The JSON names a worktree this run created; in a shared checkout
+    /// there is none, so the combination is refused up front.
+    #[test]
+    fn json_without_isolation_is_refused() {
+        let args = RunArgs {
+            json: true,
+            ..run_args()
+        };
+        let err = validate_run_flags(&args).expect_err("json without a worktree");
+        assert!(err.to_string().contains("--worktree"), "got: {err}");
+    }
+
+    /// The JSON line is a wire contract with the daemon: these field names
+    /// are what `worktree/create` parses.
+    #[test]
+    fn created_session_json_names_its_fields() {
+        let id = Uuid::nil();
+        let dir = std::path::PathBuf::from("/w/t");
+        let line = serde_json::to_value(CreatedSession {
+            session_id: id,
+            tmux_session_name: "tmux_t",
+            worktree_path: dir.to_string_lossy(),
+            branch: "ainb/t",
+            claude_session_id: None,
+            model: Some("opus"),
+        })
+        .expect("serialize");
+        assert_eq!(line["session_id"], id.to_string());
+        assert_eq!(line["tmux_session_name"], "tmux_t");
+        assert_eq!(line["worktree_path"], "/w/t");
+        assert_eq!(line["branch"], "ainb/t");
+        assert_eq!(line["model"], "opus");
+        assert!(line.get("claude_session_id").is_none(), "absent, not null");
     }
 }

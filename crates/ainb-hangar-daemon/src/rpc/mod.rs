@@ -508,17 +508,12 @@ where
 {
     // The single writer: every outbound frame is queued here so a pushed event
     // can never split a response frame (or vice versa).
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if write_half.write_all(&frame).await.is_err() {
-                break;
-            }
-            if write_half.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+    let writer = spawn_writer(
+        write_half,
+        out_rx,
+        idle_timeout_from_env(WRITE_DEADLINE_ENV, DEFAULT_WRITE_DEADLINE),
+    );
 
     // Gate 2 — first-frame token auth: the connection's first frame must be a
     // valid `auth/hello`. Unauthenticated or wrong-token connections get an
@@ -590,13 +585,18 @@ where
             },
         )
         .await;
-    if listed {
-        emit_connections_changed(&events, &registry).await;
-    }
     // The connection's event subscriptions: at most one forwarder per stream,
     // and a re-subscribe replaces it (last subscribe wins, no duplicate
     // delivery). See [`Subscriptions`] for what each one carries.
-    let mut subscriptions = Subscriptions::default();
+    //
+    // The guard owns them from here to the end of the connection, so the
+    // teardown runs on every exit: the read loop ending, a handler panic, or
+    // the task being aborted. It is built with no await between it and the
+    // insert, so an abort during the announcement below still removes the row.
+    let mut guard = ConnectionTeardown::new(connection.conn_id, registry.clone(), events.clone());
+    if listed {
+        emit_connections_changed(&events, &registry).await;
+    }
 
     // Idle read timeout so an abandoned / half-open client connection cannot pin
     // this per-connection task (and its fd) forever. Request/response clients
@@ -613,7 +613,7 @@ where
         idle_timeout_from_env(SUBSCRIBED_IDLE_TIMEOUT_ENV, DEFAULT_SUBSCRIBED_IDLE_TIMEOUT);
     let served: std::io::Result<()> = async {
         while let Some(body) = {
-            let subscribed = subscriptions.any_live();
+            let subscribed = guard.subscriptions.any_live();
             let window = if subscribed {
                 subscribed_idle_timeout
             } else {
@@ -694,7 +694,7 @@ where
             if let Ok(req) = &req {
                 if acked && req.method == methods::WORKSPACE_SUBSCRIBE {
                     if let Ok(Some(ws)) = resolve(&pool, req).await {
-                        if let Some(old) = subscriptions.workspace.take() {
+                        if let Some(old) = guard.subscriptions.workspace.take() {
                             old.abort();
                         }
                         // Register the LIVE forwarder FIRST so no event emitted
@@ -711,7 +711,7 @@ where
                         // with no durable replay behind it, so one missed in
                         // that window is gone, not merely late.
                         let ws_rx = pending_workspace_rx.unwrap_or_else(|| broker.subscribe());
-                        subscriptions.workspace =
+                        guard.subscriptions.workspace =
                             Some(spawn_event_forwarder(ws_rx, ws.clone(), out_tx.clone()));
                         // A2: the same subscription's TRANSCRIPT half, drained
                         // from its own broadcast so a chatty run cannot evict the
@@ -726,12 +726,12 @@ where
                         // by `banner_hides_on_task_finished_event`); the visible
                         // effect is a banner clearing a beat early, or a first
                         // transcript line missed before it opens.
-                        if let Some(old) = subscriptions.task_stream.take() {
+                        if let Some(old) = guard.subscriptions.task_stream.take() {
                             old.abort();
                         }
                         let rx = pending_task_stream_rx
                             .unwrap_or_else(|| broker.subscribe_task_stream());
-                        subscriptions.task_stream =
+                        guard.subscriptions.task_stream =
                             Some(spawn_event_forwarder(rx, ws.clone(), out_tx.clone()));
                         // T1 resume: a client that carried a `since_seq` catches
                         // up on every durable event after that cursor before it
@@ -749,15 +749,15 @@ where
                     // by workspace — it carries the no-workspace host sessions —
                     // with an OPTIONAL narrowing when the client passed a
                     // workspace_id.
-                    if let Some(old) = subscriptions.attention.take() {
+                    if let Some(old) = guard.subscriptions.attention.take() {
                         old.abort();
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    subscriptions.attention =
+                    guard.subscriptions.attention =
                         Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
-                    if let Some(old) = subscriptions.fleet.take() {
+                    if let Some(old) = guard.subscriptions.fleet.take() {
                         old.abort();
                     }
                     let head_revision = resp
@@ -768,14 +768,14 @@ where
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or_default();
                     let rx = pending_fleet_rx.unwrap_or_else(|| broker.subscribe_fleet());
-                    subscriptions.fleet = Some(spawn_fleet_forwarder(
+                    guard.subscriptions.fleet = Some(spawn_fleet_forwarder(
                         pool.clone(),
                         rx,
                         head_revision,
                         out_tx.clone(),
                     ));
                 } else if acked && req.method == methods::FLEET_MESSAGE_SUBSCRIBE {
-                    if let Some(old) = subscriptions.message.take() {
+                    if let Some(old) = guard.subscriptions.message.take() {
                         old.abort();
                     }
                     // An explicit after_id wins; otherwise start from the head
@@ -789,21 +789,21 @@ where
                             .map(ToString::to_string)
                     });
                     let rx = pending_message_rx.unwrap_or_else(|| broker.subscribe_message());
-                    subscriptions.message = Some(spawn_message_forwarder(
+                    guard.subscriptions.message = Some(spawn_message_forwarder(
                         pool.clone(),
                         rx,
                         start_id,
                         out_tx.clone(),
                     ));
-                    if let Some(old) = subscriptions.notification.take() {
+                    if let Some(old) = guard.subscriptions.notification.take() {
                         old.abort();
                     }
                     let notify_rx =
                         pending_notification_rx.unwrap_or_else(|| broker.subscribe_notifications());
-                    subscriptions.notification =
+                    guard.subscriptions.notification =
                         Some(spawn_notification_forwarder(notify_rx, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_TRANSCRIPT_SUBSCRIBE {
-                    if let Some(old) = subscriptions.transcript.take() {
+                    if let Some(old) = guard.subscriptions.transcript.take() {
                         old.abort();
                     }
                     if let Ok(params) = serde_json::from_value::<
@@ -819,7 +819,7 @@ where
                         });
                         let rx =
                             pending_transcript_rx.unwrap_or_else(|| broker.subscribe_transcript());
-                        subscriptions.transcript = Some(spawn_transcript_forwarder(
+                        guard.subscriptions.transcript = Some(spawn_transcript_forwarder(
                             pool.clone(),
                             rx,
                             params.session_key,
@@ -834,15 +834,9 @@ where
     }
     .await;
 
-    teardown(
-        subscriptions,
-        &registry,
-        connection.conn_id,
-        &events,
-        out_tx,
-        writer,
-    )
-    .await;
+    guard.finish().await;
+    drop(out_tx);
+    let _ = writer.await;
     served
 }
 
@@ -910,26 +904,136 @@ impl Subscriptions {
     }
 }
 
-/// Close an authenticated connection: stop its forwarders, drop its registry
-/// row, then let the writer drain what is queued and exit.
+/// The teardown of one authenticated connection, run exactly once on every
+/// exit: stop its forwarders, then drop its registry row.
 ///
-/// The one teardown for every leg and every way the read loop ends (EOF, the
-/// idle bound, a read fault). A revoke (R1-08) ends the same loop, so it runs
-/// this too, and R2 hangs its floor release here once rather than per leg.
-async fn teardown(
+/// The one teardown for every leg and every way a connection ends. The read
+/// loop's normal end (EOF, the idle bound, a read fault, and a revoke in R1-08,
+/// which ends the same loop) calls [`ConnectionTeardown::finish`]. A handler
+/// panic or an aborted task never reaches that line, so `Drop` runs the same
+/// steps instead: the forwarders are aborted at once, and the registry row,
+/// behind an async lock, is removed on a spawned task. Either way the
+/// connection's outbound sender goes with its task, so the writer drains and
+/// exits once the forwarders holding clones of it are gone. R2 hangs its floor
+/// release here, once, for both paths.
+struct ConnectionTeardown {
     subscriptions: Subscriptions,
+    conn_id: u64,
+    registry: connections::ConnectionRegistry,
+    events: EventSink,
+    armed: bool,
+    /// The row is removed but its `ConnectionsChanged` has not gone out yet.
+    /// A second removal would find nothing and announce nothing, so a `Drop`
+    /// in this window must only announce.
+    announce: bool,
+}
+
+impl ConnectionTeardown {
+    fn new(conn_id: u64, registry: connections::ConnectionRegistry, events: EventSink) -> Self {
+        Self {
+            subscriptions: Subscriptions::default(),
+            conn_id,
+            registry,
+            events,
+            armed: true,
+            announce: false,
+        }
+    }
+
+    /// The normal end: run the teardown now, and disarm the `Drop` path only
+    /// once the row is gone and announced. An abort during the removal's
+    /// await still reaches `Drop`, which retries it; an abort after the row
+    /// went but before its announcement reaches `Drop` with `announce` set,
+    /// which then only announces.
+    async fn finish(mut self) {
+        std::mem::take(&mut self.subscriptions).abort_all();
+        if self.registry.remove(self.conn_id).await {
+            // Set with no await in between, so no abort can land between the
+            // removal and the flag.
+            self.announce = true;
+            emit_connections_changed(&self.events, &self.registry).await;
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionTeardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        std::mem::take(&mut self.subscriptions).abort_all();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // No runtime means the daemon is exiting and the in-memory
+            // registry goes with it.
+            return;
+        };
+        let registry = self.registry.clone();
+        let events = self.events.clone();
+        let conn_id = self.conn_id;
+        let announce_only = self.announce;
+        runtime.spawn(async move {
+            if announce_only {
+                emit_connections_changed(&events, &registry).await;
+            } else {
+                release_registry_row(&registry, conn_id, &events).await;
+            }
+        });
+    }
+}
+
+/// Remove a closed connection's registry row, and tell subscribers when the
+/// row was listed.
+async fn release_registry_row(
     registry: &connections::ConnectionRegistry,
     conn_id: u64,
     events: &EventSink,
-    out_tx: mpsc::Sender<Vec<u8>>,
-    writer: tokio::task::JoinHandle<()>,
 ) {
-    subscriptions.abort_all();
     if registry.remove(conn_id).await {
         emit_connections_changed(events, registry).await;
     }
-    drop(out_tx);
-    let _ = writer.await;
+}
+
+/// Longest one outbound frame may take to write before the connection is
+/// dropped. A peer that stops reading fills its socket buffer, and without a
+/// bound the writer would wait on it forever: every forwarder then blocks on the
+/// full queue and the connection's task is pinned. Generous, because a slow
+/// but live client is not a dead one.
+const DEFAULT_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Operator override (milliseconds) for [`DEFAULT_WRITE_DEADLINE`].
+const WRITE_DEADLINE_ENV: &str = "AINB_HANGAR_RPC_WRITE_DEADLINE_MS";
+
+/// The connection's single writer: drain `frames` onto `write_half` one frame
+/// at a time, so a pushed event can never split a response frame (or vice
+/// versa). Ends when every sender is gone, on a write fault, or when one frame
+/// cannot be written and flushed within `deadline`. Ending drops the receiver,
+/// so the read loop's next queue fails and the connection closes.
+fn spawn_writer<W>(
+    mut write_half: W,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            let written = tokio::time::timeout(deadline, async {
+                write_half.write_all(&frame).await?;
+                write_half.flush().await
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    tracing::debug!(?deadline, "hangar rpc: peer stopped reading; closing");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Outbound frame queue depth per connection (responses + pushed events).
@@ -1426,6 +1530,13 @@ async fn dispatch_as_connection(
     connection: Option<&ConnectionRow>,
     registry: Option<&connections::ConnectionRegistry>,
 ) -> RpcResponse {
+    // Test seam: a handler that panics, so a test can prove the connection
+    // teardown still runs. Test builds only.
+    #[cfg(test)]
+    assert!(
+        req.method != tests::PANIC_METHOD,
+        "a test injected a handler panic"
+    );
     let result = match caller.authorize(&req.method) {
         // Every mutation goes through the ledger guard, so "generic dedupe at
         // dispatch for every mutation" (D18) is a property of THIS line rather
@@ -3068,12 +3179,20 @@ async fn handle_fleet_transcript_list(
 
     require_fleet_capability(FLEET_CAPABILITY_TRANSCRIPT_READ)?;
     let params: FleetTranscriptListParams =
-        parse_params(req, "{ session_key, after_order?, limit }")?;
+        parse_params(req, "{ session_key, after_order?, before_order?, limit }")?;
     if params.session_key.trim().is_empty() {
         return Err(invalid_params("session_key must not be empty"));
     }
     if params.after_order.is_some_and(|order| order < 0) {
         return Err(invalid_params("after_order must be non-negative"));
+    }
+    if params.before_order.is_some_and(|order| order < 0) {
+        return Err(invalid_params("before_order must be non-negative"));
+    }
+    if params.after_order.is_some() && params.before_order.is_some() {
+        return Err(invalid_params(
+            "after_order and before_order are exclusive: page forward or back, not both",
+        ));
     }
     let limit = i64::from(params.limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX));
     // A transcript read with NO cursor answers with the newest page, because
@@ -3093,7 +3212,7 @@ async fn handle_fleet_transcript_list(
     // and truncation flag included. A tail is bounded twice because a chunk's
     // payload has no ceiling of its own, and which bound bit is not inferable
     // from the row count, so it rides the wire.
-    let (rows, truncated) = match params.after_order {
+    let (rows, truncated, lowest_scanned) = match params.after_order {
         Some(after_order) => FleetProviderEventRepo::list_by_session_after(
             pool,
             &params.session_key,
@@ -3106,21 +3225,40 @@ async fn handle_fleet_transcript_list(
         // updates. It answers "what came after this row", so stopping early
         // has nothing to admit: `next_after_order` already tells the caller
         // where to resume.
-        .map(|rows| (within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES), false)),
-        None => {
-            FleetProviderEventRepo::list_by_session_tail(
-                pool,
-                &params.session_key,
-                limit,
-                FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        .map(|rows| {
+            (
+                within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES),
+                false,
+                None,
             )
-            .await
-        }
+        }),
+        // No forward cursor: the newest page, or with `before_order` the
+        // newest page strictly older than it (a phone scrolling back). Both
+        // are the tail read, bounded by rows and bytes, with `truncated`
+        // meaning older rows remain.
+        None => FleetProviderEventRepo::list_by_session_tail_before(
+            pool,
+            &params.session_key,
+            params.before_order,
+            limit,
+            FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        )
+        .await
+        .map(|page| (page.rows, page.truncated, page.lowest_scanned)),
     }
     .map_err(|error| store_err(&error))?;
     let chunks: Vec<_> = rows.iter().map(transcript_chunk_wire).collect();
     to_value(&FleetTranscriptListResult {
-        next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+        // A backward page is not a place to walk forward from.
+        next_after_order: if params.before_order.is_some() {
+            None
+        } else {
+            chunks.last().map(|chunk| chunk.ingest_order)
+        },
+        // Where the next page back starts: the lowest order scanned, which
+        // is below the first chunk when the oldest rows reached could not be
+        // decoded, so a walk back never stalls on them.
+        next_before_order: if truncated { lowest_scanned } else { None },
         chunks,
         truncated,
     })
@@ -13675,6 +13813,7 @@ fn session_row_to_entry(
         model_source: row.model_source,
         codex_model: row.codex_model,
         codex_thread_id: row.codex_thread_id,
+        claude_session_id: row.claude_session_id,
     }
 }
 
@@ -13695,6 +13834,7 @@ fn session_entry_to_row(
         model_source: entry.model_source,
         codex_model: entry.codex_model,
         codex_thread_id: entry.codex_thread_id,
+        claude_session_id: entry.claude_session_id,
     }
 }
 
@@ -14685,6 +14825,476 @@ mod tests {
             Some(INVALID_PARAMS),
             "the retry is not refused as a reused request id: {retried:?}"
         );
+    }
+
+    /// The method the test seam in `dispatch_as_connection` panics on.
+    pub(super) const PANIC_METHOD: &str = "test/panic";
+
+    /// How a served connection ends in [`teardown_runs_once_on_every_exit`].
+    #[derive(Debug, Clone, Copy)]
+    enum Exit {
+        /// The client closes its end: the read loop ends normally.
+        ClientEof,
+        /// A handler panics mid-request.
+        HandlerPanic,
+        /// The connection's task is aborted.
+        Abort,
+    }
+
+    /// Security review follow-up: the teardown runs exactly once on EVERY exit.
+    /// A handler panic or an aborted task used to skip it, leaving forwarders
+    /// running and the registry row listed forever. For each exit this proves:
+    /// the registry row is gone, the client reads EOF (every forwarder that
+    /// held the writer's sender was stopped, so the writer drained and
+    /// closed), and exactly one `ConnectionsChanged` announced the removal.
+    #[tokio::test]
+    async fn teardown_runs_once_on_every_exit() {
+        use tokio::io::AsyncWriteExt as _;
+
+        async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, request: &RpcRequest) {
+            let body = serde_json::to_vec(request).expect("request serializes");
+            let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+            frame.extend_from_slice(&body);
+            writer.write_all(&frame).await.expect("write request");
+            writer.flush().await.expect("flush request");
+        }
+
+        async fn next<R: tokio::io::AsyncBufRead + Unpin>(
+            reader: &mut R,
+        ) -> Option<serde_json::Value> {
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(reader))
+                .await
+                .expect("the daemon writes a frame or closes")
+                .expect("read frame")
+                .map(|body| serde_json::from_slice(&body).expect("frame is JSON"))
+        }
+
+        let home = tempfile::tempdir().expect("temporary Hangar home");
+        let store = Store::open_in(home.path()).await.expect("open store");
+        auth::ensure_socket_token(store.pool(), home.path())
+            .await
+            .expect("ensure socket token");
+        let token = std::fs::read_to_string(ainb_hangar_proto::auth::token_file_in(home.path()))
+            .expect("read socket token");
+
+        for exit in [Exit::ClientEof, Exit::HandlerPanic, Exit::Abort] {
+            let registry = connections::ConnectionRegistry::new();
+            let broker = EventBroker::new();
+            let mut registry_events = broker.subscribe_attention();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (read_half, write_half) = tokio::io::split(server);
+            let connection = tokio::spawn(serve_stream(
+                BufReader::new(read_half),
+                write_half,
+                PeerIdentity::Local { pid: None },
+                store.pool().clone(),
+                health(),
+                broker.clone(),
+                registry.clone(),
+            ));
+            let (read_half, mut write_half) = tokio::io::split(client);
+            let mut reader = BufReader::new(read_half);
+
+            send(
+                &mut write_half,
+                &req(
+                    methods::AUTH_HELLO,
+                    serde_json::json!({ "token": token.trim() }),
+                ),
+            )
+            .await;
+            let hello = next(&mut reader).await.expect("hello reply");
+            assert!(hello["error"].is_null(), "{exit:?}: {hello}");
+            // A live forwarder holding a clone of the writer's sender: the
+            // thing a skipped teardown leaks.
+            send(
+                &mut write_half,
+                &req(methods::ATTENTION_SUBSCRIBE, serde_json::json!({})),
+            )
+            .await;
+            let subscribed = next(&mut reader).await.expect("subscribe reply");
+            assert!(subscribed["error"].is_null(), "{exit:?}: {subscribed}");
+            assert_eq!(registry.list().await.connections.len(), 1, "{exit:?}");
+            // The insert's own announcement, before the exit under test.
+            while registry_events.try_recv().is_ok() {}
+
+            match exit {
+                Exit::ClientEof => {
+                    // One split half of a duplex does not close it; shutdown
+                    // is the client's EOF.
+                    write_half.shutdown().await.expect("client EOF");
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("EOF ends the connection");
+                    assert!(ended.expect("no panic").is_ok(), "{exit:?}");
+                }
+                Exit::HandlerPanic => {
+                    send(&mut write_half, &req(PANIC_METHOD, serde_json::json!({}))).await;
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("the panic ends the connection");
+                    assert!(
+                        ended.expect_err("the handler panicked").is_panic(),
+                        "{exit:?}"
+                    );
+                }
+                Exit::Abort => {
+                    connection.abort();
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("the abort ends the connection");
+                    assert!(
+                        ended.expect_err("the task was aborted").is_cancelled(),
+                        "{exit:?}"
+                    );
+                }
+            }
+
+            // EOF on the client: the forwarder is gone, so the writer closed.
+            assert!(
+                next(&mut reader).await.is_none(),
+                "{exit:?}: the client must read EOF, not a live stream"
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !registry.list().await.connections.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{exit:?}: the registry row was never removed"
+                );
+                tokio::task::yield_now().await;
+            }
+            // Exactly one removal announcement, even though the normal path
+            // and `Drop` both know how to make it.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut removals = 0;
+            while let Ok(event) = registry_events.try_recv() {
+                if let HangarEvent::ConnectionsChanged { connections } = event {
+                    assert!(connections.is_empty(), "{exit:?}");
+                    removals += 1;
+                }
+            }
+            assert_eq!(removals, 1, "{exit:?}: teardown must run exactly once");
+        }
+    }
+
+    /// #100 review: a teardown dropped after its row was removed but before
+    /// the removal was announced still announces it. A second removal finds
+    /// nothing, so without the flag the announcement would be lost for good.
+    #[tokio::test]
+    async fn a_teardown_dropped_between_removal_and_announcement_still_announces() {
+        use ainb_hangar_proto::events::HangarEvent;
+
+        let registry = connections::ConnectionRegistry::new();
+        let broker = EventBroker::new();
+        let mut announcements = broker.subscribe_attention();
+        let mut teardown = ConnectionTeardown::new(7, registry.clone(), broker.sink());
+        teardown.announce = true;
+        drop(teardown);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), announcements.recv())
+            .await
+            .expect("the spawned announcement runs")
+            .expect("event");
+        assert!(
+            matches!(event, HangarEvent::ConnectionsChanged { .. }),
+            "{event:?}"
+        );
+    }
+
+    /// Review follow-up C: a peer that never reads cannot pin the writer. The
+    /// socket buffer fills, the one frame in flight misses the deadline, the
+    /// writer ends, and the next queued frame fails, which is what ends the
+    /// read loop and runs the teardown.
+    #[tokio::test]
+    async fn a_peer_that_never_reads_times_the_writer_out() {
+        let (client, server) = tokio::io::duplex(1024);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        let deadline = std::time::Duration::from_millis(100);
+        let writer = spawn_writer(server_write, out_rx, deadline);
+
+        // Far more than the 1 KiB buffer, and the client reads none of it.
+        out_tx.send(vec![b'x'; 64 * 1024]).await.expect("queued");
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("the writer must give up at its deadline, not wait forever")
+            .expect("the writer must not panic");
+        assert!(
+            out_tx.send(b"next".to_vec()).await.is_err(),
+            "with the writer gone, the connection's next frame fails"
+        );
+        drop(client);
+    }
+
+    /// The deadline is per frame, not per connection: a reader that keeps up
+    /// is never cut off, however long the connection lives.
+    #[tokio::test]
+    async fn a_peer_that_reads_is_never_timed_out() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        // Per frame, and well above scheduler jitter on a loaded runner: the
+        // property is that a reading peer is never cut off, not how tight the
+        // bound is.
+        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_secs(2));
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = client.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        for _ in 0..8 {
+            out_tx.send(vec![b'y'; 16 * 1024]).await.expect("queued");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(out_tx);
+        writer.await.expect("writer ends when the senders do");
+        // Both split halves must go before the client reads EOF.
+        drop(server_read);
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("the client reads EOF once the server side is gone")
+            .expect("reader");
+        assert_eq!(total, 8 * 16 * 1024);
+    }
+
+    /// F4 and F2: a byte-capped backward page, and an oldest row that cannot
+    /// be decoded. The byte bound stops a page early with `truncated` and a
+    /// cursor at its first row; the bad row is skipped but still moves the
+    /// cursor below it, so the walk ends instead of asking for it forever.
+    #[tokio::test]
+    async fn backward_pages_stop_on_the_byte_budget_and_step_past_a_bad_row() {
+        use ainb_hangar_proto::fleet::FLEET_TRANSCRIPT_LIST_MAX_BYTES;
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let pool = store.pool();
+        let big = "x".repeat(FLEET_TRANSCRIPT_LIST_MAX_BYTES / 3);
+        let events: Vec<_> = (0..10)
+            .map(|n| NewFleetProviderEvent {
+                event_id: format!("big-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("big".to_string()),
+                provider_session_id: None,
+                observed_at: n,
+                received_at: n,
+                event_type: "agent_message_chunk".to_string(),
+                raw_payload: format!("{{\"n\":{n},\"pad\":\"{big}\"}}"),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(pool, &events).await.expect("seed");
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            async move { dispatch_as(pool, &request, &health(), &sink(), &auth::Caller::Operator).await }
+        };
+        let orders_of = |result: &serde_json::Value| -> Vec<i64> {
+            result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["ingest_order"].as_i64().unwrap())
+                .collect()
+        };
+
+        // Byte-capped: 100 rows asked, each a third of the budget.
+        let mut seen = Vec::new();
+        let mut before: Option<i64> = None;
+        let mut pages = 0;
+        loop {
+            let mut params = serde_json::json!({"session_key": "big", "limit": 100});
+            if let Some(before) = before {
+                params["before_order"] = serde_json::json!(before);
+            }
+            let page = list(params).await;
+            let result = page.result.clone().expect("a page");
+            let orders = orders_of(&result);
+            assert!(
+                orders.len() <= 3,
+                "the byte budget caps the page: {}",
+                orders.len()
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+            if result["truncated"] != true {
+                assert!(result.get("next_before_order").is_none());
+                break;
+            }
+            assert_eq!(
+                result["next_before_order"].as_i64(),
+                orders.first().copied()
+            );
+            before = result["next_before_order"].as_i64();
+            assert!(pages < 20, "the walk must end");
+        }
+        assert_eq!(seen.len(), 10, "every row once");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+
+        // F2: the oldest row cannot be decoded.
+        sqlx::query("UPDATE fleet_provider_event SET raw_payload = x'ff' WHERE event_id = 'big-0'")
+            .execute(pool)
+            .await
+            .expect("corrupt the oldest row");
+        let bad_order = seen[0];
+        let mut before = Some(seen[1]);
+        let mut steps = 0;
+        let mut stepped_past = false;
+        while let Some(cursor) = before {
+            let page = list(serde_json::json!({
+                "session_key": "big", "before_order": cursor, "limit": 100,
+            }))
+            .await;
+            let result = page.result.clone().expect("a page");
+            assert!(
+                orders_of(&result).is_empty(),
+                "the bad row is never returned"
+            );
+            if result["next_before_order"].as_i64() == Some(bad_order) {
+                stepped_past = true;
+            }
+            before = result["next_before_order"].as_i64();
+            steps += 1;
+            assert!(steps < 5, "a bad oldest row must not stall the walk back");
+        }
+        assert!(
+            stepped_past,
+            "the cursor moved to the bad row's order, below it next"
+        );
+    }
+
+    /// `fleet/transcript_list { before_order }` on a dense session: 1000 rows
+    /// for the watched session interleaved with 1000 for another, so its
+    /// orders are not contiguous. Paging back from the newest page with
+    /// `before_order` = the first order held returns 100 rows at a time, each
+    /// page ascending and strictly older, no row twice and none skipped,
+    /// `truncated` until the oldest page. The request cap holds at 100, and
+    /// both cursors together are refused.
+    #[tokio::test]
+    async fn transcript_list_pages_back_with_before_order_on_a_dense_session() {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let event = |session: &str, n: usize| NewFleetProviderEvent {
+            event_id: format!("{session}-{n}"),
+            provider: "claude".to_string(),
+            source: "acp".to_string(),
+            session_key: Some(session.to_string()),
+            provider_session_id: None,
+            observed_at: 1_000 + i64::try_from(n).unwrap(),
+            received_at: 1_000 + i64::try_from(n).unwrap(),
+            event_type: "agent_message_chunk".to_string(),
+            raw_payload: format!("{{\"n\":{n}}}"),
+        };
+        let mut batch = Vec::new();
+        for n in 0..1000 {
+            batch.push(event("dense", n));
+            batch.push(event("other", n));
+        }
+        FleetProviderEventRepo::append_batch(store.pool(), &batch).await.expect("seed");
+
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(&pool, &request, &health(), &sink(), &auth::Caller::Operator).await
+            }
+        };
+        let page_of = |response: &RpcResponse| {
+            let result = response.result.as_ref().expect("a page");
+            let orders: Vec<i64> = result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|chunk| {
+                    assert_eq!(chunk["session_key"], "dense", "only the watched session");
+                    chunk["ingest_order"].as_i64().unwrap()
+                })
+                .collect();
+            (orders, result["truncated"].as_bool().unwrap_or(false))
+        };
+
+        // The newest page, then back until the start.
+        let newest = list(serde_json::json!({"session_key": "dense", "limit": 100})).await;
+        let (mut orders, mut truncated) = page_of(&newest);
+        let mut seen: Vec<i64> = orders.clone();
+        let mut pages = 1;
+        let mut next_before = newest.result.as_ref().unwrap()["next_before_order"].as_i64();
+        while truncated {
+            // F2: the walk follows the daemon's cursor, the first order here.
+            let before = next_before.expect("a truncated page names where to go back");
+            assert_eq!(before, orders[0]);
+            let older = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            (orders, truncated) = page_of(&older);
+            next_before = older.result.as_ref().unwrap()["next_before_order"].as_i64();
+            // F3: a backward page never offers a forward cursor.
+            assert!(
+                older.result.as_ref().unwrap().get("next_after_order").is_none(),
+                "page {pages}"
+            );
+            assert_eq!(orders.len(), 100, "page {pages}");
+            assert!(
+                orders.windows(2).all(|w| w[0] < w[1]),
+                "ascending within a page"
+            );
+            assert!(
+                *orders.last().unwrap() < before,
+                "strictly before the cursor"
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(next_before, None, "nothing older remains");
+        assert_eq!(seen.len(), 1000, "every row once");
+
+        // F4: a cursor at, or below, the first row, and a cursor of 0, are
+        // empty, complete pages.
+        for before in [seen[0], seen[0] - 1, 0] {
+            let empty = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            let result = empty.result.as_ref().expect("a page");
+            assert_eq!(result["chunks"].as_array().unwrap().len(), 0, "{before}");
+            assert_eq!(result["truncated"], false, "{before}");
+            assert!(result.get("next_before_order").is_none(), "{before}");
+            assert!(result.get("next_after_order").is_none(), "{before}");
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "no row twice, none out of order"
+        );
+
+        // The cap: asking for more than 100 still answers 100.
+        let capped = list(serde_json::json!({
+            "session_key": "dense", "before_order": i64::MAX, "limit": 5000,
+        }))
+        .await;
+        assert_eq!(page_of(&capped).0.len(), 100);
+
+        // Exclusive cursors, and no negative cursor.
+        for bad in [
+            serde_json::json!({"session_key": "dense", "after_order": 1, "before_order": 9, "limit": 10}),
+            serde_json::json!({"session_key": "dense", "before_order": -1, "limit": 10}),
+        ] {
+            let refused = list(bad).await;
+            assert_eq!(refused.error.as_ref().map(|e| e.code), Some(INVALID_PARAMS));
+        }
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
