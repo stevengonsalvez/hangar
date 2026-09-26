@@ -127,3 +127,10 @@ test("background detaches the stream before the socket closes", async () => {
   const log = await fake.connectionLog();
   expect(log.at(-1)?.event).toBe("close");
 });
+
+test("the terminal tab shows the engine state and names an ignored link's host", async () => {
+  const screen = await openTerminal();
+  expect(await screen.findByText("engine ready")).toBeTruthy();
+  await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never?x=1" })));
+  expect(await screen.findByText("link ignored: example.invalid")).toBeTruthy();
+});
