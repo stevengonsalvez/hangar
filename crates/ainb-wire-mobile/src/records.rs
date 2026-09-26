@@ -672,9 +672,13 @@ impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
 pub struct TranscriptPage {
     /// Chunks in ascending order.
     pub chunks: Vec<TranscriptChunkRecord>,
-    /// The cursor for the next page, or absent when this page is empty.
+    /// The cursor for the next forward page, or absent when this page is
+    /// empty or is a backward page.
     pub next_after_order: Option<i64>,
-    /// Whether the uncursored tail read left older rows behind.
+    /// The cursor for the next backward page (`before_order`), when the
+    /// daemon paged backward and older rows remain.
+    pub next_before_order: Option<i64>,
+    /// Whether the uncursored or backward read left older rows behind.
     pub truncated: bool,
 }
 
@@ -683,6 +687,7 @@ impl From<FleetTranscriptListResult> for TranscriptPage {
         Self {
             chunks: r.chunks.into_iter().map(TranscriptChunkRecord::from).collect(),
             next_after_order: r.next_after_order,
+            next_before_order: r.next_before_order,
             truncated: r.truncated,
         }
     }
