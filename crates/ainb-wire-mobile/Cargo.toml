@@ -59,13 +59,14 @@ strip = true
 panic = "unwind"
 
 # The untuned baseline the size job measures first (`--profile untuned`):
-# cargo's own release defaults, so every "before" is honest.
+# cargo's own release defaults (opt-level 3, no LTO, 16 codegen units,
+# debuginfo stripped), so every "before" is honest.
 [profile.untuned]
 inherits = "release"
 opt-level = 3
 lto = false
 codegen-units = 16
-strip = false
+strip = "debuginfo"
 
 [lints.rust]
 missing_docs = "warn"
