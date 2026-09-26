@@ -78,8 +78,9 @@ impl Judge {
         method: &str,
         path: &str,
         headers: &HashMap<String, String>,
+        content_length: usize,
     ) -> Result<Route, Refusal> {
-        self.admit_at(method, path, headers, Instant::now())
+        self.admit_at(method, path, headers, content_length, Instant::now())
     }
 
     fn admit_at(
@@ -87,6 +88,7 @@ impl Judge {
         method: &str,
         path: &str,
         headers: &HashMap<String, String>,
+        content_length: usize,
         now: Instant,
     ) -> Result<Route, Refusal> {
         // DNS rebinding: a browser tricked into this port sends its own Host.
@@ -115,8 +117,8 @@ impl Judge {
         if !json {
             return Err(refuse(415, "unsupported media type"));
         }
-        let length: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-        if length > MAX_BODY {
+        // The strict parser already proved Content-Length is digits and fits.
+        if content_length > MAX_BODY {
             return Err(refuse(413, "payload too large"));
         }
         Ok(route)
@@ -202,11 +204,11 @@ mod tests {
     fn a_good_request_names_its_route() {
         let j = judge();
         assert_eq!(
-            j.admit("POST", "/hook/claude", &ok_headers()),
+            j.admit("POST", "/hook/claude", &ok_headers(), 2),
             Ok(Route::Event(HookSource::Claude))
         );
         assert_eq!(
-            j.admit("POST", "/hook/claude/hold", &ok_headers()),
+            j.admit("POST", "/hook/claude/hold", &ok_headers(), 2),
             Ok(Route::Hold(HookSource::Claude))
         );
     }
@@ -217,9 +219,12 @@ mod tests {
         let mut h = ok_headers();
         h.insert("x-ainb-hook-token".into(), "wrong".into());
         // An unknown route with a bad token is 403, not 404: no route probing.
-        assert_eq!(j.admit("POST", "/nope", &h).unwrap_err().status, 403);
+        assert_eq!(j.admit("POST", "/nope", &h, 2).unwrap_err().status, 403);
         h.remove("x-ainb-hook-token");
-        assert_eq!(j.admit("POST", "/hook/claude", &h).unwrap_err().status, 403);
+        assert_eq!(
+            j.admit("POST", "/hook/claude", &h, 2).unwrap_err().status,
+            403
+        );
     }
 
     #[test]
@@ -227,10 +232,16 @@ mod tests {
         let j = judge();
         let mut h = ok_headers();
         h.insert("host".into(), "evil.example:4000".into());
-        assert_eq!(j.admit("POST", "/hook/claude", &h).unwrap_err().status, 403);
+        assert_eq!(
+            j.admit("POST", "/hook/claude", &h, 2).unwrap_err().status,
+            403
+        );
         let mut h = ok_headers();
         h.insert("origin".into(), "http://127.0.0.1:4000".into());
-        assert_eq!(j.admit("POST", "/hook/claude", &h).unwrap_err().status, 403);
+        assert_eq!(
+            j.admit("POST", "/hook/claude", &h, 2).unwrap_err().status,
+            403
+        );
     }
 
     #[test]
@@ -243,22 +254,30 @@ mod tests {
             "/hook/claude/x",
             "/hook/claude/hold/x",
         ] {
-            assert_eq!(j.admit("POST", bad, &h).unwrap_err().status, 404, "{bad}");
+            assert_eq!(
+                j.admit("POST", bad, &h, 2).unwrap_err().status,
+                404,
+                "{bad}"
+            );
         }
-        assert_eq!(j.admit("GET", "/hook/claude", &h).unwrap_err().status, 405);
+        assert_eq!(
+            j.admit("GET", "/hook/claude", &h, 2).unwrap_err().status,
+            405
+        );
         let mut t = ok_headers();
         t.insert("content-type".into(), "text/plain".into());
-        assert_eq!(j.admit("POST", "/hook/claude", &t).unwrap_err().status, 415);
+        assert_eq!(
+            j.admit("POST", "/hook/claude", &t, 2).unwrap_err().status,
+            415
+        );
         let mut t = ok_headers();
         t.insert(
             "content-type".into(),
             "application/json; charset=utf-8".into(),
         );
-        assert!(j.admit("POST", "/hook/claude", &t).is_ok());
-        let mut big = ok_headers();
-        big.insert("content-length".into(), (MAX_BODY + 1).to_string());
+        assert!(j.admit("POST", "/hook/claude", &t, 2).is_ok());
         assert_eq!(
-            j.admit("POST", "/hook/claude", &big).unwrap_err().status,
+            j.admit("POST", "/hook/claude", &h, MAX_BODY + 1).unwrap_err().status,
             413
         );
     }
@@ -270,14 +289,14 @@ mod tests {
         let t0 = Instant::now();
         let burst = usize::try_from(RATE_BURST as u64).unwrap();
         for _ in 0..burst {
-            assert!(j.admit_at("POST", "/hook/claude", &h, t0).is_ok());
+            assert!(j.admit_at("POST", "/hook/claude", &h, 2, t0).is_ok());
         }
         assert_eq!(
-            j.admit_at("POST", "/hook/claude", &h, t0).unwrap_err().status,
+            j.admit_at("POST", "/hook/claude", &h, 2, t0).unwrap_err().status,
             429
         );
         let later = t0 + std::time::Duration::from_millis(50);
-        assert!(j.admit_at("POST", "/hook/claude", &h, later).is_ok());
+        assert!(j.admit_at("POST", "/hook/claude", &h, 2, later).is_ok());
     }
 
     #[test]
