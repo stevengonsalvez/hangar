@@ -180,8 +180,13 @@ export function statusForSession(
     }
   }
   switch (rowStatus(session.status)) {
+    // "Running" is the tmux session being alive, not the agent doing work: a
+    // shell tab and an agent waiting at its prompt both read it. With no card
+    // and no chip, nothing has said what the agent is doing, which is
+    // exactly `unverifiable` (never "working", which would spin for every
+    // idle shell).
     case "running":
-      return { kind: "working" };
+      return { kind: "unverifiable" };
     case "error":
       return { kind: "needs", need: "error" };
     case "idle":
