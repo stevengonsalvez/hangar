@@ -307,9 +307,9 @@ export class FakeWire implements WireClient {
     host.connected = false;
     const v = FakeWire.verdict(code, reason);
     if (code === 4403) host.row.repair = "revoked";
-    else if (code === 4401) host.row.repair = "identity";
-    else if (code === 4409) host.row.notice = "update_required";
-    else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_close";
+    else if (code === 4401) host.row.repair = "unauthenticated";
+    else if (code === 4409) host.row.notice = "incompatible";
+    else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_code";
     this.record(hostId, "close", String(code));
     this.emit({ kind: "closed", hostId, code, reason: reason ?? "", ...v });
   }
@@ -332,9 +332,9 @@ export class FakeWire implements WireClient {
       const kind: WireErrorKind = refuse.kind ?? "closed";
       if (kind === "closed" && refuse.code !== undefined) {
         if (refuse.code === 4403) host.row.repair = "revoked";
-        else if (refuse.code === 4401) host.row.repair = "identity";
-        else if (refuse.code === 4409) host.row.notice = "update_required";
-        else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_close";
+        else if (refuse.code === 4401) host.row.repair = "unauthenticated";
+        else if (refuse.code === 4409) host.row.notice = "incompatible";
+        else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_code";
       } else if (kind === "peer_changed") host.row.repair = "peer_changed";
       this.record(hostId, "refused", kind === "closed" ? String(refuse.code) : kind);
       this.emit({ kind: "reachability", hostId, reachability: host.row.reachability, sinceMs: host.row.sinceMs });
@@ -349,8 +349,8 @@ export class FakeWire implements WireClient {
     const host = this.host(hostId);
     host.connected = false;
     this.record(hostId, "close", "1000");
-    // The crate reports a close the phone asked for as never retryable.
-    this.emit({ kind: "closed", hostId, code: 1000, reason: "closed by app", retryable: false });
+    // The crate reports a close the phone asked for with no code and never retryable.
+    this.emit({ kind: "closed", hostId, reason: "closed by app", retryable: false });
   }
 
   async hostInfo(hostId: HostId): Promise<HostInfo> {
