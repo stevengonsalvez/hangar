@@ -1101,6 +1101,34 @@ skip_all = false
         assert_no_key(&error);
     }
 
+    /// Well-formed TOML of the wrong type: serde's message quotes the value it
+    /// rejected, so the key would print even though no line is broken.
+    #[test]
+    fn a_wrong_type_environment_does_not_quote_the_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("presets.toml");
+        fs::write(
+            &file,
+            format!("[[preset]]\nname = \"typo\"\nenvironment = \"API_KEY={LEAKY}\"\n"),
+        )
+        .expect("write");
+        let Err(error) = PresetManager::with_file(file) else {
+            panic!("a string environment must not load");
+        };
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+        ] {
+            assert!(
+                !rendered.contains(LEAKY),
+                "API key in the error: {rendered}"
+            );
+            assert!(rendered.contains("invalid type: string"), "{rendered}");
+            assert!(rendered.contains("line "), "{rendered}");
+        }
+    }
+
     #[test]
     fn saving_or_deleting_over_a_broken_file_does_not_quote_the_key() {
         let dir = tempfile::tempdir().expect("tempdir");
