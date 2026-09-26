@@ -137,6 +137,7 @@ async fn a_stopped_session_still_paints_the_label_it_ran_under() {
         model_source: ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("save sessions.json");
 

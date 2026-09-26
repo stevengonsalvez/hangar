@@ -419,6 +419,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let info = SessionInfo::from_metadata(&metadata, true, true);
@@ -441,6 +442,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let info = SessionInfo::from_metadata(&metadata, true, false);
@@ -463,6 +465,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let info = SessionInfo::from_metadata(&metadata, false, false);
@@ -507,6 +510,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let info = SessionInfo::from_metadata(&metadata, true, true);
@@ -567,6 +571,7 @@ mod tests {
                 model_source: Default::default(),
                 codex_model: None,
                 codex_thread_id: None,
+                claude_session_id: None,
             };
 
             // What the TUI paints: `AppState::load_real_workspaces` longhand.
