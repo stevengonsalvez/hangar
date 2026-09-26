@@ -111,12 +111,16 @@ pub async fn pane_pid(id: &str) -> Option<u32> {
 /// index target is never typed into: tmux renumbers it and matches a bare
 /// session name by prefix, so what it names now is not what the row meant.
 ///
+/// `Ok(None)` when tmux has no session by that name at all: there is nothing
+/// to narrow, and whether the send is refused or goes to a broker peer is
+/// the route's call, not this one's.
+///
 /// # Errors
 ///
 /// Why nothing may be typed: the agent's pane is gone, moved to another
 /// session, or runs another process now; or nothing is recorded and the
 /// session has no pane or more than one.
-pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<String, String> {
+pub async fn resolve_send_pane(session: &str, hint: &PaneHint) -> Result<Option<String>, String> {
     let named = hint
         .fingerprint
         .as_deref()
@@ -152,7 +156,7 @@ pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<Strin
                 None => return Err(format!("the agent's pane {id} is gone from {session}")),
             }
         }
-        return Ok(id.to_string());
+        return Ok(Some(id.to_string()));
     }
     // Every pane of the session, in every window, the session matched
     // exactly: tmux would otherwise take `dev` for `devbox` and list the
@@ -170,7 +174,7 @@ pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<Strin
         .await
         .map_err(|error| format!("tmux could not list {session}: {error}"))?;
     if !output.status.success() {
-        return Err(format!("no tmux session {session} to type into"));
+        return Ok(None);
     }
     let panes: Vec<String> = String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -178,14 +182,26 @@ pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<Strin
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
-    only_pane(session, &panes)
-        .map(str::to_string)
-        .map_err(|reason| match hint.target.as_deref() {
+    only_pane(session, &panes).map(|id| Some(id.to_string())).map_err(|reason| {
+        match hint.target.as_deref() {
             Some(target) => format!(
                 "{reason} (the row names {target}, an index tmux renumbers, which is not trusted)"
             ),
             None => reason,
-        })
+        }
+    })
+}
+
+/// [`resolve_send_pane`], with a session tmux has no name for refused here;
+/// kept until every caller has moved.
+///
+/// # Errors
+///
+/// As [`resolve_send_pane`], plus the missing session.
+pub async fn resolve_send_target(session: &str, hint: &PaneHint) -> Result<String, String> {
+    resolve_send_pane(session, hint)
+        .await?
+        .ok_or_else(|| format!("no tmux session {session} to type into"))
 }
 
 #[cfg(test)]
