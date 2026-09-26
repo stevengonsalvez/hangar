@@ -71,12 +71,8 @@ test("exactly one of dark and light is on the root", () => {
   assert.deepEqual([...classes], ["dark"]);
 });
 
-test("terminal colours come from the tokens, with a dark fallback per token", async () => {
-  const { terminalColors } = await import("./theme/theme.ts");
-  const tokens: Record<string, string> = { "--background": " #ffffff", "--foreground": "#0f172a" };
-  const colors = terminalColors((token) => tokens[token] ?? "");
-  assert.equal(colors.background, "#ffffff");
-  assert.equal(colors.foreground, "#0f172a");
-  assert.equal(colors.cursor, "rgb(96, 165, 250)", "an unset token falls back, never empty");
-  assert.equal(colors.selectionBackground, "#1e2636");
+test("terminals keep the dark palette whatever the window theme", async () => {
+  const { TERMINAL_COLORS } = await import("./theme/theme.ts");
+  assert.equal(TERMINAL_COLORS.background, "#0b0e14");
+  assert.equal(TERMINAL_COLORS.foreground, "rgb(226, 232, 240)");
 });
