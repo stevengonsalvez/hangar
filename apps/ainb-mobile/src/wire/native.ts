@@ -151,9 +151,10 @@ export interface NativeMobileHost {
     receiptStatus: string;
     ack?: NativeMutationReceipt;
   }>;
-  transcriptPage(sessionKey: string, afterOrder: bigint | undefined, limit: number): Promise<{
+  transcriptPage(sessionKey: string, afterOrder: bigint | undefined, beforeOrder: bigint | undefined, limit: number): Promise<{
     chunks: NativeTranscriptChunk[];
     nextAfterOrder?: bigint | number;
+    nextBeforeOrder?: bigint | number;
     truncated: boolean;
   }>;
   subscribeTranscript(sessionKey: string, afterOrder?: bigint): Promise<bigint | number | undefined>;
@@ -513,6 +514,9 @@ interface Live {
 /** The page the transcript screen asks for: the daemon caps a page at 100. */
 export const TRANSCRIPT_PAGE = 100;
 
+/** The daemon capability behind a backward transcript page (`before_order`). */
+export const CAP_TRANSCRIPT_PAGE_BACK = "fleet.transcript.page_back";
+
 /** `WireClient` over the linked `ainb-wire-mobile` binding. */
 export class NativeWire implements WireClient {
   private readonly b: Bindings;
@@ -756,19 +760,18 @@ export class NativeWire implements WireClient {
 
   /**
    * Without `beforeSeq`: the newest page (the daemon's cap, 100 rows). With
-   * it: the page of entries older than `beforeSeq`, which the wire cannot
-   * fetch yet: `fleet/transcript_list` reads forward from `after_order` and
-   * caps at 100, so any window below `beforeSeq` returns the OLDEST rows of
-   * the session, not the ones just below the cursor. Until the daemon takes
-   * a `before_order`, an older page is empty and the screen shows what it
-   * has. ponytail: swap the `[]` for one call with `before_order` when it
-   * lands.
+   * it: the page of entries older than `beforeSeq`, ascending, asked with
+   * `before_order` only of a host that advertises
+   * `fleet.transcript.page_back` (an older daemon ignores the field and
+   * answers the forward page, which would read as history). Without the
+   * capability the older page is empty and the screen shows what it has.
+   * The crate refuses a page whose rows are not all below the cursor.
    */
   async transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]> {
     const host = this.hostOf(hostId);
-    if (beforeSeq !== undefined) return [];
-    const tail = await this.guard(() => host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE));
-    return tail.chunks.map(toTranscriptEntry).filter((e): e is TranscriptEntry => e !== undefined);
+    if (beforeSeq !== undefined && !host.advertises(CAP_TRANSCRIPT_PAGE_BACK)) return [];
+    const page = await this.guard(() => host.transcriptPage(sessionKey, undefined, bigOpt(beforeSeq), TRANSCRIPT_PAGE));
+    return page.chunks.map(toTranscriptEntry).filter((e): e is TranscriptEntry => e !== undefined);
   }
 
   /**
