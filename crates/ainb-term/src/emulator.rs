@@ -36,16 +36,13 @@
 //! movement, DECSTBM and RIS clear it; DECSC/DECRC save and restore it.
 //! [`Modes::wrap_pending`] is what the snapshot re-enters.
 //!
-//! Cost of the wrapper over the raw fork, measured in release on spike 2's
-//! 50 MB attributed flood at 120x40 with a 1,000-row window, on a Mac
-//! shared with other builds (the raw fork alone varies 10 to 15 s between
-//! runs there): with 4 KiB feeds the wrapper took 13.2 to 25.1 s over five
-//! runs against the fork's 10.1 to 14.9 s, a same-run overhead of 2 to 69
-//! percent and 32 percent best against best; with 64 KiB feeds 13.5 to
-//! 18.2 s against 11.4 to 12.7 s. Before the parser was streamed (one
-//! `Action` per byte, one emulator entry per escape sequence) the same
-//! flood measured 146 percent over the fork. Reproduce with the ignored
-//! test `flood_throughput_wrapper_against_raw_fork`.
+//! The wrapper's cost over the raw fork is measured with the ignored release
+//! test `flood_throughput_wrapper_against_raw_fork`: spike 2's 50 MB
+//! attributed flood (`make-workload.py --flood`) at 120x40 with a 1,000-row
+//! window, fed in 4 KiB and 64 KiB chunks through `feed` and through the
+//! fork's `advance_bytes`, same-run ratio reported. Take several runs and
+//! compare best against best; the machine and the numbers belong in the PR
+//! that changes the feed path, not here.
 //!
 //! A panic inside the emulator is contained: the fork lacks upstream's fix for
 //! a divide by zero in inline image placement, and crafted agent output must
@@ -268,46 +265,27 @@ impl Modes {
     /// column `x`: a pending wrap moves to column 0 first; a glyph whose
     /// end reaches the margin leaves the cursor and sets the flag when
     /// autowrap is on; a zero-width cluster joins the previous cell.
-    fn observe_print(&mut self, text: &str, mut x: usize, cols: usize) {
-        if text.is_ascii() {
-            // Every printable ASCII byte is one cell: no width lookup.
-            let n = text.len();
-            if self.wrap_pending {
-                x = 0;
-                self.wrap_pending = false;
-            }
-            if cols == 0 {
-                return;
-            }
-            // `room` chars fit before the margin; the next one lands on it
-            // and parks the cursor. After that every `cols` chars park it
-            // again, so the run ends pending exactly when the remainder is
-            // a multiple of the width. With autowrap off the cursor stays
-            // on the margin and the fork overwrites it: never pending.
-            let room = cols - 1 - x.min(cols - 1);
-            self.wrap_pending = n > room && self.auto_wrap && (n - room - 1).is_multiple_of(cols);
-            return;
-        }
-        let uv = UnicodeVersion {
-            version: UNICODE_VERSION,
-            ambiguous_are_wide: false,
-            cell_widths: None,
+    fn observe_print(&mut self, text: &str, x: usize, cols: usize) {
+        self.wrap_pending = if text.is_ascii() {
+            wrap_after_ascii(text.len(), x, cols, self.wrap_pending, self.auto_wrap)
+        } else {
+            wrap_after_widths(
+                text.graphemes(true).map(|g| {
+                    grapheme_column_width(
+                        g,
+                        Some(&UnicodeVersion {
+                            version: UNICODE_VERSION,
+                            ambiguous_are_wide: false,
+                            cell_widths: None,
+                        }),
+                    )
+                }),
+                x,
+                cols,
+                self.wrap_pending,
+                self.auto_wrap,
+            )
         };
-        for g in text.graphemes(true) {
-            let w = grapheme_column_width(g, Some(&uv));
-            if w == 0 {
-                continue;
-            }
-            if self.wrap_pending {
-                x = 0;
-                self.wrap_pending = false;
-            }
-            if x + w >= cols {
-                self.wrap_pending = self.auto_wrap;
-            } else {
-                x += w;
-            }
-        }
     }
 
     /// Whether a non-print action leaves the pending wrap alone. Measured
@@ -452,6 +430,53 @@ impl Modes {
             _ => {}
         }
     }
+}
+
+/// The fork's print rule over a run of cell widths from column `x`: a
+/// pending wrap moves to column 0 first; a glyph whose end reaches the
+/// margin leaves the cursor and sets the flag when autowrap is on; a
+/// zero-width cluster joins the previous cell. Returns whether a wrap is
+/// pending after the run.
+fn wrap_after_widths(
+    widths: impl Iterator<Item = usize>,
+    mut x: usize,
+    cols: usize,
+    mut pending: bool,
+    auto_wrap: bool,
+) -> bool {
+    for w in widths {
+        if w == 0 {
+            continue;
+        }
+        if pending {
+            x = 0;
+            pending = false;
+        }
+        if x + w >= cols {
+            pending = auto_wrap;
+        } else {
+            x += w;
+        }
+    }
+    pending
+}
+
+/// [`wrap_after_widths`] in closed form for `n` one-cell glyphs: `room`
+/// glyphs fit before the margin, the next one parks the cursor on it, and
+/// after that every `cols` glyphs park it again, so the run ends pending
+/// exactly when the remainder is a multiple of the width. With autowrap
+/// off the cursor stays on the margin and the fork overwrites it: never
+/// pending. A property test holds the two rules equal.
+fn wrap_after_ascii(n: usize, x: usize, cols: usize, pending: bool, auto_wrap: bool) -> bool {
+    if n == 0 {
+        return pending;
+    }
+    if cols == 0 {
+        return false;
+    }
+    let x = if pending { 0 } else { x };
+    let room = cols - 1 - x.min(cols - 1);
+    n > room && auto_wrap && (n - room - 1).is_multiple_of(cols)
 }
 
 /// Split the last grapheme cluster off `text`: the head is performed now,
@@ -744,6 +769,27 @@ impl PaneEmulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4000))]
+        /// The closed-form ASCII rule equals the general loop over runs up
+        /// to three rows long, from any column, starting with or without a
+        /// pending wrap, with autowrap on or off, at widths 1 to 200.
+        #[test]
+        fn the_ascii_wrap_rule_equals_the_general_loop(
+            cols in 1usize..200,
+            x in 0usize..200,
+            n in 0usize..640,
+            pending in any::<bool>(),
+            auto_wrap in any::<bool>(),
+        ) {
+            let x = x.min(cols - 1);
+            let general = wrap_after_widths(std::iter::repeat_n(1usize, n), x, cols, pending, auto_wrap);
+            let fast = wrap_after_ascii(n, x, cols, pending, auto_wrap);
+            prop_assert_eq!(fast, general, "cols {} x {} n {} pending {} auto_wrap {}", cols, x, n, pending, auto_wrap);
+        }
+    }
 
     fn pane(cols: u16, rows: u16) -> PaneEmulator {
         PaneEmulator::new(cols, rows, crate::DEFAULT_LIVE_ROWS)
