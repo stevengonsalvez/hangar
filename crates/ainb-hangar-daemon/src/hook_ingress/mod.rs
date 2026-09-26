@@ -21,6 +21,7 @@
 
 mod endpoint;
 mod guard;
+mod ingest;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -34,6 +35,7 @@ use tokio::sync::Semaphore;
 
 pub use endpoint::{EndpointFiles, remove_stale};
 pub use guard::{Judge, MAX_BODY, MAX_CONNECTIONS, MAX_HEAD, Refusal, Route};
+pub use ingest::{IngestSink, MAX_INLINE_PAYLOAD, event_line};
 
 use crate::local_http::{read_body, read_head, write_response};
 
@@ -75,6 +77,9 @@ pub enum HookReply {
     NoContent,
     /// `200` with a JSON body the hook prints to its agent.
     Json(Vec<u8>),
+    /// `503`: the event could not be recorded (a store fault). The hook
+    /// spools it and the next daemon start replays it.
+    Unavailable,
 }
 
 /// Where admitted hook calls go.
@@ -306,6 +311,7 @@ async fn handle(
     match reply {
         HookReply::NoContent => write_response(stream, 204, "text/plain", b"").await,
         HookReply::Json(body) => write_response(stream, 200, "application/json", &body).await,
+        HookReply::Unavailable => write_response(stream, 503, "text/plain", b"unavailable").await,
     }
 }
 
