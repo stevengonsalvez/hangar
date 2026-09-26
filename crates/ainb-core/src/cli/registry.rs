@@ -200,9 +200,12 @@ impl CliCommand for RunCommand {
                 .about("Spawn a new AI coding session"),
         )
     }
-    fn run(&self, matches: &ArgMatches, _ctx: CliContext) -> BoxFuture<'static, Result<()>> {
+    fn run(&self, matches: &ArgMatches, ctx: CliContext) -> BoxFuture<'static, Result<()>> {
         match crate::cli::RunArgs::from_arg_matches(matches) {
-            Ok(args) => Box::pin(async move { crate::cli::run::execute(args).await }),
+            Ok(mut args) => {
+                args.json = matches!(ctx.format, crate::cli::OutputFormat::Json);
+                Box::pin(async move { crate::cli::run::execute(args).await })
+            }
             Err(e) => boxed_err(e),
         }
     }

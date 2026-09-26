@@ -127,6 +127,7 @@ Options:
       --repo <REPO>                    Local repository path
       --create-branch <CREATE_BRANCH>  Create a new branch with this name
       --worktree                       Use git worktree for isolation
+      --base <REF>                     Base ref the new worktree branch starts from (needs --worktree or --create-branch)
       --tool <TOOL>                    AI tool to use [default: claude] [possible values: claude, codex, gemini, copilot, antigravity]
       --model <MODEL>                  Provider model ID to pass through unchanged
   -p, --prompt <PROMPT>                Initial prompt to send
