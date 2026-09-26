@@ -246,9 +246,6 @@ pub fn no_live_target_reason(session_id: &str) -> &'static str {
     }
 }
 
-/// Superseded by [`no_live_target_reason`]; kept until every caller has moved.
-pub const NO_LIVE_TARGET: &str = "no live session runs under this id (started before the upgrade): start a new session to answer here";
-
 /// Unified session identity. May be backed by 1+ sources after merge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
