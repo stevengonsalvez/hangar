@@ -81,7 +81,7 @@ test("a 4403 close latches the host to re-pair; a 4503 does not", async () => {
   await waitFor(() => expect(screen.queryByTestId(`repair-${FAKE_HOST_A}`)).toBeNull());
 });
 
-test("a 4401 close latches identity re-pair", async () => {
+test("a 4401 close latches unauthenticated re-pair", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
   await screen.findByText("laptop");
   fake.closedBy(FAKE_HOST_A, 4401);
@@ -98,4 +98,30 @@ test("4409 and an unknown close code park the host row without a re-pair latch",
   fake.closedBy("01K5B0000000000000000BBBBB", 4999);
   expect(await screen.findByText("closed with an unknown code, check the host")).toBeTruthy();
   expect(screen.queryByTestId("repair-01K5B0000000000000000BBBBB")).toBeNull();
+});
+
+test("the five latch and notice strings from the crate's record each get their copy through hosts()", async () => {
+  const { REPAIR_COPY, NOTICE_COPY } = require("../app/index") as { REPAIR_COPY: Record<string, string>; NOTICE_COPY: Record<string, string> };
+  // pairing.rs constants: REPAIR_REVOKED, REPAIR_UNAUTHENTICATED, REPAIR_PEER_CHANGED, NOTICE_INCOMPATIBLE, NOTICE_UNKNOWN_CODE
+  const cases: { hostId: string; repair?: string; notice?: string; copy: string }[] = [
+    { hostId: "01K5R0000000000000000RRRRR", repair: "revoked", copy: REPAIR_COPY.revoked! },
+    { hostId: "01K5U0000000000000000UUUUU", repair: "unauthenticated", copy: REPAIR_COPY.unauthenticated! },
+    { hostId: "01K5P0000000000000000PPPPP", repair: "peer_changed", copy: REPAIR_COPY.peer_changed! },
+    { hostId: "01K5I0000000000000000IIIII", notice: "incompatible", copy: NOTICE_COPY.incompatible! },
+    { hostId: "01K5K0000000000000000KKKKK", notice: "unknown_code", copy: NOTICE_COPY.unknown_code! },
+    { hostId: "01K5N0000000000000000NNNNN", repair: "something_newer", copy: "pair again (something_newer)" },
+  ];
+  for (const c of cases) {
+    fake.addHost(c.hostId, `host-${c.hostId.slice(-5)}`, "reachable");
+    const row = (await fake.hosts()).find((h) => h.hostId === c.hostId)!;
+    row.repair = c.repair;
+    row.notice = c.notice;
+  }
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  for (const c of cases) {
+    expect(await screen.findByText(c.copy)).toBeTruthy();
+    expect(screen.getByTestId(c.repair ? `repair-${c.hostId}` : `notice-${c.hostId}`)).toBeTruthy();
+  }
+  // none of them was dialled: the lifecycle skips every latched or parked host
+  for (const c of cases) expect(fake.isConnected(c.hostId)).toBe(false);
 });
