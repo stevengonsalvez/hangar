@@ -59,8 +59,12 @@ impl World {
     }
 
     fn token(&self) -> String {
-        let line = std::fs::read_to_string(self.endpoint().headers_path).unwrap();
+        let line = std::fs::read_to_string(self.headers_path()).unwrap();
         line.trim_end().strip_prefix("X-Ainb-Hook-Token: ").unwrap().to_string()
+    }
+
+    fn headers_path(&self) -> std::path::PathBuf {
+        self.home.path().join("hangar").join("hook-headers")
     }
 
     fn host(&self) -> String {
@@ -268,7 +272,7 @@ async fn files_are_private_and_the_endpoint_holds_no_token() {
     let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir), 0o700);
     assert_eq!(mode(&dir.join(ENDPOINT_FILE_NAME)), 0o600);
-    assert_eq!(mode(&w.endpoint().headers_path), 0o600);
+    assert_eq!(mode(&w.headers_path()), 0o600);
     let endpoint = std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap();
     assert!(!endpoint.contains(&w.token()));
     assert_eq!(w.endpoint().port, w.running.port());
@@ -306,7 +310,7 @@ async fn a_restart_mints_a_new_token_and_the_old_one_is_refused() {
 async fn dropping_the_listener_removes_both_files() {
     let w = World::start().await;
     let dir = w.home.path().join("hangar");
-    let headers = w.endpoint().headers_path;
+    let headers = w.headers_path();
     drop(w.running);
     assert!(!dir.join(ENDPOINT_FILE_NAME).exists());
     assert!(!headers.exists());
@@ -373,4 +377,101 @@ async fn hostile_framing_is_refused_and_never_reaches_the_sink() {
     s.read_to_end(&mut out).await.unwrap();
     assert_eq!(status(&String::from_utf8_lossy(&out)), 400);
     assert!(w.events().is_empty());
+}
+
+/// A sink that never answers, for the deadline and cap tests.
+struct Stuck;
+
+impl HookSink for Stuck {
+    fn ingest(
+        &self,
+        _event: HookEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            HookReply::NoContent
+        })
+    }
+}
+
+async fn stuck_world(limits: hook_ingress::Limits) -> (tempfile::TempDir, hook_ingress::Running) {
+    let home = tempfile::tempdir().unwrap();
+    let running = hook_ingress::start_with(home.path(), Arc::new(Stuck), limits).await.unwrap();
+    (home, running)
+}
+
+/// The headers file's line, as an HTTP header line (CRLF, not the file's LF).
+fn token_line(home: &std::path::Path) -> String {
+    let line = std::fs::read_to_string(home.join("hangar").join("hook-headers")).unwrap();
+    format!("{}\r\n", line.trim_end())
+}
+
+#[tokio::test]
+async fn a_slow_head_gets_408() {
+    let w = World::start().await;
+    let mut s = TcpStream::connect(("127.0.0.1", w.running.port())).await.unwrap();
+    s.write_all(b"POST /hook/claude HTTP/1.1\r\n").await.unwrap();
+    let mut out = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+        .await
+        .expect("answered within the head deadline")
+        .unwrap();
+    assert_eq!(status(&String::from_utf8_lossy(&out)), 408);
+}
+
+#[tokio::test]
+async fn a_sink_past_its_deadline_is_answered_204() {
+    let (home, running) = stuck_world(hook_ingress::Limits {
+        event_deadline: Duration::from_millis(200),
+        hold_deadline: Duration::from_millis(200),
+        max_holds: 4,
+    })
+    .await;
+    let host = format!("127.0.0.1:{}", running.port());
+    for path in ["/hook/claude", "/hook/claude/hold"] {
+        let started = std::time::Instant::now();
+        let resp = exchange(
+            running.port(),
+            &post(path, &host, &token_line(home.path()), "{}"),
+        )
+        .await;
+        assert_eq!(status(&resp), 204, "{path}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_hold_past_the_cap_is_answered_at_once() {
+    let (home, running) = stuck_world(hook_ingress::Limits {
+        event_deadline: Duration::from_secs(1),
+        hold_deadline: Duration::from_secs(30),
+        max_holds: 1,
+    })
+    .await;
+    let host = format!("127.0.0.1:{}", running.port());
+    let tok = token_line(home.path());
+    // The first hold takes the only slot and waits on the stuck sink.
+    let first = {
+        let (port, host, tok) = (running.port(), host.clone(), tok.clone());
+        tokio::spawn(
+            async move { exchange(port, &post("/hook/claude/hold", &host, &tok, "{}")).await },
+        )
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The second is recorded as status and answered without waiting the 30s.
+    let started = std::time::Instant::now();
+    let second = tokio::time::timeout(
+        Duration::from_secs(15),
+        exchange(
+            running.port(),
+            &post("/hook/claude/hold", &host, &tok, "{}"),
+        ),
+    )
+    .await;
+    // With the stuck sink the second waits its event deadline (1s), never
+    // the hold deadline (30s).
+    let second = second.expect("answered on the event deadline, not the hold deadline");
+    assert_eq!(status(&second), 204);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    first.abort();
 }
