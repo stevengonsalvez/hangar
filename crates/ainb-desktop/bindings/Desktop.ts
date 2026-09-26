@@ -9,14 +9,15 @@ export type CreateWorktreeArgs = {
 	branch: string | null,
 	/**  Ref the branch starts from; the repository's default branch when absent. */
 	base: string | null,
-	/**  `claude`, `codex`, `gemini`, `copilot` or `antigravity`. */
-	agent: string,
+	/**
+	 *  The agent CLI: the daemon's own `SpawnAgent`, so the list of agents is
+	 *  written once, in the proto, and generated into TypeScript.
+	 */
+	agent: SpawnAgent,
 	/**  Provider model id, passed through unchanged. */
 	model: string | null,
 	/**  First prompt for the agent. */
 	prompt: string | null,
-	/**  Tmux session name; the daemon picks one when absent. */
-	name: string | null,
 };
 
 /**  What the window needs back: the session to attach and to show. */
@@ -119,3 +120,20 @@ export type SetupWrite =
  *  settings and the shell rc outside it, and the collector if installed.
  */
 { kind: "finish_open_telemetry"; otlp_endpoint: string; instance_id: string; api_token: string };
+
+/**
+ *  The agent CLI a new session runs. Mirrors `ainb run --tool`. The one
+ *  list of agents: the desktop's command takes it and its TypeScript is
+ *  generated from it, so no surface keeps a copy.
+ */
+export type SpawnAgent = 
+/**  Claude Code. */
+"claude" | 
+/**  The `OpenAI` Codex CLI. */
+"codex" | 
+/**  Gemini CLI. */
+"gemini" | 
+/**  GitHub Copilot CLI. */
+"copilot" | 
+/**  Antigravity CLI. */
+"antigravity";
