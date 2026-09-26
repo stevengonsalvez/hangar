@@ -43,13 +43,13 @@
 //!   screen the primary screen is not carried, so a client sees a blank
 //!   primary screen when the app exits alt mode until the app repaints. The
 //!   emulator does not expose its inactive screen.
-//! * A pending autowrap is lost. After a row is filled exactly, the next
-//!   glyph wraps in the original but overwrites the last column in the
-//!   replay, until the app repositions the cursor. The emulator does not
-//!   expose `wrap_next`, and its public state after a full row is the same
-//!   as after `CUP` to the last column. Pinned by
-//!   `a_pending_autowrap_is_the_documented_loss`; the accessor belongs
-//!   upstream.
+//!
+//! A pending autowrap (the cursor parked on the last column after a full
+//! row) is re-entered: the wrapper shadows the fork's rule in
+//! [`crate::emulator::Modes::wrap_pending`], and the snapshot reprints the
+//! cell under the cursor with autowrap on after positioning it, which parks
+//! the replaying terminal the same way. Pinned by
+//! `a_pending_autowrap_is_restored`.
 
 use std::fmt::Write as _;
 
@@ -129,6 +129,31 @@ pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Result<Vec<u
         u32::from(row) + 1,
         u32::from(cursor.col) + 1
     );
+    if modes.wrap_pending {
+        // Reprint the glyph under the cursor with autowrap on: reaching the
+        // margin parks the cursor there with the wrap pending, as in the
+        // original. Restore the real autowrap afterwards.
+        let (_, viewport) = lines(pane, 0);
+        let cell = viewport
+            .get(usize::from(cursor.row))
+            .and_then(|l| l.get_cell(usize::from(cursor.col)).map(|c| c.as_cell()));
+        if let Some(cell) = cell {
+            let sgr = sgr_params(cell.attrs());
+            let _ = write!(out, "{ESC}[?7h{ESC}[0m");
+            if !sgr.is_empty() {
+                let _ = write!(out, "{ESC}[{sgr}m");
+            }
+            if let Some(h) = cell.attrs().hyperlink() {
+                let id = h.params().get("id").map_or_else(String::new, |id| format!("id={id}"));
+                let _ = write!(out, "{ESC}]8;{id};{}{ESC}\\", h.uri());
+            }
+            out.push_str(cell.str());
+            out.push_str("\x1b[0m\x1b]8;;\x1b\\");
+            if !modes.auto_wrap {
+                out.push_str("\x1b[?7l");
+            }
+        }
+    }
     out.push_str(if cursor.visible {
         "\x1b[?25h"
     } else {
@@ -530,32 +555,51 @@ mod tests {
         round_trip("wrap-padded", &mut p, 0);
     }
 
-    /// The documented ceiling: the emulator does not expose a pending
-    /// autowrap, so after an exactly full row the replay overwrites the last
-    /// column where the original wraps.
+    /// After an exactly full row the cursor parks on the last column with
+    /// the wrap pending; the replay re-enters that state, so the next glyph
+    /// wraps on both.
     #[test]
-    fn a_pending_autowrap_is_the_documented_loss() {
+    fn a_pending_autowrap_is_restored() {
+        for (label, bytes) in [
+            ("plain", b"0123456789".as_slice()),
+            ("styled", b"01234567\x1b[1;32m89\x1b[0m"),
+            (
+                "linked",
+                b"012345678\x1b]8;;https://x/\x1b\\9\x1b]8;;\x1b\\",
+            ),
+            ("wide at the margin", "01234567\u{4E2D}".as_bytes()),
+        ] {
+            let mut p = PaneEmulator::new(10, 3, 10);
+            p.feed(bytes).unwrap();
+            p.flush().unwrap();
+            assert!(p.modes().wrap_pending, "{label}");
+            round_trip(label, &mut p, 0);
+            let snap = snapshot(&mut p, 0).unwrap();
+            let mut fresh = PaneEmulator::new(10, 3, 10);
+            fresh.feed(&snap).unwrap();
+            assert!(fresh.modes().wrap_pending, "{label}: replay pending");
+            p.feed(b"X").unwrap();
+            fresh.feed(b"X").unwrap();
+            let (mut a, mut b) = (canon(&mut fresh, 0), canon(&mut p, 0));
+            if label == "wide at the margin" {
+                // The fork sets the wrapped flag on the physical last cell
+                // but reads it from the last visible one; after the clear
+                // the replayed line has a tenth blank cell behind the wide
+                // glyph, so only that reflow flag differs. Text, cursor and
+                // the wrap itself match.
+                a.grid_wrapped.clear();
+                b.grid_wrapped.clear();
+            }
+            assert_eq!(a.render(), b.render(), "{label}: after X");
+            assert_eq!(b.row_text(1), "X", "{label}: wrapped");
+        }
+        // With autowrap off there is no pending wrap and the replay keeps
+        // the cursor on the last column without one.
         let mut p = PaneEmulator::new(10, 3, 10);
-        p.feed(b"0123456789").unwrap();
+        p.feed(b"\x1b[?7l0123456789").unwrap();
         p.flush().unwrap();
-        let snap = snapshot(&mut p, 0).unwrap();
-        let mut fresh = PaneEmulator::new(10, 3, 10);
-        fresh.feed(&snap).unwrap();
-        assert_eq!(
-            canon(&mut fresh, 0).render(),
-            canon(&mut p, 0).render(),
-            "equal until the next glyph"
-        );
-        p.feed(b"X").unwrap();
-        fresh.feed(b"X").unwrap();
-        p.flush().unwrap();
-        fresh.flush().unwrap();
-        assert_eq!(canon(&mut p, 0).row_text(1), "X", "the original wraps");
-        assert_eq!(
-            canon(&mut fresh, 0).row_text(0),
-            "012345678X",
-            "the replay overwrites"
-        );
+        assert!(!p.modes().wrap_pending);
+        round_trip("autowrap off", &mut p, 0);
     }
 
     #[test]
