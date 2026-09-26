@@ -553,6 +553,92 @@ pub fn command_contexts(state: &AppState) -> Vec<KeyContext> {
     contexts.into_iter().map(|(context, _)| context).collect()
 }
 
+/// Whether the row `id` names, bound in `ctx`, runs by name now. A host-authored
+/// row (a host's reports, a plugin action naming its plugin) runs from any
+/// screen. Every other row passes the gate a key passes: it runs only while its
+/// context is active and no overlay covers it, so a click resolved on one screen
+/// cannot act after the user has left it or opened a dialog over it. The
+/// reducer drops a name that fails this, and a host asks it first so the
+/// surface that sent the name hears the refusal rather than silence (#121).
+#[must_use]
+pub fn command_on_screen(state: &AppState, id: &CommandId, ctx: &KeyContext) -> bool {
+    let host_authored = crate::app::reports::ids::ALL.contains(&id.as_str())
+        || crate::app::plugin_action::ids::ALL.contains(&id.as_str());
+    host_authored || command_contexts(state).contains(ctx)
+}
+
+/// Why a command sent by name will not run, in the order the reducer judges
+/// it: a name it has no row for; a row that writes outside ainb, which runs
+/// only from its key; a payload the row cannot parse; what the row would
+/// write, bind or trust (`AppState::remote_command_refusal`); and last the
+/// screen gate. The reducer drops a name for any of these, and a host asks
+/// [`judge_command`] first so the surface that sent the name hears the reason
+/// instead of a dispatch that did nothing (#121).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandRefusal {
+    /// No row has this name.
+    Unknown,
+    /// The row writes outside ainb and runs only from its key.
+    KeyOnly,
+    /// The payload does not fit the row; the field names it carried, never
+    /// their values, which can be a pairing code, a path or typed text.
+    Payload(Vec<String>),
+    /// The row's effect, judged with its payload, is the host's to run.
+    Remote(&'static str),
+    /// The row's context is not active, or an overlay covers it.
+    OffScreen,
+}
+
+impl CommandRefusal {
+    /// The reason, as a surface shows it.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Unknown => "the host has no such row",
+            Self::KeyOnly => "it writes outside ainb, so it runs only from its key",
+            Self::Payload(_) => "its payload does not fit the row",
+            Self::Remote(why) => why,
+            Self::OffScreen => "it is not active on this screen",
+        }
+    }
+}
+
+/// The action the row `id` names runs with `args` now, or why it may not.
+///
+/// # Errors
+///
+/// The first [`CommandRefusal`] that applies, in the order listed there.
+pub fn judge_command(
+    state: &AppState,
+    keymap: &Keymap,
+    id: &CommandId,
+    args: &serde_json::Value,
+) -> Result<KeyAction, CommandRefusal> {
+    let Some(binding) = keymap.command(id) else {
+        return Err(CommandRefusal::Unknown);
+    };
+    if binding.key_only() {
+        return Err(CommandRefusal::KeyOnly);
+    }
+    let Some(action) = binding.action.with_args(args) else {
+        let fields = args
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        return Err(CommandRefusal::Payload(fields));
+    };
+    // Judged with its payload: a pointer row's action is what the arguments
+    // name (the settings row a `config.set_row` edits, #1224), not the
+    // placeholder the table wrote.
+    if let Some(why) = state.remote_command_refusal(&action) {
+        return Err(CommandRefusal::Remote(why));
+    }
+    if !command_on_screen(state, id, &binding.ctx) {
+        return Err(CommandRefusal::OffScreen);
+    }
+    Ok(action)
+}
+
 /// Mirror host dispatch precedence without allowing renderer state into `AppState`.
 #[must_use]
 pub fn active_contexts(state: &AppState) -> Vec<KeyContext> {

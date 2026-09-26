@@ -56,6 +56,15 @@ jobs:
           # means a fork PR can restore a cache but never write one.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
+      # crates/ainb-desktop is its own cargo workspace with its own lock, and
+      # its path dependencies live in this one. A PR that adds a crate or a
+      # dependency to one of them leaves that lock stale without failing
+      # anything required, and the desktop bundle smoke (`cargo tauri build
+      # ... --locked`) then fails on main on both runners. Resolve it here with
+      # --locked, so the PR that drifts the lock is the one that goes red. The
+      # fix is `cargo update -w --manifest-path crates/ainb-desktop/Cargo.toml`.
+      - name: The desktop shell's lock file is current
+        run: cargo metadata --locked --format-version 1 --manifest-path crates/ainb-desktop/Cargo.toml > /dev/null
       # The peer wire is shared with the phone crate, which cannot be rebuilt
       # from here, so a dependency that stops compiling for a phone target has
       # to fail this job, not a mobile build weeks later. `check` needs no

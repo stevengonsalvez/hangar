@@ -181,13 +181,46 @@ enum Ended {
     Closed,
 }
 
+/// The retry schedule, apart from the clock that sleeps it, so the delays it
+/// chooses are something a test can read rather than time.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    timing: Timing,
+    next: Duration,
+}
+
+impl Backoff {
+    const fn new(timing: Timing) -> Self {
+        Self {
+            timing,
+            next: timing.backoff_initial,
+        }
+    }
+
+    /// How long to wait after an attempt that ended as `ended`, `None` when
+    /// the task should stop. `connected` and `uptime` describe the attempt:
+    /// only a connection that stayed up `min_uptime` restarts the backoff.
+    fn after(&mut self, ended: &Ended, connected: bool, uptime: Duration) -> Option<Duration> {
+        if connected && uptime >= self.timing.min_uptime {
+            self.next = self.timing.backoff_initial;
+        }
+        let wait = match ended {
+            Ended::Closed => return None,
+            Ended::Absent => self.timing.backoff_max,
+            Ended::Failed => self.next,
+        };
+        self.next = (self.next * 2).min(self.timing.backoff_max);
+        Some(wait)
+    }
+}
+
 async fn run(
     dialer: Dialer,
     tx: mpsc::UnboundedSender<AgentStatusUpdate>,
     legacy_panel: bool,
     timing: Timing,
 ) {
-    let mut backoff = timing.backoff_initial;
+    let mut backoff = Backoff::new(timing);
     let mut connected_before = false;
     loop {
         let started = tokio::time::Instant::now();
@@ -196,17 +229,10 @@ async fn run(
             Err(error) => (report(&tx, &error), false),
         };
         connected_before |= connected;
-        // Only a connection that stayed up restarts the backoff.
-        if connected && started.elapsed() >= timing.min_uptime {
-            backoff = timing.backoff_initial;
-        }
-        let wait = match ended {
-            Ended::Closed => return,
-            Ended::Absent => timing.backoff_max,
-            Ended::Failed => backoff,
+        let Some(wait) = backoff.after(&ended, connected, started.elapsed()) else {
+            return;
         };
         tokio::time::sleep(wait).await;
-        backoff = (backoff * 2).min(timing.backoff_max);
     }
 }
 
@@ -754,17 +780,19 @@ mod tests {
         );
     }
 
-    /// #1019 review, backoff and item 8: a dial failure renders a generic
-    /// reason (no socket path) and retries on a growing, bounded backoff.
+    /// #1019 review, item 8: a dial failure renders a generic reason (no
+    /// socket path), and the task keeps retrying. How long it waits between
+    /// attempts is the schedule's, pinned by the test below: measured wall
+    /// time between attempts on a loaded runner says nothing about it.
     #[tokio::test]
-    async fn a_dead_socket_backs_off_and_never_renders_its_path() {
+    async fn a_dead_socket_retries_and_never_renders_its_path() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("missing.sock");
-        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen_attempts = attempts.clone();
         let path = socket.clone();
         let dialer: Dialer = Box::new(move || {
-            seen_attempts.lock().unwrap().push(std::time::Instant::now());
+            seen_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(DaemonClient::with_parts(path.clone(), "t".to_string()))
         });
         let mut reader = AgentStatusReader::spawn_timed(dialer, false, fast());
@@ -777,17 +805,53 @@ mod tests {
             assert_eq!(reason, "daemon not reachable");
             assert!(!reason.contains(&socket.display().to_string()));
         }
-        let times = attempts.lock().unwrap().clone();
-        let gaps: Vec<_> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
-        assert!(gaps.len() >= 3, "{gaps:?}");
         assert!(
-            gaps[2] > gaps[0],
-            "the wait grows between attempts: {gaps:?}"
+            attempts.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "one dial per failure reported"
         );
-        assert!(
-            gaps.iter().all(|gap| *gap < Duration::from_secs(1)),
-            "and stays bounded: {gaps:?}"
+    }
+
+    /// #1019 review, backoff: failures back off from `backoff_initial`,
+    /// doubling to `backoff_max` and holding there; read from the delays the
+    /// schedule chooses, not from a clock.
+    #[test]
+    fn failures_back_off_doubling_to_a_bound() {
+        let mut backoff = Backoff::new(fast());
+        let waits: Vec<_> = (0..6)
+            .map(|_| backoff.after(&Ended::Failed, false, Duration::ZERO).unwrap())
+            .collect();
+        let ms = |n| Duration::from_millis(n);
+        assert_eq!(waits, [ms(20), ms(40), ms(80), ms(160), ms(160), ms(160)]);
+    }
+
+    /// Only a connection that stayed up `min_uptime` restarts the backoff; a
+    /// daemon that accepts and drops at once keeps it growing, a daemon
+    /// without the read waits the bound, and a closed channel stops the task.
+    #[test]
+    fn the_backoff_restarts_only_after_a_connection_that_stayed_up() {
+        let timing = fast();
+        let ms = |n| Duration::from_millis(n);
+        let mut backoff = Backoff::new(timing);
+        assert_eq!(
+            backoff.after(&Ended::Failed, false, Duration::ZERO),
+            Some(ms(20))
         );
+        assert_eq!(
+            backoff.after(&Ended::Failed, false, Duration::ZERO),
+            Some(ms(40))
+        );
+        // Accepted, then dropped at once: no reset.
+        assert_eq!(backoff.after(&Ended::Failed, true, ms(10)), Some(ms(80)));
+        // Stayed up past min_uptime: back to the start.
+        assert_eq!(
+            backoff.after(&Ended::Failed, true, timing.min_uptime),
+            Some(ms(20))
+        );
+        assert_eq!(
+            backoff.after(&Ended::Absent, false, Duration::ZERO),
+            Some(ms(160))
+        );
+        assert_eq!(backoff.after(&Ended::Closed, false, Duration::ZERO), None);
     }
 
     /// #1019 review, reconnect: after a connection drops, the task resets

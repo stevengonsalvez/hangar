@@ -60,6 +60,7 @@ pub fn entry_to_metadata(entry: &WorkspaceSessionEntry) -> Result<SessionMetadat
         model_source,
         codex_model,
         codex_thread_id: entry.codex_thread_id.clone(),
+        claude_session_id: entry.claude_session_id.clone(),
     })
 }
 
@@ -88,6 +89,7 @@ pub fn metadata_to_entry(meta: &SessionMetadata) -> WorkspaceSessionEntry {
         model_source,
         codex_model,
         codex_thread_id: meta.codex_thread_id.clone(),
+        claude_session_id: meta.claude_session_id.clone(),
     }
 }
 
@@ -1154,6 +1156,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session2 = SessionMetadata {
@@ -1170,6 +1173,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         store.sessions.insert(session1.tmux_session_name.clone(), session1);

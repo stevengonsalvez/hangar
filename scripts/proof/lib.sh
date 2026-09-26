@@ -677,10 +677,14 @@ start_desktop() {
   # follows this return would race that boot (d3p-inbox did: its issue_create
   # found no token file), so the wait lives here, as it does in start_tui, and
   # every desktop node's first read finds a daemon. A daemon that never comes
-  # is recorded against the boot rather than against the read.
-  if ! wait_for 60 daemon_running \
-    || ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
-    observe "the daemon the window starts had no bound socket and token 90 s after its first batch: $("$AINB_BIN" hangar daemon status 2>&1 | head -1)"
+  # fails the node here, against the boot, rather than against the read.
+  # Each wait is named with its own bound and the time actually waited, so a
+  # failure says which half of the boot never happened.
+  local booted=$SECONDS
+  if ! wait_for 60 daemon_running; then
+    check "the daemon the window starts answers on its socket within 60 s of the first batch (waited $((SECONDS - booted)) s; status: $("$AINB_BIN" hangar daemon status 2>&1 | head -1))" false
+  elif ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
+    check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - booted)) s since the first batch)" false
   fi
 }
 
