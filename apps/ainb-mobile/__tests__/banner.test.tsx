@@ -63,6 +63,9 @@ test("a no_target outcome keeps the row open; only an answer retires it", async 
   expect(await screen.findByText("No live session to answer")).toBeTruthy();
   fireEvent.press(screen.getByTestId("answer-done"));
   expect(screen.getByTestId("banner-att-1")).toBeTruthy(); // still open until the daemon says otherwise
+  // Nothing was taken, so the pin is gone: the options are back, and a different one may go out.
+  fireEvent.press(screen.getByTestId("banner-att-1"));
+  expect(await screen.findByTestId("option-2")).toBeTruthy();
 });
 
 test("already_answered_by names the winner", async () => {
