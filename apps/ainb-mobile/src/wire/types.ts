@@ -259,6 +259,9 @@ export interface WireClient {
   terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome>;
   terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied>;
 
+  /** Lane E's `backoff_delay_ms`: jittered, 1 s doubling to a 60 s ceiling; a `retry-after` from the close reason overrides it. */
+  backoffDelayMs(attempt: number, retryAfterSecs?: number): number;
+
   connectionLog(): Promise<LogLine[]>;
   deviceKeyFingerprint(): Promise<string>;
 
