@@ -39,6 +39,10 @@ impl SessionStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionInfo {
     pub session_id: String,
+    /// The agent's own session id: the Codex thread, else the Claude session
+    /// id ainb minted for it. What a hook line names, and what an answer is
+    /// delivered by (#132).
+    pub provider_session_id: Option<String>,
     pub tmux_session_name: String,
     pub workspace_name: String,
     pub display_name: Option<String>,
@@ -63,6 +67,10 @@ impl SessionInfo {
     ) -> Self {
         Self {
             session_id: metadata.session_id.to_string(),
+            provider_session_id: metadata
+                .codex_thread_id
+                .clone()
+                .or_else(|| metadata.claude_session_id.clone()),
             tmux_session_name: metadata.tmux_session_name.clone(),
             workspace_name: metadata.display_workspace_name(),
             display_name: None,
@@ -264,6 +272,7 @@ mod tests {
         let created_at = chrono::Utc::now();
         let info = |id: &str, running: bool, active: bool| SessionInfo {
             session_id: id.to_string(),
+            provider_session_id: None,
             tmux_session_name: format!("tmux_repo-{id}"),
             workspace_name: "repo".to_string(),
             display_name: Some(format!("deploy {canary}")),
@@ -331,6 +340,7 @@ mod tests {
     fn frame_rows_sort_on_the_instant_not_the_stamp_text() {
         let row = |id: &str, created_at: &str| SessionInfo {
             session_id: id.to_string(),
+            provider_session_id: None,
             tmux_session_name: format!("tmux_repo-{id}"),
             workspace_name: "repo".to_string(),
             display_name: None,
@@ -359,6 +369,7 @@ mod tests {
     fn frame_rows_are_newest_first_across_workspaces() {
         let row = |id: &str, workspace: &str, minutes_ago: i64| SessionInfo {
             session_id: id.to_string(),
+            provider_session_id: None,
             tmux_session_name: format!("tmux_{workspace}-{id}"),
             workspace_name: workspace.to_string(),
             display_name: None,
@@ -380,6 +391,7 @@ mod tests {
     fn a_session_with_an_unparseable_id_is_skipped_not_given_a_fresh_one() {
         let row = |id: &str| SessionInfo {
             session_id: id.to_string(),
+            provider_session_id: None,
             tmux_session_name: format!("tmux_repo-{id}"),
             workspace_name: "repo".to_string(),
             display_name: None,
