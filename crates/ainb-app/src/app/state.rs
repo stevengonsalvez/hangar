@@ -11997,7 +11997,7 @@ impl AppState {
         // made every attachable quiet session look like active work.
         let _ = generating;
         let agent = agent?;
-        let cwd = session_cwd.trim_end_matches('/');
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(session_cwd);
 
         for rec in recent {
             // `recent` is newest-first and `ts`-sorted globally, so the
@@ -12005,7 +12005,7 @@ impl AppState {
             if rec.ts <= baseline_ms {
                 break;
             }
-            if rec.agent != agent || rec.cwd.trim_end_matches('/') != cwd {
+            if rec.agent != agent || !ainb_fleet_core::read::jsonl_tail::same_dir(&rec.cwd, &cwd) {
                 continue;
             }
             if let Some(provider_session_id) = provider_session_id {
@@ -12120,11 +12120,11 @@ impl AppState {
         recent: &[ainb_plugin_notifyd::NotificationRecord],
     ) -> Option<(crate::models::SessionStatus, i64)> {
         let agent = agent?;
-        let cwd = session_cwd.trim_end_matches('/');
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(session_cwd);
         let newest = recent.iter().find(|record| {
             if record.ts <= baseline_ms
                 || record.agent != agent
-                || record.cwd.trim_end_matches('/') != cwd
+                || !ainb_fleet_core::read::jsonl_tail::same_dir(&record.cwd, &cwd)
             {
                 return false;
             }
@@ -12473,10 +12473,10 @@ impl AppState {
         });
         let first_tmux = tmux_rows.next();
         let by_unique_tmux = first_tmux.filter(|_| tmux_rows.next().is_none());
-        let cwd = session.workspace_path.trim_end_matches('/');
-        let mut by_cwd = snapshot
-            .iter()
-            .filter(|row| row.provider == provider && row.cwd.trim_end_matches('/') == cwd);
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(&session.workspace_path);
+        let mut by_cwd = snapshot.iter().filter(|row| {
+            row.provider == provider && ainb_fleet_core::read::jsonl_tail::same_dir(&row.cwd, &cwd)
+        });
         let first = by_cwd.next();
         let by_unique_cwd = first.filter(|_| by_cwd.next().is_none());
         // Tmux and cwd can recover *display metadata* but never hook identity:
@@ -13240,14 +13240,14 @@ impl AppState {
             // the only place the host learns it — the session tree carries
             // ainb's own UUID, which the hook never sees.
             let hook_session = self.find_session(id).and_then(|session| {
-                let cwd = session.workspace_path.trim_end_matches('/');
+                let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(&session.workspace_path);
                 let agent = Self::agent_hook_name(session.agent_type)?;
                 if let Some(known) = provider_session_id.as_deref() {
                     recent
                         .iter()
                         .find(|row| {
                             row.agent == agent
-                                && row.cwd.trim_end_matches('/') == cwd
+                                && ainb_fleet_core::read::jsonl_tail::same_dir(&row.cwd, &cwd)
                                 && row.session_id == known
                         })
                         .map(|row| row.session_id.clone())
