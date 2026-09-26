@@ -14271,6 +14271,79 @@ mod tests {
         assert_eq!(sender, "device:01J0PHONE");
     }
 
+    /// WP13, the scope rows for R2's terminal methods, driven through the real
+    /// dispatch path. A device the table refuses gets `UNAUTHORIZED` before
+    /// any handler runs. A device the table allows passes the gate and meets
+    /// the dark switch instead: `METHOD_NOT_FOUND` until R2's handlers land
+    /// (RECONCILED M13). So the scope gate never stands in for the dark
+    /// switch, and neither hides the other.
+    ///
+    /// The remaining WP13 checks need R2's handlers: `terminal/input` from
+    /// `mobile+type` succeeding (WP9b), and a stream never receiving another
+    /// stream's frames (WP9a, RECONCILED M12).
+    #[tokio::test]
+    async fn terminal_methods_are_gated_by_scope_before_the_dark_switch() {
+        use ainb_hangar_proto::devices::DeviceScope;
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let watch = serde_json::json!({
+            "stream_id": 1,
+            "session": {"host_id": "local", "session_key": "s1"},
+            "want_input": false,
+        });
+        let typing = serde_json::json!({
+            "stream_id": 1,
+            "session": {"host_id": "local", "session_key": "s1"},
+            "want_input": true,
+        });
+        // (method, params, which scopes the table lets through)
+        let cases: [(&str, &serde_json::Value, [bool; 4]); 8] = [
+            // [mobile, mobile+type, desktop, desktop+admin]
+            (methods::TERMINAL_ATTACH, &watch, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &typing, [false, true, true, true]),
+            (methods::TERMINAL_DETACH, &watch, [true, true, true, true]),
+            (methods::TERMINAL_ACK, &watch, [true, true, true, true]),
+            (
+                methods::TERMINAL_SCROLLBACK,
+                &watch,
+                [true, true, true, true],
+            ),
+            (methods::TERMINAL_INPUT, &watch, [false, true, true, true]),
+            (methods::TERMINAL_FLOOR, &watch, [false, true, true, true]),
+            (methods::TERMINAL_RESIZE, &watch, [false, true, true, true]),
+        ];
+        let scopes = [
+            DeviceScope::MOBILE,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::DESKTOP,
+            DeviceScope::DESKTOP_ADMIN,
+        ];
+        for (method, params, allowed) in cases {
+            for (scope, allowed) in scopes.into_iter().zip(allowed) {
+                let device = auth::Caller::Device {
+                    device_id: "01J0DEVICE".to_string(),
+                    scope,
+                };
+                let request = RpcRequest {
+                    jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+                    id: RpcId::Number(1),
+                    method: method.to_string(),
+                    params: params.clone(),
+                };
+                let response =
+                    dispatch_as(store.pool(), &request, &health(), &sink(), &device).await;
+                let code = response.error.as_ref().map(|e| e.code);
+                let expected = if allowed {
+                    METHOD_NOT_FOUND
+                } else {
+                    ainb_hangar_proto::auth::UNAUTHORIZED
+                };
+                assert_eq!(code, Some(expected), "{method} {params} for {scope:?}");
+            }
+        }
+    }
+
     /// A workspace subscription owns both the durable event forwarder and the
     /// task-stream forwarder. Once its peer closes, `serve_conn` must stop both
     /// before dropping its sender and awaiting the writer; otherwise the live
