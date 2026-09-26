@@ -2,7 +2,9 @@
 #
 # The Expo app's native module points its ubrn at this file, so the crate
 # owns how it is built for each phone target and the app owns nothing about
-# Rust. Paths are relative to this crate.
+# Rust. ubrn resolves `rust.directory` against the React Native project
+# root (the app directory it runs in, `apps/ainb-mobile`), not against this
+# file, so the path below walks from the app to this crate.
 #
 # `useSharedLibrary: false` links the Rust staticlib into the module's own
 # JSI library; the app's link step adds `-Wl,--exclude-libs,libainb_wire_mobile.a
@@ -10,7 +12,7 @@
 # `.github/workflows/mobile.yml` measures the release cdylib per ABI as the
 # proxy for that.
 rust:
-  directory: .
+  directory: ../../crates/ainb-wire-mobile
   manifestPath: Cargo.toml
 android:
   targets:
