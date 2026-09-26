@@ -171,8 +171,10 @@ test("statusForSession falls back to the row's own ring and lifecycle with no ma
   const idle = session("u-2", { status: "Idle" });
   assert.deepEqual(statusForSession(idle, [], {}, NO_ACKS), { kind: "idle" });
 
+  // A live tmux session with no card and no chip: alive, but nothing says
+  // the agent is working, so it must not spin.
   const running = session("u-3", { status: "Running" });
-  assert.deepEqual(statusForSession(running, [], {}, NO_ACKS), { kind: "working" });
+  assert.deepEqual(statusForSession(running, [], {}, NO_ACKS), { kind: "unverifiable" });
 
   const errored = session("u-4", { status: { Error: "crashed" } as never });
   assert.deepEqual(statusForSession(errored, [], {}, NO_ACKS), { kind: "needs", need: "error" });
