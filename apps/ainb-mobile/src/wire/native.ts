@@ -106,7 +106,13 @@ export interface NativeMutationReceipt {
   receipt?: string;
 }
 
-/** `TranscriptChunkRecord`: `role` and `text` come from the daemon's classifier in the crate (scrubbed, capped). */
+/**
+ * `TranscriptChunkRecord`: `role` and `text` are the crate's own read of the
+ * chunk body. The text is UNSCRUBBED and uncapped until classification moves
+ * to the daemon (the crate cannot carry the daemon's regex scrub under the
+ * 3 MiB library gate); once the daemon serves classified chunks the crate
+ * record drops its raw `payload` and `text` is the daemon's scrubbed line.
+ */
 export interface NativeTranscriptChunk {
   ingestOrder: bigint | number;
   eventId: string;
