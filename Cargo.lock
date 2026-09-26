@@ -457,6 +457,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "curve25519-dalek",
  "dirs",
  "fs2",
  "futures-util",
@@ -484,6 +485,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "which",
+ "zeroize",
 ]
 
 [[package]]
