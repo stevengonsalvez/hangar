@@ -243,6 +243,17 @@ function Shell() {
     if (!inboxOpen()) return;
     void run(CLOSE_INBOX);
   };
+  /**
+   * The answer banner's sends. Its rows are the session list's, and the
+   * banner is drawn over every page: the host is asked to put the reducer on
+   * the session list first, by the reducer's own screen (#121), and then the
+   * rows go as before.
+   */
+  const answer = async (intents: RendererIntent[]) => {
+    if (intents.length === 0) return;
+    await invoke("answer_home");
+    await run(intents);
+  };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
     void invoke<boolean>("setup_write", { write }).then((ran) => {
@@ -623,7 +634,7 @@ function Shell() {
           </nav>
           {/* One banner per open request, latched for a short grace across
               frames that carry none (#1266): `AnswerSlot`. */}
-          <AnswerSlot question={question()} ask={ask()} run={run} />
+          <AnswerSlot question={question()} ask={ask()} run={answer} />
           <Show when={transcriptKey()}>
             {(key) => (
               <AcpCard
