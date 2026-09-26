@@ -325,8 +325,11 @@ fn bounded(text: &str) -> String {
 pub struct AttentionOptionRecord {
     /// The label the user picks; delivered as the answer text.
     pub label: String,
-    /// The option's own explanation, or empty.
+    /// The option's own explanation (a hook option's `description`, an ACP
+    /// option's `kind`), or empty.
     pub description: String,
+    /// An ACP permission option's `optionId`, when the row is one.
+    pub id: Option<String>,
 }
 
 /// The attention payload, decoded: every producer nests it differently, so
@@ -336,13 +339,18 @@ pub struct AttentionOptionRecord {
 /// its kind alone.
 #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
 pub struct AttentionPayload {
-    /// The one-line question, when the payload says one.
+    /// The one-line question, when the payload says one: a hook ASK's
+    /// `question` or `header`, an ACP permission's `toolCall.title`.
     pub question: Option<String>,
     /// The structured options, empty for free text.
     pub options: Vec<AttentionOptionRecord>,
-    /// Free text beside the question (`text`), when any.
+    /// Whether several options may be picked at once (a hook ASK's
+    /// `multi_select`); the daemon delivers such an answer as free text.
+    pub multi_select: bool,
+    /// Free text beside the question: `text`, an ERR row's `snippet`, an
+    /// IDLE row's `last_assistant_text`.
     pub text: Option<String>,
-    /// Approval or notification prose (`message`), when any.
+    /// Approval or notification prose (`message`), or an ERR row's pattern.
     pub message: Option<String>,
 }
 
@@ -378,16 +386,28 @@ impl AttentionPayload {
                         return Some(AttentionOptionRecord {
                             label: bounded(label),
                             description: String::new(),
+                            id: None,
                         });
                     }
-                    let label = o.get("label").and_then(serde_json::Value::as_str)?;
+                    // A hook ASK option is `{label, description}`; an ACP
+                    // permission option is `{optionId, name, kind}`.
+                    let label = o
+                        .get("label")
+                        .or_else(|| o.get("name"))
+                        .and_then(serde_json::Value::as_str)?;
                     Some(AttentionOptionRecord {
                         label: bounded(label),
                         description: bounded(
                             o.get("description")
+                                .or_else(|| o.get("kind"))
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or_default(),
                         ),
+                        id: o
+                            .get("optionId")
+                            .or_else(|| o.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(bounded),
                     })
                 })
                 .collect()
@@ -400,10 +420,22 @@ impl AttentionPayload {
                 "/payload/tool_input/questions/0/question",
                 "/question",
                 "/reason",
+                "/toolCall/title",
+                "/context/header",
+                "/header",
             ]),
             options,
-            text: first(&["/context/text", "/text"]),
-            message: first(&["/message", "/payload/message"]),
+            multi_select: ["/context/multi_select", "/multi_select"]
+                .iter()
+                .find_map(|p| value.pointer(p).and_then(serde_json::Value::as_bool))
+                .unwrap_or(false),
+            text: first(&[
+                "/context/text",
+                "/text",
+                "/context/snippet",
+                "/context/last_assistant_text",
+            ]),
+            message: first(&["/message", "/payload/message", "/context/pattern"]),
         }
     }
 }
@@ -563,8 +595,6 @@ pub struct TranscriptChunkRecord {
     /// (a string, or the joined `text` of its parts), else `message`.
     /// Absent when the body has none, which the app renders as the kind.
     pub text: Option<String>,
-    /// The chunk body as JSON text, for the log; the app renders `text`.
-    pub payload: String,
     /// Observation time, epoch ms.
     pub observed_at: i64,
 }
@@ -581,23 +611,46 @@ fn transcript_role(event_type: &str) -> &'static str {
 
 /// The line a transcript body carries, if it carries one.
 fn transcript_text(payload: &serde_json::Value) -> Option<String> {
+    transcript_text_raw(payload).map(|t| {
+        // A ceiling, not a display width: one tool result can be megabytes,
+        // and the phone's list row must never receive it whole.
+        if t.chars().count() > MAX_TRANSCRIPT_TEXT_CHARS {
+            t.chars().take(MAX_TRANSCRIPT_TEXT_CHARS).collect()
+        } else {
+            t
+        }
+    })
+}
+
+/// Most characters of one transcript line the crate hands the app.
+const MAX_TRANSCRIPT_TEXT_CHARS: usize = 8192;
+
+/// The text of one content part: `{text}`, or the reducer's nested
+/// `{type: content, content: {type: text, text}}` a tool call carries.
+fn part_text(part: &serde_json::Value) -> Option<&str> {
+    part.get("text").or_else(|| part.get("content")?.get("text"))?.as_str()
+}
+
+fn transcript_text_raw(payload: &serde_json::Value) -> Option<String> {
     if let Some(t) = payload.get("text").and_then(serde_json::Value::as_str) {
         return Some(t.to_owned());
     }
     match payload.get("content") {
         Some(serde_json::Value::String(s)) => return Some(s.clone()),
         Some(serde_json::Value::Array(parts)) => {
-            let joined: Vec<&str> = parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
-                .collect();
+            let joined: Vec<&str> = parts.iter().filter_map(part_text).collect();
             if !joined.is_empty() {
                 return Some(joined.join(""));
             }
         }
         _ => {}
     }
-    payload.get("message").and_then(serde_json::Value::as_str).map(str::to_owned)
+    // A tool call names itself; a bookkeeping row says its message.
+    payload
+        .get("title")
+        .or_else(|| payload.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
@@ -609,7 +662,6 @@ impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
             role: transcript_role(&c.event_type).to_owned(),
             text: transcript_text(&c.payload),
             event_type: c.event_type,
-            payload: c.payload.to_string(),
             observed_at: c.observed_at,
         }
     }
@@ -830,7 +882,70 @@ mod tests {
         );
         let l = chunk("acp.turn_completed", json!({"usage": 1}));
         assert_eq!((l.role.as_str(), l.text), ("system", None));
-        assert!(l.payload.contains("usage"));
+        // The reducer's tool call: nested content parts, else the title.
+        let nested = chunk(
+            "acp.tool_call",
+            json!({"title": "Bash", "content": [{"type": "content", "content": {"type": "text", "text": "ran ls"}}]}),
+        );
+        assert_eq!(nested.text.as_deref(), Some("ran ls"));
+        let titled = chunk(
+            "acp.tool_call",
+            json!({"title": "Bash", "status": "pending"}),
+        );
+        assert_eq!(titled.text.as_deref(), Some("Bash"));
+        // A megabyte of prose is cut at the ceiling, never shipped whole.
+        let long = chunk("acp.message", json!({"text": "x".repeat(100_000)}));
+        assert_eq!(long.text.unwrap().chars().count(), 8192);
+    }
+
+    #[test]
+    fn attention_payloads_decode_acp_permissions_hook_context_and_multi_select() {
+        let acp = AttentionPayload::parse(
+            &json!({"kind": "acp_permission",
+                "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}],
+                "toolCall": {"title": "rm -rf fixture"}})
+            .to_string(),
+        );
+        assert_eq!(acp.question.as_deref(), Some("rm -rf fixture"));
+        assert_eq!(acp.options.len(), 1);
+        assert_eq!(acp.options[0].label, "Allow once");
+        assert_eq!(acp.options[0].description, "allow_once");
+        assert_eq!(acp.options[0].id.as_deref(), Some("allow-once"));
+        assert!(!acp.multi_select);
+        let ask = AttentionPayload::parse(
+            &json!({"kind": "ASK", "context": {"header": "Pick", "options": ["a", "b"], "multi_select": true}})
+                .to_string(),
+        );
+        assert_eq!(ask.question.as_deref(), Some("Pick"));
+        assert!(ask.multi_select);
+        assert_eq!(ask.options.len(), 2);
+        let err = AttentionPayload::parse(
+            &json!({"kind": "ERR", "context": {"pattern": "panic", "snippet": "thread main panicked"}})
+                .to_string(),
+        );
+        assert_eq!(err.text.as_deref(), Some("thread main panicked"));
+        assert_eq!(err.message.as_deref(), Some("panic"));
+        let idle = AttentionPayload::parse(
+            &json!({"kind": "IDLE", "context": {"last_assistant_text": "done"}}).to_string(),
+        );
+        assert_eq!(idle.text.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn an_rpc_error_reason_is_read_from_data_or_the_ledger_ack() {
+        assert_eq!(
+            error_reason(Some(&json!({"reason": "turn_advanced"}))).as_deref(),
+            Some("turn_advanced")
+        );
+        assert_eq!(
+            error_reason(Some(
+                &json!({"ack": {"status": "rejected", "reason": "op_id_foreign"}})
+            ))
+            .as_deref(),
+            Some("op_id_foreign")
+        );
+        assert_eq!(error_reason(Some(&json!({"other": 1}))), None);
+        assert_eq!(error_reason(None), None);
     }
 
     #[test]
