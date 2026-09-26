@@ -1789,6 +1789,14 @@ pub struct FleetTranscriptListParams {
     /// Return chunks strictly after this `ingest_order`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_order: Option<i64>,
+    /// Return the NEWEST page of chunks strictly before this `ingest_order`,
+    /// oldest first: the backward page a phone scrolls up into. Bounded like
+    /// the uncursored tail (rows, then payload bytes), with `truncated`
+    /// meaning older rows remain. Mutually exclusive with `after_order`.
+    /// Absent on the wire when unset, so an older daemon sees the request it
+    /// always saw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_order: Option<i64>,
     /// Requested chunk count, clamped to [`FLEET_TRANSCRIPT_LIST_MAX`].
     pub limit: u32,
 }
@@ -2901,8 +2909,24 @@ mod tests {
         round_trip(&FleetTranscriptListParams {
             session_key: "acp:01J0KEY".to_string(),
             after_order: Some(7),
+            before_order: None,
             limit: FLEET_TRANSCRIPT_LIST_MAX,
         });
+        round_trip(&FleetTranscriptListParams {
+            session_key: "acp:01J0KEY".to_string(),
+            after_order: None,
+            before_order: Some(9),
+            limit: FLEET_TRANSCRIPT_LIST_MAX,
+        });
+        // Backward compatible both ways: an unset cursor is absent on the
+        // wire, and a request without it decodes as `None`.
+        let old: FleetTranscriptListParams =
+            serde_json::from_value(serde_json::json!({"session_key": "s", "limit": 5})).unwrap();
+        assert_eq!(old.before_order, None);
+        assert!(
+            serde_json::to_value(&old).unwrap().get("before_order").is_none(),
+            "an unset before_order is not on the wire"
+        );
         round_trip(&FleetTranscriptListResult {
             chunks: vec![sample_chunk()],
             next_after_order: Some(41),

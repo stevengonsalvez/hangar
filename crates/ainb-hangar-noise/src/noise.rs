@@ -20,6 +20,12 @@
 //! [`Session`] can be [`split`](Session::split) into a [`Sealer`] and an
 //! [`Opener`] so a reader task and a writer task each own their half with no
 //! lock: the nonce of each direction is counted by the half that uses it.
+//!
+//! IK message 1 can be REPLAYED: anyone who saw it can send it again, and the
+//! host will read it and answer. So the host learns nothing it may act on
+//! from message 1. The device key is handed out only by
+//! [`Opener::remote_static`] once a transport frame from the device has
+//! opened, which a replayer cannot produce.
 
 use std::sync::Arc;
 
@@ -27,6 +33,7 @@ use ainb_hangar_proto::hosts::{CarrierKind, HostId};
 use snow::params::NoiseParams;
 use snow::resolvers::{CryptoResolver, DefaultResolver};
 use snow::{Builder, HandshakeState, StatelessTransportState};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::frame::HeaderError;
 use crate::prologue::{PrologueError, prologue};
@@ -48,6 +55,9 @@ pub enum NoiseError {
     Decrypt,
     /// A handshake message carried a payload; version 1 sends none. Fatal.
     HandshakePayload(usize),
+    /// Message 1 named a low-order device static key ([`is_low_order`]): a
+    /// session keyed on it is not secret. Fatal: the host closes 4401.
+    LowOrderKey,
     /// A call out of turn: writing when it is the other side's turn, reading
     /// after the handshake finished, or a session from an unfinished
     /// handshake.
@@ -79,6 +89,7 @@ impl std::fmt::Display for NoiseError {
             Self::Prologue(e) => write!(f, "noise prologue: {e}"),
             Self::Decrypt => f.write_str("noise message did not decrypt"),
             Self::HandshakePayload(n) => write!(f, "handshake message carried a {n}-byte payload"),
+            Self::LowOrderKey => f.write_str("handshake named a low-order static key"),
             Self::State(what) => write!(f, "noise state: {what}"),
             Self::TooLarge(n) => write!(f, "{n} bytes do not fit one noise message"),
             Self::Exhausted => f.write_str("noise nonce exhausted"),
@@ -107,8 +118,11 @@ fn params() -> NoiseParams {
         .unwrap_or_else(|e| unreachable!("{NOISE_PATTERN} does not parse: {e}"))
 }
 
-/// An X25519 static key pair.
-#[derive(Clone, PartialEq, Eq)]
+/// An X25519 static key pair. Zeroed when dropped.
+///
+/// No `PartialEq`: comparing private keys with `==` is not constant time, and
+/// nothing needs it. Compare `public` where an identity check is wanted.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Keypair {
     /// The private key. Never logged.
     pub private: [u8; KEY_LEN],
@@ -133,11 +147,15 @@ fn key(bytes: &[u8]) -> Result<[u8; KEY_LEN], NoiseError> {
 
 /// A fresh static key pair from the operating system's random source.
 pub fn generate_keypair() -> Result<Keypair, NoiseError> {
-    let pair = Builder::new(params()).generate_keypair()?;
-    Ok(Keypair {
-        private: key(&pair.private)?,
-        public: key(&pair.public)?,
-    })
+    let mut pair = Builder::new(params()).generate_keypair()?;
+    let keys = key(&pair.private).and_then(|private| {
+        Ok(Keypair {
+            private,
+            public: key(&pair.public)?,
+        })
+    });
+    pair.private.zeroize();
+    keys
 }
 
 /// The public key of an X25519 private key, for a key read back from
@@ -150,9 +168,39 @@ pub fn public_key(private: &[u8; KEY_LEN]) -> Result<[u8; KEY_LEN], NoiseError> 
     key(dh.pubkey())
 }
 
+/// Whether `public` is a low-order X25519 point: one whose Diffie-Hellman
+/// output is all zero whatever the other side's key, so a session keyed on it
+/// is not secret. The host refuses such a device key at redeem (R1-07).
+///
+/// The check multiplies `public` by a clamped scalar, which is a multiple of
+/// the cofactor 8, so the product is zero exactly when `public` lies in the
+/// small subgroup (non-canonical encodings of those points included).
+#[must_use]
+pub fn is_low_order(public: &[u8; KEY_LEN]) -> bool {
+    let Some(mut dh) = DefaultResolver.resolve_dh(&params().dh) else {
+        return true;
+    };
+    dh.set(&[0x5a; KEY_LEN]);
+    let mut out = [0u8; KEY_LEN];
+    if dh.dh(public, &mut out).is_err() {
+        return true;
+    }
+    out.iter().all(|b| *b == 0)
+}
+
+/// F2: the host's check on the device static key message 1 named.
+fn refuse_low_order(remote: Option<[u8; KEY_LEN]>) -> Result<(), NoiseError> {
+    match remote {
+        Some(key) if is_low_order(&key) => Err(NoiseError::LowOrderKey),
+        _ => Ok(()),
+    }
+}
+
 /// A handshake in progress.
 pub struct Handshake {
     state: HandshakeState,
+    /// Set once a message was refused; every later call fails.
+    refused: bool,
 }
 
 impl std::fmt::Debug for Handshake {
@@ -178,7 +226,10 @@ pub fn initiator(
         .remote_public_key(host_static_pub)
         .prologue(&prologue)
         .build_initiator()?;
-    Ok(Handshake { state })
+    Ok(Handshake {
+        state,
+        refused: false,
+    })
 }
 
 /// The host side: the host's static key, and the carrier and host id of the
@@ -193,12 +244,18 @@ pub fn responder(
         .local_private_key(host_static)
         .prologue(&prologue)
         .build_responder()?;
-    Ok(Handshake { state })
+    Ok(Handshake {
+        state,
+        refused: false,
+    })
 }
 
 impl Handshake {
     /// Write this side's next handshake message (empty payload).
     pub fn write_message(&mut self) -> Result<Vec<u8>, NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if self.state.is_handshake_finished() || !self.state.is_my_turn() {
             return Err(NoiseError::State("not this side's turn to write"));
         }
@@ -208,8 +265,12 @@ impl Handshake {
         Ok(out)
     }
 
-    /// Read the other side's next handshake message. A payload is refused.
+    /// Read the other side's next handshake message. A payload is refused,
+    /// and on the host so is a low-order device static key in message 1.
     pub fn read_message(&mut self, message: &[u8]) -> Result<(), NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if self.state.is_handshake_finished() || self.state.is_my_turn() {
             return Err(NoiseError::State("not this side's turn to read"));
         }
@@ -219,7 +280,11 @@ impl Handshake {
         let mut payload = vec![0u8; MAX_NOISE_MESSAGE];
         let len = self.state.read_message(message, &mut payload)?;
         if len != 0 {
+            self.refused = true;
             return Err(NoiseError::HandshakePayload(len));
+        }
+        if !self.state.is_initiator() {
+            refuse_low_order(self.raw_remote_static()).inspect_err(|_| self.refused = true)?;
         }
         Ok(())
     }
@@ -230,21 +295,24 @@ impl Handshake {
         self.state.is_handshake_finished()
     }
 
-    /// The other side's static key: on the host, the device key, known once
-    /// message 1 is read (the token check binds to it); on the client, the
-    /// pinned host key.
-    #[must_use]
-    pub fn remote_static(&self) -> Option<[u8; KEY_LEN]> {
+    fn raw_remote_static(&self) -> Option<[u8; KEY_LEN]> {
         self.state.get_remote_static().and_then(|k| k.try_into().ok())
     }
 
     /// The transport session. The handshake must be finished.
     pub fn into_session(self) -> Result<Session, NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if !self.state.is_handshake_finished() {
             return Err(NoiseError::State("handshake is not finished"));
         }
         let remote_static =
-            self.remote_static().ok_or(NoiseError::State("no remote static key"))?;
+            self.raw_remote_static().ok_or(NoiseError::State("no remote static key"))?;
+        // The client pinned the host key before it dialed, so that key is
+        // known. The host's view of the device key is proven only by the
+        // first frame that opens.
+        let proven = self.state.is_initiator();
         let handshake_hash = self.state.get_handshake_hash().to_vec();
         let transport = Arc::new(self.state.into_stateless_transport_mode()?);
         Ok(Session {
@@ -255,8 +323,9 @@ impl Handshake {
             opener: Opener {
                 transport,
                 nonce: 0,
+                remote_static,
+                proven,
             },
-            remote_static,
             handshake_hash,
         })
     }
@@ -267,7 +336,6 @@ impl Handshake {
 pub struct Session {
     sealer: Sealer,
     opener: Opener,
-    remote_static: [u8; KEY_LEN],
     handshake_hash: Vec<u8>,
 }
 
@@ -282,10 +350,11 @@ impl Session {
         self.opener.open(message)
     }
 
-    /// The other side's static key.
+    /// The other side's static key, once it is proven: see
+    /// [`Opener::remote_static`].
     #[must_use]
-    pub const fn remote_static(&self) -> [u8; KEY_LEN] {
-        self.remote_static
+    pub const fn remote_static(&self) -> Option<[u8; KEY_LEN]> {
+        self.opener.remote_static()
     }
 
     /// The Noise handshake hash, the same on both sides: a channel binding
@@ -340,21 +409,45 @@ impl Sealer {
 pub struct Opener {
     transport: Arc<StatelessTransportState>,
     nonce: u64,
+    remote_static: [u8; KEY_LEN],
+    proven: bool,
 }
 
 impl std::fmt::Debug for Opener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Opener").field("nonce", &self.nonce).finish_non_exhaustive()
+        f.debug_struct("Opener")
+            .field("nonce", &self.nonce)
+            .field("proven", &self.proven)
+            .finish_non_exhaustive()
     }
 }
 
 impl Opener {
+    /// The other side's static key, or `None` until it is proven.
+    ///
+    /// On the client it is the pinned host key, known from the start. On the
+    /// host it is the device key, and it is `None` until one transport frame
+    /// from the device has opened: IK message 1 can be replayed by anyone who
+    /// saw it, and a replayer can finish the host's half of the handshake but
+    /// never produce a frame. Bind a token, a device row or anything else to
+    /// the key only through this call.
+    #[must_use]
+    pub const fn remote_static(&self) -> Option<[u8; KEY_LEN]> {
+        if self.proven {
+            Some(self.remote_static)
+        } else {
+            None
+        }
+    }
+
     /// Decrypt one Noise message into one frame.
     ///
     /// A message that does not decrypt leaves the nonce where it was, so the
     /// session is dead ([`NoiseError::Decrypt`] is fatal). A message that
-    /// decrypts but holds an unknown opcode has used its nonce; the session
-    /// goes on.
+    /// decrypts but holds an unknown opcode, or a reserved one that version 1
+    /// does not use ([`Opcode::in_use`](crate::opcode::Opcode::in_use)), has
+    /// used its nonce and is dropped with
+    /// [`HeaderError::UnknownOpcode`]; the session goes on.
     pub fn open(&mut self, message: &[u8]) -> Result<Frame, NoiseError> {
         if message.len() > MAX_NOISE_MESSAGE {
             return Err(NoiseError::TooLarge(message.len()));
@@ -368,7 +461,18 @@ impl Opener {
         let mut plain = vec![0u8; message.len()];
         let len = self.transport.read_message(self.nonce, message, &mut plain)?;
         self.nonce += 1;
-        Frame::decode(&plain[..len]).map_err(NoiseError::Frame)
+        // It authenticated under this session's keys, so the peer holds the
+        // static key the handshake named.
+        self.proven = true;
+        let frame = Frame::decode(&plain[..len]).map_err(NoiseError::Frame)?;
+        if !frame.header.opcode.in_use() {
+            // No capability names a reserved opcode yet (the binary lane),
+            // so none is accepted.
+            return Err(NoiseError::Frame(HeaderError::UnknownOpcode(
+                frame.header.opcode.as_u8(),
+            )));
+        }
+        Ok(frame)
     }
 }
 
@@ -435,5 +539,36 @@ mod tests {
         assert_eq!(client.encrypt_frame(&ping), Err(NoiseError::Exhausted));
         host.opener.nonce = u64::MAX;
         assert_eq!(host.decrypt_frame(&[0u8; 32]), Err(NoiseError::Exhausted));
+    }
+
+    /// F2: a low-order device static is refused. A real peer cannot send one
+    /// (its public key comes from a clamped private key), so the guard the
+    /// responder runs after message 1 is exercised directly.
+    #[test]
+    fn the_responder_refuses_a_low_order_device_static() {
+        let mut one = [0u8; KEY_LEN];
+        one[0] = 1;
+        for low in [[0u8; KEY_LEN], one] {
+            assert_eq!(refuse_low_order(Some(low)), Err(NoiseError::LowOrderKey));
+        }
+        let genuine = generate_keypair().unwrap();
+        assert_eq!(refuse_low_order(Some(genuine.public)), Ok(()));
+        assert_eq!(refuse_low_order(None), Ok(()));
+        assert!(NoiseError::LowOrderKey.is_fatal());
+    }
+
+    /// A refused handshake stays refused.
+    #[test]
+    fn a_refused_handshake_refuses_every_later_call() {
+        let host = generate_keypair().unwrap();
+        let id = HostId::parse(HOST).unwrap();
+        let mut r = responder(&host.private, CarrierKind::Lan, &id).unwrap();
+        r.refused = true;
+        assert!(matches!(
+            r.read_message(&[0; 96]),
+            Err(NoiseError::State(_))
+        ));
+        assert!(matches!(r.write_message(), Err(NoiseError::State(_))));
+        assert!(matches!(r.into_session(), Err(NoiseError::State(_))));
     }
 }

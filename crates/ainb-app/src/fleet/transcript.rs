@@ -289,6 +289,7 @@ fn read_page(session_key: String, after: Option<i64>) -> TranscriptOutcome {
             .transcript_list(FleetTranscriptListParams {
                 session_key,
                 after_order: after,
+                before_order: None,
                 limit: PAGE,
             })
             .await
