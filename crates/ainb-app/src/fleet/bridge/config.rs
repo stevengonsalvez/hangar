@@ -297,6 +297,25 @@ impl std::fmt::Debug for RawDiscord {
     }
 }
 
+/// A config.toml parse failure as its message and line number only.
+///
+/// `toml::de::Error`'s `Display` quotes the offending source line under a
+/// caret, and the bridge section holds bot tokens, so a malformed `token =`
+/// line would print the token into the error chain and every log that
+/// carries it. The message and the 1-based line are enough to find the
+/// mistake; the snippet never leaves this function.
+fn toml_parse_error(toml_text: &str, error: &toml::de::Error) -> anyhow::Error {
+    let message = error.message().trim_end();
+    error.span().map_or_else(
+        || anyhow!("parsing config.toml: {message}"),
+        |span| {
+            let before = toml_text.get(..span.start).unwrap_or(toml_text);
+            let line = before.matches('\n').count() + 1;
+            anyhow!("parsing config.toml: {message} (line {line})")
+        },
+    )
+}
+
 /// Resolve ainb's config.toml path, honouring `AINB_CONFIG_PATH`.
 #[must_use]
 pub fn default_config_path() -> PathBuf {
@@ -497,7 +516,8 @@ fn parse_discord(raw: RawDiscord, shared_timeout: u64) -> Result<DiscordConfig> 
 /// Build a [`BridgeConfig`] from a parsed TOML string. Split out so it can be
 /// unit-tested without touching the filesystem.
 pub fn parse_config(toml_text: &str) -> Result<BridgeConfig> {
-    let root: RawRoot = toml::from_str(toml_text).context("parsing config.toml")?;
+    let root: RawRoot =
+        toml::from_str(toml_text).map_err(|error| toml_parse_error(toml_text, &error))?;
     let bridge = root
         .fleet
         .and_then(|f| f.bridge)
@@ -959,5 +979,35 @@ mod tests {
             assert!(rendered.contains("<redacted>"), "{rendered}");
             assert!(rendered.contains(visible), "{rendered}");
         }
+    }
+
+    /// A malformed token line names the problem and the line, and never
+    /// quotes the line: toml's own `Display` would print the token under a
+    /// caret.
+    #[test]
+    fn a_malformed_token_line_errors_without_quoting_the_token() {
+        let text = "[fleet.bridge.telegram]\ntoken = \"123:s3cr3tUnterminated\nuser_id = 42\n";
+        let error = parse_config(text).expect_err("an unterminated string is a parse error");
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!rendered.contains("s3cr3t"), "token leaked: {rendered}");
+            assert!(rendered.contains("line 2"), "no line number: {rendered}");
+            assert!(rendered.contains("parsing config.toml"), "{rendered}");
+        }
+    }
+
+    /// The same holds for a token line that is well-formed TOML but the wrong
+    /// shape for the table around it.
+    #[test]
+    fn a_misplaced_token_value_errors_without_quoting_it() {
+        let text = "[fleet.bridge.slack]\nbot_token = \"xoxb-s3cr3tBot\"\nbot_token = \"xoxb-s3cr3tAgain\"\n";
+        let error = parse_config(text).expect_err("a duplicate key is a parse error");
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("s3cr3t"), "token leaked: {rendered}");
+        assert!(rendered.contains("line 3"), "{rendered}");
     }
 }
