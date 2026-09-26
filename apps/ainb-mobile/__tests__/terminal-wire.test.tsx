@@ -11,6 +11,8 @@ import { setWire } from "../src/wire";
 
 const { bridge } = webview as unknown as typeof import("../__mocks__/react-native-webview");
 const URL = `/host/${FAKE_HOST_A}/session/claude:hangar`;
+/** What one fake attach paints: clear, the alt-screen snapshot, then the OSC 8 output line. */
+const SNAPSHOT = ["clear", `write:${FIXTURES["f1-altscreen"].length}`, `write:${FIXTURES["f4-osc8"].length}`];
 
 let fake: FakeWire;
 beforeEach(() => {
@@ -36,7 +38,7 @@ async function openTerminal() {
 
 test("attach feeds the snapshot into the sink: clear, then the fixture bytes", async () => {
   const screen = await openTerminal();
-  await waitFor(() => expect(sinkCalls()).toEqual(["clear", `write:${FIXTURES["f1-altscreen"].length}`]));
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT));
   expect(await screen.findByText("80x24")).toBeTruthy();
   expect(screen.getByTestId("native-badge")).toBeTruthy();
 });
@@ -87,28 +89,28 @@ test("a snapshot that lands before the engine is ready is painted once it is", a
   await screen.findByTestId("terminal");
   let frames = 0;
   const off = fake.onEvent((ev) => ev.kind === "terminal_frame" && frames++);
-  await waitFor(() => expect(frames).toBeGreaterThanOrEqual(3)); // the snapshot has been sent
+  await waitFor(() => expect(frames).toBeGreaterThanOrEqual(4)); // the snapshot has been sent
   expect(sinkCalls()).toEqual([]); // and queued: the engine has not said ready
   await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
-  expect(sinkCalls()).toEqual(["clear", `write:${FIXTURES["f1-altscreen"].length}`]);
+  expect(sinkCalls()).toEqual(SNAPSHOT);
   off();
 });
 
 test("background detaches and foreground re-attaches a fresh stream", async () => {
   const screen = await openTerminal();
-  await waitFor(() => expect(sinkCalls()).toHaveLength(2));
+  await waitFor(() => expect(sinkCalls()).toHaveLength(3));
   await act(() => onAppState(fake, "background"));
   expect(fake.detached).toEqual([1]);
   await act(() => onAppState(fake, "active"));
-  await waitFor(() => expect(sinkCalls()).toHaveLength(4)); // a second clear + snapshot
+  await waitFor(() => expect(sinkCalls()).toHaveLength(6)); // a second clear + snapshot
   expect(await screen.findByText("80x24")).toBeTruthy();
 });
 
 test("a data gap clears the screen and the fresh snapshot follows", async () => {
   await openTerminal();
-  await waitFor(() => expect(sinkCalls()).toHaveLength(2));
+  await waitFor(() => expect(sinkCalls()).toHaveLength(3));
   await act(async () => fake.dropFeed(1));
-  expect(sinkCalls()).toEqual(["clear", `write:${FIXTURES["f1-altscreen"].length}`, "clear", "clear", `write:${FIXTURES["f1-altscreen"].length}`]);
+  expect(sinkCalls()).toEqual([...SNAPSHOT, "clear", ...SNAPSHOT]);
 });
 
 test("the type toggle is hidden when the daemon does not advertise terminal.input", async () => {
@@ -119,7 +121,7 @@ test("the type toggle is hidden when the daemon does not advertise terminal.inpu
 
 test("background detaches the stream before the socket closes", async () => {
   await openTerminal();
-  await waitFor(() => expect(sinkCalls()).toHaveLength(2));
+  await waitFor(() => expect(sinkCalls()).toHaveLength(3));
   await act(() => onAppState(fake, "background"));
   expect(fake.detached).toEqual([1]);
   const log = await fake.connectionLog();
