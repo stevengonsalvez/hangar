@@ -2972,12 +2972,20 @@ async fn handle_fleet_transcript_list(
 
     require_fleet_capability(FLEET_CAPABILITY_TRANSCRIPT_READ)?;
     let params: FleetTranscriptListParams =
-        parse_params(req, "{ session_key, after_order?, limit }")?;
+        parse_params(req, "{ session_key, after_order?, before_order?, limit }")?;
     if params.session_key.trim().is_empty() {
         return Err(invalid_params("session_key must not be empty"));
     }
     if params.after_order.is_some_and(|order| order < 0) {
         return Err(invalid_params("after_order must be non-negative"));
+    }
+    if params.before_order.is_some_and(|order| order < 0) {
+        return Err(invalid_params("before_order must be non-negative"));
+    }
+    if params.after_order.is_some() && params.before_order.is_some() {
+        return Err(invalid_params(
+            "after_order and before_order are exclusive: page forward or back, not both",
+        ));
     }
     let limit = i64::from(params.limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX));
     // A transcript read with NO cursor answers with the newest page, because
@@ -3011,10 +3019,15 @@ async fn handle_fleet_transcript_list(
         // has nothing to admit: `next_after_order` already tells the caller
         // where to resume.
         .map(|rows| (within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES), false)),
+        // No forward cursor: the newest page, or with `before_order` the
+        // newest page strictly older than it (a phone scrolling back). Both
+        // are the tail read, bounded by rows and bytes, with `truncated`
+        // meaning older rows remain.
         None => {
-            FleetProviderEventRepo::list_by_session_tail(
+            FleetProviderEventRepo::list_by_session_tail_before(
                 pool,
                 &params.session_key,
+                params.before_order,
                 limit,
                 FLEET_TRANSCRIPT_LIST_MAX_BYTES,
             )
@@ -14350,6 +14363,108 @@ mod tests {
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
         );
+    }
+
+    /// `fleet/transcript_list { before_order }` on a dense session: 1000 rows
+    /// for the watched session interleaved with 1000 for another, so its
+    /// orders are not contiguous. Paging back from the newest page with
+    /// `before_order` = the first order held returns 100 rows at a time, each
+    /// page ascending and strictly older, no row twice and none skipped,
+    /// `truncated` until the oldest page. The request cap holds at 100, and
+    /// both cursors together are refused.
+    #[tokio::test]
+    async fn transcript_list_pages_back_with_before_order_on_a_dense_session() {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let event = |session: &str, n: usize| NewFleetProviderEvent {
+            event_id: format!("{session}-{n}"),
+            provider: "claude".to_string(),
+            source: "acp".to_string(),
+            session_key: Some(session.to_string()),
+            provider_session_id: None,
+            observed_at: 1_000 + i64::try_from(n).unwrap(),
+            received_at: 1_000 + i64::try_from(n).unwrap(),
+            event_type: "agent_message_chunk".to_string(),
+            raw_payload: format!("{{\"n\":{n}}}"),
+        };
+        let mut batch = Vec::new();
+        for n in 0..1000 {
+            batch.push(event("dense", n));
+            batch.push(event("other", n));
+        }
+        FleetProviderEventRepo::append_batch(store.pool(), &batch).await.expect("seed");
+
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(&pool, &request, &health(), &sink(), &auth::Caller::Operator).await
+            }
+        };
+        let page_of = |response: &RpcResponse| {
+            let result = response.result.as_ref().expect("a page");
+            let orders: Vec<i64> = result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|chunk| {
+                    assert_eq!(chunk["session_key"], "dense", "only the watched session");
+                    chunk["ingest_order"].as_i64().unwrap()
+                })
+                .collect();
+            (orders, result["truncated"].as_bool().unwrap_or(false))
+        };
+
+        // The newest page, then back until the start.
+        let newest = list(serde_json::json!({"session_key": "dense", "limit": 100})).await;
+        let (mut orders, mut truncated) = page_of(&newest);
+        let mut seen: Vec<i64> = orders.clone();
+        let mut pages = 1;
+        while truncated {
+            let before = orders[0];
+            let older = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            (orders, truncated) = page_of(&older);
+            assert_eq!(orders.len(), 100, "page {pages}");
+            assert!(
+                orders.windows(2).all(|w| w[0] < w[1]),
+                "ascending within a page"
+            );
+            assert!(
+                *orders.last().unwrap() < before,
+                "strictly before the cursor"
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(seen.len(), 1000, "every row once");
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "no row twice, none out of order"
+        );
+
+        // The cap: asking for more than 100 still answers 100.
+        let capped = list(serde_json::json!({
+            "session_key": "dense", "before_order": i64::MAX, "limit": 5000,
+        }))
+        .await;
+        assert_eq!(page_of(&capped).0.len(), 100);
+
+        // Exclusive cursors, and no negative cursor.
+        for bad in [
+            serde_json::json!({"session_key": "dense", "after_order": 1, "before_order": 9, "limit": 10}),
+            serde_json::json!({"session_key": "dense", "before_order": -1, "limit": 10}),
+        ] {
+            let refused = list(bad).await;
+            assert_eq!(refused.error.as_ref().map(|e| e.code), Some(INVALID_PARAMS));
+        }
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
