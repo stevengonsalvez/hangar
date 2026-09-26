@@ -110,10 +110,36 @@ export function connectHost(wire: WireClient, hostId: HostId): Promise<FleetCurs
   return p;
 }
 
-/** Connect every paired host that is not latched (revoked, identity, parked). */
+/**
+ * Redial after a delay, and keep redialling on failure with growing backoff,
+ * until the dial succeeds, the app backgrounds, or a non-retryable close
+ * arrives (which clears the timer through `onClosed`).
+ */
+function scheduleRedial(wire: WireClient, hostId: HostId) {
+  const l = entry(hostId);
+  if (l.timer) clearTimeout(l.timer);
+  l.timer = setTimeout(() => {
+    l.timer = undefined;
+    if (!foreground) return;
+    connectHost(wire, hostId).catch(() => {
+      l.attempts += 1;
+      scheduleRedial(wire, hostId); // the host's retry-after still applies
+    });
+  }, wire.backoffDelayMs(l.attempts, l.retryAfter));
+}
+
+/** Connect every paired host that is not latched (revoked, identity, parked); a failed dial enters the redial loop. */
 export async function connectAll(wire: WireClient) {
   const hosts = await wire.hosts().catch(() => []);
-  await Promise.allSettled(hosts.filter((h) => !h.repair && !h.notice).map((h) => connectHost(wire, h.hostId)));
+  await Promise.allSettled(
+    hosts
+      .filter((h) => !h.repair && !h.notice)
+      .map((h) =>
+        connectHost(wire, h.hostId).catch(() => {
+          if (foreground) scheduleRedial(wire, h.hostId);
+        }),
+      ),
+  );
 }
 
 async function closeAll(wire: WireClient) {
@@ -161,24 +187,6 @@ export function onAppState(wire: WireClient, next: AppStateStatus): Promise<void
 export function noteRevision(hostId: HostId, revision: number) {
   const l = live.get(hostId);
   if (l && revision > (l.cursor ?? -1)) l.cursor = revision;
-}
-
-/**
- * Redial after a delay, and keep redialling on failure with growing backoff,
- * until the dial succeeds, the app backgrounds, or a non-retryable close
- * arrives (which clears the timer through `onClosed`).
- */
-function scheduleRedial(wire: WireClient, hostId: HostId) {
-  const l = entry(hostId);
-  if (l.timer) clearTimeout(l.timer);
-  l.timer = setTimeout(() => {
-    l.timer = undefined;
-    if (!foreground) return;
-    connectHost(wire, hostId).catch(() => {
-      l.attempts += 1;
-      scheduleRedial(wire, hostId); // the host's retry-after still applies
-    });
-  }, wire.backoffDelayMs(l.attempts, l.retryAfter));
 }
 
 /** The socket went away while foregrounded: redial when the code allows it. */
