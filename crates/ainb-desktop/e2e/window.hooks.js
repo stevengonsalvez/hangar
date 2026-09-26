@@ -27,31 +27,37 @@ export const mochaHooks = {
     if (process.platform !== "darwin") return;
     await browser.setWindowRect(0, 30, 1280, 800);
     let state = "unknown";
-    // The last error the page read itself threw, kept apart from the wait's
-    // own: a session that died or a page that stopped answering is not a
-    // hidden window, and must not be reported as one.
-    let unreadable = null;
+    // Whether a page read was still running when the wait gave up. wdio's
+    // timer rejects at its deadline without waiting for a read in flight, so
+    // a page that stopped answering would otherwise look like a window that
+    // is still hidden.
+    let reading = false;
     try {
       await browser.waitUntil(
         async () => {
+          reading = true;
           try {
             state = await browser.execute(() => document.visibilityState);
-            unreadable = null;
-          } catch (error) {
-            unreadable = error;
-            return false;
+          } finally {
+            reading = false;
           }
           return state === "visible";
         },
         { timeout: VISIBLE_WITHIN_MS, interval: 250 },
       );
     } catch (error) {
-      if (unreadable !== null) {
+      if (reading) {
         throw new Error(
-          `the window's visibility could not be read for ${VISIBLE_WITHIN_MS / 1000} s after it was ` +
-            `placed on screen: ${unreadable.message ?? unreadable}`,
-          { cause: unreadable },
+          `the page did not answer a visibility read before the ${VISIBLE_WITHIN_MS / 1000} s wait ran out ` +
+            `(the last answer read "${state}"): the session or the webview has stopped responding`,
+          { cause: error },
         );
+      }
+      // wdio words its rejection by how the last poll ended: "timed out" when
+      // the page answered and was not visible, "failed with the following
+      // reason" when the last read itself threw.
+      if (!/timed out/i.test(error.message)) {
+        throw new Error(`the window's visibility could not be read: ${error.message}`, { cause: error });
       }
       throw new Error(
         `the window is still occluded ${VISIBLE_WITHIN_MS / 1000} s after it was placed on screen ` +
