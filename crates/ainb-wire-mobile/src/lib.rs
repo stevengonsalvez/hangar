@@ -23,6 +23,7 @@ uniffi::setup_scaffolding!();
 pub mod api;
 pub mod connlog;
 pub mod custody;
+pub mod pairing;
 pub mod records;
 pub mod session;
 
