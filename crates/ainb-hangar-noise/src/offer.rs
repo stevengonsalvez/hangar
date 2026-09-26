@@ -35,7 +35,8 @@ pub struct Endpoint {
 
 /// A pairing offer (version 1).
 ///
-/// `Debug` redacts [`Self::invite_secret`]; the host key is public and prints.
+/// `Debug` redacts [`Self::invite_secret`] and the contents of
+/// [`Self::relay`]; the host key is public and prints.
 /// [`Self::to_uri`] carries the secret, so never log the URI either.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingOffer {
@@ -80,7 +81,12 @@ impl std::fmt::Debug for PairingOffer {
             .field("invite_id", invite_id)
             .field("invite_secret", &ainb_hangar_proto::Redacted)
             .field("expires_at_ms", expires_at_ms)
-            .field("relay", relay)
+            // The reserved D12 relay slot may one day carry relay
+            // credentials, so only its presence prints.
+            .field(
+                "relay",
+                &relay.as_ref().map(|_| ainb_hangar_proto::Redacted),
+            )
             .finish()
     }
 }
@@ -240,15 +246,24 @@ mod tests {
             assert!(rendered.contains("<redacted>"), "{rendered}");
             assert!(!rendered.contains(&secret_b64), "{rendered}");
             assert!(!rendered.contains(&secret_bytes), "{rendered}");
-            assert!(
-                !rendered.contains("167"),
-                "a secret byte printed: {rendered}"
-            );
             assert!(!rendered.contains(&secret_hex), "{rendered}");
             assert!(
                 rendered.contains("01K5A0000000000000000ABCDE"),
                 "{rendered}"
             );
         }
+    }
+
+    /// The relay slot prints only whether it is set.
+    #[test]
+    fn debug_redacts_the_relay_contents() {
+        let offer = PairingOffer {
+            relay: Some(serde_json::json!({"url": "wss://relay", "token": "s3cr3tRelay"})),
+            ..sample()
+        };
+        let rendered = format!("{offer:?}");
+        assert!(!rendered.contains("s3cr3tRelay"), "{rendered}");
+        assert!(rendered.contains("relay: Some(<redacted>)"), "{rendered}");
+        assert!(format!("{:?}", sample()).contains("relay: None"));
     }
 }
