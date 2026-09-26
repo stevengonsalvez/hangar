@@ -43,6 +43,8 @@ interface HostOpts {
   refuse?: { code: number; reason: string };
   /** `nextEvent` throws once the queue is empty. */
   pumpFails?: boolean;
+  /** `attentionList` throws. */
+  attentionListFails?: boolean;
   /** A global transcript: `ingest_order` values this session has. */
   transcript?: number[];
 }
@@ -61,7 +63,6 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
     eventType: "acp.agent_message",
     role: "agent",
     text: `line ${order}`,
-    payload: '{"opaque":true}',
     observedAt: 2n,
   });
   // With no scripted event left, `nextEvent` waits like the crate's pump
@@ -98,6 +99,7 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
     },
     attentionList: async () => {
       calls.attentionList += 1;
+      if (opts.attentionListFails) throw new Error("list refused");
       return [{ id: "att-2", sessionId: "s-1", kind: "ask_user_question", version: 9n, payload: { question: "which?", options: [], text: undefined, message: undefined }, degraded: false, createdAt: 4n }];
     },
     subscribeAttention: async () => [
@@ -236,7 +238,7 @@ describe("native adapter", () => {
     const events: Tagged[] = [
       { tag: "FleetRevision", inner: { event: { revision: 7n } } },
       { tag: "AttentionRaised", inner: { attentionId: "att-2", sessionId: "s-1", kind: "ask_user_question", createdAt: 4n } },
-      { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 12n, eventId: "e12", sessionKey: "claude:s-1", eventType: "acp.user_message", role: "user", text: "go", payload: "{}", observedAt: 3n } } },
+      { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 12n, eventId: "e12", sessionKey: "claude:s-1", eventType: "acp.user_message", role: "user", text: "go", observedAt: 3n } } },
       { tag: "TerminalFrame", inner: { streamId: 7n, seq: 105n, frame: { tag: "Output", inner: { data: new Uint8Array([104, 105]).buffer } } } },
       { tag: "Closed", inner: { code: 4503n, reason: "draining", retryable: true } },
     ];
@@ -262,6 +264,23 @@ describe("native adapter", () => {
     expect(closed.code).toBe(4503);
     expect(closed.retryable).toBe(true);
     expect(must((await wire.hosts())[0], "host row").reachability).toBe("unreachable");
+  });
+
+  test("a raised attention whose re-read fails asks the app to resync", async () => {
+    const events: Tagged[] = [{ tag: "AttentionRaised", inner: { attentionId: "att-2", sessionId: "s-1", kind: "ask_user_question", createdAt: 4n } }];
+    const wire = wireOver(scriptedHost(events, { attentionListFails: true }).host);
+    const seen: WireEvent[] = [];
+    wire.onEvent((ev) => seen.push(ev));
+    await wire.connect("h1");
+    for (let i = 0; i < 10 && seen.length < 1; i++) await flush();
+    expect(seen).toEqual([{ kind: "fleet_resync_required", hostId: "h1" }]);
+  });
+
+  test("an RPC refusal carries the daemon's reason beside its message", () => {
+    const e = toPeerCloseError({ tag: "Rpc", inner: { code: -32602, message: "invalid params", reason: "session_key: unknown" } });
+    expect(e.kind).toBe("rpc");
+    expect(e.reason).toBe("invalid params: session_key: unknown");
+    expect(toPeerCloseError({ tag: "Rpc", inner: { code: -32601, message: "no such method" } }).reason).toBe("no such method");
   });
 
   test("a failed event pull closes the host with retryable false", async () => {
