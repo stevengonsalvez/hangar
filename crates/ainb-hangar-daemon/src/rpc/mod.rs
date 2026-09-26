@@ -754,8 +754,12 @@ where
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    subscriptions.attention =
-                        Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
+                    subscriptions.attention = Some(spawn_attention_forwarder(
+                        rx,
+                        filter,
+                        authenticated.caller.clone(),
+                        out_tx.clone(),
+                    ));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
                     if let Some(old) = subscriptions.fleet.take() {
                         old.abort();
@@ -995,6 +999,7 @@ fn attention_subscribe_filter(req: &RpcRequest) -> Option<String> {
 fn spawn_attention_forwarder(
     mut rx: broadcast::Receiver<ainb_hangar_proto::events::HangarEvent>,
     filter: Option<String>,
+    caller: auth::Caller,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     use ainb_hangar_proto::events::HangarEvent;
@@ -1002,6 +1007,13 @@ fn spawn_attention_forwarder(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // The attention stream is two families: the inbox, and the
+                    // live surface registry riding it. A device receives only
+                    // the families its scope grants, so `ConnectionsChanged`
+                    // never reaches a non-admin (RECONCILED C6).
+                    if !caller.receives(attention_stream_family(&event)) {
+                        continue;
+                    }
                     // Optional workspace narrowing: applies only to the
                     // workspace-bearing AttentionRaised. A `None`-workspace (host)
                     // event never matches a filter, so a narrowed subscription
@@ -1024,6 +1036,18 @@ fn spawn_attention_forwarder(
             }
         }
     })
+}
+
+/// The event family of one event on the attention stream.
+fn attention_stream_family(
+    event: &ainb_hangar_proto::events::HangarEvent,
+) -> ainb_hangar_proto::devices::EventFamily {
+    use ainb_hangar_proto::devices::EventFamily;
+    use ainb_hangar_proto::events::HangarEvent;
+    match event {
+        HangarEvent::ConnectionsChanged { .. } => EventFamily::Connections,
+        _ => EventFamily::Attention,
+    }
 }
 
 /// Spawn a gapless durable Fleet revision forwarder.
@@ -1426,7 +1450,7 @@ async fn dispatch_as_connection(
     connection: Option<&ConnectionRow>,
     registry: Option<&connections::ConnectionRegistry>,
 ) -> RpcResponse {
-    let result = match caller.authorize(&req.method) {
+    let result = match caller.authorize(&req.method, &req.params) {
         // Every mutation goes through the ledger guard, so "generic dedupe at
         // dispatch for every mutation" (D18) is a property of THIS line rather
         // than of ~96 hand-written transactions. A read, or a mutation whose
@@ -1701,7 +1725,9 @@ async fn handle(
         // `attention/subscribe` acks with the current OPEN snapshot; the live
         // fleet-wide forwarder is the stream side (see `serve_conn`).
         methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req).await,
-        methods::ATTENTION_ANSWER => handle_attention_answer(pool, req, events, connection).await,
+        methods::ATTENTION_ANSWER => {
+            handle_attention_answer(pool, req, events, caller, connection).await
+        }
         methods::ATC_REGISTER => handle_atc_register(pool, req).await,
         methods::ATC_LIST => handle_atc_list(pool).await,
         methods::ATC_RETRY_LIST => handle_atc_retry_list(pool, req).await,
@@ -2294,6 +2320,12 @@ async fn handle_fleet_message_send(
                 )));
             }
         }
+    }
+    // A paired device is pinned the same way, to the id its credential names
+    // (RECONCILED T12, S2): a phone that could write `actor: "operator"` would
+    // post as the human. Pinned, not validated: whatever it sent is replaced.
+    if let Some(device_id) = caller.device_id() {
+        params.actor = Some(format!("device:{device_id}"));
     }
     let span = tracing::info_span!(
         "fleet.message.send",
@@ -13080,12 +13112,13 @@ async fn handle_attention_answer(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
     connection: Option<&ConnectionRow>,
 ) -> Result<serde_json::Value, RpcError> {
     let mut params: ainb_hangar_proto::snapshots::AnswerParams =
         parse_params(req, "{ attention_id, answer, answered_by, is_answer? }")?;
-    if let Some(connection) = connection {
-        params.answered_by = crate::answer::answered_by(connection);
+    if let Some(stamp) = crate::answer::answered_by_caller(caller, connection) {
+        params.answered_by = stamp;
     }
     let result = crate::answer::answer(pool, events, &params, SystemClock.now_ms())
         .await
@@ -14233,6 +14266,200 @@ mod tests {
             id: RpcId::Number(1),
             method: method.into(),
             params,
+        }
+    }
+
+    /// RECONCILED C6: `ConnectionsChanged` rides the attention stream, so the
+    /// attention forwarder drops it for a device without the Connections
+    /// family and still forwards the inbox events around it. An admin gets it.
+    #[tokio::test]
+    async fn connections_changed_never_reaches_a_non_admin_device() {
+        use ainb_hangar_proto::devices::DeviceScope;
+        use ainb_hangar_proto::events::HangarEvent;
+
+        async fn forwarded(scope: DeviceScope) -> Vec<String> {
+            let (tx, rx) = broadcast::channel(8);
+            let (out_tx, mut out_rx) = mpsc::channel(8);
+            let caller = auth::Caller::Device {
+                device_id: "01J0DEVICE".to_string(),
+                scope,
+            };
+            let forwarder = spawn_attention_forwarder(rx, None, caller, out_tx);
+            tx.send(HangarEvent::ConnectionsChanged {
+                connections: Vec::new(),
+            })
+            .unwrap();
+            tx.send(HangarEvent::AttentionAnswered {
+                attention_id: "a1".to_string(),
+                by: "tui@host".to_string(),
+            })
+            .unwrap();
+            drop(tx);
+            let mut kinds = Vec::new();
+            while let Some(frame) = out_rx.recv().await {
+                let text = String::from_utf8(frame).unwrap();
+                let body = &text[text.find("\r\n\r\n").unwrap() + 4..];
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                kinds.push(value["params"]["event"].as_str().unwrap().to_string());
+            }
+            forwarder.await.unwrap();
+            kinds
+        }
+
+        for scope in [
+            DeviceScope::DESKTOP,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::MOBILE,
+        ] {
+            assert_eq!(forwarded(scope).await, ["attention_answered"], "{scope:?}");
+        }
+        assert_eq!(
+            forwarded(DeviceScope::DESKTOP_ADMIN).await,
+            ["connections_changed", "attention_answered"]
+        );
+    }
+
+    /// RECONCILED T12/S2: a device's `fleet/message_send` is written as
+    /// `device:<id>`, whatever `actor` it sent, the operator's name included.
+    #[tokio::test]
+    async fn a_device_message_is_pinned_to_its_own_actor() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let sent = dispatch_as(
+            store.pool(),
+            &req(
+                methods::FLEET_MESSAGE_SEND,
+                serde_json::json!({
+                    "actor": "operator",
+                    "targets": ["s1"],
+                    "text": "status?",
+                    "request_id": "req-phone",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &phone,
+        )
+        .await;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let message_id = sent.result.as_ref().unwrap()["message_id"].as_str().unwrap().to_string();
+        let sender: String = sqlx::query_scalar("SELECT sender FROM fleet_message WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sender, "device:01J0PHONE");
+    }
+
+    /// WP13, the scope rows for R2's terminal methods, driven through the real
+    /// dispatch path. A device the table refuses gets `UNAUTHORIZED` before
+    /// any handler runs. A device the table allows passes the gate and meets
+    /// the dark switch instead: `METHOD_NOT_FOUND` until R2's handlers land
+    /// (RECONCILED M13). So the scope gate never stands in for the dark
+    /// switch, and neither hides the other.
+    ///
+    /// The remaining WP13 checks need R2's handlers: `terminal/input` from
+    /// `mobile+type` succeeding (WP9b), and a stream never receiving another
+    /// stream's frames (WP9a, RECONCILED M12).
+    #[tokio::test]
+    async fn terminal_methods_are_gated_by_scope_before_the_dark_switch() {
+        use ainb_hangar_proto::devices::DeviceScope;
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let watch = serde_json::json!({
+            "stream_id": 1,
+            "session": {"host_id": "local", "session_key": "s1"},
+            "want_input": false,
+        });
+        let typing = serde_json::json!({
+            "stream_id": 1,
+            "session": {"host_id": "local", "session_key": "s1"},
+            "want_input": true,
+        });
+        let attach_with = |want_input: serde_json::Value| {
+            serde_json::json!({
+                "session": {"host_id": "local", "session_key": "s1"},
+                "want_input": want_input,
+            })
+        };
+        let omitted = serde_json::json!({
+            "session": {"host_id": "local", "session_key": "s1"},
+        });
+        // Non-bool `want_input` does not parse as `TerminalAttachParams`, so
+        // it earns no params rule: the watch-only grant is refused whatever
+        // the value looks like, and a scope that allows attach outright still
+        // passes the gate (the handler's own parse answers it, once it lands).
+        let number = attach_with(serde_json::json!(1));
+        let string_false = attach_with(serde_json::json!("false"));
+        let null = attach_with(serde_json::Value::Null);
+        let object = attach_with(serde_json::json!({"want_input": false}));
+        // (method, params, which scopes the table lets through)
+        let cases: [(&str, &serde_json::Value, [bool; 4]); 13] = [
+            // [mobile, mobile+type, desktop, desktop+admin]
+            (methods::TERMINAL_ATTACH, &watch, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &typing, [false, true, true, true]),
+            // Omitted is the serde default, `false`: watch-only is earned.
+            (methods::TERMINAL_ATTACH, &omitted, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &number, [false, true, true, true]),
+            (
+                methods::TERMINAL_ATTACH,
+                &string_false,
+                [false, true, true, true],
+            ),
+            (methods::TERMINAL_ATTACH, &null, [false, true, true, true]),
+            (methods::TERMINAL_ATTACH, &object, [false, true, true, true]),
+            (methods::TERMINAL_DETACH, &watch, [true, true, true, true]),
+            (methods::TERMINAL_ACK, &watch, [true, true, true, true]),
+            (
+                methods::TERMINAL_SCROLLBACK,
+                &watch,
+                [true, true, true, true],
+            ),
+            (methods::TERMINAL_INPUT, &watch, [false, true, true, true]),
+            (methods::TERMINAL_FLOOR, &watch, [false, true, true, true]),
+            (methods::TERMINAL_RESIZE, &watch, [false, true, true, true]),
+        ];
+        let scopes = [
+            DeviceScope::MOBILE,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::DESKTOP,
+            DeviceScope::DESKTOP_ADMIN,
+        ];
+        for (method, params, allowed) in cases {
+            for (scope, allowed) in scopes.into_iter().zip(allowed) {
+                let device = auth::Caller::Device {
+                    device_id: "01J0DEVICE".to_string(),
+                    scope,
+                };
+                let request = RpcRequest {
+                    jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+                    id: RpcId::Number(1),
+                    method: method.to_string(),
+                    params: params.clone(),
+                };
+                let response =
+                    dispatch_as(store.pool(), &request, &health(), &sink(), &device).await;
+                let code = response.error.as_ref().map(|e| e.code);
+                let expected = if allowed {
+                    METHOD_NOT_FOUND
+                } else {
+                    ainb_hangar_proto::auth::UNAUTHORIZED
+                };
+                assert_eq!(code, Some(expected), "{method} {params} for {scope:?}");
+            }
         }
     }
 
