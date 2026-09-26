@@ -2456,7 +2456,17 @@ async fn handle_fleet_message_send(
         // A lifecycle clock is one session's, so a fenced send names exactly
         // one target: fanning one clock across several sessions would check
         // all but one of them against a value nobody read.
-        let [target] = params.targets.as_slice() else {
+        // Counted the way the send will deliver: blanks dropped and
+        // duplicates folded, so `["s1", "s1"]` is still one target.
+        let mut distinct: Vec<&str> = params
+            .targets
+            .iter()
+            .map(String::as_str)
+            .filter(|target| !target.trim().is_empty())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let [target] = distinct.as_slice() else {
             return Err(invalid_params(
                 "a fenced fleet/message_send must name exactly one target",
             ));
@@ -4972,7 +4982,7 @@ pub(crate) async fn execute_fleet_action(
         None,
     )
     .await
-    .map_err(fleet_repo_err)?;
+    .map_err(action_target_err)?;
     // The fingerprint gate is a STALENESS check for providers whose session row
     // carries the one request they are blocked on. An ACP session can be blocked
     // on SEVERAL at once (an adapter running parallel tool calls raises a
@@ -7345,6 +7355,23 @@ fn action_receipt_wire(
         session_version: row.session_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+/// [`fleet_repo_err`] for the `fleet/action` target check, except that a stale
+/// `expected_version` is a D18 refusal (`-32008`, reason `conflict`) rather
+/// than a malformed request: the client's view of the session moved on, and
+/// a surface renders a refusal where it would show a parameter error as a
+/// bug. The ledger abandons it like the fence refusals, so re-reading the
+/// session and resending under the same request id works.
+fn action_target_err(error: ainb_hangar_store::repo::fleet::FleetRepoError) -> RpcError {
+    use ainb_hangar_store::repo::fleet::FleetRepoError;
+    match error {
+        FleetRepoError::StaleVersion { .. } => mutation::rejected(
+            ainb_hangar_proto::mutation::REASON_CONFLICT,
+            format!("{error}; nothing was done, re-read the session and retry"),
+        ),
+        other => fleet_repo_err(other),
     }
 }
 
@@ -14757,6 +14784,24 @@ mod tests {
             Some(INVALID_PARAMS),
             "{two:?}"
         );
+        // #139 review: counted after the send's own normalisation, so a
+        // repeated or blank target still names one session.
+        let repeated = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s1", " "],
+                "text": "go on",
+                "request_id": "req-repeated",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_ne!(
+            repeated.error.as_ref().map(|e| e.message.as_str()),
+            Some("a fenced fleet/message_send must name exactly one target"),
+            "{repeated:?}"
+        );
 
         let wrong_kind = call(
             &store,
@@ -15066,6 +15111,61 @@ mod tests {
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
         );
+    }
+
+    /// A stale `expected_version` on `fleet/action` is a D18 refusal the phone
+    /// can render (`-32008`, reason `conflict`), not an `INVALID_PARAMS`, and
+    /// it is abandoned in the ledger: no receipt is written, and a retry under
+    /// the SAME request id with the re-read version passes the check.
+    #[tokio::test]
+    async fn a_stale_action_version_is_a_conflict_refusal_that_can_be_retried() {
+        let (_home, store) = fenced_session_store().await;
+        let interrupt = |version: i64| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": version,
+                "request_id": "req-stale-version",
+                "action": {"action": "interrupt"},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_ACTION, interrupt(5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_CONFLICT),
+            "{stale:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action writes no receipt");
+
+        // The retry with the re-read version RUNS: the refusal was never this
+        // request id's recorded answer.
+        let retried = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert!(
+            retried.error.is_none(),
+            "the retry succeeds: {:?}",
+            retried.error
+        );
+        let ack = &retried.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "created", "{ack}");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 1, "the retry wrote exactly one receipt");
+
+        // And from then on the op id has an answer: the same call replays it.
+        let again = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert!(again.error.is_none(), "{:?}", again.error);
+        let ack = &again.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "replayed", "{ack}");
     }
 
     /// The method the test seam in `dispatch_as_connection` panics on.

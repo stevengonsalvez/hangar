@@ -79,7 +79,10 @@ pub const REASON_ALREADY_ANSWERED_BY: &str = "already_answered_by";
 pub const REASON_TURN_ADVANCED: &str = "turn_advanced";
 /// Reason: a different process now owns the session name.
 pub const REASON_INCARNATION_MISMATCH: &str = "incarnation_mismatch";
-/// Reason: a concurrent admin edit moved the registry version.
+/// Reason: the version the client read has moved on. A concurrent admin
+/// edit moved the device registry version (`registry_version` fence), or
+/// the fleet session's `version` is no longer the `expected_version` a
+/// `fleet/action` named. Re-read and resend under the same op id.
 pub const REASON_CONFLICT: &str = "conflict";
 /// Reason: the daemon died between `writing` and the reply, so the bytes may
 /// or may not have reached the PTY.
