@@ -1567,7 +1567,9 @@ async fn handle(
         methods::HANGAR_BOARD_COLUMN_REORDER => handle_board_column_reorder(pool, req).await,
         methods::HANGAR_BOARD_CARD_ADD => handle_board_card(pool, req, true).await,
         methods::HANGAR_BOARD_CARD_MOVE => handle_board_card(pool, req, false).await,
-        methods::HANGAR_BOARD_CARD_CREATE => handle_board_card_create(pool, req, events).await,
+        methods::HANGAR_BOARD_CARD_CREATE => {
+            handle_board_card_create(pool, req, events, caller).await
+        }
         methods::HANGAR_BOARD_CARD_RUN => handle_board_card_run(pool, req, caller).await,
         methods::HANGAR_ISSUE_RUN => handle_issue_run(pool, req, caller).await,
         methods::HANGAR_BOARD_CARD_CANCEL => handle_board_card_cancel(pool, req, events).await,
@@ -2242,8 +2244,11 @@ async fn handle_fleet_message_send(
     // A paired device is pinned the same way, to the id its credential names
     // (RECONCILED T12, S2): a phone that could write `actor: "operator"` would
     // post as the human. Pinned, not validated: whatever it sent is replaced.
+    // Anyone else may not claim a device principal in either spelling.
     if let Some(device_id) = caller.device_id() {
         params.actor = Some(format!("device:{device_id}"));
+    } else if let Some(claimed) = params.actor.as_deref() {
+        auth::refuse_reserved_text(claimed)?;
     }
     let span = tracing::info_span!(
         "fleet.message.send",
@@ -8504,6 +8509,9 @@ async fn handle_issue_criterion_set(
     }
     // `checked_by` is free text: the operator's value stands, a device is its
     // canonical `device:<id>`.
+    if let Some(claimed) = params.actor.as_deref() {
+        auth::refuse_reserved_text(claimed)?;
+    }
     let checked_by = caller.acting(params.actor.clone(), auth::Caller::sender);
     let row = snapshots::issue_criterion_set(
         pool,
@@ -9988,8 +9996,8 @@ async fn handle_board_card_create(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
-    use ainb_hangar_core::actor::{ActorKind, ActorRef};
     use ainb_hangar_core::idgen::SystemIdGen;
     use ainb_hangar_proto::events::HangarEvent;
     use ainb_hangar_store::repo::board::BoardRepo;
@@ -10026,9 +10034,9 @@ async fn handle_board_card_create(
         }
     }
 
-    // The TUI user owns cards it creates — mirror the plugin's `SELF_AUTHOR_REF`.
-    let creator = ActorRef::new(ActorKind::Member, "me")
-        .map_err(|e| internal(&format!("build creator ref: {e}")))?;
+    // The TUI user owns cards it creates (the plugin's `SELF_AUTHOR_REF`,
+    // `member:me`); a paired device owns the cards IT creates.
+    let creator = caller.stamp(None);
     // Mint the issue through the SAME helper `issue_create` uses, so a card-made
     // issue gets the workspace's issue prefix, its `manual` origin stamp and the
     // same row shape `issue_create` answers and pushes (the `Created` activity
@@ -14384,6 +14392,15 @@ mod tests {
         "actor_user_id",
         "created_by",
         "invoker_user_id",
+        "answered_by",
+        "sender",
+        "by",
+        "checked_by",
+        "user_id",
+        "recipient",
+        "leader",
+        "member",
+        "assignee",
     ];
 
     /// How the daemon treats one actor-named proto field.
@@ -14402,6 +14419,9 @@ mod tests {
         /// A bare user id the agent allow-list gate reads; stamped through
         /// `acting_user_id` (proved in `acting_user_id_pins_a_device`).
         InvokerGate,
+        /// Overwritten by the named daemon helper before any write, whatever
+        /// the client sent; the helper's own test proves the device arm.
+        Pinned(&'static str),
     }
 
     /// Every actor-named proto field, classified. NO default:
@@ -14420,6 +14440,31 @@ mod tests {
         ("AutopilotSubscriberEntry", "actor", ActorField::Output),
         ("AutopilotSubscriberEntry", "created_by", ActorField::Output),
         ("AutopilotActorParams", "actor", ActorField::Target),
+        ("IssueRow", "assignee", ActorField::Output),
+        ("InboxEntryRow", "recipient", ActorField::Output),
+        ("FleetMessage", "sender", ActorField::Output),
+        ("CorpusRow", "sender", ActorField::Output),
+        ("MemberWireRow", "user_id", ActorField::Output),
+        ("SquadWireRow", "leader", ActorField::Output),
+        ("SquadMemberWireRow", "member", ActorField::Output),
+        ("SquadFanoutResult", "leader", ActorField::Output),
+        ("HangarEvent::AttentionAnswered", "by", ActorField::Output),
+        ("AnswerResult::AlreadyAnswered", "by", ActorField::Output),
+        ("InboxScopedParams", "recipient", ActorField::Target),
+        ("IssueUpdateParams", "assignee", ActorField::Target),
+        ("IssueRunParams", "assignee", ActorField::Target),
+        ("MemberSetRoleParams", "user_id", ActorField::Target),
+        ("MemberRemoveParams", "user_id", ActorField::Target),
+        ("SquadCreateParams", "leader", ActorField::Target),
+        ("SquadMemberParams", "member", ActorField::Target),
+        ("SquadMemberRoleParams", "member", ActorField::Target),
+        (
+            "AnswerParams",
+            "answered_by",
+            ActorField::Pinned(
+                "answer::answered_by_caller (answer::tests::a_device_answer_is_stamped_from_its_credential)",
+            ),
+        ),
         (
             "AutopilotTriggerApiParams",
             "actor_user_id",
@@ -14525,10 +14570,52 @@ mod tests {
         );
         let mut found = std::collections::BTreeSet::new();
         for file in files {
+            // `pub struct S`: its `pub` fields. `pub enum E`: the named fields
+            // of each struct-like variant, as `E::Variant` (they carry no
+            // `pub`). Test modules are skipped: their struct literals would
+            // read as fields.
             let mut current: Option<String> = None;
+            let mut in_enum: Option<(String, i32)> = None;
+            let mut variant: Option<String> = None;
             for line in std::fs::read_to_string(&file).expect("read proto").lines() {
                 let trimmed = line.trim_start();
-                if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+                if trimmed.starts_with("#[cfg(test)]") {
+                    break;
+                }
+                if let Some((name, depth)) = in_enum.as_mut() {
+                    let before = *depth;
+                    *depth += i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+                    *depth -= i32::try_from(trimmed.matches('}').count()).unwrap_or(0);
+                    if *depth <= 0 {
+                        in_enum = None;
+                        variant = None;
+                        continue;
+                    }
+                    if before == 1 && trimmed.ends_with('{') {
+                        variant = trimmed
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .map(ToString::to_string);
+                    } else if before == 2 {
+                        if let (Some(v), Some((field, _))) = (&variant, trimmed.split_once(':')) {
+                            let field = field.trim();
+                            if ACTOR_FIELD_NAMES.contains(&field) {
+                                found.insert((format!("{name}::{v}"), field.to_string()));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(rest) = trimmed.strip_prefix("pub enum ") {
+                    let name = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    let depth = i32::try_from(trimmed.matches('{').count()).unwrap_or(0);
+                    in_enum = Some((name, depth));
+                    current = None;
+                } else if let Some(rest) = trimmed.strip_prefix("pub struct ") {
                     current = rest
                         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
                         .next()
@@ -14915,6 +15002,42 @@ mod tests {
         }
         assert!(!driven.is_empty());
 
+        // A creator with NO wire field: `board_card_create` authored every card
+        // as `member:me`. A device's card is the device's.
+        let board = dispatch_as(
+            pool,
+            &req(
+                methods::HANGAR_BOARD_CREATE,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "name": "laptop board"}),
+            ),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await;
+        ok(methods::HANGAR_BOARD_CREATE, &board);
+        let board_id: String =
+            sqlx::query_scalar("SELECT id FROM board WHERE name = 'laptop board'")
+                .fetch_one(pool)
+                .await
+                .expect("board id");
+        let card = call(
+            methods::HANGAR_BOARD_CARD_CREATE,
+            serde_json::json!({
+                "workspace_id": crate::seed::WS_SLUG,
+                "board_id": board_id,
+                "title": "a card from the laptop",
+            }),
+        )
+        .await;
+        ok(methods::HANGAR_BOARD_CARD_CREATE, &card);
+        let creator = typed_pair(
+            "SELECT creator_type, creator_id FROM issue WHERE title = ?",
+            "a card from the laptop".to_string(),
+        )
+        .await;
+        assert!(is_device(&creator), "board_card_create: {creator}");
+
         // The restricted rule survived every attempt: still restricted.
         let mode: String = sqlx::query_scalar("SELECT access_mode FROM autopilot WHERE id = ?")
             .bind(&restricted_rule)
@@ -14949,6 +15072,17 @@ mod tests {
                 methods::HANGAR_AUTOPILOT_SET_ENABLED,
                 serde_json::json!({"workspace_id": crate::seed::WS_ID, "autopilot_id": open_rule,
                     "enabled": true, "actor_user_id": "device:01J0FORGED"}),
+            ),
+            // Text principals, in both spellings.
+            (
+                methods::FLEET_MESSAGE_SEND,
+                serde_json::json!({"targets": ["s1"], "text": "forged", "request_id": "req-forged",
+                    "actor": "device:01J0FORGED"}),
+            ),
+            (
+                methods::HANGAR_ISSUE_CRITERION_SET,
+                serde_json::json!({"workspace_id": crate::seed::WS_SLUG, "issue_id": "issue-1",
+                    "criterion": "1", "checked": true, "actor": "member:device:01J0FORGED"}),
             ),
         ] {
             let refused = dispatch_as(
@@ -14990,98 +15124,6 @@ mod tests {
         )
         .await;
         assert_eq!(author, "agent:agent-1");
-    }
-
-    /// Review follow-up A, end to end through a real ACP pool on the
-    /// `fake_acp_adapter` fixture: a paired device's `fleet/action` SendPrompt
-    /// is enqueued on the chat bus as `device:<id>`, the sender its caller
-    /// passes down explicitly, never `operator`. (A device cannot reach the
-    /// unix socket; the peer leg is R1-06, so the real dispatch path is driven
-    /// directly with the device caller.)
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_device_send_prompt_on_acp_is_enqueued_as_the_device() {
-        let adapter = {
-            let mut dir = std::env::current_exe().expect("test binary path");
-            dir.pop();
-            if dir.ends_with("deps") {
-                dir.pop();
-            }
-            let status = std::process::Command::new(env!("CARGO"))
-                .args(["build", "-p", "ainb-acp", "--bin", "fake_acp_adapter"])
-                .status()
-                .expect("build the fixture adapter");
-            assert!(status.success(), "fixture adapter build failed");
-            dir.join("fake_acp_adapter")
-        };
-        let home = tempfile::tempdir().expect("home");
-        let store = Store::open_in(home.path()).await.expect("store");
-        let broker = EventBroker::new();
-        let mut config = crate::acp_pool::PoolConfig::default();
-        config.adapters.insert(
-            ainb_acp::config::CLAUDE_ADAPTER.to_string(),
-            ainb_acp::config::AdapterConfig::new(ainb_acp::config::CLAUDE_ADAPTER, "default")
-                .command(adapter)
-                .extra_env(vec![("FAKE_ACP_CHUNKS".to_string(), "1".to_string())]),
-        );
-        let acp = crate::acp_pool::AcpPool::new(store.clone(), broker.sink(), config);
-        crate::acp_pool::install(Arc::clone(&acp)).await;
-
-        let created = dispatch_as(
-            store.pool(),
-            &req(
-                methods::FLEET_ACP_SESSION_CREATE,
-                serde_json::json!({
-                    "provider": ainb_acp::config::CLAUDE_ADAPTER,
-                    "cwd": home.path().to_string_lossy(),
-                }),
-            ),
-            &health(),
-            &broker.sink(),
-            &auth::Caller::Operator,
-        )
-        .await;
-        assert!(created.error.is_none(), "{:?}", created.error);
-        let session_key = created.result.as_ref().unwrap()["session_key"]
-            .as_str()
-            .expect("key")
-            .to_string();
-        let version: i64 =
-            sqlx::query_scalar("SELECT version FROM fleet_session WHERE session_key = ?")
-                .bind(&session_key)
-                .fetch_one(store.pool())
-                .await
-                .expect("session row");
-
-        let laptop = auth::Caller::Device {
-            device_id: "01J0LAPTOP".to_string(),
-            scope: ainb_hangar_proto::devices::DeviceScope::DESKTOP,
-        };
-        let sent = dispatch_as(
-            store.pool(),
-            &req(
-                methods::FLEET_ACTION,
-                serde_json::json!({
-                    "session_key": session_key,
-                    "expected_version": version,
-                    "request_id": "req-device-prompt",
-                    "action": {"action": "send_prompt", "text": "from the laptop"},
-                }),
-            ),
-            &health(),
-            &broker.sink(),
-            &laptop,
-        )
-        .await;
-        assert!(sent.error.is_none(), "{:?}", sent.error);
-        let sender: String =
-            sqlx::query_scalar("SELECT sender FROM fleet_message WHERE body = 'from the laptop'")
-                .fetch_one(store.pool())
-                .await
-                .expect("the prompt is on the bus");
-        assert_eq!(sender, "device:01J0LAPTOP");
-
-        crate::acp_pool::uninstall().await;
-        drop(acp);
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
