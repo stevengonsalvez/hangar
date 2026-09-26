@@ -308,14 +308,16 @@ describe("native adapter", () => {
     await wire.connect("h1");
     const reply = await wire.answer({ hostId: "h1", attentionId: "att-1", answer: "yes", version: 4, opId: "op-a" });
     expect(reply.outcome).toEqual({ kind: "rejected", reason: "turn_advanced" });
-    expect(reply.ack).toEqual({ status: "rejected", reason: "turn_advanced" });
-    expect(await wire.sendPrompt({ hostId: "h1", sessionKey: "claude:s-1", text: "hi", lifecycleUpdatedAt: 5, opId: "op-p" })).toEqual({ status: "rejected", reason: "turn_advanced" });
-    expect(await wire.interrupt({ hostId: "h1", sessionKey: "claude:s-1", sessionIncarnation: "fp-1", version: 3, opId: "op-i" })).toEqual({ status: "rejected", reason: "turn_advanced" });
+    expect(reply.ack).toEqual({ status: "rejected", reason: "turn_advanced", code: -32008 });
+    expect(await wire.sendPrompt({ hostId: "h1", sessionKey: "claude:s-1", text: "hi", lifecycleUpdatedAt: 5, opId: "op-p" })).toEqual({ status: "rejected", reason: "turn_advanced", code: -32008 });
+    expect(await wire.interrupt({ hostId: "h1", sessionKey: "claude:s-1", sessionIncarnation: "fp-1", version: 3, opId: "op-i" })).toEqual({ status: "rejected", reason: "turn_advanced", code: -32008 });
     expect(turned.calls.answer).toEqual([{ version: 4, opId: "op-a" }]);
 
     const unknown = wireOver(scriptedHost([], { refuse: { code: -32009, reason: "ledger_unavailable" } }).host);
     await unknown.connect("h1");
-    expect((await unknown.answer({ hostId: "h1", attentionId: "att-1", answer: "yes", version: 4, opId: "op-a" })).outcome).toEqual({ kind: "unknown", reason: "ledger_unavailable" });
+    const unknownReply = await unknown.answer({ hostId: "h1", attentionId: "att-1", answer: "yes", version: 4, opId: "op-a" });
+    expect(unknownReply.outcome).toEqual({ kind: "unknown", reason: "ledger_unavailable" });
+    expect(unknownReply.ack?.code).toBe(-32009);
 
     const other = wireOver(scriptedHost([], { refuse: { code: -32602, reason: "bad params" } }).host);
     await other.connect("h1");
