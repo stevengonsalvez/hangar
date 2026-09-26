@@ -87,6 +87,10 @@ pub struct Canon {
     pub scrollback: Vec<Vec<Cell>>,
     /// The viewport.
     pub grid: Vec<Vec<Cell>>,
+    /// Per scrollback row: the row wrapped into the next.
+    pub scrollback_wrapped: Vec<bool>,
+    /// Per viewport row: the row wrapped into the next.
+    pub grid_wrapped: Vec<bool>,
 }
 
 /// `-`, `i<n>` or `#rrggbb`.
@@ -120,8 +124,10 @@ fn attr_tags(a: &CellAttributes) -> String {
         Underline::Dotted => tags.push("u:"),
         Underline::Dashed => tags.push("u-"),
     }
-    if a.blink() != wezterm_term::Blink::None {
-        tags.push("blink");
+    match a.blink() {
+        wezterm_term::Blink::None => {}
+        wezterm_term::Blink::Slow => tags.push("blink"),
+        wezterm_term::Blink::Rapid => tags.push("blink!"),
     }
     if a.reverse() {
         tags.push("rev");
@@ -217,6 +223,8 @@ pub fn canon(pane: &mut PaneEmulator, scrollback_rows: usize) -> Canon {
         modes: modes_key(pane.modes()),
         scrollback: history.iter().map(|l| canon_line(l, cols)).collect(),
         grid: viewport.iter().map(|l| canon_line(l, cols)).collect(),
+        scrollback_wrapped: history.iter().map(Line::last_cell_was_wrapped).collect(),
+        grid_wrapped: viewport.iter().map(Line::last_cell_was_wrapped).collect(),
     }
 }
 
@@ -241,10 +249,18 @@ impl Canon {
         let _ = writeln!(out, "title {:?}", self.title);
         let _ = writeln!(out, "modes {}", self.modes);
         for (r, row) in self.scrollback.iter().enumerate() {
-            render_row(&mut out, &format!("s{r:03}"), row);
+            let label = format!("s{r:03}");
+            render_row(&mut out, &label, row);
+            if self.scrollback_wrapped.get(r).copied().unwrap_or(false) {
+                let _ = writeln!(out, "{label} wrap");
+            }
         }
         for (r, row) in self.grid.iter().enumerate() {
-            render_row(&mut out, &format!("r{r:03}"), row);
+            let label = format!("r{r:03}");
+            render_row(&mut out, &label, row);
+            if self.grid_wrapped.get(r).copied().unwrap_or(false) {
+                let _ = writeln!(out, "{label} wrap");
+            }
         }
         out
     }
