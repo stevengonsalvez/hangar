@@ -89,25 +89,25 @@ jobs:
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android24-clang"
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$tc/x86_64-linux-android24-clang"
           export RUSTFLAGS="-C link-arg=-Wl,--gc-sections"
-          # Before: cargo's default release profile. After: the size-tuned
-          # mobile profile the app ships. Both are printed by the gate step.
+          # Before: the untuned profile (cargo's release defaults). After:
+          # `release`, the size-tuned profile the app ships with. Both are
+          # printed by the gate step.
+          cargo build --profile untuned --lib --target aarch64-linux-android
+          cargo build --profile untuned --lib --target x86_64-linux-android
           cargo build --release --lib --target aarch64-linux-android
           cargo build --release --lib --target x86_64-linux-android
-          cargo build --profile mobile --lib --target aarch64-linux-android
-          cargo build --profile mobile --lib --target x86_64-linux-android
       # Per ABI: a warning above the 2 MiB M1-03 budget, a failure above
-      # 3 MiB. First measurements with the size profile: arm64-v8a 2,074,712
-      # bytes, x86_64 2,374,560 bytes (its x86 code is about 15 percent larger
-      # for the same crate). Both numbers are printed before either fails.
+      # 3 MiB, on the release profile the app ships with. Both numbers are
+      # printed before either fails, after the untuned baseline.
       - name: Size gate, warn above 2 MiB and fail above 3 MiB per ABI
         run: |
-          echo "before (release profile, not gated):"
-          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 9999999999 9999999999 "arm64-v8a release"
-          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 9999999999 9999999999 "x86_64 release"
-          echo "after (mobile profile, gated):"
+          echo "before (untuned profile, not gated):"
+          bash scripts/size-gate.sh target/aarch64-linux-android/untuned/libainb_wire_mobile.so 9999999999 9999999999 "arm64-v8a untuned"
+          bash scripts/size-gate.sh target/x86_64-linux-android/untuned/libainb_wire_mobile.so 9999999999 9999999999 "x86_64 untuned"
+          echo "after (release profile, the one the app ships, gated):"
           rc=0
-          bash scripts/size-gate.sh target/aarch64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=1
-          bash scripts/size-gate.sh target/x86_64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 x86_64 || rc=1
+          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=1
+          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 x86_64 || rc=1
           exit $rc
 
   ios:
@@ -132,9 +132,9 @@ jobs:
       - name: Build the release static library for device and simulator
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
-          cargo build --profile mobile --lib --target aarch64-apple-ios
-          cargo build --profile mobile --lib --target aarch64-apple-ios-sim
-          ls -l target/aarch64-apple-ios/mobile/libainb_wire_mobile.a target/aarch64-apple-ios-sim/mobile/libainb_wire_mobile.a
+          cargo build --release --lib --target aarch64-apple-ios
+          cargo build --release --lib --target aarch64-apple-ios-sim
+          ls -l target/aarch64-apple-ios/release/libainb_wire_mobile.a target/aarch64-apple-ios-sim/release/libainb_wire_mobile.a
 
   app:
     name: Expo app (ubuntu-latest)
