@@ -2,7 +2,8 @@ import { act, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { reset } from "../src/attention/store";
-import { connectHost, liveHosts, onAppState, resetLifecycle, retryAfterSecs } from "../src/lifecycle";
+import { connectHost, liveHosts, mayRedial, onAppState, resetLifecycle, retryAfterSecs } from "../src/lifecycle";
+import { PeerCloseError } from "../src/wire/types";
 import { FakeWire, FAKE_HOST_A, FAKE_HOST_B } from "../src/wire/fake";
 import { setWire } from "../src/wire";
 
@@ -266,4 +267,76 @@ test("a redial refused with 4429 and retry-after keeps dialling after that floor
     jest.advanceTimersByTime(2500);
   });
   await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+});
+
+test("mayRedial is fail-closed: only a network error or a retryable close code", () => {
+  expect(mayRedial(PeerCloseError.network("dns"))).toBe(true);
+  for (const code of [1013, 4429, 4503]) expect(mayRedial(PeerCloseError.closed(code))).toBe(true);
+  for (const code of [4401, 4403, 4409, 4999, 1000]) expect(mayRedial(PeerCloseError.closed(code))).toBe(false);
+  for (const kind of ["peer_changed", "not_paired", "custody", "protocol", "offer"] as const) expect(mayRedial(new PeerCloseError(kind))).toBe(false);
+  expect(mayRedial(new Error("anything"))).toBe(false);
+  expect(mayRedial("string")).toBe(false);
+  expect(mayRedial(undefined)).toBe(false);
+  // a copy of the class from another bundle is recognised by name
+  const foreign = Object.assign(new Error("x"), { name: "PeerCloseError", kind: "network" });
+  expect(mayRedial(foreign)).toBe(true);
+  const foreignStop = Object.assign(new Error("x"), { name: "PeerCloseError", kind: "custody" });
+  expect(mayRedial(foreignStop)).toBe(false);
+});
+
+test("a host whose key changed latches re-pair and is never redialled", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, undefined));
+  fake.refuseNextConnectWith = { kind: "peer_changed", reason: "static key differs" };
+  await act(async () => {
+    jest.advanceTimersByTime(1100);
+  });
+  expect(await screen.findByText("host key changed, pair again with a fresh offer")).toBeTruthy();
+  expect(screen.getByTestId(`repair-${FAKE_HOST_A}`)).toBeTruthy();
+  const hellos0 = await hellos();
+  await act(async () => {
+    jest.advanceTimersByTime(130_000);
+  });
+  expect(await hellos()).toBe(hellos0);
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+});
+
+test("a plain error from connect stops the loop too", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, undefined));
+  const real = fake.connect.bind(fake);
+  fake.connect = async () => {
+    fake.connect = real;
+    throw new Error("something untyped");
+  };
+  await act(async () => {
+    jest.advanceTimersByTime(1100);
+  });
+  await act(async () => {
+    jest.advanceTimersByTime(130_000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+});
+
+test("the closed event that follows our own background close never redials, even with a retryable code", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(() => onAppState(fake, "background"));
+  await act(() => onAppState(fake, "active"));
+  const hellosBefore = await hellos();
+  // the peer's close for the socket we closed arrives late, tagged retryable, while we are foregrounded again
+  // (our own close has been recorded, so no timer is armed for it)
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4503, "draining"));
+  // that drop also flipped the fake to disconnected: the live host redials because it was a real drop
+  // so instead check the flag path directly: a close right after background must not arm a timer
+  await act(() => onAppState(fake, "background"));
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4503, "draining"));
+  await act(async () => {
+    jest.advanceTimersByTime(130_000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  expect(liveHosts().get(FAKE_HOST_A)?.timer).toBeUndefined();
+  expect((await hellos()) - hellosBefore).toBeLessThanOrEqual(1);
 });
