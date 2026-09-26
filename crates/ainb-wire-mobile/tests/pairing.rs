@@ -189,10 +189,16 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        err,
-        WireError::Draining,
-        "4503 at hello is the host draining"
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(4503),
+                retryable: true,
+                ..
+            }
+        ),
+        "4503 at hello is the host draining: {err:?}"
     );
     assert!(redeemed.load(Ordering::SeqCst), "the invite was consumed");
     let saved = list_pairings(dir_s.clone()).unwrap();
@@ -216,7 +222,17 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err, WireError::Revoked);
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(4403),
+                retryable: false,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
     let latched = list_pairings(other_s).unwrap();
     assert_eq!(latched.len(), 1);
     assert!(
@@ -330,7 +346,17 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
     })
     .await
     .unwrap_err();
-    assert_eq!(err, WireError::Revoked);
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(4403),
+                retryable: false,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
     assert!(
         list_pairings(dir_s.clone()).unwrap()[0].repair,
         "4403 at hello sets the re-pair latch"
