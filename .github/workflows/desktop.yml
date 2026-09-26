@@ -16,13 +16,29 @@ on:
   workflow_dispatch:
   workflow_call:
   pull_request:
+    # The desktop builds against these crates (path dependencies), and the
+    # sidecar gate runs the real daemon, so a change to any of them can break
+    # the desktop without touching its tree.
     paths:
       - "crates/ainb-desktop/**"
       - "crates/ainb-app/**"
+      - "crates/ainb-core/**"
+      - "crates/ainb-hangar-core/**"
+      - "crates/ainb-hangar-proto/**"
+      - "crates/ainb-hangar-client/**"
+      - "crates/ainb-hangar-daemon/**"
+      - "xtask/**"
+      - "Cargo.lock"
       - ".github/workflows/desktop.yml"
 
 permissions:
   contents: read
+
+# One run per pull request: a new push cancels the one in flight. Dispatch and
+# release calls group by ref and are never cancelled by a pull request run.
+concurrency:
+  group: desktop-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
