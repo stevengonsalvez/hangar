@@ -61,11 +61,68 @@ pub struct PairingRecord {
     pub expires_at_ms: i64,
     /// When the pairing happened, epoch ms.
     pub paired_at_ms: i64,
-    /// The re-pair latch: set when the session layer sees a 4401 or 4403
-    /// close from this host, cleared only by a successful pair. The app
-    /// shows it as `HostRow.repair` and keeps no copy.
-    #[serde(default)]
-    pub repair: bool,
+    /// The re-pair latch: why the host refused this device's identity, when
+    /// it did. `peer_changed` (a wrong pinned host key, or 4401 before Noise
+    /// message 2), `unauthenticated` (4401) or `revoked` (4403). Set under
+    /// the index lock when the session layer sees the refusal, cleared only
+    /// by a successful pair. The app shows it as `HostRow.repair` and keeps
+    /// no copy.
+    #[serde(default, deserialize_with = "flag")]
+    pub repair: Option<String>,
+    /// A notice the app shows without a re-pair: `incompatible` (4409, one
+    /// side needs an update) or `unknown_code` (a close code this build does
+    /// not know). Set and cleared like `repair`.
+    #[serde(default, deserialize_with = "flag")]
+    pub notice: Option<String>,
+}
+
+/// A flag on the index: a string, absent, or the `true` / `false` an index
+/// written by an earlier build carries (read as `revoked` / clear).
+fn flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Text(String),
+        Old(bool),
+        None(()),
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        Some(Raw::Text(s)) => Some(s),
+        Some(Raw::Old(true)) => Some(REPAIR_REVOKED.to_owned()),
+        _ => None,
+    })
+}
+
+/// `repair` value: a wrong pinned host key, or 4401 before Noise message 2.
+pub const REPAIR_PEER_CHANGED: &str = "peer_changed";
+/// `repair` value: 4401.
+pub const REPAIR_UNAUTHENTICATED: &str = "unauthenticated";
+/// `repair` value: 4403.
+pub const REPAIR_REVOKED: &str = "revoked";
+/// `notice` value: 4409.
+pub const NOTICE_INCOMPATIBLE: &str = "incompatible";
+/// `notice` value: a close code this build does not know.
+pub const NOTICE_UNKNOWN_CODE: &str = "unknown_code";
+
+/// What a refusal sets on the record: `(repair, notice)`. A retryable close
+/// (no code, 4429, 1013, 4503) sets nothing.
+#[must_use]
+pub fn refusal_flags(err: &WireError) -> (Option<&'static str>, Option<&'static str>) {
+    use ainb_hangar_proto::peer_close as pc;
+    match err {
+        WireError::PeerChanged => (Some(REPAIR_PEER_CHANGED), None),
+        WireError::Closed {
+            code: Some(code),
+            retryable: false,
+            ..
+        } => match *code {
+            pc::UNAUTHENTICATED => (Some(REPAIR_UNAUTHENTICATED), None),
+            pc::REVOKED => (Some(REPAIR_REVOKED), None),
+            pc::PROTOCOL_INCOMPATIBLE => (None, Some(NOTICE_INCOMPATIBLE)),
+            _ => (None, Some(NOTICE_UNKNOWN_CODE)),
+        },
+        _ => (None, None),
+    }
 }
 
 fn token_secret(host_id: &str) -> String {
@@ -142,11 +199,33 @@ pub fn save(custody_dir: &Path, record: PairingRecord, token: &str) -> Result<()
     })
 }
 
-/// Set or clear the re-pair latch on `host_id`; absent is not an error.
-pub fn mark_repair(custody_dir: &Path, host_id: &str, repair: bool) -> Result<(), WireError> {
+/// Record a refusal from `host_id` on its pairing, under the index lock:
+/// `repair` for an identity refusal, `notice` for an incompatible or unknown
+/// close. A retryable error sets nothing. An absent host is not an error.
+pub fn mark_refusal(custody_dir: &Path, host_id: &str, err: &WireError) -> Result<(), WireError> {
+    let (repair, notice) = refusal_flags(err);
+    if repair.is_none() && notice.is_none() {
+        return Ok(());
+    }
     with_index(custody_dir, |records| {
         for r in records.iter_mut().filter(|r| r.host_id == host_id) {
-            r.repair = repair;
+            if let Some(repair) = repair {
+                r.repair = Some(repair.to_owned());
+            }
+            if let Some(notice) = notice {
+                r.notice = Some(notice.to_owned());
+            }
+        }
+    })
+}
+
+/// Clear both flags on `host_id`, under the index lock (tests and the
+/// successful-pair path use `save`, which replaces the record whole).
+pub fn clear_flags(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {
+    with_index(custody_dir, |records| {
+        for r in records.iter_mut().filter(|r| r.host_id == host_id) {
+            r.repair = None;
+            r.notice = None;
         }
     })
 }
@@ -222,6 +301,20 @@ pub(crate) async fn pair(
             url: e.url.clone(),
         })
         .collect();
+    // An offer is unauthenticated input (a QR code, a link, a paste). When
+    // a pairing for this host already exists, only an offer carrying the key
+    // already pinned may touch it: a stale or hostile offer with another key
+    // is refused here, before any dial, and the record stays as it was.
+    let pinned = find(custody_dir, offer.host_id.as_str())?;
+    if let Some(existing) = &pinned {
+        if existing.host_static_pubkey != offer.host_static_pubkey {
+            return Err(WireError::Offer {
+                message: "the offer's host key differs from the key pinned for this host; \
+                          forget the host to pair it afresh"
+                    .to_owned(),
+            });
+        }
+    }
     let key = DeviceKey::load_or_create(custody_dir)?;
     let session = match dial(
         &endpoints,
@@ -234,11 +327,10 @@ pub(crate) async fn pair(
     {
         Ok(session) => session,
         Err(e) => {
-            // Re-pairing an already paired host with an offer whose key the
-            // host refuses: the existing record latches; a first pair has
-            // no record and nothing to latch.
-            if matches!(e, WireError::PeerChanged) {
-                mark_repair(custody_dir, offer.host_id.as_str(), true)?;
+            // The host refused the key we already pin: the existing record
+            // takes the flag. A first pair has no record and nothing to mark.
+            if pinned.is_some() {
+                mark_refusal(custody_dir, offer.host_id.as_str(), &e)?;
             }
             return Err(e);
         }
@@ -263,7 +355,8 @@ pub(crate) async fn pair(
         admin: redeemed.scope.admin(),
         expires_at_ms: redeemed.expires_at_ms,
         paired_at_ms: now_ms(),
-        repair: false,
+        repair: None,
+        notice: None,
     };
     save(custody_dir, record.clone(), &redeemed.device_token)?;
     let hello = crate::api::hello(
@@ -280,18 +373,7 @@ pub(crate) async fn pair(
             // The pairing stays saved to retry; a 4401 or 4403 on the very
             // first hello is still the host refusing this device, so the
             // re-pair latch is set exactly as it would be on a later connect.
-            if matches!(
-                e,
-                WireError::Closed {
-                    code: Some(
-                        ainb_hangar_proto::peer_close::UNAUTHENTICATED
-                            | ainb_hangar_proto::peer_close::REVOKED
-                    ),
-                    ..
-                }
-            ) {
-                mark_repair(custody_dir, &record.host_id, true)?;
-            }
+            mark_refusal(custody_dir, &record.host_id, &e)?;
             Err(e)
         }
     }
@@ -339,24 +421,79 @@ mod tests {
             admin: false,
             expires_at_ms: 1,
             paired_at_ms: 2,
-            repair: false,
+            repair: None,
+            notice: None,
+        }
+    }
+
+    fn closed(code: Option<u16>, retryable: bool) -> WireError {
+        WireError::Closed {
+            code,
+            reason: String::new(),
+            retryable,
+            retry_after_ms: None,
         }
     }
 
     #[test]
-    fn the_repair_latch_sets_clears_and_survives_an_old_index() {
+    fn refusals_set_repair_or_notice_and_retryable_closes_set_nothing() {
+        assert_eq!(
+            refusal_flags(&WireError::PeerChanged),
+            (Some("peer_changed"), None)
+        );
+        assert_eq!(
+            refusal_flags(&closed(Some(4401), false)),
+            (Some("unauthenticated"), None)
+        );
+        assert_eq!(
+            refusal_flags(&closed(Some(4403), false)),
+            (Some("revoked"), None)
+        );
+        assert_eq!(
+            refusal_flags(&closed(Some(4409), false)),
+            (None, Some("incompatible"))
+        );
+        assert_eq!(
+            refusal_flags(&closed(Some(4999), false)),
+            (None, Some("unknown_code"))
+        );
+        assert_eq!(refusal_flags(&closed(None, true)), (None, None));
+        assert_eq!(refusal_flags(&closed(Some(4429), true)), (None, None));
+        assert_eq!(refusal_flags(&closed(Some(4503), true)), (None, None));
+
         let dir = tempfile::tempdir().unwrap();
         save(dir.path(), record("h1"), "mdd_one").unwrap();
-        mark_repair(dir.path(), "h1", true).unwrap();
-        assert!(find(dir.path(), "h1").unwrap().unwrap().repair);
-        mark_repair(dir.path(), "nope", true).unwrap();
-        mark_repair(dir.path(), "h1", false).unwrap();
-        assert!(!find(dir.path(), "h1").unwrap().unwrap().repair);
-        // An index written before the field reads as not latched.
-        let mut old = serde_json::to_value(vec![record("h2")]).unwrap();
+        mark_refusal(dir.path(), "h1", &closed(Some(4403), false)).unwrap();
+        mark_refusal(dir.path(), "h1", &closed(Some(4409), false)).unwrap();
+        let r = find(dir.path(), "h1").unwrap().unwrap();
+        assert_eq!(
+            (r.repair.as_deref(), r.notice.as_deref()),
+            (Some("revoked"), Some("incompatible"))
+        );
+        mark_refusal(dir.path(), "h1", &closed(None, true)).unwrap();
+        assert_eq!(
+            find(dir.path(), "h1").unwrap().unwrap().repair.as_deref(),
+            Some("revoked")
+        );
+        mark_refusal(dir.path(), "nope", &WireError::PeerChanged).unwrap();
+        clear_flags(dir.path(), "h1").unwrap();
+        let r = find(dir.path(), "h1").unwrap().unwrap();
+        assert_eq!((r.repair, r.notice), (None, None));
+        // A successful pair replaces the record whole, flags cleared.
+        mark_refusal(dir.path(), "h1", &WireError::PeerChanged).unwrap();
+        save(dir.path(), record("h1"), "mdd_two").unwrap();
+        assert_eq!(find(dir.path(), "h1").unwrap().unwrap().repair, None);
+        // An index written before the fields, or with the old bool, reads.
+        let mut old = serde_json::to_value(vec![record("h2"), record("h3")]).unwrap();
         old[0].as_object_mut().unwrap().remove("repair");
+        old[0].as_object_mut().unwrap().remove("notice");
+        old[1]["repair"] = serde_json::json!(true);
         std::fs::write(dir.path().join(INDEX_FILE), old.to_string()).unwrap();
-        assert!(!find(dir.path(), "h2").unwrap().unwrap().repair);
+        assert_eq!(find(dir.path(), "h2").unwrap().unwrap().repair, None);
+        assert_eq!(
+            find(dir.path(), "h3").unwrap().unwrap().repair.as_deref(),
+            Some("revoked")
+        );
     }
 
     #[test]
