@@ -4,6 +4,17 @@ import { FlatList, Pressable, StyleSheet, Text, View } from "react-native";
 import { colors } from "../src/theme";
 import { useWireQuery } from "../src/wire/context";
 
+/** Copy for the latch values lane E's record can carry; an unknown value still shows and still blocks. */
+const REPAIR_COPY: Record<string, string> = {
+  revoked: "revoked or expired, pair again",
+  identity: "host no longer accepts this device, pair again",
+  peer_changed: "host key changed, pair again with a fresh offer",
+};
+const NOTICE_COPY: Record<string, string> = {
+  update_required: "update the app or the host",
+  unknown_close: "closed with an unknown code, check the host",
+};
+
 export default function Hosts() {
   const { data: hosts, error } = useWireQuery((w) => w.hosts(), ["reachability", "closed"]);
   return (
@@ -28,15 +39,11 @@ export default function Hosts() {
               <Text style={styles.name}>{item.displayName}</Text>
               {item.repair ? (
                 <Text style={styles.repair} testID={`repair-${item.hostId}`}>
-                  {item.repair === "revoked"
-                    ? "revoked or expired, pair again"
-                    : item.repair === "peer_changed"
-                      ? "host key changed, pair again with a fresh offer"
-                      : "host no longer accepts this device, pair again"}
+                  {REPAIR_COPY[item.repair] ?? `pair again (${item.repair})`}
                 </Text>
               ) : item.notice ? (
                 <Text style={styles.repair} testID={`notice-${item.hostId}`}>
-                  {item.notice === "update_required" ? "update the app or the host" : "closed with an unknown code, check the host"}
+                  {NOTICE_COPY[item.notice] ?? `check the host (${item.notice})`}
                 </Text>
               ) : (
                 <Text style={item.reachability === "reachable" ? styles.up : styles.down}>
