@@ -2434,6 +2434,12 @@ export type FleetRowFrame = {
 	discovered_at: number,
 	last_observed_at: number,
 	lifecycle_updated_at: number,
+	/**
+	 *  The `fleet/action` fence value (F-1), like `lifecycle_updated_at` is
+	 *  the `fleet/message_send` one: a surface that acts through the mirror
+	 *  needs what it read.
+	 */
+	session_incarnation: string | null,
 	attention_updated_at: number,
 	model: string | null,
 	reasoning_effort: string | null,
