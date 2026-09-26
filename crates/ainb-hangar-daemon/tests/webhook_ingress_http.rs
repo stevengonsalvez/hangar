@@ -266,3 +266,107 @@ async fn event_filter_fires_on_match_and_filters_on_mismatch() {
         "the matching event fires once"
     );
 }
+
+/// Send raw bytes, optionally half-close, and return the response status.
+fn raw_status(port: u16, bytes: &[u8], half_close: bool) -> u16 {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    stream.write_all(bytes).expect("write");
+    if half_close {
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+    }
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).to_string();
+    text.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0)
+}
+
+/// Hostile framing over a real socket: every smuggling shape is a 400, a
+/// short body is a 400, a slow head is a 408, and nothing fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostile_requests_are_refused_and_fire_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in(dir.path()).await.unwrap();
+    const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    seed(store.pool(), dir.path(), SECRET, None).await;
+    let port = start_ingress(store.pool().clone(), dir.path().to_path_buf()).await;
+    let body = br#"{"event":"push"}"#;
+    let sig = compute_signature(SECRET.as_bytes(), body);
+    let head = |framing: &str| {
+        let mut b = format!(
+            "POST /hangar/webhook/ap-1 HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Hangar-Signature: {sig}\r\n{framing}\r\n"
+        )
+        .into_bytes();
+        b.extend_from_slice(body);
+        b
+    };
+    let len = body.len();
+    let cases = [
+        format!("Transfer-Encoding: chunked\r\nContent-Length: {len}\r\n"),
+        format!("Content-Length: {len}\r\nContent-Length: {len}\r\n"),
+        "Content-Length: -1\r\n".to_string(),
+        format!("Content-Length: +{len}\r\n"),
+        "Content-Length: 12345678901234567890123\r\n".to_string(),
+        format!("Content-Length : {len}\r\n"),
+        format!("Content-Length: {len}\r\n Folded: x\r\n"),
+    ];
+    for framing in cases {
+        let status = tokio::task::spawn_blocking({
+            let bytes = head(&framing);
+            move || raw_status(port, &bytes, true)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 400, "{framing:?}");
+    }
+
+    // Oversized head, oversized declared body, short body.
+    let mut big = b"POST /hangar/webhook/ap-1 HTTP/1.1\r\nX: ".to_vec();
+    big.extend(std::iter::repeat_n(b'a', 70 * 1024));
+    big.extend_from_slice(b"\r\n\r\n");
+    let oversized_body =
+        b"POST /hangar/webhook/ap-1 HTTP/1.1\r\nContent-Length: 70000\r\n\r\n".to_vec();
+    let short = b"POST /hangar/webhook/ap-1 HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc".to_vec();
+    for (name, bytes) in [
+        ("big head", big),
+        ("big body", oversized_body),
+        ("short", short),
+    ] {
+        let status = tokio::task::spawn_blocking(move || raw_status(port, &bytes, true))
+            .await
+            .unwrap();
+        assert_eq!(status, 400, "{name}");
+    }
+
+    // A slow head: never finished, never closed. The deadline answers 408.
+    let started = std::time::Instant::now();
+    let status = tokio::task::spawn_blocking(move || {
+        raw_status(port, b"POST /hangar/webhook/ap-1 HTTP/1.1\r\n", false)
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, 408);
+    assert!(started.elapsed() < Duration::from_secs(9));
+
+    assert_eq!(
+        count(store.pool(), "autopilot_run").await,
+        0,
+        "nothing fired"
+    );
+}
+
+/// Connections past the cap are turned away with 503 instead of queuing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_past_the_cap_get_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in(dir.path()).await.unwrap();
+    let port = start_ingress(store.pool().clone(), dir.path().to_path_buf()).await;
+    let mut idle = Vec::new();
+    for _ in 0..ainb_hangar_daemon::webhook_ingress::MAX_CONNECTIONS {
+        idle.push(TcpStream::connect(("127.0.0.1", port)).unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = tokio::task::spawn_blocking(move || raw_status(port, b"", true)).await.unwrap();
+    assert_eq!(status, 503);
+    drop(idle);
+}
