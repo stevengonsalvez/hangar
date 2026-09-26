@@ -2754,12 +2754,12 @@ This is ATC's durable, human-readable memory. Append one dated line per action\n
     )
 }
 
-/// The hangar home a hook script resolves: `$AINB_HANGAR_HOME`, else
-/// `$AINB_HOME`, else `~/.agents-in-a-box` (the same order `ainb-hook.sh`
-/// applies).
+/// The hangar home the daemon and `ainb-hook.sh` both resolve:
+/// `$AINB_HANGAR_HOME`, else `~/.agents-in-a-box`. Never `$AINB_HOME`, so the
+/// setup never points hooks at files the daemon did not write.
 fn hook_hangar_home() -> Option<std::path::PathBuf> {
     std::env::var_os("AINB_HANGAR_HOME")
-        .or_else(|| std::env::var_os("AINB_HOME"))
+        .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".agents-in-a-box")))
 }
