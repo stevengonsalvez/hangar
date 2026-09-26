@@ -55,6 +55,9 @@ pub enum NoiseError {
     Decrypt,
     /// A handshake message carried a payload; version 1 sends none. Fatal.
     HandshakePayload(usize),
+    /// Message 1 named a low-order device static key ([`is_low_order`]): a
+    /// session keyed on it is not secret. Fatal: the host closes 4401.
+    LowOrderKey,
     /// A call out of turn: writing when it is the other side's turn, reading
     /// after the handshake finished, or a session from an unfinished
     /// handshake.
@@ -86,6 +89,7 @@ impl std::fmt::Display for NoiseError {
             Self::Prologue(e) => write!(f, "noise prologue: {e}"),
             Self::Decrypt => f.write_str("noise message did not decrypt"),
             Self::HandshakePayload(n) => write!(f, "handshake message carried a {n}-byte payload"),
+            Self::LowOrderKey => f.write_str("handshake named a low-order static key"),
             Self::State(what) => write!(f, "noise state: {what}"),
             Self::TooLarge(n) => write!(f, "{n} bytes do not fit one noise message"),
             Self::Exhausted => f.write_str("noise nonce exhausted"),
@@ -115,7 +119,10 @@ fn params() -> NoiseParams {
 }
 
 /// An X25519 static key pair. Zeroed when dropped.
-#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+///
+/// No `PartialEq`: comparing private keys with `==` is not constant time, and
+/// nothing needs it. Compare `public` where an identity check is wanted.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct Keypair {
     /// The private key. Never logged.
     pub private: [u8; KEY_LEN],
@@ -181,9 +188,19 @@ pub fn is_low_order(public: &[u8; KEY_LEN]) -> bool {
     out.iter().all(|b| *b == 0)
 }
 
+/// F2: the host's check on the device static key message 1 named.
+fn refuse_low_order(remote: Option<[u8; KEY_LEN]>) -> Result<(), NoiseError> {
+    match remote {
+        Some(key) if is_low_order(&key) => Err(NoiseError::LowOrderKey),
+        _ => Ok(()),
+    }
+}
+
 /// A handshake in progress.
 pub struct Handshake {
     state: HandshakeState,
+    /// Set once a message was refused; every later call fails.
+    refused: bool,
 }
 
 impl std::fmt::Debug for Handshake {
@@ -209,7 +226,10 @@ pub fn initiator(
         .remote_public_key(host_static_pub)
         .prologue(&prologue)
         .build_initiator()?;
-    Ok(Handshake { state })
+    Ok(Handshake {
+        state,
+        refused: false,
+    })
 }
 
 /// The host side: the host's static key, and the carrier and host id of the
@@ -224,12 +244,18 @@ pub fn responder(
         .local_private_key(host_static)
         .prologue(&prologue)
         .build_responder()?;
-    Ok(Handshake { state })
+    Ok(Handshake {
+        state,
+        refused: false,
+    })
 }
 
 impl Handshake {
     /// Write this side's next handshake message (empty payload).
     pub fn write_message(&mut self) -> Result<Vec<u8>, NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if self.state.is_handshake_finished() || !self.state.is_my_turn() {
             return Err(NoiseError::State("not this side's turn to write"));
         }
@@ -239,8 +265,12 @@ impl Handshake {
         Ok(out)
     }
 
-    /// Read the other side's next handshake message. A payload is refused.
+    /// Read the other side's next handshake message. A payload is refused,
+    /// and on the host so is a low-order device static key in message 1.
     pub fn read_message(&mut self, message: &[u8]) -> Result<(), NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if self.state.is_handshake_finished() || self.state.is_my_turn() {
             return Err(NoiseError::State("not this side's turn to read"));
         }
@@ -250,7 +280,11 @@ impl Handshake {
         let mut payload = vec![0u8; MAX_NOISE_MESSAGE];
         let len = self.state.read_message(message, &mut payload)?;
         if len != 0 {
+            self.refused = true;
             return Err(NoiseError::HandshakePayload(len));
+        }
+        if !self.state.is_initiator() {
+            refuse_low_order(self.raw_remote_static()).inspect_err(|_| self.refused = true)?;
         }
         Ok(())
     }
@@ -267,6 +301,9 @@ impl Handshake {
 
     /// The transport session. The handshake must be finished.
     pub fn into_session(self) -> Result<Session, NoiseError> {
+        if self.refused {
+            return Err(NoiseError::State("handshake was refused"));
+        }
         if !self.state.is_handshake_finished() {
             return Err(NoiseError::State("handshake is not finished"));
         }
@@ -502,5 +539,36 @@ mod tests {
         assert_eq!(client.encrypt_frame(&ping), Err(NoiseError::Exhausted));
         host.opener.nonce = u64::MAX;
         assert_eq!(host.decrypt_frame(&[0u8; 32]), Err(NoiseError::Exhausted));
+    }
+
+    /// F2: a low-order device static is refused. A real peer cannot send one
+    /// (its public key comes from a clamped private key), so the guard the
+    /// responder runs after message 1 is exercised directly.
+    #[test]
+    fn the_responder_refuses_a_low_order_device_static() {
+        let mut one = [0u8; KEY_LEN];
+        one[0] = 1;
+        for low in [[0u8; KEY_LEN], one] {
+            assert_eq!(refuse_low_order(Some(low)), Err(NoiseError::LowOrderKey));
+        }
+        let genuine = generate_keypair().unwrap();
+        assert_eq!(refuse_low_order(Some(genuine.public)), Ok(()));
+        assert_eq!(refuse_low_order(None), Ok(()));
+        assert!(NoiseError::LowOrderKey.is_fatal());
+    }
+
+    /// A refused handshake stays refused.
+    #[test]
+    fn a_refused_handshake_refuses_every_later_call() {
+        let host = generate_keypair().unwrap();
+        let id = HostId::parse(HOST).unwrap();
+        let mut r = responder(&host.private, CarrierKind::Lan, &id).unwrap();
+        r.refused = true;
+        assert!(matches!(
+            r.read_message(&[0; 96]),
+            Err(NoiseError::State(_))
+        ));
+        assert!(matches!(r.write_message(), Err(NoiseError::State(_))));
+        assert!(matches!(r.into_session(), Err(NoiseError::State(_))));
     }
 }
