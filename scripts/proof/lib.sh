@@ -6,18 +6,23 @@
 #   $PROOF_WORLD/
 #     home/      HOME            (~/.agents-in-a-box lives here, never the real one; it is
 #                                 also AINB_HANGAR_HOME, the private daemon's home)
-#     tmux/      TMUX_TMPDIR     (two private tmux servers, see below)
+#     tmux/      TMUX_TMPDIR     (the fixture tmux server, see below)
+#     tmux.sock  PROOF_TMUX_SOCK (the harness tmux server, see below)
 #     bin/       first on PATH   (the `claude` fixture agent and the `headroom` stub)
 #     repo/      the git repository fixture sessions are spawned from
 #
-# Two tmux servers, both under $TMUX_TMPDIR, never the box's own:
+# Two tmux servers, both inside the world, never the box's own:
 #
-#   -L proof   hosts the TUI panes this harness types into and captures
-#   default    the one `ainb run` and the TUI itself use for agent sessions
+#   harness    `tmux -S $PROOF_TMUX_SOCK` (ptmux): an explicit socket path in
+#              the world, so no name lookup can resolve to a server outside
+#              it. Hosts the TUI panes this harness types into and captures.
+#   fixture    the default server under $TMUX_TMPDIR (ftmux), the one `ainb
+#              run` and the TUI itself use for agent sessions.
 #
-# The TUI runs with TMUX unset. Inside a `-L proof` pane it would otherwise
-# inherit that server as "its" tmux and list the harness panes instead of the
-# fixture sessions.
+# ptmux always runs with TMUX unset, so a harness call never talks to a server
+# named by an inherited TMUX. The TUI also runs with TMUX unset: inside a
+# harness pane it would otherwise inherit that server as "its" tmux and list
+# the harness panes instead of the fixture sessions.
 #
 # Nothing here is killed by pattern. Sessions are killed by exact name, and a
 # process is only signalled when its environment carries this world's
@@ -140,6 +145,8 @@ world_up() {
   # hook-raised card ever reaches the daemon.
   export AINB_HANGAR_HOME="$HOME/.agents-in-a-box"
   export TMUX_TMPDIR="$PROOF_WORLD/tmux"
+  # The harness server's socket: a path, never a name (see the header).
+  export PROOF_TMUX_SOCK="$PROOF_WORLD/tmux.sock"
   unset TMUX TMUX_PANE
   mkdir -p "$HOME/.agents-in-a-box/config" "$TMUX_TMPDIR" "$PROOF_WORLD/bin"
   PATH="$PROOF_WORLD/bin:${AINB_BIN%/*}:$PROOF_BASE_PATH"
@@ -212,7 +219,7 @@ world_down() {
 # tmux: the harness server and the fixture server
 # ---------------------------------------------------------------------------
 
-ptmux() { tmux -L proof "$@"; }
+ptmux() { env -u TMUX tmux -S "$PROOF_TMUX_SOCK" "$@"; }
 ftmux() { tmux "$@"; }
 
 # pane_text <session> [-e]: the visible screen of a harness pane.

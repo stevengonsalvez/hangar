@@ -55,8 +55,9 @@ The internal hostname is replaced by `<host>` in every capture and observation.
 $PROOF_WORLD/                       mktemp -d, removed at the end
   home/                   HOME
     .agents-in-a-box/     also AINB_HANGAR_HOME
-  tmux/                   TMUX_TMPDIR: server `-L proof` hosts the harness
-                          panes; the default server holds `ainb run` sessions
+  tmux/                   TMUX_TMPDIR: the default server holds `ainb run` sessions
+  tmux.sock               PROOF_TMUX_SOCK: the harness server, reached by explicit
+                          socket path (`tmux -S`), never by name; hosts the harness panes
   bin/                    first on PATH: `claude` fixture agent, `headroom` stub
   repo/                   git repository the fixture sessions are spawned from
 ```
@@ -68,7 +69,7 @@ Decisions that are easy to get wrong:
   `~/.agents-in-a-box/events.jsonl`. Split them and no hook-raised card ever
   reaches the daemon.
 - **The TUI and `ainb web` run with `TMUX` and `TMUX_PANE` unset.** Inside a
-  `-L proof` pane they would otherwise treat the harness server as their tmux.
+  harness pane they would otherwise treat the harness server as their tmux.
   The one exception is `issue-1094-own-session`, which keeps `TMUX` on purpose
   so the TUI lists the tmux session it runs in.
 - **The fixture agent** is a bash loop named `claude` that prints
