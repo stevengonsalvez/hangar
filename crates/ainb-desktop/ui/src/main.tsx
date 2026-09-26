@@ -3,7 +3,7 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AgentState, FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
-import { ackTurn, readAcks, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
+import { ackTurn, pruneAcks, readAcks, rowAckKey, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
 import {
@@ -18,7 +18,7 @@ import {
   shellUsage,
   SUBSCRIBED,
 } from "./subscription.ts";
-import { allSessions, label } from "./sessions.ts";
+import { allSessions, label, ringFor } from "./sessions.ts";
 import { ROOT_SELECTORS } from "./selectors.ts";
 import { AcpCard } from "./acp.tsx";
 import { transcriptIntent, transcriptView } from "./acp.ts";
@@ -34,7 +34,8 @@ import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
 import { Palette } from "./palette.tsx";
 import { createComposerFlow } from "./composer.ts";
-import { cardForSession, statusForTarget, statusKey } from "./status.ts";
+import { cardForSession, statusForTarget } from "./status.ts";
+import { TerminalTab } from "./terminal_tab.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { Titlebar } from "./titlebar.tsx";
@@ -205,6 +206,24 @@ function Shell() {
       return next;
     });
   };
+  // Prune acks to what this window can still see: the cards, and the rows
+  // whose Done is only a chip. A chip that clears drops its row ack, so its
+  // next Done shows again, and storage never grows with every session ever.
+  createEffect(() => {
+    // Not before both frames have landed: an empty first read would prune
+    // every ack this viewer stored last time.
+    const view = agentStatus()?.view;
+    if (view === null || view === undefined || sessions() === undefined) return;
+    const live = new Set<string>(view.cards.map((card) => card.session_key));
+    for (const row of allSessions(sessions())) {
+      if (ringFor(row) === "Done") live.add(rowAckKey(row.id));
+    }
+    setAcks((current) => {
+      const next = pruneAcks(current, live);
+      if (next !== current) writeAcks(safeStorage(), next);
+      return next;
+    });
+  });
   /** `key`'s own card, when it names a session with one: the join `status.ts`
    * uses, so opening a tab acks the exact turn its glyph shows. */
   const cardForTabKey = (key: string) => {
@@ -230,9 +249,14 @@ function Shell() {
       closeTranscript();
       closeSettings();
       focusTab(key, byHost);
-      // Opening a session acks the Done its card shows, on every surface.
+      // Opening a session acks the Done it shows, on every surface: its
+      // card's turn, or, for a Done that is only a chip, the row itself.
       const card = cardForTabKey(key);
       if (card !== undefined) ackSession(card.session_key, card.evidence_observed_at);
+      else {
+        const target = tabs().find((candidate) => candidate.key === key)?.target;
+        if (target?.kind === "session") ackSession(rowAckKey(target.id), 0);
+      }
     }
   };
   /**
@@ -683,37 +707,16 @@ function Shell() {
                 )}
               </Show>
               <For each={tabs()}>
-                {(tab) => {
-                  const status = () => tabStatus(tab);
-                  return (
-                    <span
-                      class="tab"
-                      classList={{ active: showing("terminal") && tab.key === active() }}
-                      data-state={tab.state}
-                      data-status={status() ? statusKey(status()!) : undefined}
-                    >
-                      <button
-                        type="button"
-                        class="tab-title"
-                        aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
-                        onClick={() => choose(tab)}
-                      >
-                        <Show when={status() !== null}>
-                          <span class="tab-glyph" aria-hidden="true" />
-                        </Show>
-                        {title(tab)}
-                      </button>
-                      <button
-                        type="button"
-                        class="tab-close"
-                        aria-label={`Close ${title(tab)}`}
-                        onClick={() => void invoke("terminal_close", { key: tab.key })}
-                      >
-                        ×
-                      </button>
-                    </span>
-                  );
-                }}
+                {(tab) => (
+                  <TerminalTab
+                    tab={tab}
+                    title={title(tab)}
+                    active={showing("terminal") && tab.key === active()}
+                    status={tabStatus(tab)}
+                    onChoose={() => choose(tab)}
+                    onClose={() => void invoke("terminal_close", { key: tab.key })}
+                  />
+                )}
               </For>
             </nav>
             {/* One banner per open request, latched for a short grace across
