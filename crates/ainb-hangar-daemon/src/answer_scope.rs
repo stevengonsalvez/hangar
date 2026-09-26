@@ -25,17 +25,15 @@ use ainb_hangar_store::repo::attention::AttentionKind;
 
 use crate::rpc::auth::Caller;
 
-/// The scope column a caller answers from.
-///
-/// Today every caller on the unix leg is the operator: `Caller` has no device
-/// arm until R1-04 (#71) lands, and a Pal credential never reaches
-/// `attention/answer` (its method list excludes it). When the device arm
-/// arrives it maps to the device's own column here, and the gate below applies
-/// with no other change.
+/// The scope column a caller answers from: the operator column for every
+/// unix-leg caller (a Pal credential never reaches `attention/answer`, its
+/// method list excludes it), the device's own column for a paired device.
+/// `None` for a device scope with an unknown base, which is refused.
 #[must_use]
-pub const fn column_of(caller: &Caller) -> ScopeColumn {
+pub fn column_of(caller: &Caller) -> Option<ScopeColumn> {
     match caller {
-        Caller::Operator | Caller::Pal { .. } => ScopeColumn::Operator,
+        Caller::Operator | Caller::Pal { .. } => Some(ScopeColumn::Operator),
+        Caller::Device { scope, .. } => scope.column(),
     }
 }
 
@@ -141,13 +139,42 @@ mod tests {
     }
 
     #[test]
-    fn every_current_caller_answers_from_the_operator_column() {
-        assert_eq!(column_of(&Caller::Operator), ScopeColumn::Operator);
+    fn callers_answer_from_their_own_column() {
+        use ainb_hangar_proto::devices::DeviceScope;
+        assert_eq!(column_of(&Caller::Operator), Some(ScopeColumn::Operator));
         assert_eq!(
             column_of(&Caller::Pal {
                 scope_key: "s".into()
             }),
-            ScopeColumn::Operator
+            Some(ScopeColumn::Operator)
         );
+        for (scope, column) in [
+            (DeviceScope::MOBILE, ScopeColumn::Mobile),
+            (DeviceScope::MOBILE_TYPE, ScopeColumn::MobileType),
+            (DeviceScope::DESKTOP, ScopeColumn::Desktop),
+        ] {
+            let phone = Caller::Device {
+                device_id: "d1".into(),
+                scope,
+            };
+            assert_eq!(column_of(&phone), Some(column));
+        }
+        // A phone may still answer a plain question, never an approval.
+        let phone = Caller::Device {
+            device_id: "d1".into(),
+            scope: DeviceScope::MOBILE,
+        };
+        let column = column_of(&phone).unwrap();
+        assert!(answer_allowed(
+            column,
+            AttentionKind::AskUserQuestion,
+            false
+        ));
+        assert!(!answer_allowed(column, AttentionKind::Approval, false));
+        assert!(!answer_allowed(
+            column,
+            AttentionKind::AskUserQuestion,
+            true
+        ));
     }
 }
