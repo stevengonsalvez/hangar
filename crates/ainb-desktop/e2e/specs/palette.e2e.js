@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { click, setPaletteQuery } from "../support.js";
-import { hook, paneText, seeded } from "../world.js";
+import { paneText, raiseHook, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
 const MOD = process.platform === "darwin" ? ["Meta"] : ["Control", "Shift"];
@@ -192,16 +192,13 @@ describe("the palette over a terminal", () => {
     // the pane's.
     const session = seeded()[0];
     await ready(session);
-    // Raised with no session id, matched to the row by its worktree: the
-    // banner over the row's terminal is what this case needs, not the id.
-    hook({
-      event_id: `e2e-palette-ask-${Date.now()}`,
-      ts: Date.now(),
-      session_id: "",
-      cwd: session.cwd,
-      event_type: "PreToolUse",
+    // Raised through the real hook under the id ainb minted for this launch,
+    // as the session's own agent raises it. A row that holds a minted id
+    // takes only requests filed under that id (#101): one raised with no id
+    // is never placed on it by worktree, so the banner would never appear.
+    raiseHook(session, {
+      event: "PreToolUse",
       matcher: "AskUserQuestion",
-      agent: "claude",
       payload: {
         tool_name: "AskUserQuestion",
         tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
