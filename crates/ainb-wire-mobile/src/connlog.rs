@@ -115,6 +115,8 @@ pub struct Entry {
 pub struct ConnLog {
     path: PathBuf,
     lines: Mutex<VecDeque<Entry>>,
+    /// Disk writes, one at a time, apart from the ring's lock.
+    io: Mutex<()>,
 }
 
 fn io_error(e: impl std::fmt::Display) -> WireError {
@@ -140,6 +142,24 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<ConnLog>>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The whole ring as file text.
+fn body_of(lines: &VecDeque<Entry>) -> String {
+    lines
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|l| l + "\n")
+        .collect()
+}
+
+/// Replace the file whole: temp, fsync, rename.
+fn write_whole(path: &Path, body: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 impl ConnLog {
     /// The log under `dir`: the one instance this process holds for that
     /// path, created on first use by reading back the last [`CAPACITY`]
@@ -163,21 +183,37 @@ impl ConnLog {
     pub fn load(dir: &Path) -> Result<Self, WireError> {
         let path = dir.join(LOG_FILE);
         let mut lines = VecDeque::with_capacity(CAPACITY);
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        let mut torn = false;
+        // Bytes, not a String: one torn multibyte character from a kill
+        // mid-write must not hide the 999 good lines before it.
+        if let Ok(bytes) = std::fs::read(&path) {
+            let text = String::from_utf8_lossy(&bytes);
+            torn = !text.is_empty() && !text.ends_with('\n');
             for line in text.lines() {
-                // A torn last line from a kill mid-write is dropped, not fatal.
-                if let Ok(entry) = serde_json::from_str::<Entry>(line) {
-                    if lines.len() == CAPACITY {
-                        lines.pop_front();
+                // A torn line from a kill mid-write is dropped, not fatal.
+                match serde_json::from_str::<Entry>(line) {
+                    Ok(entry) => {
+                        if lines.len() == CAPACITY {
+                            lines.pop_front();
+                        }
+                        lines.push_back(entry);
                     }
-                    lines.push_back(entry);
+                    Err(_) => torn = true,
                 }
             }
         }
-        Ok(Self {
+        let log = Self {
             path,
             lines: Mutex::new(lines),
-        })
+            io: Mutex::new(()),
+        };
+        if torn {
+            // Repair the file from what parsed, so the next append is not
+            // glued onto the fragment and lost with it.
+            let body = body_of(&log.lines.lock().unwrap());
+            let _ = write_whole(&log.path, &body);
+        }
+        Ok(log)
     }
 
     /// Append one event.
@@ -189,27 +225,35 @@ impl ConnLog {
         let Ok(line) = serde_json::to_string(&entry) else {
             return;
         };
-        let mut lines = self.lines.lock().unwrap();
-        let evicted = lines.len() == CAPACITY;
-        if evicted {
-            lines.pop_front();
-        }
-        lines.push_back(entry);
-        if evicted {
+        // The ring is updated under its own lock and released before the
+        // disk write, so `tail()` and the next `log()` never wait on a slow
+        // flash; the writes themselves queue on the io lock, one at a time,
+        // so two loggers never interleave a line or race a rewrite.
+        let body = {
+            let mut lines = self.lines.lock().unwrap();
+            let evicted = lines.len() == CAPACITY;
+            if evicted {
+                lines.pop_front();
+            }
+            lines.push_back(entry);
+            evicted.then(|| body_of(&lines))
+        };
+        let _io = self.io.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match body {
             // ponytail: rewrite the whole file once the ring is full; events
             // are connects and closes, so this is rare and 1,000 lines small.
-            let body: String = lines
-                .iter()
-                .filter_map(|e| serde_json::to_string(e).ok())
-                .map(|l| l + "\n")
-                .collect();
-            let _ = std::fs::write(&self.path, body);
-        } else {
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .and_then(|mut f| writeln!(f, "{line}"));
+            // Written whole through a rename, so a kill mid-rewrite keeps
+            // the old file rather than a truncated one.
+            Some(body) => {
+                let _ = write_whole(&self.path, &body);
+            }
+            None => {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()));
+            }
         }
     }
 
