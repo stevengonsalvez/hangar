@@ -360,6 +360,42 @@ async fn subscribe_replays_after_revision_and_events_arrive_in_order() {
 }
 
 #[tokio::test]
+async fn a_dead_network_wakes_next_event_at_the_heartbeat_death_not_the_tcp_timeout() {
+    // The peer completes the handshake and then never reads or writes
+    // again: no pong, and no close frame to answer ours. Only the
+    // heartbeat can notice, and the app's event pull must return then.
+    let deaf = spawn(
+        hello_then("mobile", |m, _| method_not_found(m)),
+        PeerOpts {
+            answer_pings: false,
+            deaf_after_handshake: true,
+            ..PeerOpts::default()
+        },
+    )
+    .await;
+    let key = DeviceKey::generate().unwrap();
+    let mut config = deaf.config(&key);
+    config.heartbeat = Some(Duration::from_millis(50));
+    let session = Session::connect(config).await.unwrap();
+    session.start_heartbeat();
+    let event = tokio::time::timeout(Duration::from_secs(2), session.next_event())
+        .await
+        .expect("next_event returns at the heartbeat death");
+    assert!(
+        matches!(event, SessionEvent::Closed { code: None, .. }),
+        "{event:?}"
+    );
+    let stats = session.stats();
+    assert!(
+        stats.close_reason.as_deref().unwrap_or("").contains("heartbeat"),
+        "{stats:?}"
+    );
+    // And every later call reports the close as retryable: a network loss.
+    let err = session.request("x", serde_json::json!({})).await.unwrap_err();
+    assert!(err.is_retryable(), "{err:?}");
+}
+
+#[tokio::test]
 async fn heartbeat_declares_dead_after_two_unanswered_pings_and_lives_on_pongs() {
     let silent = spawn(
         hello_then("mobile", |m, _| method_not_found(m)),
