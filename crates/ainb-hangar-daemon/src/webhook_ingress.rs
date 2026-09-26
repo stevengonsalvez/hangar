@@ -279,18 +279,24 @@ pub async fn serve(
     secrets: Arc<WebhookSecretStore>,
     clock: Arc<dyn HangarClock + Send + Sync>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (mut stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "webhook ingress: accept failed");
                 continue;
             }
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            let _ = write_response(&mut stream, 503, "busy").await;
+            continue;
+        };
         let pool = pool.clone();
         let secrets = secrets.clone();
         let clock = clock.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, &pool, &secrets, &*clock).await {
                 tracing::debug!(error = %e, "webhook ingress: connection error");
             }
@@ -306,10 +312,17 @@ async fn handle_connection(
     secrets: &WebhookSecretStore,
     clock: &dyn HangarClock,
 ) -> std::io::Result<()> {
-    let Some(req) = read_request(&mut stream).await? else {
+    let req = match read_request(&mut stream).await? {
+        ReadOutcome::Request(req) => req,
         // Malformed request line / headers, or over the cap: answer 400 and close.
-        write_response(&mut stream, 400, "bad request").await?;
-        return Ok(());
+        ReadOutcome::Malformed => {
+            write_response(&mut stream, 400, "bad request").await?;
+            return Ok(());
+        }
+        ReadOutcome::TimedOut => {
+            write_response(&mut stream, 408, "request timeout").await?;
+            return Ok(());
+        }
     };
 
     // Route: POST /hangar/webhook/<id>. Anything else is a 404.
@@ -358,27 +371,52 @@ struct ParsedRequest {
 /// 64 KiB is generous and caps a memory-exhaustion attempt.
 const MAX_REQUEST: usize = 64 * 1024;
 
-/// Read and parse one HTTP/1.1 request from `stream`. Returns `Ok(None)` on a
-/// malformed head or a request over [`MAX_REQUEST`] (the caller answers 400).
-/// Reads exactly `Content-Length` body bytes after the header terminator.
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<ParsedRequest>> {
-    let Some(head) = local_http::read_head(stream, MAX_REQUEST).await? else {
-        return Ok(None);
+/// Read and parse one HTTP/1.1 request from `stream`, strictly (see
+/// [`local_http`]). Malformed, over [`MAX_REQUEST`], or short is
+/// [`ReadOutcome::Malformed`] (400); head or body slower than
+/// [`REQUEST_DEADLINE`] is [`ReadOutcome::TimedOut`] (408).
+async fn read_request(stream: &mut TcpStream) -> std::io::Result<ReadOutcome> {
+    let head = tokio::time::timeout(REQUEST_DEADLINE, local_http::read_head(stream, MAX_REQUEST));
+    let Ok(head) = head.await else {
+        return Ok(ReadOutcome::TimedOut);
+    };
+    let Some(mut head) = head? else {
+        return Ok(ReadOutcome::Malformed);
     };
     let remaining = MAX_REQUEST.saturating_sub(head.head_len);
-    let method = head.method.clone();
-    let path = head.path.clone();
-    let headers = head.headers.clone();
-    let Some(body) = local_http::read_body(stream, head, remaining).await? else {
-        return Ok(None);
+    let body = tokio::time::timeout(
+        REQUEST_DEADLINE,
+        local_http::read_body(stream, &mut head, remaining),
+    );
+    let Ok(body) = body.await else {
+        return Ok(ReadOutcome::TimedOut);
     };
-    Ok(Some(ParsedRequest {
-        method,
-        path,
-        headers,
+    let Some(body) = body? else {
+        return Ok(ReadOutcome::Malformed);
+    };
+    Ok(ReadOutcome::Request(ParsedRequest {
+        method: head.method,
+        path: head.path,
+        headers: head.headers,
         body,
     }))
 }
+
+/// What reading one request produced.
+enum ReadOutcome {
+    /// A well-formed request.
+    Request(ParsedRequest),
+    /// Malformed, oversized, or short: answer 400.
+    Malformed,
+    /// Head or body did not arrive within [`REQUEST_DEADLINE`]: answer 408.
+    TimedOut,
+}
+
+/// How long the head, and then the body, may take to arrive.
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Most connections served at once; past this a connection gets 503.
+pub const MAX_CONNECTIONS: usize = 64;
 
 /// Extract a top-level `"event"` string from a JSON body, if present. A
 /// non-JSON or event-less body yields `None` (the request simply has no event).
