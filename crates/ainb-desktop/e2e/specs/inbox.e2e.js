@@ -1,16 +1,14 @@
-// The inbox journey (D3p-d): issues created through the daemon's own RPC by
-// a process that is not the window land in the local human's inbox as the
-// daemon aggregates them, the window's inbox page lists them by the daemon's
+// The inbox journey (D3p-d): issues created by a process that is not the
+// window, two through the daemon's own RPC and one from the CLI, land in the
+// local human's inbox, the window's inbox page lists them by the daemon's
 // own entry ids, the sweep from the page reaches the daemon, and the daemon's
 // record is what the page then shows. The ids are asserted by value against
 // `ainb hangar inbox list`, so a page drawing rows from anywhere but section
 // 16 cannot pass.
 //
-// The issues go through `hangar/issue_create` rather than the CLI: the CLI
-// writes the store directly and stamps its own creator, and the inbox is
-// aggregated from the events the daemon's broker carries, for the creator of
-// an unassigned issue, so only an issue the daemon created for `member:me`
-// is one the local human's inbox holds.
+// The CLI writes the store directly, so its entry is its own doing (#49):
+// until then an issue created from the CLI reached no inbox, and this
+// journey went through the RPC alone.
 
 import assert from "node:assert/strict";
 import { rpc } from "../rpc.js";
@@ -53,12 +51,18 @@ describe("the inbox from the window", () => {
       assert.ok(reply.result?.id, `the daemon refused the issue: ${JSON.stringify(reply.error ?? reply)}`);
       issues.push({ id: reply.result.id, title });
     }
+    // The third from the CLI, as a person at a terminal creates one.
+    const cliTitle = `e2e inbox ${stamp} cli`;
+    const created = run(AINB_BIN, ["hangar", "issue", "create", "--title", cliTitle]);
+    const cliId = created.match(/created issue (\S+)/)?.[1];
+    assert.ok(cliId, `the CLI created no issue: ${created}`);
+    issues.push({ id: cliId, title: cliTitle });
     const mine = (entries) => entries.filter((entry) => issues.some((issue) => issue.id === entry.subject_id));
 
     // The daemon's own record first: the entries exist, unread, with ids of
     // the daemon's minting, before the window is asked for anything.
     const seeded = mine(
-      await until(inboxList, (entries) => mine(entries).length === issues.length, "the daemon never aggregated both issues into the inbox"),
+      await until(inboxList, (entries) => mine(entries).length === issues.length, "the inbox never held all three issues"),
     );
     assert.ok(seeded.every((entry) => entry.read_at === null), "the seeded entries start unread");
     const ids = seeded.map((entry) => entry.id);
