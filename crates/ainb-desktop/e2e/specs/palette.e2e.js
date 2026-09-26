@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { click, setPaletteQuery } from "../support.js";
-import { hook, paneText, seeded } from "../world.js";
+import { paneText, raiseHook, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
 const MOD = process.platform === "darwin" ? ["Meta"] : ["Control", "Shift"];
@@ -31,6 +31,9 @@ async function focusState() {
     tabs: document.querySelectorAll(".tab[data-state]").length,
   }));
 }
+
+/** How many lines the agent in `session`'s pane has read so far. */
+const linesRead = (session) => (paneText(session.tmux).match(/agent read:/g) ?? []).length;
 
 /**
  * Give `session`'s terminal the keyboard the way a person does: choose its
@@ -139,7 +142,7 @@ describe("the palette over a terminal", () => {
 
     const typed = await typeIntoPalette(session);
     assert.equal(typed.query, QUERY, `the palette query holds ${JSON.stringify(typed.query)}; focus is on ${typed.focus}`);
-    assert.ok(!typed.pane.includes(`agent read: ${QUERY}`), `the pane read the query:\n${typed.pane}`);
+    assert.ok(!typed.pane.includes(QUERY), `the pane read the query:\n${typed.pane}`);
 
     await browser.keys(["Escape"]);
     await browser.waitUntil(async () => !(await $(".palette-query").isExisting()), {
@@ -181,22 +184,21 @@ describe("the palette over a terminal", () => {
     assert.ok(!paneText(session.tmux).includes("^["), "Escape reached the pane");
   });
 
-  it("leaves the answer banner's composer its keystrokes when a tab is focused under it", async () => {
-    // The same focus request, under the banner's own text field: a question
-    // raised for the session, the cursor put in the composer, and a tab
-    // accelerator pressed. What is typed stays the answer, not the pane's.
+  it("moves the keyboard from the answer banner's composer on a person's tab chord", async () => {
+    // The host's own focus stands down for a text field (the unit tests on
+    // terminalMayTakeFocus pin that), but a tab chord is the person moving
+    // the keyboard: pressed with the cursor in the composer, the terminal
+    // takes it, the draft stays where it was typed, and the next Enter is
+    // the pane's.
     const session = seeded()[0];
     await ready(session);
-    // Raised with no session id, matched to the row by its worktree: the
-    // banner over the row's terminal is what this case needs, not the id.
-    hook({
-      event_id: `e2e-palette-ask-${Date.now()}`,
-      ts: Date.now(),
-      session_id: "",
-      cwd: session.cwd,
-      event_type: "PreToolUse",
+    // Raised through the real hook under the id ainb minted for this launch,
+    // as the session's own agent raises it. A row that holds a minted id
+    // takes only requests filed under that id (#101): one raised with no id
+    // is never placed on it by worktree, so the banner would never appear.
+    raiseHook(session, {
+      event: "PreToolUse",
       matcher: "AskUserQuestion",
-      agent: "claude",
       payload: {
         tool_name: "AskUserQuestion",
         tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
@@ -205,15 +207,28 @@ describe("the palette over a terminal", () => {
     await focusTerminal(session);
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
     await click(".answer-banner .answer-composer input");
-    await browser.keys([...MOD, "1"]);
-    await browser.pause(300);
     await browser.keys(QUERY);
-    await browser.pause(1_500);
-    await shot("banner-typed-after-tab-accelerator");
-    const draft = await $(".answer-banner .answer-composer input").getValue();
-    const focus = await focused();
-    assert.equal(draft, QUERY, `the composer holds ${JSON.stringify(draft)}; focus is on ${focus}`);
-    assert.ok(!paneText(session.tmux).includes(QUERY), "the pane read the answer being typed");
+    assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the composer took the draft");
+
+    // The chord for this session's own tab: another spec's tab may sit ahead
+    // of it in the strip, and the strip and the mounted terminals share one
+    // order.
+    const index = await browser.execute(
+      (key) => [...document.querySelectorAll(".terminal[data-tab]")].findIndex((el) => el.getAttribute("data-tab") === key),
+      session.tmux,
+    );
+    assert.ok(index >= 0, `the session's terminal is mounted`);
+    const before = linesRead(session);
+    await browser.keys([...MOD, String(index + 1)]);
+    await browser.pause(300);
+    await browser.keys(["Enter"]);
+    await browser.waitUntil(() => linesRead(session) > before, {
+      timeout: 30_000,
+      timeoutMsg: `the terminal never took the keyboard from the composer: ${JSON.stringify(await focusState())}`,
+    });
+    await shot("composer-draft-after-tab-chord");
+    assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the draft stayed in the composer");
+    assert.ok(!paneText(session.tmux).includes(QUERY), "the draft never reached the pane");
   });
 
   it("keeps the keystrokes when the chord lands while the tab is still opening", async () => {

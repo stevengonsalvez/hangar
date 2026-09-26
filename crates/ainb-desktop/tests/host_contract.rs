@@ -706,6 +706,7 @@ fn acp_roster() -> ainb_hangar_proto::agent_status::RosterStatusResult {
         discovered_at: 1,
         last_observed_at: 1,
         lifecycle_updated_at: 1,
+        session_incarnation: None,
         attention_updated_at: 1,
         model: None,
         reasoning_effort: None,
@@ -787,6 +788,7 @@ mod transcript {
             .collect();
         TranscriptOutcome::Page(FleetTranscriptListResult {
             next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+            next_before_order: None,
             chunks,
             truncated: false,
         })
