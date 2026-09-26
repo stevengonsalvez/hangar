@@ -19,18 +19,24 @@
 //! once. On a platform whose keychain backend is not implemented (Linux
 //! today), they fall back to a `0600` file beside `peers.json`. Saving writes
 //! the secret first, then the row, so a row never names a pairing whose
-//! secret is missing. Every file write is a temp file plus rename.
+//! secret is missing. Every file write is a uniquely named temp file plus a
+//! rename, and every read-modify-write holds an in-process mutex and an
+//! exclusive lock on `{home}/hangar/peers.lock`, because the CLI and the
+//! desktop are separate processes that both write this file.
 //!
 //! Redeeming an offer (`pair`) and revoking this device before forgetting a
 //! host (`forget`) need the peer transport and land with it.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use ainb_hangar_noise::offer::Endpoint;
 use ainb_hangar_proto::devices::DeviceScope;
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_secrets::{Scope, SecretBackend, SecretBytes, SecretError};
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// The `peers.json` layout version this build reads and writes.
 pub const PEERS_FILE_VERSION: u32 = 1;
@@ -126,7 +132,7 @@ struct PeersFile {
     pairings: Vec<Pairing>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 struct StoredSecret {
     device_static: String,
     device_token: String,
@@ -223,6 +229,37 @@ impl PairingStore {
         self.dir.join("peer-secrets").join(host_id.as_str())
     }
 
+    fn lock_path(&self) -> PathBuf {
+        self.dir.join("peers.lock")
+    }
+
+    /// Run one read-modify-write under both locks: the process mutex (two
+    /// stores in one process) and an exclusive lock on `peers.lock` (the CLI
+    /// and the desktop). Reads take neither: a rename is atomic, so a reader
+    /// always sees a whole file.
+    fn locked<T>(&self, f: impl FnOnce() -> Result<T, PairingError>) -> Result<T, PairingError> {
+        static IN_PROCESS: Mutex<()> = Mutex::new(());
+        let _guard = IN_PROCESS.lock().unwrap_or_else(PoisonError::into_inner);
+        private_dir(&self.dir)?;
+        let path = self.lock_path();
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let file = options.open(&path).map_err(|source| PairingError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        file.lock().map_err(|source| PairingError::Io { path, source })?;
+        let result = f();
+        // Closing the file releases the lock.
+        drop(file);
+        result
+    }
+
     fn read_file(&self) -> Result<PeersFile, PairingError> {
         let path = self.peers_path();
         let text = match std::fs::read_to_string(&path) {
@@ -266,15 +303,17 @@ impl PairingStore {
     /// Save (or replace) a pairing and its secret: the secret first, so the
     /// row never names a pairing without one.
     pub fn save(&self, pairing: &Pairing, secrets: &PairingSecrets) -> Result<(), PairingError> {
-        self.put_secret(&pairing.host_id, secrets)?;
-        let mut file = self.read_file()?;
-        file.version = PEERS_FILE_VERSION;
-        if let Some(row) = file.pairings.iter_mut().find(|p| p.host_id == pairing.host_id) {
-            *row = pairing.clone();
-        } else {
-            file.pairings.push(pairing.clone());
-        }
-        self.write_file(&file)
+        self.locked(|| {
+            self.put_secret(&pairing.host_id, secrets)?;
+            let mut file = self.read_file()?;
+            file.version = PEERS_FILE_VERSION;
+            if let Some(row) = file.pairings.iter_mut().find(|p| p.host_id == pairing.host_id) {
+                *row = pairing.clone();
+            } else {
+                file.pairings.push(pairing.clone());
+            }
+            self.write_file(&file)
+        })
     }
 
     /// The secret half of the pairing for `host_id`.
@@ -285,13 +324,15 @@ impl PairingStore {
 
     /// The user acted on `host_id`. Returns false when it is not paired.
     pub fn touch(&self, host_id: &HostId, now_ms: i64) -> Result<bool, PairingError> {
-        let mut file = self.read_file()?;
-        let Some(row) = file.pairings.iter_mut().find(|p| &p.host_id == host_id) else {
-            return Ok(false);
-        };
-        row.last_active_ms = row.last_active_ms.max(now_ms);
-        self.write_file(&file)?;
-        Ok(true)
+        self.locked(|| {
+            let mut file = self.read_file()?;
+            let Some(row) = file.pairings.iter_mut().find(|p| &p.host_id == host_id) else {
+                return Ok(false);
+            };
+            row.last_active_ms = row.last_active_ms.max(now_ms);
+            self.write_file(&file)?;
+            Ok(true)
+        })
     }
 
     /// Drop the pairing for `host_id` from this surface: the row first, then
@@ -299,18 +340,22 @@ impl PairingStore {
     /// without one. Local only: telling the host to revoke this device is the
     /// transport's job, before it calls this.
     pub fn remove(&self, host_id: &HostId) -> Result<Option<Pairing>, PairingError> {
-        let mut file = self.read_file()?;
-        let Some(at) = file.pairings.iter().position(|p| &p.host_id == host_id) else {
+        self.locked(|| {
+            let mut file = self.read_file()?;
+            let Some(at) = file.pairings.iter().position(|p| &p.host_id == host_id) else {
+                self.delete_secret(host_id)?;
+                return Ok(None);
+            };
+            let removed = file.pairings.remove(at);
+            self.write_file(&file)?;
             self.delete_secret(host_id)?;
-            return Ok(None);
-        };
-        let removed = file.pairings.remove(at);
-        self.write_file(&file)?;
-        self.delete_secret(host_id)?;
-        Ok(Some(removed))
+            Ok(Some(removed))
+        })
     }
 
-    fn encode_secret(secrets: &PairingSecrets) -> Result<Vec<u8>, PairingError> {
+    /// The stored form of a secret. Every temporary that holds secret text is
+    /// zeroed on drop: the stored struct, and the returned bytes.
+    fn encode_secret(secrets: &PairingSecrets) -> Result<Zeroizing<Vec<u8>>, PairingError> {
         use base64::Engine as _;
         let stored = StoredSecret {
             device_static: base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -323,10 +368,14 @@ impl PairingStore {
                 })?
                 .to_string(),
         };
-        serde_json::to_vec(&stored).map_err(|e| PairingError::Malformed {
+        // Sized up front so the buffer does not reallocate and leave an
+        // unzeroed copy behind.
+        let mut out = Zeroizing::new(Vec::with_capacity(256));
+        serde_json::to_writer(&mut *out, &stored).map_err(|e| PairingError::Malformed {
             what: "secret".to_string(),
             detail: e.to_string(),
-        })
+        })?;
+        Ok(out)
     }
 
     fn decode_secret(host_id: &HostId, bytes: &[u8]) -> Result<PairingSecrets, PairingError> {
@@ -335,17 +384,19 @@ impl PairingStore {
             what: format!("secret for {host_id}"),
             detail,
         };
-        let stored: StoredSecret =
+        let mut stored: StoredSecret =
             serde_json::from_slice(bytes).map_err(|e| malformed(e.to_string()))?;
-        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(stored.device_static.as_bytes())
-            .map_err(|e| malformed(e.to_string()))?;
+        let key = Zeroizing::new(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(stored.device_static.as_bytes())
+                .map_err(|e| malformed(e.to_string()))?,
+        );
         if key.len() != 32 {
             return Err(malformed(format!("static key is {} bytes", key.len())));
         }
         Ok(PairingSecrets {
-            device_static: SecretBytes::from(key),
-            device_token: SecretBytes::from(stored.device_token.into_bytes()),
+            device_static: SecretBytes::from(key.as_slice()),
+            device_token: SecretBytes::from(std::mem::take(&mut stored.device_token).into_bytes()),
         })
     }
 
@@ -365,13 +416,14 @@ impl PairingStore {
         if let Custody::Keychain(backend) = &self.custody {
             match backend.get(&Scope::Global, &secret_account(host_id)) {
                 Ok(Some(bytes)) => return Self::decode_secret(host_id, bytes.as_bytes()).map(Some),
-                Ok(None) => return Ok(None),
-                Err(SecretError::NotImplemented) => {}
+                // A miss in the keychain still checks the file custody: a
+                // secret saved while the keychain was unavailable lives there.
+                Ok(None) | Err(SecretError::NotImplemented) => {}
                 Err(e) => return Err(e.into()),
             }
         }
         let path = self.secret_path(host_id);
-        match std::fs::read(&path) {
+        match std::fs::read(&path).map(Zeroizing::new) {
             Ok(bytes) => Self::decode_secret(host_id, &bytes).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(source) => Err(PairingError::Io { path, source }),
@@ -380,9 +432,10 @@ impl PairingStore {
 
     fn delete_secret(&self, host_id: &HostId) -> Result<(), PairingError> {
         if let Custody::Keychain(backend) = &self.custody {
+            // Deleted from the keychain, the file custody is still cleared:
+            // either may hold the secret (see `get_secret`).
             match backend.delete(&Scope::Global, &secret_account(host_id)) {
-                Ok(()) => return Ok(()),
-                Err(SecretError::NotImplemented) => {}
+                Ok(()) | Err(SecretError::NotImplemented) => {}
                 Err(e) => return Err(e.into()),
             }
         }
@@ -395,42 +448,64 @@ impl PairingStore {
     }
 }
 
+/// Create `dir` if needed and make it owner only (`0700`).
+fn private_dir(dir: &Path) -> Result<(), PairingError> {
+    let io = |source| PairingError::Io {
+        path: dir.to_path_buf(),
+        source,
+    };
+    std::fs::create_dir_all(dir).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` as a `0600` file (its directory `0700`), through a
 /// temp file and a rename so a reader never sees half a file.
+///
+/// The temp name is unique per write (process id plus a process-wide
+/// counter) and opened with `create_new`, so two writers never share one
+/// temp file even outside the store's locks.
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), PairingError> {
     use std::io::Write as _;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let io = |path: &Path| {
         let path = path.to_path_buf();
         move |source| PairingError::Io { path, source }
     };
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir).map_err(io(dir))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(io(dir))?;
-    }
+    private_dir(dir)?;
     let file_name = path
         .file_name()
         .map_or_else(|| "pairing".into(), |n| n.to_string_lossy().into_owned());
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp).map_err(io(&tmp))?;
-    file.write_all(bytes).map_err(io(&tmp))?;
-    file.sync_all().map_err(io(&tmp))?;
+    let (tmp, mut file) = loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".{file_name}.{}.{n}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            // A leftover from a crashed process with a reused pid: take the
+            // next number.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io(&tmp)(e)),
+        }
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all()).map_err(io(&tmp));
     drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).map_err(io(&tmp))?;
+    let renamed = written.and_then(|()| std::fs::rename(&tmp, path).map_err(io(path)));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(io(path))
+    renamed
 }
 
 mod b64_32 {
@@ -607,6 +682,94 @@ mod tests {
         assert_eq!(store.secrets(&id(1)).unwrap(), secrets(1));
         store.remove(&id(1)).unwrap();
         assert!(!store.secret_path(&id(1)).exists());
+    }
+
+    /// The review's Medium: concurrent read-modify-writes, each from its own
+    /// store, never leave a broken `peers.json` and never lose a row. Every
+    /// read in between parses.
+    #[test]
+    fn concurrent_saves_and_touches_never_break_the_file() {
+        let home = tempfile::tempdir().unwrap();
+        let home = std::sync::Arc::new(home.path().to_path_buf());
+        let writers: Vec<_> = (1..=8u8)
+            .map(|n| {
+                let home = std::sync::Arc::clone(&home);
+                std::thread::spawn(move || {
+                    let store = PairingStore::with_file_custody(&home);
+                    store.save(&pairing(n), &secrets(n)).unwrap();
+                    for step in 0..40 {
+                        assert!(store.touch(&id(n), 2_000 + step).unwrap());
+                        store.list().expect("every read in between parses");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("a writer");
+        }
+        let store = PairingStore::with_file_custody(&home);
+        let rows = store.list().unwrap();
+        assert_eq!(rows.len(), 8, "no row lost to a racing write");
+        assert!(rows.iter().all(|row| row.last_active_ms == 2_039));
+        let leftovers = std::fs::read_dir(&store.dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// Another process holding `peers.lock` (here, a second open of it, which
+    /// `flock` treats the same way) holds every write off until it lets go.
+    #[test]
+    fn a_write_waits_for_another_holder_of_the_lock_file() {
+        let home = tempfile::tempdir().unwrap();
+        let store = PairingStore::with_file_custody(home.path());
+        store.save(&pairing(1), &secrets(1)).unwrap();
+        let other = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.lock_path())
+            .unwrap();
+        other.lock().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let path = home.path().to_path_buf();
+        let writer = std::thread::spawn(move || {
+            let store = PairingStore::with_file_custody(&path);
+            store.touch(&id(1), 9_000).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "the write went ahead while another holder had the lock"
+        );
+        other.unlock().unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the write completes once the lock is free");
+        writer.join().unwrap();
+        assert_eq!(store.get(&id(1)).unwrap().unwrap().last_active_ms, 9_000);
+    }
+
+    /// A keychain miss still finds a secret the file custody holds, and a
+    /// keychain store's remove clears that file too.
+    #[test]
+    fn a_keychain_miss_falls_back_to_the_file_custody() {
+        let home = tempfile::tempdir().unwrap();
+        PairingStore::with_file_custody(home.path())
+            .save(&pairing(1), &secrets(1))
+            .unwrap();
+        let keychain = PairingStore::with_backend(
+            home.path(),
+            Box::new(ainb_hangar_secrets::InMemoryBackend::new()),
+        );
+        assert_eq!(keychain.secrets(&id(1)).unwrap(), secrets(1));
+        keychain.remove(&id(1)).unwrap();
+        assert!(!keychain.secret_path(&id(1)).exists());
+        assert!(matches!(
+            keychain.secrets(&id(1)),
+            Err(PairingError::MissingSecret(_))
+        ));
     }
 
     #[test]
