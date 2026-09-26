@@ -424,6 +424,35 @@ fn a_chord_or_a_name_on_a_key_only_row_is_refused() {
     assert_eq!(host.refused_from_renderer(&key("s")), None);
 }
 
+/// A name sent off its row's screen is refused for the webview with the
+/// reason, not dropped on the way to the reducer: the answer banner's pick
+/// over the inbox page sent `session_list.select_tab` and `session_list.ask.pick`
+/// while the reducer was on its Inbox screen, and the window logged them as
+/// dispatched (#121). Back on the session list the same name runs.
+#[test]
+fn a_name_off_its_screen_is_refused_with_the_reason() {
+    let log = Log::default();
+    let mut host = host(&[SectionId::Shell], &log);
+    let name = |id: &str, args: serde_json::Value| Intent::Command(CommandId::new(id), args);
+    let select_ask = || name("session_list.select_tab", serde_json::json!({ "tab": "Ask" }));
+
+    // OPEN_INBOX in inbox.ts.
+    let _ = host.dispatch(name("global.go_home", serde_json::Value::Null));
+    let _ = host.dispatch(name("home.inbox", serde_json::Value::Null));
+    assert_eq!(host.state().shell.current_screen, "inbox");
+    let refusal = host
+        .refused_from_renderer(&select_ask())
+        .expect("the session list's tab row is not the inbox screen's");
+    assert_eq!(refusal.command.as_str(), "session_list.select_tab");
+    assert!(refusal.reason.contains("not active on this screen"), "{refusal:?}");
+
+    // CLOSE_INBOX in inbox.ts.
+    let _ = host.dispatch(name("inbox.back", serde_json::Value::Null));
+    let _ = host.dispatch(name("home.sessions", serde_json::Value::Null));
+    assert_eq!(host.state().shell.current_screen, "session_list");
+    assert_eq!(host.refused_from_renderer(&select_ask()), None);
+}
+
 /// Enter confirms whatever the open dialog holds, so it is judged by that
 /// action: on the abtop setup offer, whose selected "Enable" edits Claude
 /// Code's settings, the webview's Enter is refused.
