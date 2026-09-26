@@ -2407,6 +2407,7 @@ mod tests {
             TERMINAL_RESIZE,
             HANGAR_ISSUE_CREATE,
             HANGAR_ISSUE_RUN,
+            WORKTREE_CREATE,
         ];
         for m in declared {
             assert!(
