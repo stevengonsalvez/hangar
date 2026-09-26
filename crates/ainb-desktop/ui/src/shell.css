@@ -373,7 +373,7 @@ body {
 }
 
 /* A small rotating ring, in fixed steps rather than eased, the same busy
-   read as `.ring.running::after`'s (whose keyframes this reuses): the
+   read as the working status glyph (whose keyframes this reuses): the
    composer's Create button and the sidebar's pending card both use it. */
 .spinner {
   display: inline-block;
@@ -444,8 +444,8 @@ body {
 }
 
 /* P4's status vocabulary (spec: "Status vocabulary"): one `data-status`
-   value, five colours, drawn by the sidebar's dot (`.ring`), the board's
-   card and the tab's glyph (`.tab-glyph`) alike, so the same card reads the
+   value, one colour each, drawn by the sidebar's and the tab's glyph
+   (`.status-glyph`) and the board's card alike, so the same card reads the
    same colour on every surface it appears on. `needs-*` all read amber
    except its own `error`, which reads coral like every other error. */
 [data-status] {
@@ -468,37 +468,62 @@ body {
   --status-color: var(--green);
 }
 
-/* The dot fills with the status colour; idle and unverifiable share the
-   quiet default, and unverifiable's own dashed ring is what tells the two
-   apart (spec: "muted dashed"). */
-.ring {
-  display: inline-block;
+[data-status="exited"] {
+  --status-color: var(--muted-foreground);
+}
+
+/* One glyph per status, on a sidebar row and a tab alike (`StatusGlyph`):
+   a shape and a colour, never colour alone. The words ride beside it in a
+   visually hidden label. */
+.status-glyph {
+  display: inline-grid;
+  place-items: center;
   flex-shrink: 0;
-  width: 8px;
-  height: 8px;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  color: var(--status-color, var(--idle));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.status-glyph[data-status^="needs-"]::before {
+  content: "?";
+}
+
+.status-glyph[data-status="needs-error"]::before {
+  content: "!";
+}
+
+.status-glyph[data-status="done"]::before {
+  content: "\2713";
+}
+
+.status-glyph[data-status="idle"]::before {
+  content: "\25CF";
+  font-size: 8px;
+}
+
+.status-glyph[data-status="exited"]::before {
+  content: "\00D7";
+}
+
+/* Unverifiable: a hollow dashed ring, held but unknown. */
+.status-glyph[data-status="unverifiable"] {
+  width: 10px;
+  height: 10px;
+  border: 2px dashed var(--idle);
   border-radius: 50%;
-  background: var(--status-color, var(--idle));
 }
 
-.ring[data-status="unverifiable"] {
-  background: transparent;
-  border: 1px dashed var(--idle);
-}
-
-/* Working: the compositor spinner, a rotating ring drawn in fixed steps
-   rather than eased, the way a busy indicator should read rather than a
-   smooth clock (`--dur-base` already zeroes under reduced motion). */
-.ring[data-status="working"] {
-  position: relative;
-}
-
-.ring[data-status="working"]::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
+/* Working: the compositor spinner, a ring turned in fixed steps. */
+.status-glyph[data-status="working"] {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--status-color);
+  border-top-color: transparent;
   border-radius: 50%;
-  border: 2px solid transparent;
-  border-top-color: var(--blue);
   animation: ring-spin 800ms steps(8, end) infinite;
 }
 
@@ -509,9 +534,9 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ring[data-status="working"]::after {
+  .status-glyph[data-status="working"] {
     animation: none;
-    border-color: var(--blue);
+    border-top-color: var(--status-color);
   }
 }
 
@@ -597,43 +622,6 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--text-sub);
-}
-
-/* The status glyph a session tab carries before its title (P4, spec: "the
-   same small glyph"): one character per `data-status`, on the colour
-   `[data-status]` already set on the tab itself. Decorative (the tab's own
-   text still names the session), so it carries no accessible name of its
-   own. */
-.tab-glyph {
-  display: inline-block;
-  width: 1em;
-  color: var(--status-color, var(--idle));
-  font-weight: 700;
-  text-align: center;
-}
-
-.tab[data-status^="needs-"] .tab-glyph::before {
-  content: "?";
-}
-
-.tab[data-status="needs-error"] .tab-glyph::before {
-  content: "!";
-}
-
-.tab[data-status="working"] .tab-glyph::before {
-  content: "\25D0"; /* ◐ */
-}
-
-.tab[data-status="done"] .tab-glyph::before {
-  content: "\2713"; /* ✓ */
-}
-
-.tab[data-status="idle"] .tab-glyph::before {
-  content: "\25CB"; /* ○ */
-}
-
-.tab[data-status="unverifiable"] .tab-glyph::before {
-  content: "\25CC"; /* ◌ */
 }
 
 .tab-close {
@@ -2077,4 +2065,9 @@ body {
    that draws no box, so the page's own flex layout is unchanged. */
 .shell-content {
   display: contents;
+}
+
+.board-idle-toggle summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }
