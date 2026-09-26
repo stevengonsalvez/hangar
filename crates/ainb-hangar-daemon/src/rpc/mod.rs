@@ -1741,20 +1741,20 @@ async fn handle(
         methods::HANGAR_AGENT_CREATE => handle_agent_create(pool, req).await,
         methods::HANGAR_AGENT_DELETE => handle_agent_delete(pool, req).await,
         methods::HANGAR_AGENT_UPDATE => handle_agent_update(pool, req).await,
-        methods::HANGAR_AGENT_ARCHIVE => handle_agent_archive(pool, req).await,
+        methods::HANGAR_AGENT_ARCHIVE => handle_agent_archive(pool, req, caller).await,
         methods::HANGAR_MEMBERS_LIST => handle_members_list(pool, req).await,
         methods::HANGAR_MEMBER_SET_ROLE => handle_member_set_role(pool, req).await,
         methods::HANGAR_MEMBER_REMOVE => handle_member_remove(pool, req).await,
-        methods::HANGAR_INVITE_CREATE => handle_invite_create(pool, req).await,
-        methods::HANGAR_INVITE_ACCEPT => handle_invite_accept(pool, req).await,
-        methods::HANGAR_INVITE_DECLINE => handle_invite_decline(pool, req).await,
+        methods::HANGAR_INVITE_CREATE => handle_invite_create(pool, req, caller).await,
+        methods::HANGAR_INVITE_ACCEPT => handle_invite_accept(pool, req, caller).await,
+        methods::HANGAR_INVITE_DECLINE => handle_invite_decline(pool, req, caller).await,
         methods::HANGAR_INVITE_REVOKE => handle_invite_revoke(pool, req).await,
         methods::HANGAR_SQUADS_LIST => handle_squads_list(pool, req).await,
         methods::HANGAR_SQUAD_CREATE => handle_squad_create(pool, req).await,
         methods::HANGAR_SQUAD_MEMBER_ADD => handle_squad_member(pool, req, true).await,
         methods::HANGAR_SQUAD_MEMBER_REMOVE => handle_squad_member(pool, req, false).await,
         methods::HANGAR_SQUAD_ASSIGN => handle_squad_assign(pool, req, caller).await,
-        methods::HANGAR_SQUAD_ARCHIVE => handle_squad_archive(pool, req).await,
+        methods::HANGAR_SQUAD_ARCHIVE => handle_squad_archive(pool, req, caller).await,
         methods::HANGAR_SQUAD_MEMBER_ROLE_SET => handle_squad_member_role(pool, req).await,
         methods::HANGAR_SQUAD_INSTRUCTIONS_SET => handle_squad_instructions(pool, req).await,
         methods::HANGAR_SQUAD_FANOUT => handle_squad_fanout(pool, req, caller).await,
@@ -9362,18 +9362,21 @@ fn field_to_nested<T: Clone>(
 async fn handle_agent_archive(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::snapshots::AgentArchiveParams = parse_params(
         req,
         "{ workspace_id, agent_id, archived, archived_by_user_id? }",
     )?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
+    // Who archived: the operator's claim, a device itself (never a claim).
+    let archived_by = acting_user_id(caller, params.archived_by_user_id.as_deref())?;
     let row = snapshots::agent_archive(
         pool,
         ws.as_str(),
         &params.agent_id,
         params.archived,
-        params.archived_by_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        archived_by.as_deref(),
         SystemClock.now_ms(),
     )
     .await
@@ -9489,6 +9492,7 @@ async fn members_list_value(
 async fn handle_invite_create(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::clock::SystemClock;
     use ainb_hangar_store::repo::invitation::InvitationRepo;
@@ -9501,17 +9505,35 @@ async fn handle_invite_create(
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
     let role = MemberRole::parse(&params.role)
         .ok_or_else(|| invalid_params("role must be one of admin/member"))?;
+    // Who invites: the operator's claim, a device itself, so a paired device
+    // cannot send an invitation (an admin one included) as the owner.
+    let inviter = acting_user_id(caller, Some(&params.inviter_user_id))?
+        .unwrap_or_else(|| params.inviter_user_id.clone());
     InvitationRepo::create(
         pool,
         &SystemClock,
         &ws,
-        &params.inviter_user_id,
+        &inviter,
         &params.invitee_email,
         role,
     )
     .await
     .map_err(|e| invitation_repo_err(&e))?;
     members_list_value(pool, &ws).await
+}
+
+/// Refuse a paired device on a call that acts as a named person
+/// (`actor_email`), which a device has no way to be.
+fn refuse_device_for_person(caller: &auth::Caller) -> Result<(), RpcError> {
+    if caller.device_id().is_some() {
+        return Err(RpcError {
+            code: ainb_hangar_proto::auth::UNAUTHORIZED,
+            message: "a paired device cannot accept or decline an invitation for a person"
+                .to_string(),
+            data: None,
+        });
+    }
+    Ok(())
 }
 
 /// Dispatch `hangar/invite_accept` (parity #18): the invitee joins, and the
@@ -9524,12 +9546,16 @@ async fn handle_invite_create(
 async fn handle_invite_accept(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::clock::SystemClock;
     use ainb_hangar_store::repo::invitation::InvitationRepo;
 
     let params: ainb_hangar_proto::snapshots::InviteActParams =
         parse_params(req, "{ workspace_id, invitation_id, actor_email }")?;
+    // `actor_email` names the person acting; a paired device is not a
+    // person with an email, so it cannot accept or decline for one.
+    refuse_device_for_person(caller)?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
     require_invitation_in_workspace(pool, &ws, &params.invitation_id).await?;
     InvitationRepo::accept(
@@ -9548,12 +9574,16 @@ async fn handle_invite_accept(
 async fn handle_invite_decline(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::clock::SystemClock;
     use ainb_hangar_store::repo::invitation::InvitationRepo;
 
     let params: ainb_hangar_proto::snapshots::InviteActParams =
         parse_params(req, "{ workspace_id, invitation_id, actor_email }")?;
+    // `actor_email` names the person acting; a paired device is not a
+    // person with an email, so it cannot accept or decline for one.
+    refuse_device_for_person(caller)?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
     require_invitation_in_workspace(pool, &ws, &params.invitation_id).await?;
     InvitationRepo::decline(
@@ -9761,18 +9791,20 @@ async fn handle_squad_member(
 async fn handle_squad_archive(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::snapshots::SquadArchiveParams = parse_params(
         req,
         "{ workspace_id, squad_id, archived, archived_by_user_id? }",
     )?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
+    let archived_by = acting_user_id(caller, params.archived_by_user_id.as_deref())?;
     let squads = snapshots::squad_archive(
         pool,
         ws.as_str(),
         &params.squad_id,
         params.archived,
-        params.archived_by_user_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        archived_by.as_deref(),
         SystemClock.now_ms(),
     )
     .await
@@ -15109,6 +15141,61 @@ mod tests {
         }
     }
 
+    /// #96 review: identity fields a device could fill in for someone else.
+    /// An invite's inviter and an archive's archiver are the device itself,
+    /// whatever it claims, and a device cannot accept or decline an
+    /// invitation as a named person.
+    #[tokio::test]
+    async fn a_device_cannot_invite_archive_or_accept_as_someone_else() {
+        let laptop = auth::Caller::Device {
+            device_id: "01J0LAPTP".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::DESKTOP,
+        };
+        assert_eq!(
+            acting_user_id(&laptop, Some("owner-user-id")).expect("stamp"),
+            Some("device:01J0LAPTP".to_string()),
+            "an inviter or archiver claim is replaced by the device"
+        );
+        assert_eq!(
+            acting_user_id(&laptop, None).expect("stamp"),
+            Some("device:01J0LAPTP".to_string()),
+            "an omitted archiver is the device, not nobody"
+        );
+        assert_eq!(
+            acting_user_id(&auth::Caller::Operator, Some("owner-user-id")).expect("claim"),
+            Some("owner-user-id".to_string()),
+            "the operator's claim stands"
+        );
+        let refused = refuse_device_for_person(&laptop).expect_err("device");
+        assert_eq!(refused.code, ainb_hangar_proto::auth::UNAUTHORIZED);
+        assert!(refuse_device_for_person(&auth::Caller::Operator).is_ok());
+
+        // Through dispatch: a device accepting an invitation is refused
+        // before any lookup.
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let accept = dispatch_as(
+            store.pool(),
+            &req(
+                methods::HANGAR_INVITE_ACCEPT,
+                serde_json::json!({
+                    "workspace_id": "ws",
+                    "invitation_id": "inv",
+                    "actor_email": "owner@example.com",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &laptop,
+        )
+        .await;
+        assert_eq!(
+            accept.error.as_ref().map(|e| e.code),
+            Some(ainb_hangar_proto::auth::UNAUTHORIZED),
+            "{accept:?}"
+        );
+    }
+
     /// The proto field names that say WHO acts, which a request could fill in
     /// for itself.
     const ACTOR_FIELD_NAMES: &[&str] = &[
@@ -15127,6 +15214,9 @@ mod tests {
         "leader",
         "member",
         "assignee",
+        "inviter_user_id",
+        "archived_by_user_id",
+        "actor_email",
     ];
 
     /// How the daemon treats one actor-named proto field.
@@ -15202,6 +15292,34 @@ mod tests {
             ActorField::InvokerGate,
         ),
         ("IssueRunParams", "invoker_user_id", ActorField::InvokerGate),
+        (
+            "InviteCreateParams",
+            "inviter_user_id",
+            ActorField::Pinned(
+                "acting_user_id (rpc::tests::a_device_cannot_invite_archive_or_accept_as_someone_else)",
+            ),
+        ),
+        (
+            "AgentArchiveParams",
+            "archived_by_user_id",
+            ActorField::Pinned(
+                "acting_user_id (rpc::tests::a_device_cannot_invite_archive_or_accept_as_someone_else)",
+            ),
+        ),
+        (
+            "SquadArchiveParams",
+            "archived_by_user_id",
+            ActorField::Pinned(
+                "acting_user_id (rpc::tests::a_device_cannot_invite_archive_or_accept_as_someone_else)",
+            ),
+        ),
+        (
+            "InviteActParams",
+            "actor_email",
+            ActorField::Pinned(
+                "refuse_device_for_person (rpc::tests::a_device_cannot_invite_archive_or_accept_as_someone_else)",
+            ),
+        ),
         (
             "BoardCardRunParams",
             "invoker_user_id",
