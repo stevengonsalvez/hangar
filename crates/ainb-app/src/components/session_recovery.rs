@@ -967,6 +967,10 @@ impl SessionRecoveryState {
         // Register session in sessions.json so it appears as a Workspace
         // Preserve the original agent_type if known (e.g., Copilot, Codex), otherwise default to Claude
         let agent_type = worktree.agent_type.unwrap_or_default();
+        // A recovered Claude session runs under a fresh id of ainb's, so the
+        // requests it raises from here on land on this record exactly.
+        let claude_session_id = (agent_type == SessionAgentType::Claude)
+            .then(crate::interactive::session_manager::new_claude_session_id);
         let metadata = SessionMetadata {
             session_id,
             tmux_session_name: new_session.clone(),
@@ -981,6 +985,7 @@ impl SessionRecoveryState {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: claude_session_id.clone(),
         };
 
         // Locked RMW (pu4): serialise this recovery re-register against live
@@ -1043,6 +1048,12 @@ impl SessionRecoveryState {
                     None, // model
                     true, // resume_requested — orphan recovery is a resume
                     has_history,
+                    claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: false,
+                        }
+                    }),
                 )
                 .join(" ")
             }
