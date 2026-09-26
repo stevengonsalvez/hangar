@@ -107,13 +107,11 @@ fn remember_host_id(socket: &std::path::Path, host_id: Option<&str>) {
     }
 }
 
-/// Whether `id` is a ULID: 26 characters of Crockford base32, upper case, the
-/// same alphabet migration 0100 checks.
+/// Whether `id` is a minted host id: the proto's one rule (a canonical
+/// 26-character Crockford ULID that fits 128 bits, never `local`), so the
+/// hello boundary and the peer wire accept exactly the same ids.
 fn is_host_id(id: &str) -> bool {
-    id.len() == 26
-        && id
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z'))
+    ainb_hangar_proto::hosts::HostId::parse_minted(id).is_ok()
 }
 
 /// The first host id each socket named. A socket is only ever added, and a
@@ -1480,6 +1478,8 @@ mod tests {
             "01K5A0000000000000000AAAAO",
             "01K5A0000000000000000AAAAU",
             "01k5a0000000000000000aaaaa",
+            // A first character above 7 overflows 128 bits.
+            "81K5A0000000000000000AAAAA",
         ] {
             assert!(!is_host_id(bad), "{bad}");
         }

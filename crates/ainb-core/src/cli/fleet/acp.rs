@@ -93,6 +93,7 @@ pub async fn execute_transcript(matches: &clap::ArgMatches, format: OutputFormat
         .transcript_list(FleetTranscriptListParams {
             session_key,
             after_order,
+            before_order: None,
             limit,
         })
         .await;
