@@ -272,6 +272,11 @@ pub fn install(
             signal = second.as_str(),
             "second shutdown signal during teardown; exiting immediately"
         );
+        // The exit skips every Drop, including the hook listener's own file
+        // removal. Best effort: the next boot removes them regardless.
+        if let Ok(dir) = crate::hangar_dir() {
+            crate::hook_ingress::remove_stale(&dir);
+        }
         std::process::exit(1);
     });
     Handle { cause: rx }
