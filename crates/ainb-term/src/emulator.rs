@@ -24,9 +24,17 @@
 //! The tracker mirrors what the emulator saves and restores: DECSC/DECRC and
 //! `CSI s`/`CSI u` save and restore origin mode and the G0/G1 charsets per
 //! screen, and `?1049h`/`?1049l` save on the primary screen and restore on
-//! the way back, exactly as `TerminalState::dec_save_cursor` does. Not
-//! tracked, because the emulator does not expose it: a pending autowrap
-//! (the cursor sits on the last column after a full row); see `snapshot`.
+//! the way back, exactly as `TerminalState::dec_save_cursor` does.
+//!
+//! A pending autowrap (the cursor parked on the last column after a full
+//! row, the next glyph wrapping) is not exposed by the emulator either, so
+//! the wrapper shadows the fork's own rule: for each grapheme of a print
+//! run, a pending wrap moves to column 0 first, then a glyph whose end
+//! reaches the margin sets the flag (only with autowrap on) and leaves the
+//! cursor where it is. Measured on the fork: SGR, OSC, erase, insert and
+//! delete edits, mode toggles and charset changes keep the flag; cursor
+//! movement, DECSTBM and RIS clear it; DECSC/DECRC save and restore it.
+//! [`Modes::wrap_pending`] is what the snapshot re-enters.
 //!
 //! A panic inside the emulator is contained: the fork lacks upstream's fix for
 //! a divide by zero in inline image placement, and crafted agent output must
@@ -60,9 +68,9 @@ use wezterm_escape_parser::csi::{
 };
 use wezterm_escape_parser::parser::Parser;
 use wezterm_escape_parser::{Action, ControlCode, Esc, EscCode};
-use wezterm_term::{CursorPosition, Terminal, TerminalSize};
+use wezterm_term::{CursorPosition, Terminal, TerminalSize, UnicodeVersion, grapheme_column_width};
 
-use crate::{TermConfig, new_terminal};
+use crate::{TermConfig, UNICODE_VERSION, new_terminal};
 
 /// Environment variable that sets the live window (scrollback rows kept per
 /// pane). Clamped to [`MIN_LIVE_ROWS`]..=[`MAX_LIVE_ROWS`]; unset or
@@ -147,6 +155,7 @@ struct SavedModes {
     origin: bool,
     g0: Charset,
     g1: Charset,
+    wrap_pending: bool,
 }
 
 /// The terminal state the snapshot must replay and the grid does not carry.
@@ -182,6 +191,9 @@ pub struct Modes {
     pub shift_out: bool,
     /// The alternate screen is active (`?1049`, `?1047`, `?47`).
     pub alt: bool,
+    /// The cursor sits on the last column after a full row and the next
+    /// glyph wraps: the fork's `wrap_next`, shadowed here.
+    pub wrap_pending: bool,
     /// DECSC slots, primary screen then alternate screen.
     saved: [Option<SavedModes>; 2],
 }
@@ -204,6 +216,7 @@ impl Default for Modes {
             g1: Charset::Ascii,
             shift_out: false,
             alt: false,
+            wrap_pending: false,
             saved: [None, None],
         }
     }
@@ -226,6 +239,7 @@ impl Modes {
             origin: self.origin,
             g0: self.g0,
             g1: self.g1,
+            wrap_pending: self.wrap_pending,
         });
     }
 
@@ -236,10 +250,72 @@ impl Modes {
         self.origin = saved.origin;
         self.g0 = saved.g0;
         self.g1 = saved.g1;
+        self.wrap_pending = saved.wrap_pending;
+    }
+
+    /// Shadow the fork's print rule over one run of text, from cursor
+    /// column `x`: a pending wrap moves to column 0 first; a glyph whose
+    /// end reaches the margin leaves the cursor and sets the flag when
+    /// autowrap is on; a zero-width cluster joins the previous cell.
+    fn observe_print(&mut self, text: &str, mut x: usize, cols: usize) {
+        let uv = UnicodeVersion {
+            version: UNICODE_VERSION,
+            ambiguous_are_wide: false,
+            cell_widths: None,
+        };
+        for g in text.graphemes(true) {
+            let w = grapheme_column_width(g, Some(&uv));
+            if w == 0 {
+                continue;
+            }
+            if self.wrap_pending {
+                x = 0;
+                self.wrap_pending = false;
+            }
+            if x + w >= cols {
+                self.wrap_pending = self.auto_wrap;
+            } else {
+                x += w;
+            }
+        }
+    }
+
+    /// Whether a non-print action leaves the pending wrap alone. Measured
+    /// on the fork: only cursor movement (including DECSTBM, which homes
+    /// the cursor), the C0 codes that move it, DECOM and RIS clear it.
+    fn observe_wrap(&mut self, action: &Action) {
+        match action {
+            Action::Control(code) => {
+                if !matches!(
+                    code,
+                    ControlCode::Null
+                        | ControlCode::Bell
+                        | ControlCode::ShiftIn
+                        | ControlCode::ShiftOut
+                ) {
+                    self.wrap_pending = false;
+                }
+            }
+            Action::CSI(CSI::Cursor(Cursor::SaveCursor | Cursor::RestoreCursor)) => {}
+            Action::CSI(CSI::Cursor(Cursor::CursorStyle(_))) => {}
+            Action::CSI(CSI::Cursor(_)) => self.wrap_pending = false,
+            Action::CSI(CSI::Mode(
+                Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::OriginMode))
+                | Mode::ResetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::OriginMode)),
+            )) => self.wrap_pending = false,
+            Action::Esc(Esc::Code(
+                EscCode::Index
+                | EscCode::NextLine
+                | EscCode::ReverseIndex
+                | EscCode::CursorPositionLowerLeft,
+            )) => self.wrap_pending = false,
+            _ => {}
+        }
     }
 
     /// Apply one parsed action, mirroring what the emulator does with it.
     fn observe(&mut self, action: &Action, rows: u16) {
+        self.observe_wrap(action);
         match action {
             Action::CSI(CSI::Mode(mode)) => self.observe_mode(mode),
             Action::CSI(CSI::Cursor(Cursor::SaveCursor)) => self.save_cursor(),
@@ -323,6 +399,8 @@ impl Modes {
                 if on && !self.alt {
                     self.save_cursor();
                     self.alt = true;
+                    // The cursor is homed on the cleared alternate screen.
+                    self.wrap_pending = false;
                 } else if !on && self.alt {
                     self.alt = false;
                     self.restore_cursor();
@@ -485,10 +563,27 @@ impl PaneEmulator {
                 actions.insert(0, Action::PrintString(held));
             }
             self.held = take_trailing_cluster(&mut actions);
-            for action in &actions {
-                self.modes.observe(action, rows);
+            // Print runs are performed as one string each, with the cursor
+            // read just before, so the wrap shadow starts from the real
+            // column; every other action is observed and performed in
+            // order.
+            let mut run = String::new();
+            for action in actions {
+                match action {
+                    Action::Print(c) => run.push(c),
+                    Action::PrintString(s) => run.push_str(&s),
+                    other => {
+                        if !run.is_empty() {
+                            self.perform_print(std::mem::take(&mut run));
+                        }
+                        self.modes.observe(&other, rows);
+                        self.term.perform_actions(vec![other]);
+                    }
+                }
             }
-            self.term.perform_actions(actions);
+            if !run.is_empty() {
+                self.perform_print(run);
+            }
         }));
         match outcome {
             Ok(()) => {
@@ -512,13 +607,21 @@ impl PaneEmulator {
             return Ok(());
         };
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            self.term.perform_actions(vec![Action::PrintString(held)]);
+            self.perform_print(held);
         }));
         if outcome.is_err() {
             self.poisoned = true;
             return Err(Poisoned);
         }
         Ok(())
+    }
+
+    /// Shadow the wrap rule over `text` from the real cursor column, then
+    /// print it.
+    fn perform_print(&mut self, text: String) {
+        let x = self.term.cursor_pos().x;
+        self.modes.observe_print(&text, x, usize::from(self.cols));
+        self.term.perform_actions(vec![Action::PrintString(text)]);
     }
 
     /// Whether text is held back, waiting for a flush or the next feed.
@@ -554,6 +657,8 @@ impl PaneEmulator {
         self.cols = cols;
         self.rows = rows;
         self.modes.scroll_region = None;
+        // The emulator re-places the cursor on resize.
+        self.modes.wrap_pending = false;
         Ok(())
     }
 
@@ -968,5 +1073,62 @@ mod tests {
         assert!(p.modes().alt, "?47 only switches");
         p.feed(b"\x1bc").unwrap();
         assert_eq!(*p.modes(), Modes::default());
+    }
+
+    /// The fork's `wrap_next`, shadowed: set by a glyph reaching the
+    /// margin, kept across SGR, OSC and edits, cleared by cursor movement,
+    /// saved and restored by DECSC/DECRC, never set with autowrap off.
+    #[test]
+    fn a_pending_wrap_is_shadowed_from_the_print_rule() {
+        let mut p = pane(10, 4);
+        p.feed(b"012345678").unwrap();
+        p.flush().unwrap();
+        assert!(!p.modes().wrap_pending, "one column free");
+        p.feed(b"9").unwrap();
+        p.flush().unwrap();
+        assert!(p.modes().wrap_pending, "the row is full");
+        assert_eq!(p.cursor().col, 9, "the cursor stays on the last column");
+        for keep in [
+            b"\x1b[31m".as_slice(),
+            b"\x1b[K",
+            b"\x1b]0;t\x07",
+            b"\x1b[?25l",
+            b"\x07",
+            b"\x1b(B",
+            b"\x1b[P",
+        ] {
+            p.feed(keep).unwrap();
+            assert!(p.modes().wrap_pending, "{keep:?} keeps it");
+        }
+        p.feed(b"\x1b7\r").unwrap();
+        assert!(!p.modes().wrap_pending, "CR clears it");
+        p.feed(b"\x1b8").unwrap();
+        assert!(p.modes().wrap_pending, "DECRC restores it");
+        p.feed(b"X").unwrap();
+        p.flush().unwrap();
+        assert!(!p.modes().wrap_pending);
+        assert_eq!((p.cursor().row, p.cursor().col), (1, 1), "X wrapped");
+        assert_eq!(row_text(&p, 1), "X");
+        // A wide glyph that reaches the margin also parks the cursor.
+        p.feed("\x1b[3;9H\u{4E2D}".as_bytes()).unwrap();
+        p.flush().unwrap();
+        assert!(p.modes().wrap_pending);
+        // Cursor movement and DECSTBM clear it; autowrap off never sets it.
+        p.feed(b"\x1b[3;1H").unwrap();
+        assert!(!p.modes().wrap_pending);
+        p.feed(b"0123456789").unwrap();
+        p.flush().unwrap();
+        p.feed(b"\x1b[2;3r").unwrap();
+        assert!(!p.modes().wrap_pending, "DECSTBM homes the cursor");
+        p.feed(b"\x1b[r\x1b[?7l\x1b[4;1H0123456789").unwrap();
+        p.flush().unwrap();
+        assert!(!p.modes().wrap_pending, "no autowrap, no pending wrap");
+        assert_eq!(p.cursor().col, 9);
+        // A run split across feeds still ends pending.
+        let mut p = pane(10, 4);
+        p.feed(b"01234").unwrap();
+        p.feed(b"56789").unwrap();
+        p.flush().unwrap();
+        assert!(p.modes().wrap_pending);
     }
 }
