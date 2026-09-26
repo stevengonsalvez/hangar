@@ -279,8 +279,10 @@ pub fn lsp_encode(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The body of one whole LSP-framed message, as strict as the unix leg's
-/// `read_frame`, and stricter where that one trims: `\r\n` line ends with no
+/// The body of one whole LSP-framed message.
+///
+/// As strict as the unix leg's `read_frame`, and stricter where that one
+/// trims: `\r\n` line ends with no
 /// bare CR or LF inside a header line, `Content-Length` as the only header and
 /// given once, an unsigned decimal value no larger than [`MAX_REASSEMBLED`],
 /// and exactly that many body bytes (the message is whole, so a trailing byte
