@@ -26,7 +26,13 @@
 //! they wait with it; to keep a stalled viewer's memory bounded, a new
 //! `floor`, `presence`, `resize` or `data_gap` REPLACES any unsent one of
 //! the same kind (the latest state is all the client needs), so at most
-//! four control frames plus one `closed` ever wait. The same holds for
+//! four control frames plus one `closed` ever wait. The replacement is
+//! done in place, so a `data_gap` keeps its position ahead of whatever
+//! followed it; two gaps add their `dropped_bytes` and keep the later
+//! reason. An updated `resize` therefore also sits AHEAD of output that
+//! was queued at the old size: clients rely on the repaint the pane does
+//! after a resize (every full-screen app repaints on SIGWINCH), and do not
+//! reinterpret already-queued bytes. The same holds for
 //! snapshots: only `output` bytes count against the pending cap, and a new
 //! snapshot replaces any unsent one, so a viewer that never acks holds at
 //! most one snapshot, one cap of output and the control frames. When the
@@ -428,8 +434,36 @@ impl ViewerQueue {
     }
 
     fn enqueue(&mut self, seq: u64, frame: Frame) {
+        // A later frame of a coalescing kind updates the unsent one WHERE
+        // IT SITS, so a data_gap that marks a torn snapshot stays ahead of
+        // the snapshot that replaces it.
         if let Some(key) = frame.coalesce_key() {
-            self.pending.retain(|s| s.frame.coalesce_key() != Some(key));
+            if let Some(slot) =
+                self.pending.iter_mut().find(|s| s.frame.coalesce_key() == Some(key))
+            {
+                slot.seq = seq;
+                // Two gaps merge: the bytes dropped add up, the reason is
+                // the later one.
+                if let (
+                    Frame::DataGap {
+                        dropped_bytes: Some(earlier),
+                        ..
+                    },
+                    Frame::DataGap {
+                        reason,
+                        dropped_bytes,
+                    },
+                ) = (&slot.frame, &frame)
+                {
+                    slot.frame = Frame::DataGap {
+                        reason: *reason,
+                        dropped_bytes: Some(earlier.saturating_add(dropped_bytes.unwrap_or(0))),
+                    };
+                    return;
+                }
+                slot.frame = frame;
+                return;
+            }
         }
         self.pending_bytes += frame.payload_len();
         if let Frame::Output(data) = &frame {
@@ -1060,5 +1094,116 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["gap:Dropped", "start", "chunk:4", "end"]);
         assert_eq!(q.pending_bytes(), 0);
+    }
+
+    /// The lead's repro: a snapshot torn after its start and one chunk
+    /// went out, a replacing snapshot (which queues a `dropped` gap ahead
+    /// of itself), then a second gap before that one is sent. The gap must
+    /// stay between the torn half and the new snapshot, not move behind it.
+    #[test]
+    fn a_second_gap_updates_the_first_where_it_sits() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        q.push_output(0, &[b'a'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        q.gap(8 * KIB as u64, GapReason::Paused);
+        q.push_snapshot(8 * KIB as u64, 40, 20, 1, &[b'1'; 5 * KIB]);
+        let sent = q.take_ready(3); // gap, start, one chunk
+        assert!(matches!(
+            sent[1].frame,
+            Frame::SnapshotStart { chunks: 3, .. }
+        ));
+        q.push_snapshot(9 * KIB as u64, 40, 20, 1, &[b'2'; 2 * KIB]);
+        q.gap(9 * KIB as u64, GapReason::FeedLost);
+        let kinds: Vec<String> = q
+            .pending
+            .iter()
+            .map(|s| match &s.frame {
+                Frame::DataGap { reason, .. } => format!("gap:{reason:?}"),
+                Frame::SnapshotStart { .. } => "start".to_string(),
+                Frame::SnapshotChunk(d) => format!("chunk:{}", d[0] as char),
+                Frame::SnapshotEnd => "end".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["gap:FeedLost", "start", "chunk:2", "end"]);
+        assert_eq!(
+            q.pending.front().unwrap().seq,
+            9 * KIB as u64,
+            "the gap took the newer seq"
+        );
+        // Control frames update in place too: the presence keeps its slot
+        // ahead of the floor frame pushed after it.
+        q.push_control(1, Frame::Presence { native_clients: 1 });
+        q.push_control(
+            1,
+            Frame::Floor {
+                holder: None,
+                floor_gen: 7,
+            },
+        );
+        q.push_control(2, Frame::Presence { native_clients: 2 });
+        let last_two: Vec<&Frame> = q.pending.iter().rev().take(2).map(|s| &s.frame).collect();
+        assert!(
+            matches!(last_two[0], Frame::Floor { floor_gen: 7, .. }),
+            "the floor stays last"
+        );
+        assert!(matches!(last_two[1], Frame::Presence { native_clients: 2 }));
+    }
+
+    #[test]
+    fn two_gaps_add_their_dropped_bytes_and_keep_the_later_reason() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        q.push_output(0, &[b'a'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        // Trip the cap: a dropped gap with a byte count.
+        q.push_output(8 * KIB as u64, &[b'b'; 9 * KIB]);
+        assert!(q.in_gap());
+        let first = q
+            .pending
+            .iter()
+            .find_map(|s| match &s.frame {
+                Frame::DataGap { dropped_bytes, .. } => Some(*dropped_bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first, Some(9 * KIB as u64));
+        // A feed gap before it is sent: bytes add up (a feed gap carries
+        // none of its own), the reason becomes the later one.
+        q.gap(17 * KIB as u64, GapReason::FeedLost);
+        let gaps: Vec<(GapReason, Option<u64>)> = q
+            .pending
+            .iter()
+            .filter_map(|s| match &s.frame {
+                Frame::DataGap {
+                    reason,
+                    dropped_bytes,
+                } => Some((*reason, *dropped_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gaps, vec![(GapReason::FeedLost, Some(9 * KIB as u64))]);
+        // A snapshot, then a torn replacement's dropped gap on top of an
+        // unsent feed gap: counted bytes survive, none plus none stays none.
+        q.push_snapshot(17 * KIB as u64, 40, 20, 1, &[b's'; 2 * KIB]);
+        q.ack(u64::MAX);
+        q.take_ready(usize::MAX);
+        q.gap(20 * KIB as u64, GapReason::Paused);
+        q.gap(20 * KIB as u64, GapReason::FeedLost);
+        let gaps: Vec<(GapReason, Option<u64>)> = q
+            .pending
+            .iter()
+            .filter_map(|s| match &s.frame {
+                Frame::DataGap {
+                    reason,
+                    dropped_bytes,
+                } => Some((*reason, *dropped_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gaps, vec![(GapReason::FeedLost, None)]);
     }
 }
