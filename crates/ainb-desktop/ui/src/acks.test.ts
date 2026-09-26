@@ -74,3 +74,10 @@ test("a storage that throws loses the memory of an ack for this window's life, a
   assert.doesNotThrow(() => writeAcks(storage, ackTurn(NO_ACKS, "claude:p-1", 5)));
   assert.equal(readAcks(undefined), NO_ACKS);
 });
+
+test("prune keeps only live keys and returns the same map when nothing drops", async () => {
+  const { pruneAcks } = await import("./acks.ts");
+  const acks = { "claude:a": 5, "claude:b": 7, "row:s-1": 0 };
+  assert.equal(pruneAcks(acks, new Set(["claude:a", "claude:b", "row:s-1"])), acks, "no change, same object");
+  assert.deepEqual(pruneAcks(acks, new Set(["claude:a"])), { "claude:a": 5 });
+});
