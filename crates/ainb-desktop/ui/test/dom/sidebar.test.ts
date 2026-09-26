@@ -172,9 +172,10 @@ test("a row's dot reads the same UiStatus its card would (P4)", async () => {
 test("a row with no matching card falls back to its own ring and lifecycle", async () => {
   await open();
   const dot = document.querySelector('.session-row[data-session="claude-1"] .ring');
-  // The fixture session is `Running` with no attention chips: the fallback
-  // reads it as working, the same word a hook-fed card would use.
-  assert.equal(dot?.getAttribute("data-status"), "working");
+  // The fixture session is `Running` (its tmux session is alive) with no
+  // attention chips and no card: nothing says the agent is working, so it
+  // reads unverifiable, never a spinner.
+  assert.equal(dot?.getAttribute("data-status"), "unverifiable");
 });
 
 test("a pending create draws a working card ahead of its project's real cards", async () => {
