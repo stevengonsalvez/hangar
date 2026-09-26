@@ -10,12 +10,12 @@ use ainb_hangar_proto::fleet::{
     AttentionState, FleetCapabilities, FleetConfidence, FleetProvenance, FleetProvider,
     FleetSession, LifecycleState, ManagementState, PaneBinding, TransportHealth,
 };
-use ainb_hangar_proto::hosts::HostId;
+use ainb_hangar_proto::hosts::{CarrierKind, HostId};
 use ainb_wire_mobile::api::{ConnectParams, connect_host, mint_op_id};
 use ainb_wire_mobile::custody::DeviceKey;
 use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use ainb_wire_mobile::records::{AnswerOutcome, WireError, WireEvent};
-use ainb_wire_mobile::session::{Session, SessionEvent};
+use ainb_wire_mobile::session::{ConnectConfig, Session, SessionEvent};
 use common::{FakePeer, HOST_ID, PeerOpts, Reply, hello_then, method_not_found, spawn};
 use serde_json::{Value, json};
 
@@ -414,6 +414,92 @@ async fn a_host_with_another_key_or_id_is_peer_changed() {
 
     assert!(Session::connect(peer.config(&key)).await.is_ok());
     assert_eq!(peer.handshakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_close_before_the_handshake_reply_is_classified_by_its_code() {
+    let key = DeviceKey::generate().unwrap();
+    let cases: [(u16, &str, WireError); 5] = [
+        (
+            4429,
+            "retry-after=7",
+            WireError::RateLimited {
+                retry_after_ms: Some(7_000),
+            },
+        ),
+        (
+            1013,
+            "retry-after=2",
+            WireError::OverCapacity {
+                retry_after_ms: Some(2_000),
+            },
+        ),
+        (4503, "draining", WireError::Draining),
+        (4409, "protocol", WireError::Incompatible),
+        (4403, "revoked", WireError::Revoked),
+    ];
+    for (code, reason, expected) in cases {
+        let peer = spawn(
+            hello_then("mobile", |m, _| method_not_found(m)),
+            PeerOpts {
+                refuse_before_handshake: Some((code, reason.into())),
+                ..PeerOpts::default()
+            },
+        )
+        .await;
+        let err = Session::connect(peer.config(&key)).await.unwrap_err();
+        assert_eq!(err, expected, "close {code}");
+        assert_eq!(
+            err.is_retryable(),
+            matches!(code, 4429 | 1013 | 4503),
+            "retryable for {code}"
+        );
+    }
+    assert!(!WireError::PeerChanged.is_retryable());
+    assert!(!WireError::Unauthenticated.is_retryable());
+
+    // A socket that vanishes with no close code is a network loss.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/peer", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            drop(tcp);
+        }
+    });
+    let mut config = ConnectConfig::new(
+        url,
+        CarrierKind::Lan,
+        HostId::parse(HOST_ID).unwrap(),
+        [1; 32],
+        key.private().to_vec(),
+    );
+    config.heartbeat = None;
+    let err = Session::connect(config).await.unwrap_err();
+    assert!(matches!(err, WireError::Connect { .. }), "{err:?}");
+    assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn a_silent_host_times_out_the_connect() {
+    let peer = spawn(
+        hello_then("mobile", |m, _| method_not_found(m)),
+        PeerOpts {
+            hang: true,
+            ..PeerOpts::default()
+        },
+    )
+    .await;
+    let key = DeviceKey::generate().unwrap();
+    let mut config = peer.config(&key);
+    config.connect_timeout = Duration::from_millis(300);
+    let started = tokio::time::Instant::now();
+    let err = Session::connect(config).await.unwrap_err();
+    assert!(
+        matches!(err, WireError::Connect { ref message } if message.contains("no handshake within")),
+        "{err:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(err.is_retryable());
 }
 
 #[tokio::test]
