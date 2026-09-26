@@ -138,8 +138,11 @@ pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Result<Vec<u
             .get(usize::from(cursor.row))
             .and_then(|l| l.get_cell(usize::from(cursor.col)).map(|c| c.as_cell()));
         if let Some(cell) = cell {
+            // The grid holds the glyph already translated, so it is
+            // reprinted under ASCII G0 with SI, whatever set the pane is
+            // in; the pane's designations and shift are restored after.
             let sgr = sgr_params(cell.attrs());
-            let _ = write!(out, "{ESC}[?7h{ESC}[0m");
+            let _ = write!(out, "{ESC}[?7h{ESC}(B\x0f{ESC}[0m");
             if !sgr.is_empty() {
                 let _ = write!(out, "{ESC}[{sgr}m");
             }
@@ -149,6 +152,7 @@ pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Result<Vec<u
             }
             out.push_str(cell.str());
             out.push_str("\x1b[0m\x1b]8;;\x1b\\");
+            emit_charset(&mut out, modes);
             if !modes.auto_wrap {
                 out.push_str("\x1b[?7l");
             }
@@ -192,7 +196,11 @@ fn emit_modes(out: &mut String, m: &Modes) {
     });
     out.push_str(if m.insert { "\x1b[4h" } else { "\x1b[4l" });
     dec(out, 6, m.origin);
-    // The charset in use: designations, then which one is shifted in.
+    emit_charset(out, m);
+}
+
+/// The charset in use: designations, then which one is shifted in.
+fn emit_charset(out: &mut String, m: &Modes) {
     let _ = write!(
         out,
         "{ESC}({}{ESC}){}{}",
@@ -614,5 +622,47 @@ mod tests {
             "{}",
             snap.replace('\x1b', "^[")
         );
+    }
+
+    /// The lead's repro: a row filled with `012345678q`, then the pane
+    /// switches to DEC line drawing. The pending-wrap reprint of `q` must
+    /// not come out as a line glyph, in either the G0 or the SO form.
+    #[test]
+    fn the_autowrap_reprint_is_not_translated_by_the_charset_in_use() {
+        for (label, switch) in [("G0", b"\x1b(0".as_slice()), ("SO", b"\x1b)0\x0e")] {
+            let mut p = PaneEmulator::new(10, 3, 10);
+            p.feed(b"012345678q").unwrap();
+            p.feed(switch).unwrap();
+            p.flush().unwrap();
+            assert!(p.modes().wrap_pending, "{label}");
+            let (cols, rows) = p.size();
+            let snap = snapshot(&mut p, 0).unwrap();
+            let mut fresh = PaneEmulator::new(cols, rows, 10);
+            fresh.feed(&snap).unwrap();
+            assert_eq!(
+                canon(&mut fresh, 0).render(),
+                canon(&mut p, 0).render(),
+                "{label}"
+            );
+            assert_eq!(
+                canon(&mut fresh, 0).row_text(0),
+                "012345678q",
+                "{label}: no line glyph"
+            );
+            // The charset in use survives the reprint: the next `q` draws
+            // a line on both.
+            p.feed(b"q").unwrap();
+            fresh.feed(b"q").unwrap();
+            assert_eq!(
+                canon(&mut fresh, 0).render(),
+                canon(&mut p, 0).render(),
+                "{label}: after q"
+            );
+            assert_eq!(
+                canon(&mut p, 0).row_text(1),
+                "\u{2500}",
+                "{label}: wrapped as a line"
+            );
+        }
     }
 }
