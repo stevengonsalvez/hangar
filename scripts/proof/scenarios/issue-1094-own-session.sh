@@ -4,13 +4,13 @@
 # other, and selecting it shows a placeholder instead of previewing itself.
 
 # shellcheck disable=SC2034  # read by write_result in lib.sh
-EXPECT="a TUI started inside tmux session own-tui on the private -L proof server lists own-tui and a neighbour under Other tmux; selecting own-tui shows 'This is the tmux session ainb is running in' with the session name, opens no preview client on own-tui and keeps the TUI alive; selecting the neighbour previews its live output through a read-only client"
+EXPECT="a TUI started inside tmux session own-tui on the private harness tmux server lists own-tui and a neighbour under Other tmux; selecting own-tui shows 'This is the tmux session ainb is running in' with the session name, opens no preview client on own-tui and keeps the TUI alive; selecting the neighbour previews its live output through a read-only client"
 
 # clients_on <session>: tmux client flags on a session of the harness server.
 clients_on() { ptmux list-clients -t "=$1" -F '#{client_flags}' 2>/dev/null; }
 
 scenario() {
-  # The one scenario whose TUI keeps TMUX: inside a `-L proof` pane it then
+  # The one scenario whose TUI keeps TMUX: inside a harness pane it then
   # treats the harness server as its tmux, which is exactly the setup #1094
   # is about. Every other scenario unsets TMUX (see start_tui).
   ptmux new-session -d -s neighbour -x "$PROOF_COLS" -y "$PROOF_ROWS" \
@@ -41,7 +41,7 @@ scenario() {
   done
   check "the neighbour previews its live output" wait_screen own-tui 'neighbour tick [0-9]+' 10
   observe "clients with neighbour selected: own-tui [$(clients_on own-tui | paste -sd';' -)], neighbour [$(clients_on neighbour | paste -sd';' -)]"
-  check "the neighbour preview is a read-only client" bash -c "tmux -L proof list-clients -t '=neighbour' -F '#{client_flags}' | grep -q read-only"
+  check "the neighbour preview is a read-only client" bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' list-clients -t '=neighbour' -F '#{client_flags}' | grep -q read-only"
   capture own-tui neighbour-selected
 
   for i in 1 2 3; do
@@ -52,7 +52,7 @@ scenario() {
   check "the own session shows the placeholder" \
     wait_screen own-tui 'This is the tmux session ainb is running in' 10
   check "the placeholder names the session" \
-    bash -c "tmux -L proof capture-pane -t '=own-tui:' -p | cut -c $((PROOF_COLS / 2))- | grep -A3 'This is the tmux session ainb is running in' | grep -q 'own-tui'"
+    bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=own-tui:' -p | cut -c $((PROOF_COLS / 2))- | grep -A3 'This is the tmux session ainb is running in' | grep -q 'own-tui'"
   check "the placeholder says why there is no preview" \
     wait_screen own-tui 'A live preview would show this screen inside itself' 5
   capture own-tui own-session-selected
