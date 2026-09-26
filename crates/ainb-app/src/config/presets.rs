@@ -457,7 +457,7 @@ pub fn install_default_presets(file: &Path) -> Result<()> {
         .parent()
         .map(|p| p.join("presets"))
         .unwrap_or_else(|| PathBuf::from("presets"));
-    let salvaged = cleanup_legacy_default_presets(&legacy_dir);
+    let legacy = scan_legacy_presets(&legacy_dir);
 
     if !file.exists() {
         fs::write(file, BUNDLED_PRESETS_TOML)
@@ -481,9 +481,11 @@ pub fn install_default_presets(file: &Path) -> Result<()> {
     }
 
     // Merge any salvaged user-customised legacy presets into the new file.
-    if !salvaged.is_empty() {
+    // Every early return below leaves the legacy dir in place, so a failed
+    // merge loses nothing and the next launch retries.
+    if !legacy.salvaged.is_empty() {
         let mut manager = PresetManager::with_file(file.to_path_buf())?;
-        for preset in salvaged {
+        for preset in legacy.salvaged {
             // Don't clobber a preset the bundled defaults already provide
             // under the same name — the on-disk version wins by being
             // present already.
@@ -499,22 +501,47 @@ pub fn install_default_presets(file: &Path) -> Result<()> {
         }
     }
 
+    // Only now, with every salvaged preset saved, and only when every legacy
+    // file was read and parsed: a file we could not understand stays on disk
+    // for the user to fix, instead of being deleted with the directory.
+    if legacy.complete {
+        remove_legacy_presets_dir(&legacy_dir);
+    } else {
+        tracing::warn!(
+            dir = %legacy_dir.display(),
+            "Keeping the legacy presets directory: a file in it could not be read or parsed",
+        );
+    }
+
     Ok(())
+}
+
+/// What [`scan_legacy_presets`] found in the legacy per-file presets dir.
+struct LegacyScan {
+    /// User-customised presets to carry into `presets.toml`.
+    salvaged: Vec<RepositoryPreset>,
+    /// Whether every `*.toml` was read and parsed; only then may the directory
+    /// go.
+    complete: bool,
 }
 
 /// Inspect a legacy `presets/` directory and return any user-customised
 /// preset entries that should be carried forward into the new
-/// `presets.toml`. Deletes the directory once it has been fully processed.
+/// `presets.toml`, and whether every file in it was understood. It deletes
+/// nothing: [`install_default_presets`] removes the directory only after the
+/// salvaged presets are saved, and only when the scan was complete.
 ///
 /// User-customised = NOT matching any previously-shipped signature
 /// (claude-opus-yolo, codex-yolo, claude-interactive-yolo,
 /// codex-interactive-yolo with the exact shipped shape). Anything that
-/// looks like an old shipped file is dropped silently — the new bundled
-/// defaults supersede it.
-fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
+/// looks like an old shipped file is dropped; the new bundled defaults
+/// supersede it.
+fn scan_legacy_presets(dir: &Path) -> LegacyScan {
     let mut salvaged = Vec::new();
-    if !dir.exists() {
-        return salvaged;
+    // `false` if the dir is absent too: there is nothing to remove.
+    let mut complete = dir.exists();
+    if !complete {
+        return LegacyScan { salvaged, complete };
     }
 
     // Read each `*.toml` in the legacy dir.
@@ -526,7 +553,10 @@ fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
                 error = %err,
                 "Failed to read legacy presets dir; leaving in place",
             );
-            return salvaged;
+            return LegacyScan {
+                salvaged,
+                complete: false,
+            };
         }
     };
 
@@ -543,6 +573,7 @@ fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
                     error = %err,
                     "Failed to read legacy preset file; skipping",
                 );
+                complete = false;
                 continue;
             }
         };
@@ -555,6 +586,7 @@ fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
                     error = %err,
                     "Failed to parse legacy preset file; skipping",
                 );
+                complete = false;
                 continue;
             }
         };
@@ -573,8 +605,12 @@ fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
         salvaged.push(preset);
     }
 
-    // Best-effort dir removal. If it fails (perms, files left behind), leave
-    // it in place — the next launch will retry.
+    LegacyScan { salvaged, complete }
+}
+
+/// Best-effort removal of the migrated legacy presets dir. If it fails
+/// (perms, files left behind), it stays and the next launch retries.
+fn remove_legacy_presets_dir(dir: &Path) {
     match fs::remove_dir_all(dir) {
         Ok(()) => tracing::info!(
             dir = %dir.display(),
@@ -586,8 +622,6 @@ fn cleanup_legacy_default_presets(dir: &Path) -> Vec<RepositoryPreset> {
             "Failed to remove legacy presets directory after migration",
         ),
     }
-
-    salvaged
 }
 
 /// Match a legacy on-disk preset against any signature we've ever shipped.
@@ -926,6 +960,21 @@ mod tests {
         assert!(!names.contains(&"opusplan"));
     }
 
+    /// A legacy preset file that does not parse is never deleted: the
+    /// directory stays so the user can fix it, and the next launch retries.
+    #[test]
+    fn a_broken_legacy_preset_keeps_the_legacy_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let presets_dir = tmp.path().join("presets");
+        std::fs::create_dir_all(&presets_dir).unwrap();
+        let broken = presets_dir.join("mine.toml");
+        std::fs::write(&broken, "name = \"mine\"\ndescription = \"never closed\n").unwrap();
+        let file = tmp.path().join("presets.toml");
+        install_default_presets(&file).unwrap();
+        assert!(broken.exists(), "the unparseable legacy preset was deleted");
+        assert!(file.exists(), "presets.toml is still installed");
+    }
+
     #[test]
     fn legacy_multi_file_dir_migration_deletes_shipped_only_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1076,7 +1125,9 @@ skip_all = false
         format!("[[preset]]\nname = \"broken\"\n[preset.environment]\nAPI_KEY = \"{LEAKY}\n")
     }
 
-    fn assert_no_key(error: &anyhow::Error) {
+    /// The key is absent from every rendering, and `located` (a line
+    /// marker such as `"line 4"`) is present.
+    fn assert_no_key(error: &anyhow::Error, located: &str) {
         for rendered in [
             format!("{error}"),
             format!("{error:#}"),
@@ -1086,7 +1137,7 @@ skip_all = false
                 !rendered.contains(LEAKY),
                 "API key in the error: {rendered}"
             );
-            assert!(rendered.contains("line 4"), "no line number: {rendered}");
+            assert!(rendered.contains(located), "no {located}: {rendered}");
         }
     }
 
@@ -1098,7 +1149,7 @@ skip_all = false
         let Err(error) = PresetManager::with_file(file) else {
             panic!("a broken file must not load");
         };
-        assert_no_key(&error);
+        assert_no_key(&error, "line 4");
     }
 
     /// Well-formed TOML of the wrong type: serde's message quotes the value it
@@ -1115,18 +1166,11 @@ skip_all = false
         let Err(error) = PresetManager::with_file(file) else {
             panic!("a string environment must not load");
         };
-        for rendered in [
-            format!("{error}"),
-            format!("{error:#}"),
-            format!("{error:?}"),
-        ] {
-            assert!(
-                !rendered.contains(LEAKY),
-                "API key in the error: {rendered}"
-            );
-            assert!(rendered.contains("invalid type: string"), "{rendered}");
-            assert!(rendered.contains("line "), "{rendered}");
-        }
+        assert_no_key(&error, "line ");
+        assert!(
+            format!("{error:#}").contains("invalid type: string"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -1140,8 +1184,12 @@ skip_all = false
             &manager
                 .save_preset(&make_preset("new", "claude"))
                 .expect_err("save over a broken file must refuse"),
+            "line 4",
         );
-        assert_no_key(&manager.delete("broken").expect_err("delete over a broken file"));
+        assert_no_key(
+            &manager.delete("broken").expect_err("delete over a broken file"),
+            "line 4",
+        );
     }
 
     #[test]
@@ -1150,7 +1198,10 @@ skip_all = false
         let dot = repo.path().join(".agents-box");
         fs::create_dir_all(&dot).expect("mkdir");
         fs::write(dot.join("presets.toml"), broken_presets()).expect("write multi");
-        assert_no_key(&PresetManager::load_repo_preset(repo.path()).expect_err("multi"));
+        assert_no_key(
+            &PresetManager::load_repo_preset(repo.path()).expect_err("multi"),
+            "line 4",
+        );
 
         fs::remove_file(dot.join("presets.toml")).expect("rm multi");
         fs::write(
@@ -1158,7 +1209,10 @@ skip_all = false
             format!("name = \"broken\"\n\n[environment]\nAPI_KEY = \"{LEAKY}\n"),
         )
         .expect("write single");
-        assert_no_key(&PresetManager::load_repo_preset(repo.path()).expect_err("single"));
+        assert_no_key(
+            &PresetManager::load_repo_preset(repo.path()).expect_err("single"),
+            "line 4",
+        );
     }
 
     /// The legacy cleanup logs a file it cannot parse and moves on; the log
@@ -1201,7 +1255,7 @@ skip_all = false
         .expect("write legacy");
         let log = Arc::new(Mutex::new(String::new()));
         tracing::subscriber::with_default(Capture(Arc::clone(&log)), || {
-            cleanup_legacy_default_presets(dir.path());
+            scan_legacy_presets(dir.path());
         });
         let log = log.lock().unwrap().clone();
         assert!(log.contains("Failed to parse legacy preset file"), "{log}");
