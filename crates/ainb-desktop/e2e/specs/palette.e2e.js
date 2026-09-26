@@ -5,7 +5,7 @@
 // keystroke is caught where it does damage rather than where it was typed.
 
 import assert from "node:assert/strict";
-import { click, setPaletteQuery } from "../support.js";
+import { click, intentsSent, setPaletteQuery } from "../support.js";
 import { hook, paneText, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
@@ -30,6 +30,56 @@ async function focusState() {
     visibility: document.visibilityState,
     tabs: document.querySelectorAll(".tab[data-state]").length,
   }));
+}
+
+/** The question the agent in `session`'s row is blocked on, as the Claude hook announces it. */
+const askLine = (session) => ({
+  event_id: `e2e-palette-ask-${Date.now()}`,
+  ts: Date.now(),
+  session_id: "",
+  cwd: session.cwd,
+  event_type: "PreToolUse",
+  matcher: "AskUserQuestion",
+  agent: "claude",
+  payload: {
+    tool_name: "AskUserQuestion",
+    tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
+  },
+});
+
+/**
+ * The request id of the banner over the selected row once it shows a
+ * question nobody has answered: the one just raised, not the one the case
+ * before this answered, whose banner lingers as delivered.
+ */
+async function bannerUp() {
+  let phase = "";
+  const fresh = async () => {
+    phase = await browser.execute(() => document.querySelector(".answer-banner[data-request] .answer-phase")?.dataset.phase ?? "");
+    return phase === "none";
+  };
+  await browser.waitUntil(fresh, { timeout: 60_000 }).catch(() => assert.fail(`no unanswered question came up (last phase: ${phase || "no banner"})`));
+  return $(".answer-banner[data-request]").getAttribute("data-request");
+}
+
+/**
+ * Answer `request`'s question with its first option and wait for the
+ * reducer to record the delivery, as the answer spec does, so no case leaves
+ * a question open over the row the next case uses.
+ */
+async function answerBanner(request, session) {
+  await click('.answer-banner .answer-option[data-option="0"]');
+  let phase = "";
+  const delivered = async () => {
+    phase = await browser.execute(
+      (id) => document.querySelector(`.answer-banner[data-request="${id}"] .answer-phase`)?.dataset.phase ?? "",
+      request,
+    );
+    return phase === "delivered";
+  };
+  await browser.waitUntil(delivered, { timeout: 60_000 }).catch(() =>
+    assert.fail(`the answer never read delivered (last phase: ${phase || "none"}; pane: ${paneText(session.tmux).trim().split("\n").slice(-3).join(" / ")})`),
+  );
 }
 
 /** How many lines the agent in `session`'s pane has read so far. */
@@ -194,20 +244,9 @@ describe("the palette over a terminal", () => {
     await ready(session);
     // Raised with no session id, matched to the row by its worktree: the
     // banner over the row's terminal is what this case needs, not the id.
-    hook({
-      event_id: `e2e-palette-ask-${Date.now()}`,
-      ts: Date.now(),
-      session_id: "",
-      cwd: session.cwd,
-      event_type: "PreToolUse",
-      matcher: "AskUserQuestion",
-      agent: "claude",
-      payload: {
-        tool_name: "AskUserQuestion",
-        tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
-      },
-    });
+    hook(askLine(session));
     await focusTerminal(session);
+    const request = await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
     await click(".answer-banner .answer-composer input");
     await browser.keys(QUERY);
@@ -232,6 +271,49 @@ describe("the palette over a terminal", () => {
     await shot("composer-draft-after-tab-chord");
     assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the draft stayed in the composer");
     assert.ok(!paneText(session.tmux).includes(QUERY), "the draft never reached the pane");
+    await answerBanner(request, session);
+  });
+
+  it("keeps the keyboard in the composer when the host opens a tab on its own", async () => {
+    // The other half of the rule the chord case pins: the host's own answer to
+    // a tab open, landing while the cursor is in the composer with a draft,
+    // leaves the keyboard where it is. Without the `byHost` flag on that
+    // answer the terminal would take it, and the rest of the reply would go
+    // to the agent's pane (#47).
+    const session = seeded()[0];
+    await ready(session);
+    hook(askLine(session));
+    await focusTerminal(session);
+    const request = await bannerUp();
+    await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
+    await click(".answer-banner .answer-composer input");
+    await browser.keys(QUERY);
+    assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the composer took the draft");
+
+    // The host's tab open, with nothing else touching the keyboard: the row's
+    // own click handler, run by the page rather than by a pointer press that
+    // would move focus off the composer before the host answered. The tab is
+    // already open, so the host answers with focus on it, as for a fresh one.
+    const sent = intentsSent().length;
+    await browser.execute((id) => document.querySelector(`.session-row[data-session="${id}"]`).click(), session.id);
+    await browser.waitUntil(() => intentsSent().length > sent, {
+      timeout: 30_000,
+      timeoutMsg: "the row's click never reached the host",
+    });
+    // The host's answer, and the frame the shell would focus the terminal
+    // from, are both past by now.
+    await browser.pause(1_000);
+    await browser.keys("x");
+    await browser.pause(1_500);
+    await shot("composer-draft-after-host-tab-open");
+    const state = await focusState();
+    assert.equal(
+      await $(".answer-banner .answer-composer input").getValue(),
+      `${QUERY}x`,
+      `the composer lost the keyboard to ${state.active}`,
+    );
+    assert.ok(!paneText(session.tmux).includes(QUERY), `the draft reached the pane:\n${paneText(session.tmux)}`);
+    await answerBanner(request, session);
   });
 
   it("keeps the keystrokes when the chord lands while the tab is still opening", async () => {
