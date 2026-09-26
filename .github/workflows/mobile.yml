@@ -1,0 +1,167 @@
+name: Mobile
+
+# The phone bridge (crates/ainb-wire-mobile) is its own cargo workspace,
+# excluded from the root one, so no job in ci.yml builds it or its uniffi
+# and phone toolchains. This workflow is its gate: fmt, clippy, tests and the
+# five phone-target checks on Linux; the Android release library per ABI with
+# its size budget on Linux (the NDK, no emulator); the iOS static library on
+# macOS; and the Expo app's type check and jest suite. It is never a
+# required check.
+#
+# Runs on dispatch, nightly, and on a pull request that touches the crate,
+# the two crates it consumes, the app, or this file, so a lane sees its own
+# breakage on its own PR. It holds no secrets and publishes nothing.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+  pull_request:
+    paths:
+      - "crates/ainb-wire-mobile/**"
+      - "crates/ainb-hangar-noise/**"
+      - "crates/ainb-hangar-proto/**"
+      - "apps/ainb-mobile/**"
+      - ".github/workflows/mobile.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  wire:
+    name: Wire crate (ubuntu-latest)
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ainb-wire-mobile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/ainb-wire-mobile
+      - name: Format
+        run: cargo fmt -- --check
+      - name: Clippy (library and tests)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests against the in-process peer
+        run: cargo test
+      # `check` needs no linker, so the ubuntu runner covers the Apple targets
+      # too. The targets are added here, not through the toolchain action,
+      # for the same reason ci.yml's Lint job does it: rust-toolchain.toml
+      # pins the compiler cargo actually runs.
+      - name: The crate compiles for the five phone targets
+        run: |
+          targets="aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-linux-android x86_64-linux-android"
+          # shellcheck disable=SC2086
+          rustup target add $targets
+          for target in $targets; do
+            cargo check --target "$target"
+          done
+
+  android:
+    name: Android library size (ubuntu-latest)
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/ainb-wire-mobile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/ainb-wire-mobile
+          key: android
+      # The runner image ships an NDK; its clang wrappers are the linkers
+      # cargo needs for the two ABIs the app carries (ubrn.config.yaml).
+      - name: Build the release library for arm64-v8a and x86_64
+        run: |
+          test -n "${ANDROID_NDK_LATEST_HOME:-}" || { echo "no NDK on this runner" >&2; exit 1; }
+          tc="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rustup target add aarch64-linux-android x86_64-linux-android
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android24-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$tc/x86_64-linux-android24-clang"
+          export RUSTFLAGS="-C link-arg=-Wl,--gc-sections"
+          cargo build --profile mobile --lib --target aarch64-linux-android
+          cargo build --profile mobile --lib --target x86_64-linux-android
+      # Per ABI: a warning above the 2 MiB M1-03 budget, a failure above
+      # 3 MiB. First measurements with the size profile: arm64-v8a 2,074,712
+      # bytes, x86_64 2,374,560 bytes (its x86 code is about 15 percent larger
+      # for the same crate). Both numbers are printed before either fails.
+      - name: Size gate, warn above 2 MiB and fail above 3 MiB per ABI
+        run: |
+          rc=0
+          bash scripts/size-gate.sh target/aarch64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=1
+          bash scripts/size-gate.sh target/x86_64-linux-android/mobile/libainb_wire_mobile.so 2097152 3145728 x86_64 || rc=1
+          exit $rc
+
+  ios:
+    name: iOS static library (macos-latest)
+    timeout-minutes: 45
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: crates/ainb-wire-mobile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, resolved 2026-09-21
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/ainb-wire-mobile
+          key: ios
+      # The app's size budget (a 3 MiB .app delta) is measured by the app's
+      # own build; this job proves the crate links for the device and the
+      # simulator with the runner's Xcode and records the library size.
+      - name: Record the runner's Xcode
+        run: xcodebuild -version
+      - name: Build the release static library for device and simulator
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          cargo build --profile mobile --lib --target aarch64-apple-ios
+          cargo build --profile mobile --lib --target aarch64-apple-ios-sim
+          ls -l target/aarch64-apple-ios/mobile/libainb_wire_mobile.a target/aarch64-apple-ios-sim/mobile/libainb_wire_mobile.a
+
+  app:
+    name: Expo app (ubuntu-latest)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The app lands in its own lane; until its first PR merges, this job
+      # has nothing to check and says so rather than failing the workflow.
+      - name: Find the app
+        id: app
+        run: |
+          if [ -f apps/ainb-mobile/package.json ]; then
+            echo "present=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "present=false" >>"$GITHUB_OUTPUT"
+            echo "apps/ainb-mobile is not in this tree; nothing to check" >>"$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/setup-node@v7
+        if: steps.app.outputs.present == 'true'
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/ainb-mobile/package-lock.json
+      - name: Install
+        if: steps.app.outputs.present == 'true'
+        run: npm ci --no-audit --no-fund
+        working-directory: apps/ainb-mobile
+      # `npm run check` is the app's type check and its no-wire-JSON lint
+      # (C-M1-3); `npm test` is jest.
+      - name: Check
+        if: steps.app.outputs.present == 'true'
+        run: npm run check
+        working-directory: apps/ainb-mobile
+      - name: Test
+        if: steps.app.outputs.present == 'true'
+        run: npm test
+        working-directory: apps/ainb-mobile
