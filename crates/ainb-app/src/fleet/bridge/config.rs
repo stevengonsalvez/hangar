@@ -297,25 +297,6 @@ impl std::fmt::Debug for RawDiscord {
     }
 }
 
-/// A config.toml parse failure as its message and line number only.
-///
-/// `toml::de::Error`'s `Display` quotes the offending source line under a
-/// caret, and the bridge section holds bot tokens, so a malformed `token =`
-/// line would print the token into the error chain and every log that
-/// carries it. The message and the 1-based line are enough to find the
-/// mistake; the snippet never leaves this function.
-fn toml_parse_error(toml_text: &str, error: &toml::de::Error) -> anyhow::Error {
-    let message = error.message().trim_end();
-    error.span().map_or_else(
-        || anyhow!("parsing config.toml: {message}"),
-        |span| {
-            let before = toml_text.get(..span.start).unwrap_or(toml_text);
-            let line = before.matches('\n').count() + 1;
-            anyhow!("parsing config.toml: {message} (line {line})")
-        },
-    )
-}
-
 /// Resolve ainb's config.toml path, honouring `AINB_CONFIG_PATH`.
 #[must_use]
 pub fn default_config_path() -> PathBuf {
@@ -516,8 +497,11 @@ fn parse_discord(raw: RawDiscord, shared_timeout: u64) -> Result<DiscordConfig> 
 /// Build a [`BridgeConfig`] from a parsed TOML string. Split out so it can be
 /// unit-tested without touching the filesystem.
 pub fn parse_config(toml_text: &str) -> Result<BridgeConfig> {
-    let root: RawRoot =
-        toml::from_str(toml_text).map_err(|error| toml_parse_error(toml_text, &error))?;
+    let root: RawRoot = toml::from_str(toml_text).map_err(|error| {
+        // Never `.context()` over the raw error: its Display quotes the
+        // offending line, which is a bot token when that line is broken.
+        crate::config::toml_error::toml_parse_error("parsing config.toml", toml_text, &error)
+    })?;
     let bridge = root
         .fleet
         .and_then(|f| f.bridge)
