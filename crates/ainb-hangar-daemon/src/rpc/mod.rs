@@ -828,6 +828,7 @@ where
                             rx,
                             params.session_key,
                             cursor,
+                            authenticated.caller.device_id().is_some(),
                             out_tx.clone(),
                         ));
                     }
@@ -1235,6 +1236,7 @@ fn spawn_transcript_forwarder(
     mut rx: broadcast::Receiver<(String, i64)>,
     session_key: String,
     mut cursor: i64,
+    for_device: bool,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     use ainb_hangar_store::repo::fleet_provider_event::FleetProviderEventRepo;
@@ -1248,6 +1250,7 @@ fn spawn_transcript_forwarder(
     tokio::spawn(
         async move {
             let span = tracing::Span::current();
+            let mut classifier = ainb_hangar_proto::transcript::AcpClassifier::default();
             loop {
                 // Bounded by rows only, unlike `fleet/transcript_list`. A push
                 // is one chunk per notification frame, so no single frame
@@ -1271,7 +1274,15 @@ fn spawn_transcript_forwarder(
                 if !rows.is_empty() {
                     for row in &rows {
                         cursor = row.ingest_order;
-                        let params = serde_json::json!({ "chunk": transcript_chunk_wire(row) });
+                        // A device reads render-ready lines only; the
+                        // classifier lives as long as the subscription, so a
+                        // tool update names the call it belongs to.
+                        let chunk = if for_device {
+                            device_transcript_chunk(row, &mut classifier)
+                        } else {
+                            transcript_chunk_wire(row)
+                        };
+                        let params = serde_json::json!({ "chunk": chunk });
                         if out
                             .send(encode_notification_frame("fleet/transcript_event", &params))
                             .await
@@ -1703,7 +1714,7 @@ async fn handle(
         // Both subscribe acks carry a head cursor; their per-connection
         // forwarders are registered in `serve_conn` BEFORE that head is read.
         methods::FLEET_MESSAGE_SUBSCRIBE => handle_fleet_message_subscribe(pool, req).await,
-        methods::FLEET_TRANSCRIPT_LIST => handle_fleet_transcript_list(pool, req).await,
+        methods::FLEET_TRANSCRIPT_LIST => handle_fleet_transcript_list(pool, req, caller).await,
         methods::FLEET_TRANSCRIPT_SUBSCRIBE => handle_fleet_transcript_subscribe(pool, req).await,
         methods::FLEET_TRANSCRIPT_PRUNE => handle_fleet_transcript_prune(pool, req).await,
         // Part 2's chat surface. Each arm's capability is advertised in the
@@ -2209,6 +2220,31 @@ fn transcript_chunk_wire(
         event_type: row.event_type.clone(),
         payload,
         observed_at: row.observed_at,
+        lines: Vec::new(),
+    }
+}
+
+/// The chunk a paired device receives: no payload, only render-ready lines
+/// from `classifier`, which scrubs and caps every body. Feed one session's
+/// rows through one classifier, oldest first, so a tool update can name the
+/// call it belongs to.
+fn device_transcript_chunk(
+    row: &ainb_hangar_store::repo::fleet_provider_event::FleetProviderEventRow,
+    classifier: &mut ainb_hangar_proto::transcript::AcpClassifier,
+) -> ainb_hangar_proto::fleet::FleetTranscriptChunk {
+    let lines = classifier
+        .classify_row(&row.event_type, &row.raw_payload)
+        .into_iter()
+        .map(|(kind, text)| ainb_hangar_proto::fleet::FleetTranscriptLine { kind, text })
+        .collect();
+    ainb_hangar_proto::fleet::FleetTranscriptChunk {
+        ingest_order: row.ingest_order,
+        event_id: row.event_id.clone(),
+        session_key: row.session_key.clone().unwrap_or_default(),
+        event_type: row.event_type.clone(),
+        payload: serde_json::Value::Null,
+        observed_at: row.observed_at,
+        lines,
     }
 }
 
@@ -2995,6 +3031,7 @@ async fn handle_fleet_message_subscribe(
 async fn handle_fleet_transcript_list(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_proto::fleet::{
         FLEET_CAPABILITY_TRANSCRIPT_READ, FLEET_TRANSCRIPT_LIST_MAX,
@@ -3072,7 +3109,16 @@ async fn handle_fleet_transcript_list(
         .map(|page| (page.rows, page.truncated, page.lowest_scanned)),
     }
     .map_err(|error| store_err(&error))?;
-    let chunks: Vec<_> = rows.iter().map(transcript_chunk_wire).collect();
+    // A paired device gets render-ready lines, classified oldest first across
+    // the page, and no raw payload: the phone does no parsing or secret
+    // filtering of its own. A tool update whose call fell outside this page
+    // degrades to the unnamed `tool` form, as the board timeline's tail does.
+    let chunks: Vec<_> = if caller.device_id().is_some() {
+        let mut classifier = ainb_hangar_proto::transcript::AcpClassifier::default();
+        rows.iter().map(|row| device_transcript_chunk(row, &mut classifier)).collect()
+    } else {
+        rows.iter().map(transcript_chunk_wire).collect()
+    };
     to_value(&FleetTranscriptListResult {
         // A backward page is not a place to walk forward from.
         next_after_order: if params.before_order.is_some() {
@@ -14737,6 +14783,160 @@ mod tests {
             let refused = list(bad).await;
             assert_eq!(refused.error.as_ref().map(|e| e.code), Some(INVALID_PARAMS));
         }
+    }
+
+    /// Seed one ACP session: a tool call, its completed update carrying a
+    /// secret in its output, and an agent message carrying another.
+    async fn seed_device_transcript(pool: &SqlitePool) {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+        let secret = format!("ghp_{}", "A".repeat(36));
+        let rows = [
+            (
+                "acp.tool_call",
+                serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
+                    "title": "Bash", "status": "pending", "rawInput": {"command": "env"}}),
+            ),
+            (
+                "acp.tool_call",
+                serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                    "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text",
+                        "text": format!("GITHUB_TOKEN={secret}")}}]}),
+            ),
+            (
+                "acp.message",
+                serde_json::json!({"text": format!("pushed with {secret}")}),
+            ),
+        ];
+        let events: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(n, (event_type, payload))| NewFleetProviderEvent {
+                event_id: format!("dev-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("acp:dev".to_string()),
+                provider_session_id: None,
+                observed_at: i64::try_from(n).unwrap(),
+                received_at: i64::try_from(n).unwrap(),
+                event_type: (*event_type).to_string(),
+                raw_payload: payload.to_string(),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(pool, &events).await.expect("seed");
+    }
+
+    /// Lead item: a paired device reads transcript chunks already classified
+    /// and scrubbed: no raw payload, render-ready lines in the daemon's own
+    /// lanes, the tool update named from its call, and no secret anywhere.
+    /// The operator's chunks are unchanged: a payload, and no lines.
+    #[tokio::test]
+    async fn a_device_reads_transcript_lines_classified_and_scrubbed() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        seed_device_transcript(store.pool()).await;
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let request = req(
+            methods::FLEET_TRANSCRIPT_LIST,
+            serde_json::json!({"session_key": "acp:dev", "limit": 100}),
+        );
+
+        let device = dispatch_as(store.pool(), &request, &health(), &sink(), &phone).await;
+        assert!(device.error.is_none(), "{:?}", device.error);
+        let body = serde_json::to_string(device.result.as_ref().unwrap()).unwrap();
+        assert!(
+            !body.contains("ghp_AAAA"),
+            "a device never sees the secret: {body}"
+        );
+        let chunks = device.result.as_ref().unwrap()["chunks"].as_array().unwrap().clone();
+        assert_eq!(chunks.len(), 3);
+        for chunk in &chunks {
+            assert!(
+                chunk["payload"].is_null(),
+                "no raw payload for a device: {chunk}"
+            );
+        }
+        let lane =
+            |i: usize| chunks[i]["lines"][0]["kind"].as_str().unwrap_or_default().to_string();
+        let text =
+            |i: usize| chunks[i]["lines"][0]["text"].as_str().unwrap_or_default().to_string();
+        assert_eq!(lane(0), "tool_call");
+        assert!(text(0).starts_with("Bash"), "{}", text(0));
+        assert_eq!(lane(1), "tool_result");
+        assert!(
+            text(1).starts_with("Bash"),
+            "the update is named from its call: {}",
+            text(1)
+        );
+        assert!(
+            text(1).contains(ainb_hangar_core::redact::REDACTED),
+            "{}",
+            text(1)
+        );
+        assert_eq!(lane(2), "agent");
+        assert!(
+            text(2).contains(ainb_hangar_core::redact::REDACTED),
+            "{}",
+            text(2)
+        );
+
+        let operator = dispatch_as(
+            store.pool(),
+            &request,
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await;
+        let chunks = operator.result.as_ref().unwrap()["chunks"].as_array().unwrap().clone();
+        assert!(
+            chunks.iter().all(|c| !c["payload"].is_null()),
+            "the operator keeps payloads"
+        );
+        assert!(
+            chunks.iter().all(|c| c.get("lines").is_none()),
+            "and gets no lines"
+        );
+    }
+
+    /// The live subscription does the same for a device, with one classifier
+    /// for the whole subscription.
+    #[tokio::test]
+    async fn a_device_transcript_subscription_pushes_classified_lines() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        seed_device_transcript(store.pool()).await;
+        let (_tx, rx) = broadcast::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let forwarder = spawn_transcript_forwarder(
+            store.pool().clone(),
+            rx,
+            "acp:dev".to_string(),
+            0,
+            true,
+            out_tx,
+        );
+        let mut kinds = Vec::new();
+        for _ in 0..3 {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.recv())
+                .await
+                .expect("a pushed chunk")
+                .expect("frame");
+            let text = String::from_utf8(frame).unwrap();
+            assert!(!text.contains("ghp_AAAA"), "{text}");
+            let body = &text[text.find("\r\n\r\n").unwrap() + 4..];
+            let value: serde_json::Value = serde_json::from_str(body).unwrap();
+            let chunk = &value["params"]["chunk"];
+            assert!(chunk["payload"].is_null(), "{chunk}");
+            kinds.push(chunk["lines"][0]["kind"].as_str().unwrap().to_string());
+        }
+        assert_eq!(kinds, ["tool_call", "tool_result", "agent"]);
+        forwarder.abort();
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
