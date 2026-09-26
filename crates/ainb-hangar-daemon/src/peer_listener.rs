@@ -2,7 +2,9 @@
 //! Noise IK responder and the pre-auth gate.
 //!
 //! ```text
-//! TCP ──▶ admit (per source: 30 handshakes/min -> 4429, 8 unauthenticated -> 1013)
+//! TCP ──▶ admit per source FIRST (30 handshakes/min -> 4429; 8 unauthenticated
+//!         or 16 sockets -> 1013), THEN a global slot (full -> 1013); a refusal
+//!         spends its own small budget, and past it the TCP is just dropped
 //!     ──▶ WS upgrade on /peer (65535-byte message and frame caps)
 //!     ──▶ Noise msg1 within 2 s ──▶ IK responder (carrier + host id prologue)
 //!           wrong carrier / host id / unpinned key ──▶ 4401
@@ -55,13 +57,23 @@ const HANDSHAKES_PER_WINDOW: usize = 30;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Unauthenticated sockets one source may hold at once before 1013.
 const UNAUTHENTICATED_PER_SOURCE: usize = 8;
+/// Sockets of any state one source may hold at once before 1013, so no
+/// source can take the global slots from the rest.
+const SOCKETS_PER_SOURCE: usize = 16;
 /// Peer sockets served at once, the peer leg's own cap (the unix leg has
-/// its own); an accept past it is dropped at once.
+/// its own). Taken only AFTER a source is admitted.
 const MAX_PEER_CONNECTIONS: usize = 64;
-/// The retry hint a 4429 carries, in seconds.
-const RATE_LIMITED_RETRY_S: u64 = 60;
-/// The retry hint a 1013 carries, in seconds.
-const OVER_CAPACITY_RETRY_S: u64 = 5;
+/// Refusals (4429, 1013) in flight at once. A refusal costs an upgrade and a
+/// close frame; past this budget the TCP connection is dropped unanswered,
+/// so a refused source cannot tie up the served ones.
+const REFUSAL_BUDGET: usize = 8;
+/// The close reason a 4429 carries: back off at least this long.
+const RATE_LIMITED_REASON: &str = "retry-after=60";
+/// The close reason a 1013 carries: back off at least this long.
+const OVER_CAPACITY_REASON: &str = "retry-after=5";
+/// How long shutdown waits for open peer sockets to send their 4503 before
+/// the daemon exits anyway.
+pub const DRAIN_BOUND: Duration = Duration::from_secs(5);
 /// Longest one outbound WebSocket message (a handshake reply, a refusal, a
 /// close frame) may take before the socket is dropped: a peer that stops
 /// reading cannot hold the task.
@@ -180,6 +192,13 @@ pub async fn start(
     host: PeerHost,
     mut shutdown: crate::shutdown::Handle,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    // Refuse to bind a leg whose every handshake would fail: a bad key or host
+    // id is a boot error to report, not a socket that answers 4401 to all.
+    ainb_hangar_noise::responder(&host.secret, config.carrier, &host.host_id).map_err(|error| {
+        std::io::Error::other(format!(
+            "the peer leg's Noise responder cannot be built: {error}"
+        ))
+    })?;
     let listener = TcpListener::bind(config.addr).await?;
     if config.carrier == CarrierKind::Lan {
         tracing::warn!(
@@ -203,8 +222,9 @@ pub async fn start(
     )))
 }
 
-/// The accept loop. Ends when `cancel` fires; every connection it spawned
-/// watches the same token and closes 4503.
+/// The accept loop. Ends when `cancel` fires, then drains every connection
+/// task it spawned (each watches the same token and closes 4503), bounded by
+/// [`DRAIN_BOUND`], so the closes are sent before the daemon exits.
 async fn run(
     listener: TcpListener,
     carrier: CarrierKind,
@@ -213,6 +233,8 @@ async fn run(
 ) {
     let limits = Arc::new(Mutex::new(Limits::default()));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PEER_CONNECTIONS));
+    let refusals = Arc::new(tokio::sync::Semaphore::new(REFUSAL_BUDGET));
+    let tasks = tokio_util::task::TaskTracker::new();
     loop {
         let accepted = tokio::select! {
             () = cancel.cancelled() => break,
@@ -225,17 +247,39 @@ async fn run(
                 continue;
             }
         };
-        let Ok(slot) = Arc::clone(&slots).try_acquire_owned() else {
-            drop(stream);
-            continue;
+        // Per source first, so one source's sockets can never be the reason
+        // another source finds the global slots full.
+        let admission = match Limits::admit(&limits, source.ip(), Instant::now()) {
+            Admission::Admitted(source_slot) => match Arc::clone(&slots).try_acquire_owned() {
+                Ok(global) => Admission::Admitted(source_slot.holding(global)),
+                Err(_) => Admission::OverCapacity,
+            },
+            refused => refused,
         };
-        let admission = Limits::admit(&limits, source.ip(), Instant::now());
+        let refusal = if matches!(admission, Admission::Admitted(_)) {
+            None
+        } else {
+            match Arc::clone(&refusals).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    drop(stream);
+                    continue;
+                }
+            }
+        };
         let host = Arc::clone(&host);
         let cancel = cancel.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
+        tasks.spawn(async move {
+            let _refusal = refusal;
             serve_socket(stream, admission, carrier, &host, &cancel).await;
         });
+    }
+    tasks.close();
+    if tokio::time::timeout(DRAIN_BOUND, tasks.wait()).await.is_err() {
+        tracing::warn!(
+            open = tasks.len(),
+            "peer leg: sockets still open after the drain bound"
+        );
     }
 }
 
@@ -270,15 +314,13 @@ async fn serve_socket(
         return;
     };
     let ending = match admission {
-        Admission::RateLimited => Ending::Close(peer_close::RATE_LIMITED, "retry-after=60"),
-        Admission::OverCapacity => Ending::Close(peer_close::OVER_CAPACITY, "retry-after=5"),
+        Admission::RateLimited => Ending::Close(peer_close::RATE_LIMITED, RATE_LIMITED_REASON),
+        Admission::OverCapacity => Ending::Close(peer_close::OVER_CAPACITY, OVER_CAPACITY_REASON),
         Admission::Admitted(_guard) => tokio::select! {
             () = cancel.cancelled() => Ending::Close(peer_close::DRAINING, "draining"),
             ending = pre_auth(&mut ws, carrier, host) => ending,
         },
     };
-    debug_assert_eq!(RATE_LIMITED_RETRY_S, 60);
-    debug_assert_eq!(OVER_CAPACITY_RETRY_S, 5);
     if let Ending::Close(code, reason) = ending {
         close(&mut ws, code, reason).await;
     }
@@ -426,39 +468,54 @@ where
     let _ = tokio::time::timeout(WRITE_DEADLINE, ws.close(None)).await;
 }
 
-/// Per-source pre-auth accounting.
+/// Per-source accounting.
 #[derive(Debug, Default)]
 struct Limits {
     sources: HashMap<IpAddr, Source>,
+    /// Whether the shared loopback budget has been reported this run.
+    warned_loopback: bool,
 }
 
 #[derive(Debug, Default)]
 struct Source {
     handshakes: VecDeque<Instant>,
     unauthenticated: usize,
+    sockets: usize,
 }
 
 /// What admission decided for one new socket.
 enum Admission {
-    /// Admitted; the guard holds its unauthenticated slot.
-    Admitted(UnauthenticatedSlot),
+    /// Admitted; the guard holds its per-source and global slots.
+    Admitted(SourceSlot),
     /// Over [`HANDSHAKES_PER_WINDOW`]: close 4429.
     RateLimited,
-    /// Over [`UNAUTHENTICATED_PER_SOURCE`]: close 1013.
+    /// Over [`UNAUTHENTICATED_PER_SOURCE`] or [`SOCKETS_PER_SOURCE`], or no
+    /// global slot: close 1013.
     OverCapacity,
 }
 
-/// One source's unauthenticated slot, released on drop.
-struct UnauthenticatedSlot {
+/// One admitted socket's slots, released on drop: its source's socket and
+/// unauthenticated counts (R1-06b releases the unauthenticated one at hello),
+/// and its global slot.
+struct SourceSlot {
     limits: Arc<Mutex<Limits>>,
     ip: IpAddr,
+    global: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
-impl Drop for UnauthenticatedSlot {
+impl SourceSlot {
+    fn holding(mut self, global: tokio::sync::OwnedSemaphorePermit) -> Self {
+        self.global = Some(global);
+        self
+    }
+}
+
+impl Drop for SourceSlot {
     fn drop(&mut self) {
         let mut limits = self.limits.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(source) = limits.sources.get_mut(&self.ip) {
             source.unauthenticated = source.unauthenticated.saturating_sub(1);
+            source.sockets = source.sockets.saturating_sub(1);
         }
     }
 }
@@ -470,7 +527,7 @@ impl Limits {
     fn admit(limits: &Arc<Mutex<Self>>, ip: IpAddr, now: Instant) -> Admission {
         let mut guard = limits.lock().unwrap_or_else(PoisonError::into_inner);
         guard.sources.retain(|_, s| {
-            s.unauthenticated > 0
+            s.sockets > 0
                 || s.handshakes.back().is_some_and(|t| now.duration_since(*t) < RATE_WINDOW)
         });
         let source = guard.sources.entry(ip).or_default();
@@ -479,23 +536,28 @@ impl Limits {
         }
         let refused = if source.handshakes.len() >= HANDSHAKES_PER_WINDOW {
             Some(Admission::RateLimited)
-        } else if source.unauthenticated >= UNAUTHENTICATED_PER_SOURCE {
+        } else if source.unauthenticated >= UNAUTHENTICATED_PER_SOURCE
+            || source.sockets >= SOCKETS_PER_SOURCE
+        {
             Some(Admission::OverCapacity)
         } else {
             None
         };
         if let Some(refused) = refused {
-            if ip.is_loopback() {
+            if ip.is_loopback() && !guard.warned_loopback {
+                guard.warned_loopback = true;
                 tracing::warn!("peer leg: the shared loopback (ssh -L) budget is exhausted");
             }
             return refused;
         }
         source.handshakes.push_back(now);
         source.unauthenticated += 1;
+        source.sockets += 1;
         drop(guard);
-        Admission::Admitted(UnauthenticatedSlot {
+        Admission::Admitted(SourceSlot {
             limits: Arc::clone(limits),
             ip,
+            global: None,
         })
     }
 }
@@ -758,6 +820,33 @@ mod tests {
             close_code(&mut before_msg1).await,
             Some(peer_close::DRAINING)
         );
+    }
+
+    /// Review follow-up F1: one source's silent sockets cannot lock out
+    /// another. 64 connections from 127.0.0.2 that never even send the HTTP
+    /// upgrade take at most their source's share and the refusal budget; a
+    /// device on 127.0.0.1 still completes its handshake. Skips where
+    /// 127.0.0.2 is not configured (the macOS default).
+    #[tokio::test]
+    async fn a_noisy_source_does_not_lock_out_another() {
+        let rig = rig().await;
+        let mut silent = Vec::new();
+        for _ in 0..MAX_PEER_CONNECTIONS {
+            let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+            if socket.bind("127.0.0.2:0".parse().unwrap()).is_err() {
+                eprintln!("SKIP: 127.0.0.2 is not a local address here");
+                return;
+            }
+            silent.push(socket.connect(rig.addr).await.expect("connect"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_ws, done) = handshake(&rig, CarrierKind::SshL, HOST_ID, rig.host_public).await;
+        assert!(
+            done.is_ok(),
+            "the other source must still get msg2: {:?}",
+            done.err()
+        );
+        drop(silent);
     }
 
     /// Nine unauthenticated sockets from one source: the ninth closes 1013
