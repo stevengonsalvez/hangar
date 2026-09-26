@@ -10495,26 +10495,50 @@ impl AppState {
     /// Returns `None` when the project directory is missing or contains no
     /// transcripts.
     pub fn find_latest_transcript(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
-        let home = dirs::home_dir()?;
-        Self::find_latest_transcript_in(&home, worktree_path)
+        Self::find_latest_transcript_under(&Self::claude_projects_dir()?, worktree_path)
+    }
+
+    /// Where Claude keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects` when
+    /// that variable is set, as `models::usage` reads it, else
+    /// `~/.claude/projects`. A resume that read the default while Claude
+    /// wrote elsewhere would relaunch under an id Claude already holds, and
+    /// the pane would die on "already in use".
+    fn claude_projects_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("CLAUDE_CONFIG_DIR")
+            .map(std::path::PathBuf::from)
+            .map(|dir| dir.join("projects"))
+            .or_else(|| dirs::home_dir().map(|home| home.join(".claude").join("projects")))
     }
 
     /// Whether Claude holds a transcript for `session_id` in `worktree_path`'s
     /// project directory, which is what a `--resume <session_id>` needs: the
     /// transcript is named by the session id.
     pub fn claude_transcript_exists(worktree_path: &std::path::Path, session_id: &str) -> bool {
-        dirs::home_dir()
-            .is_some_and(|home| Self::claude_transcript_exists_in(&home, worktree_path, session_id))
+        Self::claude_projects_dir().is_some_and(|projects| {
+            Self::claude_transcript_exists_under(&projects, worktree_path, session_id)
+        })
     }
 
-    /// Test-friendly variant of [`Self::claude_transcript_exists`].
+    /// Test-friendly variant of [`Self::claude_transcript_exists`]: `home` is
+    /// the home directory whose `.claude/projects` is read.
     pub(crate) fn claude_transcript_exists_in(
         home: &std::path::Path,
         worktree_path: &std::path::Path,
         session_id: &str,
     ) -> bool {
-        home.join(".claude")
-            .join("projects")
+        Self::claude_transcript_exists_under(
+            &home.join(".claude").join("projects"),
+            worktree_path,
+            session_id,
+        )
+    }
+
+    fn claude_transcript_exists_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        projects
             .join(Self::claude_project_dir_name(worktree_path))
             .join(format!("{session_id}.jsonl"))
             .is_file()
@@ -10531,10 +10555,14 @@ impl AppState {
         home: &std::path::Path,
         worktree_path: &std::path::Path,
     ) -> Option<std::path::PathBuf> {
-        let project_dir = home
-            .join(".claude")
-            .join("projects")
-            .join(Self::claude_project_dir_name(worktree_path));
+        Self::find_latest_transcript_under(&home.join(".claude").join("projects"), worktree_path)
+    }
+
+    fn find_latest_transcript_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let project_dir = projects.join(Self::claude_project_dir_name(worktree_path));
 
         let read = std::fs::read_dir(&project_dir).ok()?;
         let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
