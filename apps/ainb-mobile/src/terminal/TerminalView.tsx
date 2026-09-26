@@ -44,6 +44,10 @@ export interface TerminalViewProps {
   /** Keystrokes from the soft keyboard or the accessory bar; absent = read only. */
   onInput?(data: string): void;
   onFit?(cols: number, rows: number): void;
+  /** The engine reports a link tap it refused to open. */
+  onLink?(uri: string): void;
+  /** Engine lifecycle for the status row: loading, ready, or a dropped message with its origin. */
+  onEngine?(state: string): void;
   testID?: string;
 }
 
@@ -51,7 +55,7 @@ export interface TerminalViewProps {
  * xterm.js inside a webview. Bytes queue until the engine says `ready`, then
  * cross the bridge as base64; the engine coalesces them per frame.
  */
-export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewProps) {
+export function TerminalView({ onSink, onInput, onFit, onLink, onEngine, testID }: TerminalViewProps) {
   const web = useRef<WebView>(null);
   const ready = useRef(false);
   const queue = useRef<ToEngine[]>([]);
@@ -85,7 +89,10 @@ export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewPro
   const onMessage = (e: WebViewMessageEvent) => {
     // Only the inline document may talk to us. Any navigated-to page would
     // have the same bridge, so a foreign origin is dropped before decoding.
-    if (e.nativeEvent.url !== ENGINE_URL) return;
+    if (e.nativeEvent.url !== ENGINE_URL) {
+      onEngine?.(`dropped message from ${e.nativeEvent.url}`);
+      return;
+    }
     const msg = decodeFromEngine(e.nativeEvent.data);
     if (!msg) return;
     if (msg.t === "ready") {
@@ -93,8 +100,10 @@ export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewPro
       send({ t: "readonly", on: readOnly });
       for (const m of queue.current) send(m);
       queue.current = [];
+      onEngine?.("engine ready");
     } else if (msg.t === "fit") onFit?.(msg.cols, msg.rows);
     else if (msg.t === "input") type(msg.data);
+    else if (msg.t === "link") onLink?.(msg.uri);
   };
 
   const type = (data: string) => {
