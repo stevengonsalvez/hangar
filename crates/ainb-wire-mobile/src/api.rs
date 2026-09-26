@@ -79,7 +79,7 @@ fn split_ack<R: serde::de::DeserializeOwned>(
 }
 
 fn open_log(log_dir: &str) -> Result<Arc<ConnLog>, WireError> {
-    ConnLog::open(Path::new(log_dir)).map(Arc::new)
+    ConnLog::open(Path::new(log_dir))
 }
 
 /// A fresh 128-bit op id from the crate's CSPRNG, for an app that mints
