@@ -28,6 +28,7 @@ pub fn discover_from_jobs() -> Result<Vec<Session>> {
         let cwd = entry.path().to_string_lossy().into_owned();
         out.push(Session {
             id: name.clone(),
+            provider_session_id: None,
             cwd,
             pid: None,
             git_root: None,
