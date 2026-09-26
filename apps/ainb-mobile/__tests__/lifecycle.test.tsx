@@ -265,6 +265,7 @@ test("mayRedial is fail-closed and reads the crate's verdict, not a code table o
   // the crate's Connect and Timeout are retryable by default; Closed carries its own flag
   expect(mayRedial(new PeerCloseError("connect", { reason: "dns" }))).toBe(true);
   expect(mayRedial(new PeerCloseError("timeout", { reason: "hello" }))).toBe(true);
+  expect(mayRedial(new PeerCloseError("not_connected", { reason: "no live session" }))).toBe(true); // a call before the dial: redial, not a latch
   expect(mayRedial(new PeerCloseError("closed", { reason: "network loss", retryable: true }))).toBe(true); // code None, retryable
   expect(mayRedial(new PeerCloseError("closed", { code: 4503, reason: "draining", retryable: true }))).toBe(true);
   expect(mayRedial(new PeerCloseError("closed", { code: 4403, reason: "revoked", retryable: false }))).toBe(false);
