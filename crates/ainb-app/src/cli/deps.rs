@@ -275,9 +275,46 @@ pub fn catalog() -> &'static [DepSpec] {
     ]
 }
 
+/// The lowest tmux the terminal stream (R2) can drive. The daemon's feed
+/// client runs every watched pane under `refresh-client -f pause-after`, which
+/// arrived in tmux 3.2, and asserts it at boot; below this floor the daemon
+/// never advertises `terminal.stream`.
+pub const TMUX_MIN_VERSION: (u32, u32) = (3, 2);
+
+/// `(major, minor)` from a `tmux -V` line: `tmux 3.6a`, `tmux 3.2`,
+/// `tmux next-3.7` and `tmux 3.3a-openbsd` all parse. `None` when the line
+/// carries no dotted number, which a build from a bare git checkout can print.
+pub fn parse_tmux_version(line: &str) -> Option<(u32, u32)> {
+    let rest = line.trim().strip_prefix("tmux")?.trim_start();
+    let rest = rest.strip_prefix("next-").unwrap_or(rest);
+    let (major, tail) = rest.split_once('.')?;
+    let minor: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 /// Probe a single dependency's state on the given host.
 fn detect_one(spec: &DepSpec, env: &dyn Env) -> DepState {
     match spec.name {
+        // tmux: any version runs a session today, but the terminal stream (R2)
+        // needs `refresh-client -f pause-after`, so the floor is reported here,
+        // where an operator looks first. An unparseable `-V` line counts as
+        // present: refusing a working tmux over its version string would be
+        // worse than a missing detail.
+        "tmux" => {
+            if !env.which("tmux") {
+                return DepState::Missing;
+            }
+            match env.run("tmux", &["-V"]) {
+                Some(line) => match parse_tmux_version(&line) {
+                    Some(version) if version < TMUX_MIN_VERSION => DepState::TooOld(format!(
+                        "{line} (need >={}.{} for terminal streams: refresh-client -f pause-after)",
+                        TMUX_MIN_VERSION.0, TMUX_MIN_VERSION.1
+                    )),
+                    _ => DepState::Ok(Some(line)),
+                },
+                None => DepState::Ok(None),
+            }
+        }
         // bash needs >=4 (associative arrays in the timeline dashboard).
         // The statusline runs via `#!/usr/bin/env bash`, so the PATH bash is
         // what matters — probe it, not /bin/bash.
@@ -488,6 +525,58 @@ mod tests {
         assert!(matches!(bash.state, DepState::TooOld(_)));
         assert!(!bash.satisfied);
         assert!(bash.is_blocking());
+    }
+
+    #[test]
+    fn tmux_version_line_parses_release_patch_and_next_builds() {
+        assert_eq!(parse_tmux_version("tmux 3.6a"), Some((3, 6)));
+        assert_eq!(parse_tmux_version("tmux 3.2"), Some((3, 2)));
+        assert_eq!(parse_tmux_version("tmux 3.3a-openbsd"), Some((3, 3)));
+        assert_eq!(parse_tmux_version("tmux next-3.7"), Some((3, 7)));
+        assert_eq!(parse_tmux_version("tmux 2.9a"), Some((2, 9)));
+        assert_eq!(parse_tmux_version("tmux master"), None);
+        assert_eq!(parse_tmux_version("screen 4.9"), None);
+    }
+
+    #[test]
+    fn tmux_below_3_2_reports_too_old_and_names_pause_after() {
+        let env = MockEnv {
+            present: vec!["tmux"],
+            runs: HashMap::from([("tmux -V".to_string(), "tmux 3.1c".to_string())]),
+        };
+        let reports = detect(&env);
+        let tmux = find(&reports, "tmux");
+        match &tmux.state {
+            DepState::TooOld(detail) => {
+                assert!(detail.contains("tmux 3.1c"), "{detail}");
+                assert!(detail.contains("pause-after"), "{detail}");
+            }
+            other => panic!("expected TooOld, got {other:?}"),
+        }
+        assert!(tmux.is_blocking());
+    }
+
+    #[test]
+    fn tmux_at_or_above_3_2_is_ok_and_shows_its_version() {
+        for line in ["tmux 3.2", "tmux 3.4", "tmux 3.6a", "tmux next-3.7"] {
+            let env = MockEnv {
+                present: vec!["tmux"],
+                runs: HashMap::from([("tmux -V".to_string(), line.to_string())]),
+            };
+            let reports = detect(&env);
+            let tmux = find(&reports, "tmux");
+            assert_eq!(tmux.state, DepState::Ok(Some(line.to_string())), "{line}");
+            assert!(tmux.satisfied);
+        }
+    }
+
+    #[test]
+    fn tmux_with_an_unreadable_version_still_counts_as_present() {
+        let env = MockEnv {
+            present: vec!["tmux"],
+            runs: HashMap::new(),
+        };
+        assert_eq!(find(&detect(&env), "tmux").state, DepState::Ok(None));
     }
 
     #[test]
