@@ -182,6 +182,11 @@ pub async fn resolve_send_pane(session: &str, hint: &PaneHint) -> Result<Option<
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
+    // A session tmux lists with no pane at all is not a session tmux has: a
+    // stand-in tmux that answers nothing. Nothing to narrow; the route decides.
+    if panes.is_empty() {
+        return Ok(None);
+    }
     only_pane(session, &panes).map(|id| Some(id.to_string())).map_err(|reason| {
         match hint.target.as_deref() {
             Some(target) => format!(
