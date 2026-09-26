@@ -8,10 +8,10 @@
 //! and nothing else is ever written, which [`Entry`]'s closed field set
 //! guarantees by construction and `tests/connlog.rs` proves on a real run.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -132,10 +132,35 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The process-wide registry: one [`ConnLog`] per log file, so two callers
+/// (a `connect_host`, a `read_connection_log`, a backoff note) share one
+/// ring and cannot erase each other's lines.
+fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<ConnLog>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<ConnLog>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 impl ConnLog {
-    /// Open the log under `dir`, reading back the last [`CAPACITY`] lines.
-    pub fn open(dir: &Path) -> Result<Self, WireError> {
+    /// The log under `dir`: the one instance this process holds for that
+    /// path, created on first use by reading back the last [`CAPACITY`]
+    /// lines.
+    pub fn open(dir: &Path) -> Result<Arc<Self>, WireError> {
         std::fs::create_dir_all(dir).map_err(io_error)?;
+        let key = dir.canonicalize().map_err(io_error)?;
+        let mut registry = registry().lock().unwrap();
+        if let Some(log) = registry.get(&key) {
+            return Ok(Arc::clone(log));
+        }
+        let log = Arc::new(Self::load(&key)?);
+        registry.insert(key, Arc::clone(&log));
+        Ok(log)
+    }
+
+    /// Read the log under `dir` from disk into a fresh instance, as a new
+    /// process would. Tests only: a second instance on one path is the bug
+    /// [`Self::open`] exists to prevent.
+    #[doc(hidden)]
+    pub fn load(dir: &Path) -> Result<Self, WireError> {
         let path = dir.join(LOG_FILE);
         let mut lines = VecDeque::with_capacity(CAPACITY);
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -230,7 +255,7 @@ mod tests {
         }
         assert_eq!(log.tail(usize::MAX).len(), CAPACITY);
         drop(log);
-        let reopened = ConnLog::open(dir.path()).unwrap();
+        let reopened = ConnLog::load(dir.path()).unwrap();
         let tail = reopened.tail(usize::MAX);
         assert_eq!(tail.len(), CAPACITY);
         assert_eq!(
@@ -253,6 +278,40 @@ mod tests {
     }
 
     #[test]
+    fn one_instance_per_path_and_two_writers_keep_every_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ConnLog::open(dir.path()).unwrap();
+        let b = ConnLog::open(dir.path()).unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "the same path is the same instance");
+        let other = tempfile::tempdir().unwrap();
+        assert!(!Arc::ptr_eq(&a, &ConnLog::open(other.path()).unwrap()));
+        let writers: Vec<_> = [Arc::clone(&a), Arc::clone(&b)]
+            .into_iter()
+            .enumerate()
+            .map(|(w, log)| {
+                std::thread::spawn(move || {
+                    for i in 0..300u32 {
+                        log.log(Event::Backoff {
+                            attempt: u32::try_from(w).unwrap() * 1_000 + i,
+                            delay_ms: 1,
+                        });
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        assert_eq!(a.tail(usize::MAX).len(), 600);
+        let on_disk = std::fs::read_to_string(a.path()).unwrap();
+        assert_eq!(on_disk.lines().count(), 600);
+        assert_eq!(
+            ConnLog::load(dir.path()).unwrap().tail(usize::MAX).len(),
+            600
+        );
+    }
+
+    #[test]
     fn a_torn_last_line_is_dropped_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let log = ConnLog::open(dir.path()).unwrap();
@@ -265,7 +324,7 @@ mod tests {
         let mut f = std::fs::OpenOptions::new().append(true).open(log.path()).unwrap();
         write!(f, "{{\"t_ms\": 1, \"event\": \"clo").unwrap();
         drop(f);
-        let reopened = ConnLog::open(dir.path()).unwrap();
+        let reopened = ConnLog::load(dir.path()).unwrap();
         assert_eq!(reopened.tail(usize::MAX).len(), 1);
     }
 }
