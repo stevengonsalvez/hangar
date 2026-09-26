@@ -477,6 +477,7 @@ dependencies = [
  "ainb-hangar-client",
  "ainb-hangar-core",
  "ainb-hangar-daemon",
+ "ainb-hangar-noise",
  "ainb-hangar-proto",
  "ainb-hangar-sandbox",
  "ainb-hangar-secrets",
