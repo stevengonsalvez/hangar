@@ -227,3 +227,136 @@ fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
         "the counted report was left on the queue: {reports:?}"
     );
 }
+
+/// P6e: a write still running when a flush gives up is counted then, as not
+/// written. When it fails afterwards it is only logged: a report would make
+/// the next flush (the desktop flushes on several exit paths) count it again.
+///
+/// The write is held on the `sessions.json` lock, taken here, past a short
+/// flush bound; once the lock goes it runs and is refused.
+#[test]
+fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    use ainb_app::app::Persist;
+    use ainb_app::interactive::session_manager::{SessionMetadata, SessionStore};
+
+    let home = scratch_home();
+    let tmux = "tmux_desktop-p6e-late-failure".to_string();
+    let mut store = SessionStore::load();
+    store.upsert(SessionMetadata {
+        session_id: uuid::Uuid::new_v4(),
+        tmux_session_name: tmux.clone(),
+        worktree_path: home.join("work"),
+        workspace_name: "ws".to_string(),
+        created_at: serde_json::from_str("\"2026-09-19T00:00:00Z\"").expect("a timestamp"),
+        agent_type: ainb_app::models::session::SessionAgentType::default(),
+        headroom_enabled: true,
+        rtk_enabled: false,
+        skip_permissions: None,
+        model: None,
+        model_source: ainb_app::interactive::session_manager::ModelSource::default(),
+        codex_model: None,
+        codex_thread_id: None,
+    });
+    store.save().expect("seed sessions.json");
+
+    // Collect logs from here on, before the write can fail.
+    log_says(LATE_FAILURE);
+    let guard = SessionStore::try_lock()
+        .expect("the sessions.json lock")
+        .expect("the sessions.json lock was already held");
+    let mut executor = ainb_desktop::executor::DesktopExecutor::new(None);
+    // Refused once it runs: the switch is on and this write expects it off.
+    let queued = executor.execute(Effect::Persist(Persist::SessionHeadroom {
+        tmux_session: tmux.clone(),
+        expected: false,
+        enabled: true,
+    }));
+    assert!(
+        queued.is_empty(),
+        "the write reported on the tick: {queued:?}"
+    );
+    assert_eq!(
+        executor.flush_session_store_writes(Duration::from_millis(200)),
+        1,
+        "the held write was not counted when the flush gave up on it"
+    );
+
+    // The write now takes the lock, runs and is refused, on a worker the
+    // flush has let go. Wait for it to be done, which shows either as the
+    // warn the worker logs for it or as a report on the queue.
+    drop(guard);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reports = Vec::new();
+    while !log_says(LATE_FAILURE) && reports.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned write never finished"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        reports.extend(executor.take_deferred());
+    }
+    assert!(
+        reports.is_empty(),
+        "the late failure was reported: {reports:?}"
+    );
+    assert_eq!(
+        executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a write counted when the first flush gave up was counted again"
+    );
+    let reports = executor.take_deferred();
+    assert!(
+        reports.is_empty(),
+        "the late failure was reported: {reports:?}"
+    );
+}
+
+/// What the worker logs for a write that fails after the flush let it go.
+const LATE_FAILURE: &str = "a session-store write failed after the exit stopped waiting for it";
+
+/// Whether any thread has logged a message containing `text` since this
+/// binary started. The first call installs a process-wide collector; the
+/// worker logs from its own thread, so a thread-local one would not see it.
+fn log_says(text: &str) -> bool {
+    static LOG: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<String>>>> =
+        std::sync::OnceLock::new();
+    let log = LOG.get_or_init(|| {
+        let log = std::sync::Arc::default();
+        let _ = tracing::subscriber::set_global_default(Collect(std::sync::Arc::clone(&log)));
+        log
+    });
+    log.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|line| line.contains(text))
+}
+
+/// A subscriber that keeps each event's message and nothing else.
+struct Collect(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Collect {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(message.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}

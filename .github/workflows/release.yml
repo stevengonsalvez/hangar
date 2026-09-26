@@ -400,7 +400,9 @@ jobs:
               exit 0
             fi
           fi
-          reported="$("${via[@]}" "$BIN" --version)"
+          # The guarded expansion, because an empty array under `set -u` is an
+          # unbound variable on the macOS runner's bash 3.2.
+          reported="$(${via[@]+"${via[@]}"} "$BIN" --version)"
           echo "sidecar reports: $reported"
           case "$reported" in
             *" ${VERSION}") ;;
@@ -494,8 +496,12 @@ jobs:
           DEB="$(find "${DESKTOP_DIR}/target/${TARGET}/release/bundle/deb" -maxdepth 1 -name '*.deb' -print -quit)"
           test -x "$APPIMAGE"
           test -f "$DEB"
-          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-hangar-daemon$'
-          dpkg-deb --contents "$DEB" | grep -q 'usr/bin/ainb-desktop$'
+          # Listed once and grepped from the string: `grep -q` quits on the first
+          # match, and under pipefail the listing's tar dying on the closed pipe
+          # fails the step even though the file is there.
+          contents="$(dpkg-deb --contents "$DEB")"
+          grep -q 'usr/bin/ainb-hangar-daemon$' <<<"$contents"
+          grep -q 'usr/bin/ainb-desktop$' <<<"$contents"
           echo "bundles: $APPIMAGE $DEB"
       # Stable, target-named file names: the manifest and the release page
       # name these, not the bundler's spaced product name.
