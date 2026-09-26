@@ -270,6 +270,23 @@ impl Caller {
             Self::Device { device_id, .. } => Some(device_id),
         }
     }
+
+    /// Whether this caller reads transcript chunks as render-ready lines
+    /// instead of payloads: a device paired with a phone scope.
+    ///
+    /// Decided by the credential, never by a request field, so a phone cannot
+    /// ask for raw payloads. A desktop-scope device keeps the scrubbed payload
+    /// the desktop renderer reads; a base this build does not know gets lines,
+    /// the narrower shape.
+    #[must_use]
+    pub fn reads_transcript_lines(&self) -> bool {
+        match self {
+            Self::Operator | Self::Pal { .. } => false,
+            Self::Device { scope, .. } => {
+                scope.base() != ainb_hangar_proto::devices::BaseScope::Desktop
+            }
+        }
+    }
 }
 
 /// Live Pal credentials: `sha256(plaintext) -> scope_key`.

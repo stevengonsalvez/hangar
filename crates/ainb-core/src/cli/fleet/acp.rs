@@ -253,6 +253,7 @@ mod tests {
             event_type: "acp.message".to_string(),
             payload,
             observed_at: 1,
+            lines: Vec::new(),
         }
     }
 
