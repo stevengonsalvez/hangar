@@ -449,8 +449,8 @@ interface Live {
   pumping: boolean;
 }
 
-/** The page the transcript screen asks for. */
-export const TRANSCRIPT_PAGE = 200;
+/** The page the transcript screen asks for: the daemon caps a page at 100. */
+export const TRANSCRIPT_PAGE = 100;
 
 /** `WireClient` over the linked `ainb-wire-mobile` binding. */
 export class NativeWire implements WireClient {
@@ -577,7 +577,10 @@ export class NativeWire implements WireClient {
     }
   }
 
+  /** A close during a dial waits for that dial, then closes what it produced. */
   async close(hostId: HostId): Promise<void> {
+    const inFlight = this.dialing.get(hostId);
+    if (inFlight) await inFlight.catch(() => undefined);
     const l = this.live.get(hostId);
     if (!l) return;
     l.host.close();
@@ -653,27 +656,20 @@ export class NativeWire implements WireClient {
   }
 
   /**
-   * Without `beforeSeq`: the newest page. With it: the page of entries older
-   * than `beforeSeq`, ascending. The wire pages forward only (`after_order`),
-   * so the older page is read from a window below `beforeSeq` and cut.
-   * ponytail: a `before_order` cursor on `fleet/transcript_list` would make
-   * this one call; until then a sparse `ingest_order` (it is global across
-   * sessions) can return a short page, which the screen treats as "older
-   * rows may exist" by asking again with a smaller `beforeSeq`.
+   * Without `beforeSeq`: the newest page (the daemon's cap, 100 rows). With
+   * it: the page of entries older than `beforeSeq`, which the wire cannot
+   * fetch yet: `fleet/transcript_list` reads forward from `after_order` and
+   * caps at 100, so any window below `beforeSeq` returns the OLDEST rows of
+   * the session, not the ones just above the cursor. Until the daemon takes
+   * a `before_order`, an older page is empty and the screen shows what it
+   * has. ponytail: swap the `[]` for one call with `before_order` when it
+   * lands.
    */
   async transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]> {
     const host = this.hostOf(hostId);
-    if (beforeSeq === undefined) {
-      const tail = await host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE);
-      return tail.chunks.map(toTranscriptEntry);
-    }
-    const window = 4 * TRANSCRIPT_PAGE;
-    const after = Math.max(0, beforeSeq - 1 - window);
-    const page = await host.transcriptPage(sessionKey, after, window);
-    return page.chunks
-      .map(toTranscriptEntry)
-      .filter((e) => e.seq < beforeSeq)
-      .slice(-TRANSCRIPT_PAGE);
+    if (beforeSeq !== undefined) return [];
+    const tail = await host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE);
+    return tail.chunks.map(toTranscriptEntry);
   }
 
   subscribeTranscript(hostId: HostId, sessionKey: SessionKey, cb: (entry: TranscriptEntry) => void): Unsubscribe {
