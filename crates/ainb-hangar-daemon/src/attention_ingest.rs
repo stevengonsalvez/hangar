@@ -133,6 +133,10 @@ struct HookEventLine {
     matcher: String,
     #[serde(default, deserialize_with = "null_as_default")]
     agent: String,
+    /// The tmux pane id (`%N`) the agent runs in, from the `AINB_PANE_KEY`
+    /// ainb handed it at launch; empty for a hook run without it.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pane_key: String,
 }
 
 /// Deserialize a field that may be `null` into its `Default`.
@@ -590,6 +594,15 @@ impl AttentionIngest {
             Err(e) => {
                 tracing::warn!(error = %e, "attention ingest: insert failed");
                 return LineOutcome::Retry;
+            }
+        }
+        // The pane the agent runs in, kept beside the row: an answer is typed
+        // into that pane exactly, provider session id or none.
+        if !line.pane_key.is_empty() {
+            if let Err(error) =
+                AttentionRepo::record_pane_key(&self.pool, &row.id, &line.pane_key).await
+            {
+                tracing::warn!(%error, attention_id = %row.id, "the row's pane key was not recorded");
             }
         }
         self.events.emit_attention(HangarEvent::AttentionRaised {
