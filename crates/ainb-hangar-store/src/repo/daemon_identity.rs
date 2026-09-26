@@ -130,6 +130,54 @@ impl DaemonIdentityRepo {
         .await?
         .rows_affected())
     }
+
+    /// The Noise IK static public key recorded for this daemon (R1-02), or
+    /// `None` when no key has been made or no daemon has booted this home.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the query fails.
+    pub async fn host_static_pubkey(pool: &SqlitePool) -> Result<Option<Vec<u8>>, sqlx::Error> {
+        let row = sqlx::query("SELECT host_static_pubkey FROM daemon_identity WHERE singleton = 1")
+            .fetch_optional(pool)
+            .await?;
+        Ok(row
+            .map(|row| row.try_get::<Option<Vec<u8>>, _>("host_static_pubkey"))
+            .transpose()?
+            .flatten())
+    }
+
+    /// Record `pubkey` as this daemon's Noise IK static public key and return
+    /// the value it replaced (`None` on the first record).
+    ///
+    /// One `IMMEDIATE` transaction, so the returned value is exactly the one
+    /// this write overwrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`sqlx::Error::RowNotFound`] when the home has no identity row
+    /// (the key belongs to a minted host, never to `local`), or a
+    /// [`sqlx::Error`] if a statement fails; nothing is committed.
+    pub async fn set_host_static_pubkey(
+        pool: &SqlitePool,
+        pubkey: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, sqlx::Error> {
+        let mut tx = pool.begin_with(crate::repo::fleet::IMMEDIATE_TRANSACTION).await?;
+        let previous: Option<Vec<u8>> =
+            sqlx::query("SELECT host_static_pubkey FROM daemon_identity WHERE singleton = 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(sqlx::Error::RowNotFound)?
+                .try_get("host_static_pubkey")?;
+        if previous.as_deref() != Some(&pubkey[..]) {
+            sqlx::query("UPDATE daemon_identity SET host_static_pubkey = ? WHERE singleton = 1")
+                .bind(&pubkey[..])
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(previous)
+    }
 }
 
 /// The `host_id` a writer stamps, read on the writer's own connection:
@@ -155,4 +203,62 @@ async fn read_on(conn: &mut SqliteConnection) -> Result<Option<DaemonIdentity>, 
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use ainb_hangar_core::clock::SystemClock;
+    use ainb_hangar_core::idgen::SystemIdGen;
+
+    use super::*;
+
+    /// The key belongs to a minted host: without an identity row there is
+    /// nothing to record it on, and the write says so instead of inventing one.
+    #[tokio::test]
+    async fn the_host_public_key_needs_a_minted_identity() {
+        let home = tempfile::tempdir().expect("home");
+        let store = crate::Store::open_in(home.path()).await.expect("store");
+        let refused = DaemonIdentityRepo::set_host_static_pubkey(store.pool(), &[1; 32])
+            .await
+            .expect_err("no identity row");
+        assert!(matches!(refused, sqlx::Error::RowNotFound), "{refused:?}");
+        assert_eq!(
+            DaemonIdentityRepo::host_static_pubkey(store.pool()).await.expect("read"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_host_public_key_round_trips_and_reports_what_it_replaced() {
+        let home = tempfile::tempdir().expect("home");
+        let store = crate::Store::open_in(home.path()).await.expect("store");
+        let pool = store.pool();
+        let minted = DaemonIdentityRepo::mint_or_read(pool, &SystemIdGen, &SystemClock)
+            .await
+            .expect("identity");
+
+        assert_eq!(
+            DaemonIdentityRepo::set_host_static_pubkey(pool, &[1; 32]).await.expect("first"),
+            None
+        );
+        assert_eq!(
+            DaemonIdentityRepo::set_host_static_pubkey(pool, &[1; 32]).await.expect("same"),
+            Some(vec![1; 32])
+        );
+        assert_eq!(
+            DaemonIdentityRepo::set_host_static_pubkey(pool, &[2; 32])
+                .await
+                .expect("replace"),
+            Some(vec![1; 32])
+        );
+        assert_eq!(
+            DaemonIdentityRepo::host_static_pubkey(pool).await.expect("read"),
+            Some(vec![2; 32])
+        );
+        assert_eq!(
+            DaemonIdentityRepo::read(pool).await.expect("read"),
+            Some(minted.identity),
+            "recording the key leaves the identity itself alone"
+        );
+    }
 }
