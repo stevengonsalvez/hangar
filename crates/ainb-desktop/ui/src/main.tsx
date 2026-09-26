@@ -33,6 +33,14 @@ import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
 import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
+import {
+  type ComposerFields,
+  type CreateState,
+  type CreatedWorktree,
+  type PendingWorktree,
+  toArgs,
+} from "./composer.ts";
+import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { Titlebar } from "./titlebar.tsx";
 import { Statusbar } from "./statusbar.tsx";
@@ -291,6 +299,51 @@ function Shell() {
     if (palette()) closePalette();
     else setPalette(true);
   };
+
+  // The composer: mounted only while open, like the palette. Its own request
+  // is tracked here rather than inside it, so Cancel (or Esc) closing the
+  // view never stops a create already running on the host, and the sidebar's
+  // pending card keeps drawing until the host answers.
+  const [composerOpen, setComposerOpen] = createSignal(false);
+  const [createState, setCreateState] = createSignal<CreateState>({ kind: "idle" });
+  const [pending, setPending] = createSignal<PendingWorktree | null>(null);
+  const openComposer = () => {
+    // Reopening over a request that already finished (or failed) starts
+    // fresh; reopening over one still running shows it running, rather than
+    // silently dropping back to idle while the host is still working.
+    if (createState().kind !== "creating") setCreateState({ kind: "idle" });
+    setComposerOpen(true);
+  };
+  const closeComposer = () => {
+    setComposerOpen(false);
+    const key = active();
+    if (key !== null) focusers.get(key)?.();
+    else sidebar?.focus();
+  };
+  const createWorktree = (fields: ComposerFields) => {
+    const args = toArgs(fields);
+    setPending({ projectPath: fields.projectPath, name: fields.name.trim() || "New worktree" });
+    setCreateState({ kind: "creating" });
+    void invoke<CreatedWorktree>("worktree_create", { args })
+      .then((result) => setCreateState({ kind: "done", result }))
+      .catch((error: unknown) => setCreateState({ kind: "failed", message: String(error) }));
+  };
+  // The request settles independently of whether its view is still open
+  // (Cancel closed it, or it never was): a finished create always clears the
+  // pending card, and a failure the composer is not open to show becomes a
+  // toast instead of vanishing.
+  createEffect(
+    on(createState, (state) => {
+      if (state.kind === "done") {
+        setPending(null);
+        setComposerOpen(false);
+      } else if (state.kind === "failed") {
+        setPending(null);
+        if (!composerOpen()) toast(state.message);
+      }
+    }),
+  );
+
   const onAccelerator = (shell: Accelerator) => {
     switch (shell.kind) {
       case "tab": {
@@ -318,6 +371,9 @@ function Shell() {
         return;
       case "palette":
         togglePalette();
+        return;
+      case "new":
+        openComposer();
         return;
     }
   };
@@ -508,7 +564,9 @@ function Shell() {
           sessions={sessions()}
           stale={sessionsStale()}
           loading={loading()}
+          pending={pending()}
           onOpen={openSession}
+          onNew={openComposer}
           ref={(element) => (sidebar = element)}
         />
         <section class="workarea">
@@ -708,6 +766,9 @@ function Shell() {
       />
       <Show when={palette()}>
         <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
+      </Show>
+      <Show when={composerOpen()}>
+        <Composer sessions={sessions()} state={createState()} onSubmit={createWorktree} onClose={closeComposer} />
       </Show>
       <div class="toasts" aria-live="polite">
         <Show when={updateLine(updatePhase())}>{(line) => <div class="toast update-status">{line()}</div>}</Show>
