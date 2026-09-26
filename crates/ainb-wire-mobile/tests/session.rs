@@ -13,6 +13,7 @@ use ainb_hangar_proto::fleet::{
 use ainb_hangar_proto::hosts::HostId;
 use ainb_wire_mobile::api::{ConnectParams, connect_host};
 use ainb_wire_mobile::custody::DeviceKey;
+use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use ainb_wire_mobile::records::{AnswerOutcome, WireError, WireEvent};
 use ainb_wire_mobile::session::{Session, SessionEvent};
 use common::{FakePeer, HOST_ID, PeerOpts, Reply, hello_then, method_not_found, spawn};
@@ -66,17 +67,31 @@ fn roster() -> Value {
     .unwrap()
 }
 
+/// Save a pairing for `peer` under `dir` and return the params to connect.
 fn params_for(peer: &FakePeer, dir: &std::path::Path) -> ConnectParams {
+    pairing::save(
+        dir,
+        PairingRecord {
+            host_id: HOST_ID.into(),
+            host_static_pubkey: peer.host_pubkey.to_vec(),
+            endpoints: vec![EndpointRecord {
+                carrier: "lan".into(),
+                url: peer.url.clone(),
+            }],
+            device_id: "01K5A0000000000000000DEV01".into(),
+            display_name: "test phone".into(),
+            scope: "mobile".into(),
+            admin: false,
+            expires_at_ms: 1_800_000_000_000,
+            paired_at_ms: 1,
+        },
+        "mdd_test",
+    )
+    .unwrap();
     ConnectParams {
-        url: peer.url.clone(),
-        carrier: "lan".into(),
         host_id: HOST_ID.into(),
-        host_static_pubkey: peer.host_pubkey.to_vec(),
         custody_dir: dir.to_string_lossy().into_owned(),
         log_dir: dir.to_string_lossy().into_owned(),
-        device_token: "mdd_test".into(),
-        device_id: "01K5A0000000000000000DEV01".into(),
-        display_name: "test phone".into(),
     }
 }
 
