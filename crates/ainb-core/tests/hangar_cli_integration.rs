@@ -2639,7 +2639,7 @@ fn issue_subscribe_persists_to_sqlite_and_survives_a_new_process() {
     assert!(ok, "issue show should exit 0; out={out}");
     assert!(out.contains("Subscribers:"), "the show block:\n{out}");
 
-    // Unsubscribe really removes the row (the creator's own row survives — it
+    // Unsubscribe really removes the row (the creator's own row survives: it
     // is a DIFFERENT actor, so this also proves the delete is actor-scoped)
     // and a second unsubscribe is an idempotent no-op.
     let (ok, out) = run(
