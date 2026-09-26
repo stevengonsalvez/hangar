@@ -68,7 +68,9 @@ async function bannerUp() {
  * a question open over the row the next case uses.
  */
 async function answerBanner(request, session) {
-  await click('.answer-banner .answer-option[data-option="0"]');
+  // The option of THIS request's banner: a fresh question from the agent
+  // could replace the banner between the read and the click.
+  await click(`.answer-banner[data-request="${request}"] .answer-option[data-option="0"]`);
   let phase = "";
   const delivered = async () => {
     phase = await browser.execute(
@@ -92,8 +94,10 @@ const linesRead = (session) => (paneText(session.tmux).match(/agent read:/g) ?? 
  * an occluded window) never runs one, so a wait on that alone holds on one
  * runner and not another. The keyboard is then proven where it matters: an
  * Enter through the driver reaches the agent, which echoes the line it read.
- * `document.activeElement` is not read for it, because WebKitGTK under xvfb
- * never names the terminal's textarea there even while its keys land.
+ * `document.activeElement` is not read for it here: after a pointer click
+ * WebKitGTK under xvfb names the textarea there unevenly, while a key the
+ * agent echoes is proof on every runner. (The chord case does read it, for
+ * a focus the shell moves itself, which that driver reports reliably.)
  */
 async function focusTerminal(session) {
   await click(`.session-row[data-session="${session.id}"]`);
@@ -187,6 +191,9 @@ async function backToSessionList() {
 /** How many tab-strip answers the host has given, as the strip counts them. */
 const hostAnswers = async () => Number(await $(".tabs").getAttribute("data-host-answers"));
 
+/** The tab the host's last strip answer focused, or "" for none. */
+const hostFocus = async () => (await $(".tabs").getAttribute("data-host-focus")) ?? "";
+
 describe("the palette over a terminal", () => {
   // Whatever a case left behind is put away here, so one failure cannot
   // spill into the next: a palette still open, and a question still open
@@ -199,7 +206,14 @@ describe("the palette over a terminal", () => {
     if (!(await $(".answer-banner[data-request]").isExisting())) return;
     const phase = await browser.execute(() => document.querySelector(".answer-banner[data-request] .answer-phase")?.dataset.phase ?? "");
     if (phase === "delivered" || phase === "already_answered") return;
-    await answerBanner(await $(".answer-banner[data-request]").getAttribute("data-request"), seeded()[0]);
+    const request = await $(".answer-banner[data-request]").getAttribute("data-request");
+    try {
+      await answerBanner(request, seeded()[0]);
+    } catch (error) {
+      // A question a case left in flight or failed is reported here, not
+      // turned into a failure of every case after it.
+      console.warn(`palette: the open question ${request} was not put away: ${error.message}`);
+    }
   });
 
   it("takes every keystroke when the terminal already has focus", async () => {
@@ -263,14 +277,7 @@ describe("the palette over a terminal", () => {
     // as the session's own agent raises it. A row that holds a minted id
     // takes only requests filed under that id (#101): one raised with no id
     // is never placed on it by worktree, so the banner would never appear.
-    raiseHook(session, {
-      event: "PreToolUse",
-      matcher: "AskUserQuestion",
-      payload: {
-        tool_name: "AskUserQuestion",
-        tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
-      },
-    });
+    raiseHook(session, ASK);
     await focusTerminal(session);
     await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
@@ -341,9 +348,12 @@ describe("the palette over a terminal", () => {
     // already open, so the host answers with focus on it, as for a fresh one.
     const answers = await hostAnswers();
     await browser.execute((id) => document.querySelector(`.session-row[data-session="${id}"]`).click(), session.id);
-    await browser.waitUntil(async () => (await hostAnswers()) > answers, {
+    // The click's own answer, not a strip update that focused nothing (a tab
+    // ending, a redial) landing in the same window: a later answer that
+    // focuses this row's tab.
+    await browser.waitUntil(async () => (await hostAnswers()) > answers && (await hostFocus()) === session.tmux, {
       timeout: 30_000,
-      timeoutMsg: "the host never answered the row's click with its tabs",
+      timeoutMsg: `the host never answered the row's click with focus on its tab (last focus: ${JSON.stringify(await hostFocus())})`,
     });
     // The frame the shell would focus the terminal from is the one after the
     // answer: two frames on, whatever it did is done.
