@@ -62,7 +62,9 @@ export default function Pair() {
         <Text style={styles.repair} testID="repair-notice">
           {repair === "revoked"
             ? "This device was revoked or its pairing expired. Pair again with a new offer."
-            : "This host no longer accepts this device. Pair again with a new offer."}
+            : repair === "peer_changed"
+              ? "This host's key changed. Ask the operator for a fresh offer and pair again."
+              : "This host no longer accepts this device. Pair again with a new offer."}
         </Text>
       ) : null}
       {scanning ? (

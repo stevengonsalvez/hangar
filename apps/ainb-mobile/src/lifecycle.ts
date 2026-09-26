@@ -17,12 +17,14 @@ import { useEffect } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import { reconcile } from "./attention/store";
-import { PeerCloseError, type FleetCursor, type HostId, type WireClient } from "./wire/types";
+import { isPeerCloseError, type FleetCursor, type HostId, type WireClient } from "./wire/types";
 
 interface Live {
   cursor?: number;
   replay?: FleetCursor["replayState"];
   connected: boolean;
+  /** We asked for this close ourselves (background, or the race guard): its `closed` event never redials. */
+  closing: boolean;
   attempts: number;
   /** The host's `retry-after`, kept for every redial of this outage. */
   retryAfter?: number;
@@ -40,10 +42,15 @@ let foreground = true;
 /** Close codes worth redialing through (T9). Undefined is a plain network drop. */
 const RETRYABLE = new Set([1013, 4429, 4503]);
 
-/** Whether a dial failure may be redialled: a network error yes, a peer close only for the three retryable codes. */
-function mayRedial(e: unknown): boolean {
-  if (e instanceof PeerCloseError) return e.code === undefined || RETRYABLE.has(e.code);
-  return true;
+/**
+ * Fail-closed: only an explicit network failure, or a peer close with one of
+ * the three retryable codes, is redialled. A plain error, an unknown object,
+ * a key mismatch, a custody or protocol failure all stop the loop.
+ */
+export function mayRedial(e: unknown): boolean {
+  if (!isPeerCloseError(e)) return false;
+  if (e.kind === "network") return true;
+  return e.kind === "close" && e.code !== undefined && RETRYABLE.has(e.code);
 }
 const HOOK_BUDGET_MS = 500;
 const RETRY_AFTER_PREFIX = "retry-after=";
@@ -72,7 +79,7 @@ export function retryAfterSecs(reason: string | undefined): number | undefined {
 function entry(hostId: HostId): Live {
   let l = live.get(hostId);
   if (!l) {
-    l = { connected: false, attempts: 0 };
+    l = { connected: false, closing: false, attempts: 0 };
     live.set(hostId, l);
   }
   return l;
@@ -92,6 +99,7 @@ export function connectHost(wire: WireClient, hostId: HostId): Promise<FleetCurs
     await wire.connect(hostId);
     // Tracked from this instant: whatever happens next, the socket is ours to close.
     l.connected = true;
+    l.closing = false;
     try {
       const cursor = await wire.subscribeFleet(hostId, l.cursor);
       l.cursor = cursor.revision;
@@ -102,12 +110,14 @@ export function connectHost(wire: WireClient, hostId: HostId): Promise<FleetCurs
       if (!foreground || myGeneration !== generation) {
         // A background began while we were dialling: DV3 says no socket stays open.
         l.connected = false;
+        l.closing = true;
         await wire.close(hostId).catch(() => undefined);
       }
       return cursor;
     } catch (e) {
       // A half-set-up session is not a connection: close it now and let the caller see the failure.
       l.connected = false;
+      l.closing = true;
       await wire.close(hostId).catch(() => undefined);
       throw e;
     }
@@ -129,7 +139,7 @@ function scheduleRedial(wire: WireClient, hostId: HostId) {
     if (!foreground) return;
     connectHost(wire, hostId).catch((e: unknown) => {
       if (!mayRedial(e)) return; // 4401, 4403, 4409 or an unknown code: the row shows the latch, no more dials
-      if (e instanceof PeerCloseError) l.retryAfter = retryAfterSecs(e.reason) ?? l.retryAfter;
+      if (isPeerCloseError(e)) l.retryAfter = retryAfterSecs(e.reason) ?? l.retryAfter;
       l.attempts += 1;
       scheduleRedial(wire, hostId); // the host's retry-after still applies
     });
@@ -156,6 +166,7 @@ async function closeAll(wire: WireClient) {
     l.timer = undefined;
     if (!l.connected) continue;
     l.connected = false;
+    l.closing = true;
     await wire.close(hostId).catch(() => undefined);
   }
 }
@@ -203,6 +214,11 @@ function onClosed(wire: WireClient, hostId: HostId, code: number | undefined, re
   l.connected = false;
   if (l.timer) clearTimeout(l.timer);
   l.timer = undefined;
+  if (l.closing) {
+    // Our own close coming back, whatever code it carries: no redial from it.
+    l.closing = false;
+    return;
+  }
   if (!foreground) return;
   if (code !== undefined && !RETRYABLE.has(code)) return;
   l.retryAfter = retryAfterSecs(reason) ?? l.retryAfter;

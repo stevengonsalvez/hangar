@@ -28,7 +28,11 @@ export default function Hosts() {
               <Text style={styles.name}>{item.displayName}</Text>
               {item.repair ? (
                 <Text style={styles.repair} testID={`repair-${item.hostId}`}>
-                  {item.repair === "revoked" ? "revoked or expired, pair again" : "host no longer accepts this device, pair again"}
+                  {item.repair === "revoked"
+                    ? "revoked or expired, pair again"
+                    : item.repair === "peer_changed"
+                      ? "host key changed, pair again with a fresh offer"
+                      : "host no longer accepts this device, pair again"}
                 </Text>
               ) : item.notice ? (
                 <Text style={styles.repair} testID={`notice-${item.hostId}`}>
