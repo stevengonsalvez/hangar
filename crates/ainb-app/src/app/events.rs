@@ -2037,23 +2037,18 @@ impl EventHandler {
         state: &mut AppState,
         chip: &crate::fleet::attention::SessionAttention,
     ) {
-        // The row's own identity for the verified send: the provider session
-        // id is not knowable here, so the tmux name is the identity the send
-        // path correlates on, with the worktree as the cwd its ambiguity
-        // guard checks.
-        let (session_id, cwd) = state.get_selected_session().map_or_else(
-            || (String::new(), String::new()),
-            |session| {
-                (
-                    session.tmux_session_name.clone().unwrap_or_default(),
-                    session.workspace_path.clone(),
-                )
-            },
-        );
+        // The row's own identity for the verified send: the id its agent runs
+        // under (the Claude id ainb minted, a Codex thread), which the send
+        // path matches exactly. A row with none delivers nowhere; the cwd is
+        // no fallback (#132).
+        let session_id = state
+            .get_selected_session()
+            .and_then(|session| session.provider_session_id.clone())
+            .unwrap_or_default();
         // Read before the send borrows the Fleet section: the answer is
         // recorded under the surface this process is, whichever that is.
         let surface = state.host.surface;
-        if let Err(refusal) = state.fleet.ask_state.send(chip, &session_id, &cwd, surface) {
+        if let Err(refusal) = state.fleet.ask_state.send(chip, &session_id, surface) {
             // Refusals are shown, never swallowed: a send that silently does
             // nothing is the failure mode this screen exists to remove.
             state.add_info_notification(refusal);
