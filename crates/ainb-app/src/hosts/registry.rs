@@ -109,62 +109,90 @@ impl HostRegistry {
     /// Name this machine's own host, keyed by the id its daemon named at
     /// hello (the minted ULID), or `local` while it has named none.
     ///
-    /// There is one local host. Called again with a new id (the daemon minted
-    /// after the surface started), it re-keys that host and keeps its state.
-    /// The key matters: the daemon stamps every row with its minted id, and
-    /// [`super::census::listing_from_read`] refuses rows that name another
-    /// host, so a local host still keyed `local` would refuse its own rows.
+    /// There is one local host. The key matters: the daemon stamps every row
+    /// with its minted id, and [`super::census::listing_from_read`] refuses
+    /// rows that name another host, so a local host keyed wrongly refuses its
+    /// own rows. Each call lands in one of these cases:
     ///
-    /// A paired host already known under this id is this machine seen through
-    /// the peer leg (paired before the local daemon named itself). It is
-    /// dropped, and the local host takes the id: a host is never paired with
-    /// itself, and refusing here would leave the local host keyed `local`.
-    pub fn set_local(&mut self, host_id: HostId, now_ms: i64) -> &mut HostApp {
-        if let Some(at) = self
-            .hosts
-            .iter()
-            .position(|h| h.kind == HostKind::Remote && h.host_id == host_id)
-        {
-            self.hosts.remove(at);
+    /// - `local` to minted (the daemon minted after the surface started): the
+    ///   host is re-keyed and keeps its state.
+    /// - minted to another minted id (a reset daemon, another home): that is
+    ///   a different daemon, so the host starts fresh. Keeping a stale
+    ///   `last_seq` would make a resync skip the new daemon's events.
+    /// - minted to `local` (an older daemon, or a hello that named none): the
+    ///   minted key is kept. Going back to `local` would refuse every row the
+    ///   store still stamps with the minted id.
+    /// - A paired host already known under the new id is this machine seen
+    ///   through the peer leg (paired before its daemon named itself). It is
+    ///   dropped: a host is never paired with itself, and refusing here would
+    ///   leave the local host keyed `local` for good.
+    ///
+    /// Returns a shared reference: the key and kind change only through the
+    /// registry, which keeps these invariants.
+    pub fn set_local(&mut self, host_id: HostId, now_ms: i64) -> &HostApp {
+        let current = self.hosts.iter().position(|h| h.kind == HostKind::Local);
+        if let Some(at) = current {
+            if host_id.is_local() && !self.hosts[at].host_id.is_local() {
+                return &self.hosts[at];
+            }
         }
-        let at = if let Some(at) = self.hosts.iter().position(|h| h.kind == HostKind::Local) {
-            self.hosts[at].host_id = host_id;
-            at
-        } else {
-            self.hosts.push(HostApp::new(host_id, HostKind::Local, now_ms));
-            self.hosts.len() - 1
+        self.hosts.retain(|h| !(h.kind == HostKind::Remote && h.host_id == host_id));
+        let at = match self.hosts.iter().position(|h| h.kind == HostKind::Local) {
+            Some(at) if self.hosts[at].host_id == host_id => at,
+            Some(at) if self.hosts[at].host_id.is_local() => {
+                self.hosts[at].host_id = host_id;
+                at
+            }
+            Some(at) => {
+                self.hosts[at] = HostApp::new(host_id, HostKind::Local, now_ms);
+                at
+            }
+            None => {
+                self.hosts.push(HostApp::new(host_id, HostKind::Local, now_ms));
+                self.hosts.len() - 1
+            }
         };
-        &mut self.hosts[at]
+        &self.hosts[at]
     }
 
     /// Add a paired host, or return the one already there. A new host is
     /// unreachable since it was added, until a read reaches it.
     ///
     /// Refused: `local` (a peer is always a minted host), this machine's own
-    /// id, and a new host past [`MAX_PAIRED_HOSTS`].
+    /// id, and a new host past [`MAX_PAIRED_HOSTS`]. Returns a shared
+    /// reference, as [`Self::set_local`] does.
     pub fn upsert_remote(
         &mut self,
         host_id: HostId,
         now_ms: i64,
-    ) -> Result<&mut HostApp, RegistryError> {
+    ) -> Result<&HostApp, RegistryError> {
         if host_id.is_local() {
             return Err(RegistryError::LocalIsPaired(host_id));
         }
-        if let Some(at) = self.hosts.iter().position(|h| h.host_id == host_id) {
+        // One pass: the match, and how many paired hosts there are.
+        let (existing, paired) =
+            self.hosts
+                .iter()
+                .enumerate()
+                .fold((None, 0usize), |(existing, paired), (at, h)| {
+                    (
+                        existing.or((h.host_id == host_id).then_some(at)),
+                        paired + usize::from(h.kind == HostKind::Remote),
+                    )
+                });
+        if let Some(at) = existing {
             if self.hosts[at].kind == HostKind::Local {
                 return Err(RegistryError::LocalIsPaired(host_id));
             }
-            return Ok(&mut self.hosts[at]);
+            return Ok(&self.hosts[at]);
         }
-        let paired = self.hosts.iter().filter(|h| h.kind == HostKind::Remote).count();
         if paired >= MAX_PAIRED_HOSTS {
             return Err(RegistryError::Full {
                 cap: MAX_PAIRED_HOSTS,
             });
         }
         self.hosts.push(HostApp::new(host_id, HostKind::Remote, now_ms));
-        let at = self.hosts.len() - 1;
-        Ok(&mut self.hosts[at])
+        Ok(&self.hosts[self.hosts.len() - 1])
     }
 
     /// This machine's own host, once named.
@@ -443,5 +471,49 @@ mod tests {
         assert!(r.upsert_remote(id(1), 5).is_ok(), "a known host is not new");
         r.remove(&id(1));
         assert!(r.upsert_remote(id(99), 0).is_ok(), "room after a remove");
+    }
+
+    /// Review of #157, finding 1: a move from one minted id to another is a
+    /// different daemon, so the local host starts fresh.
+    #[test]
+    fn a_new_minted_id_is_a_new_daemon_and_starts_fresh() {
+        let mut r = HostRegistry::new();
+        r.set_local(id(1), 10);
+        r.reached(&id(1), CarrierKind::SshL, 20);
+        r.behind(&id(1), 900, 30);
+        let local = r.set_local(id(2), 40);
+        assert_eq!(local.host_id, id(2));
+        assert_eq!(local.added_at_ms, 40);
+        assert_eq!(local.last_contact_ms, None);
+        assert_eq!(
+            local.reachability,
+            Reachability::Unreachable { since_ms: 40 },
+            "no stale last_seq carried over from the other daemon"
+        );
+        assert_eq!(r.len(), 1);
+    }
+
+    /// Finding 3: once minted, the local key never goes back to `local`.
+    #[test]
+    fn a_minted_local_key_is_never_downgraded_to_local() {
+        let mut r = HostRegistry::new();
+        r.set_local(id(1), 10);
+        r.reached(&id(1), CarrierKind::SshL, 20);
+        let local = r.set_local(HostId::local(), 30);
+        assert_eq!(local.host_id, id(1));
+        assert_eq!(local.last_contact_ms, Some(20), "left as it was");
+        assert!(r.get(&HostId::local()).is_none());
+        assert_eq!(r.len(), 1);
+    }
+
+    /// Naming the same id again changes nothing.
+    #[test]
+    fn naming_the_local_host_again_keeps_it() {
+        let mut r = HostRegistry::new();
+        r.set_local(id(1), 10);
+        r.reached(&id(1), CarrierKind::Tailnet, 20);
+        let local = r.set_local(id(1), 30);
+        assert_eq!(local.added_at_ms, 10);
+        assert_eq!(local.carrier(), Some(CarrierKind::Tailnet));
     }
 }
