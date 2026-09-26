@@ -43,12 +43,42 @@ impl HostId {
     /// [`Mirror::set_host`]; nothing re-reads it while a mirror is live.
     #[must_use]
     pub fn of_daemon(socket: &std::path::Path) -> Self {
-        ainb_hangar_client::daemon_host_id(socket).map_or_else(Self::local, Self)
+        ainb_hangar_client::daemon_host_id(socket)
+            .and_then(|id| ainb_hangar_proto::hosts::HostId::parse_minted(&id).ok())
+            .map_or_else(Self::local, Self::from)
     }
 
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+// Amendment T1: this type stays the permissive mirror host key (tests name
+// hosts `h1`, renderers peer by it), and the proto `HostId` guards the wire.
+// Ids convert only at a wire boundary (the hello above, a pairing offer, a
+// peer frame): into the app freely, out of it through the proto's
+// ULID-or-`local` check.
+
+impl From<ainb_hangar_proto::hosts::HostId> for HostId {
+    fn from(id: ainb_hangar_proto::hosts::HostId) -> Self {
+        Self(id.into())
+    }
+}
+
+impl TryFrom<HostId> for ainb_hangar_proto::hosts::HostId {
+    type Error = ainb_hangar_proto::hosts::HostIdError;
+
+    fn try_from(id: HostId) -> Result<Self, Self::Error> {
+        Self::parse(&id.0)
+    }
+}
+
+impl TryFrom<&HostId> for ainb_hangar_proto::hosts::HostId {
+    type Error = ainb_hangar_proto::hosts::HostIdError;
+
+    fn try_from(id: &HostId) -> Result<Self, Self::Error> {
+        Self::parse(&id.0)
     }
 }
 
@@ -481,6 +511,37 @@ mod tests {
             assert_eq!(frame.host_id, ulid);
             assert_eq!(frame.epoch, 8);
         }
+    }
+
+    /// Amendment T1: into the app freely, back out only through the proto's
+    /// check, so a test name like `h1` stays a valid mirror key but never
+    /// crosses the wire.
+    #[test]
+    fn a_host_id_crosses_the_wire_boundary_only_when_it_is_valid() {
+        use ainb_hangar_proto::hosts::{HostId as WireHostId, HostIdError};
+        let minted = WireHostId::parse("01K5A0000000000000000AAAAA").expect("a ULID");
+        let app = HostId::from(minted.clone());
+        assert_eq!(app.as_str(), minted.as_str());
+        assert_eq!(WireHostId::try_from(&app), Ok(minted.clone()));
+        assert_eq!(WireHostId::try_from(app), Ok(minted));
+        assert_eq!(
+            WireHostId::try_from(HostId::local()),
+            Ok(WireHostId::local())
+        );
+        assert_eq!(
+            WireHostId::try_from(HostId::new("h1")),
+            Err(HostIdError::Length(2))
+        );
+        assert_eq!(
+            WireHostId::try_from(&HostId::new("01K5A0000000000000000AAAAI")),
+            Err(HostIdError::Alphabet('I'))
+        );
+        // The wire shape is the same bare string either way.
+        let wire = serde_json::to_value(HostId::new("01K5A0000000000000000AAAAA")).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WireHostId>(wire).unwrap().as_str(),
+            "01K5A0000000000000000AAAAA"
+        );
     }
 
     #[test]
