@@ -17,4 +17,4 @@ pub mod registry;
 
 pub use ainb_hangar_proto::hosts::{CarrierKind, HostCoverage, HostId, Reachability};
 pub use census::{Census, CensusRow, HostListing, fold, listing_from_read};
-pub use registry::{HostApp, HostKind, HostRegistry};
+pub use registry::{HostApp, HostKind, HostRegistry, MAX_PAIRED_HOSTS, RegistryError};
