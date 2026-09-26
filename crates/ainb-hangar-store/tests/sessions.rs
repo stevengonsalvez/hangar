@@ -21,6 +21,7 @@ fn test_session(id: &str, tmux: &str, ws: &str, created_at: i64) -> SessionRow {
         model_source: "Raw".to_string(),
         codex_model: None,
         codex_thread_id: Some("thread-xyz".to_string()),
+        claude_session_id: None,
     }
 }
 
