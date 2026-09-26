@@ -1,0 +1,10 @@
+mouse fixture
+[?1000hX10+click on
+[?1005hutf8 ext on
+[?1005lutf8 ext off
+[?1002hbtn-event on
+[?1006hsgr ext on
+[?1004hfocus on
+[?2004hbracketed paste on
+[?1happlication cursor on
+final: 1000 1002 1006 1004 2004 DECCKM
