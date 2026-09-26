@@ -20,20 +20,26 @@ export interface HostRow {
   sinceMs?: number;
   scope?: DeviceScope;
   /**
-   * A close that only a new pairing clears, per `peer_close.rs` (T9):
-   * 4403 `revoked` (revoked OR token expired, "latch re-pair") and 4401
-   * `identity` (unauthenticated: "identity changed, re-pair"). Kept with
-   * the pairing record so it survives a restart; a 4503 rescope never sets it.
+   * The re-pair latch, verbatim from lane E's `PairingRecord.repair`
+   * (`Option<String>`, set by `mark_repair`; constants in pairing.rs):
+   * `revoked` (4403, revoked or expired), `unauthenticated` (4401),
+   * `peer_changed` (the host's static key is not the pinned one). Read from
+   * `hosts()` on every call; the app keeps no copy. Any value, known or not,
+   * means no redial and a path to the pair screen.
    */
-  /** Also `peer_changed`: the host's static key no longer matches the pinned one, a fresh offer and never a redial. Read from lane E's pairing record (#98 `mark_repair`), no copy kept. */
-  repair?: "revoked" | "identity" | "peer_changed";
+  repair?: RepairLatch;
   /**
-   * A state nobody should redial through: 4409 (update one side), a code this
-   * build does not know, or a host whose static key no longer matches the
-   * pinned one (`peer_changed`: ask the operator for a fresh offer).
+   * A parked state from the same record (`Option<String>`): `incompatible`
+   * (4409, update one side) or `unknown_code` (a close code this build does
+   * not know). Read from `hosts()`, no copy kept. Any value means no redial.
    */
-  notice?: "update_required" | "unknown_close";
+  notice?: HostNotice;
 }
+
+/** The crate's latch strings (pairing.rs `REPAIR_*`), plus any newer value, which still compiles and still blocks. */
+export type RepairLatch = "revoked" | "unauthenticated" | "peer_changed" | (string & {});
+/** The crate's parked strings (pairing.rs `NOTICE_*`), plus any newer value. */
+export type HostNotice = "incompatible" | "unknown_code" | (string & {});
 
 export type BaseScope = "desktop" | "mobile" | "mobile+type" | "unknown";
 export interface DeviceScope {
