@@ -149,22 +149,30 @@ fn text_ok(field: &'static str, value: &str, max: usize) -> Result<(), SpawnPara
     Ok(())
 }
 
-/// A conservative subset of `git check-ref-format`: no leading `-` (it would
-/// reach `ainb run` and git as a flag), no whitespace, no `..`, no `@{`, none
-/// of `~^:?*[\`, no leading or trailing `/` or `.`, no `.lock` suffix.
+/// A conservative subset of `git check-ref-format`, whole name and per
+/// `/`-separated component.
+///
+/// Whole name: no leading `-` (it would reach `ainb run` and git as a flag),
+/// no whitespace or control characters, none of `~^:?*[\`, no `..`, no `@{`,
+/// not `@` alone, no trailing `/` or `.`. Each component: not empty (so no
+/// leading `/` or `//`), no leading `.`, no `.lock` suffix.
+///
+/// The cases are pinned by `tests/fixtures/spawn_validation.json`, which the
+/// desktop composer's validator is tested against too, so the two cannot
+/// drift apart.
 fn ref_ok(field: &'static str, value: &str) -> Result<(), SpawnParamsError> {
     text_ok(field, value, SPAWN_FIELD_MAX)?;
-    let bad = value.starts_with('-')
-        || value.starts_with('/')
+    let whole_bad = value.starts_with('-')
+        || value == "@"
         || value.ends_with('/')
-        || value.starts_with('.')
         || value.ends_with('.')
-        || value.to_ascii_lowercase().ends_with(".lock")
         || value.contains("..")
         || value.contains("@{")
-        || value.contains("//")
         || value.chars().any(|c| c.is_whitespace() || "~^:?*[\\".contains(c));
-    if bad {
+    let part_bad = value.split('/').any(|part| {
+        part.is_empty() || part.starts_with('.') || part.to_ascii_lowercase().ends_with(".lock")
+    });
+    if whole_bad || part_bad {
         return Err(SpawnParamsError::BadRef(field));
     }
     Ok(())
