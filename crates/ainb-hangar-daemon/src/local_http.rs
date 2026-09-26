@@ -83,10 +83,7 @@ pub(crate) async fn read_head<S: AsyncRead + Unpin>(
             headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
         }
     }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let content_length = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
 
     Ok(Some(RequestHead {
         method: method.to_string(),
