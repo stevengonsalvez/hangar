@@ -462,6 +462,7 @@ pub fn exact_target<'a>(
 /// description, `Err` the reason nothing was delivered.
 async fn resolve_and_send_typed(
     session_id: &str,
+    pane: &crate::fleet::send::PaneHint,
     text: &str,
     is_answer: bool,
 ) -> Result<String, String> {
@@ -480,9 +481,15 @@ async fn resolve_and_send_typed(
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
     let merged = merge_sessions(vec![ainb, peers]);
     let Some(session) = exact_target(&merged, session_id) else {
-        return Err(crate::fleet::types::NO_LIVE_TARGET.to_string());
+        return Err(crate::fleet::types::no_live_target_reason(session_id).to_string());
     };
-    outcome_result(send(session, text).await)
+    // The agent's own pane, by its stable id, as the daemon sends: a session
+    // name would land in whichever pane is active.
+    let mut session = session.clone();
+    if let Some(name) = session.tmux_session.clone() {
+        session.tmux_session = Some(crate::fleet::send::resolve_send_target(&name, pane).await?);
+    }
+    outcome_result(send(&session, text).await)
 }
 
 /// Map a `send()` result to a verdict plus its description.
@@ -511,6 +518,19 @@ fn outcome_result(
 ///
 /// Returns the reason nothing was delivered.
 pub fn answer_via_tmux_blocking(session_id: &str, text: &str) -> Result<String, String> {
+    answer_via_tmux_blocking_at(session_id, &crate::fleet::send::PaneHint::default(), text)
+}
+
+/// [`answer_via_tmux_blocking`], into the agent's own pane as `pane` names it.
+///
+/// # Errors
+///
+/// Returns the reason nothing was delivered.
+pub fn answer_via_tmux_blocking_at(
+    session_id: &str,
+    pane: &crate::fleet::send::PaneHint,
+    text: &str,
+) -> Result<String, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -518,7 +538,7 @@ pub fn answer_via_tmux_blocking(session_id: &str, text: &str) -> Result<String, 
     // `is_answer` is always true here: this path exists only for answers, and
     // an answer routed to the wrong agent by a cwd guess is the failure the
     // guard exists to prevent.
-    runtime.block_on(resolve_and_send_typed(session_id, text, true))
+    runtime.block_on(resolve_and_send_typed(session_id, pane, text, true))
 }
 
 /// Answer one parked permission request through notifyd's approve broker.
