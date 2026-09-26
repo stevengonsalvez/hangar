@@ -135,8 +135,8 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
     // refuse and one pane is typed into, counted across every window. After
     // the first pane closes the second is renumbered, so its old index names
     // nothing while its id still does.
-    use ainb_fleet_core::send::{PaneHint, resolve_send_target, tmux_session_exists};
-    let resolve = |hint: PaneHint| runtime.block_on(resolve_send_target(&name, &hint));
+    use ainb_fleet_core::send::{PaneHint, resolve_send_pane, tmux_session_exists};
+    let resolve = |hint: PaneHint| runtime.block_on(resolve_send_pane(&name, &hint));
     let read = |id: &str, format: &str| {
         tmux(&["display-message", "-p", "-t", id, format]).unwrap().trim().to_string()
     };
@@ -160,7 +160,7 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
             target: Some(target.clone()),
             fingerprint: fingerprint(&active_id)
         }),
-        Ok(active_id.clone()),
+        Ok(Some(active_id.clone())),
         "the fingerprint's id outranks the index target"
     );
     assert_eq!(
@@ -168,7 +168,7 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
             target: None,
             fingerprint: Some(format!("pane={active_id}"))
         }),
-        Ok(active_id.clone()),
+        Ok(Some(active_id.clone())),
         "a fingerprint with no pid and no start is checked for the session alone"
     );
     let refused = resolve(PaneHint {
@@ -238,7 +238,7 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
             target: None,
             fingerprint: fingerprint(&first_id)
         }),
-        Ok(first_id.clone()),
+        Ok(Some(first_id.clone())),
         "what runs in the respawned pane now is delivered to"
     );
     // The routed send, aimed at a pane id: the tmux gate lets it through and
@@ -299,13 +299,23 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
             target: Some(format!("{name}:{window}.{second_index_before}")),
             fingerprint: fingerprint(&active_id)
         }),
-        Ok(active_id.clone()),
+        Ok(Some(active_id.clone())),
         "the fingerprint still names the surviving pane after the renumbering"
     );
     assert_eq!(
         resolve(PaneHint::default()),
-        Ok(active_id.clone()),
+        Ok(Some(active_id.clone())),
         "one pane left: typed into"
+    );
+    // A session tmux has no name for is not this resolver's refusal: the
+    // route decides between a refusal and a broker peer.
+    assert_eq!(
+        runtime.block_on(resolve_send_pane(
+            "no-such-session-exact-pane",
+            &PaneHint::default()
+        )),
+        Ok(None),
+        "no such tmux session: nothing to narrow"
     );
     // A pane in another window of the session counts: with nothing recorded
     // the session has two panes again, whichever window is current.
