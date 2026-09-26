@@ -50,6 +50,8 @@ pub enum WireError {
         message: String,
         /// `error.data.reason`, the D18 vocabulary, when the daemon sent one.
         reason: Option<String>,
+        /// The whole `error.data` as JSON text, when the daemon sent one.
+        data: Option<String>,
     },
     /// The request outlived its timeout with no reply.
     #[error("{method} timed out")]
@@ -512,6 +514,15 @@ pub enum WireEvent {
         code: Option<u16>,
         /// Why.
         reason: String,
+    },
+    /// One frame of an attached terminal stream, bytes already decoded.
+    TerminalFrame {
+        /// The stream.
+        stream_id: u64,
+        /// The feed offset at emit time.
+        seq: u64,
+        /// The frame.
+        frame: crate::terminal::TerminalFrameRecord,
     },
     /// A notification this build does not map; the app ignores it.
     Other {
