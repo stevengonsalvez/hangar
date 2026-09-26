@@ -53,4 +53,6 @@ test("the daemon dot names the sidecar's own state", async () => {
   const dot = document.querySelector(".statusbar-daemon-dot");
   assert.equal(dot?.classList.contains("error"), true);
   assert.equal(dot?.getAttribute("title"), "degraded");
+  // A live region with no text announces nothing: the state is spelled out.
+  assert.match(dot?.textContent ?? "", /Daemon degraded/);
 });

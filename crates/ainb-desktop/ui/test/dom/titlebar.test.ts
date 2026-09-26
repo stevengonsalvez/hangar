@@ -39,11 +39,17 @@ async function open(over: Partial<Parameters<typeof Titlebar>[0]> = {}) {
   return { calls };
 }
 
-test("the bar drags the window and carries the app name", async () => {
-  await open();
+test("the bar drags the window; it names the app only on macOS", async () => {
+  await open({ mac: true });
   const bar = document.querySelector("header.titlebar");
   assert.ok(bar?.hasAttribute("data-tauri-drag-region"), "the bar itself is the drag region");
   assert.match(document.querySelector(".titlebar-app")?.textContent ?? "", /ainb/i);
+
+  // Elsewhere the native title bar already names the window.
+  cleanup?.();
+  document.body.innerHTML = "";
+  await open({ mac: false });
+  assert.equal(document.querySelector(".titlebar-app"), null);
 });
 
 test("macOS gets the traffic-light padding class; other platforms do not", async () => {

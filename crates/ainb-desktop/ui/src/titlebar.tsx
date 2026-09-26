@@ -29,7 +29,10 @@ interface Props {
 export function Titlebar(props: Props) {
   return (
     <header class="titlebar" classList={{ mac: props.mac }} data-tauri-drag-region="true">
-      <span class="titlebar-app">ainb</span>
+      {/* Elsewhere the native title bar already names the window. */}
+      <Show when={props.mac}>
+        <span class="titlebar-app">ainb</span>
+      </Show>
       <div class="titlebar-actions">
         <button
           type="button"

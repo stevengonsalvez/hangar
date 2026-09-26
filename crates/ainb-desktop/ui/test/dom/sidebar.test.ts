@@ -144,3 +144,57 @@ test("collapsing a project persists across a relaunch", async () => {
   const reopened = document.querySelector<HTMLDetailsElement>('details.workspace[data-workspace="repo"]');
   assert.equal(reopened?.open, false, "the collapse survived the relaunch");
 });
+
+/**
+ * Every frame rebuilds the rows; the sidebar draws them by key, so a frame
+ * that changes ANOTHER row patches in place and the focused row keeps the
+ * keyboard. Drawn by object, the whole list remounted and focus fell to
+ * <body> mid-typing (#1267's failure, in the sidebar).
+ */
+test("a focused row keeps focus when a frame changes another row", async () => {
+  const two = (claudeChanges: number) =>
+    frame({
+      workspaces: [
+        {
+          name: "repo",
+          path: "/repo",
+          sessions: [
+            session("claude-1", "/repo/wt-a", { git_changes: { added: claudeChanges, modified: 0, deleted: 0 } }),
+            session("codex-1", "/repo/wt-b", { agent_type: "Codex", name: "codex-1" }),
+          ],
+          shell_session: null,
+        },
+      ],
+    });
+  const { setHeld } = await open(two(0));
+  const row = document.querySelector<HTMLButtonElement>('.session-row[data-session="codex-1"]');
+  row?.focus();
+  assert.equal(document.activeElement, row, "the row took focus");
+
+  // A fresh frame object, as the host sends, with only claude-1's counts moved.
+  setHeld(two(3));
+  await settle();
+
+  assert.equal(
+    document.activeElement,
+    row,
+    "the same node still holds focus, not <body>"
+  );
+  assert.equal(document.querySelector('.session-row[data-session="codex-1"]'), row, "the row was patched, not remounted");
+  assert.match(document.querySelector(".git-counts")?.textContent ?? "", /\+3/, "the other card did update");
+});
+
+test("collapse is remembered by project path, so two repos with one name stay apart", async () => {
+  const twins = frame({
+    workspaces: [
+      { name: "app", path: "/work/app", sessions: [session("a-1", "/work/app/wt")], shell_session: null },
+      { name: "app", path: "/personal/app", sessions: [session("b-1", "/personal/app/wt")], shell_session: null },
+    ],
+  });
+  await open(twins);
+  const [first, second] = [...document.querySelectorAll<HTMLDetailsElement>("details.workspace")];
+  first.querySelector<HTMLElement>("summary")?.click();
+  await settle();
+  assert.equal(first.open, false);
+  assert.equal(second.open, true, "the other 'app' stays open");
+});
