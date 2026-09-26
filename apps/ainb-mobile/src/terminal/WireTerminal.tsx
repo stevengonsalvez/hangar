@@ -64,7 +64,7 @@ export function WireTerminal({ hostId, sessionKey }: { hostId?: HostId; sessionK
         onSink={setSink}
         onInput={state.canType && state.typing ? input : undefined}
         onFit={fit}
-        onEngine={setEngine}
+        onEngine={(st) => setEngine((prev) => (prev === st ? prev : st))}
         onLink={(uri) => setLink(hostOf(uri))}
       />
     </View>
