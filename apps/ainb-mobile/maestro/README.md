@@ -11,6 +11,7 @@ export FAKE="-e HOST_ID=01K5A0000000000000000AAAAA -e SESSION_KEY=claude:hangar 
 maestro test $FAKE maestro/banner-answer.yaml
 maestro test $FAKE maestro/background-foreground.yaml
 maestro test $FAKE maestro/terminal-fixtures.yaml
+maestro test $FAKE maestro/terminal-osc8-link.yaml
 
 # real daemon (M1-14): the proof scenario supplies every value
 maestro test -e OFFER="ainb://pair#..." -e HOST_ID=... -e ATTENTION_ID=... -e QUESTION="..." \
