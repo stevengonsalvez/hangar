@@ -1,4 +1,4 @@
-//! The paired-device registry (migration 0103, R1-03, spec D13).
+//! The paired-device registry (migration 0104, R1-03, spec D13).
 //!
 //! ```text
 //! operator ──▶ create_invite ──▶ device_invite (5 min, single use)
@@ -29,12 +29,22 @@ pub const MAX_INVITE_ATTEMPTS: i64 = 5;
 /// accepted hello slides it; there is no refresh RPC.
 pub const IDLE_EXPIRY_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 /// The longest display name the registry stores, in characters. The CHECK in
-/// migration 0103 enforces it (with non-blank and no line breaks), because the
-/// redeeming device, not the operator, chooses the name.
+/// migration 0104 enforces it, with a 256-byte bound (SQLite's `length` stops
+/// at a NUL, so the byte length is what bounds the stored value), no NUL, no
+/// C0 control, DEL or bidi override, and not blank once spaces, tabs and
+/// no-break spaces are trimmed, because the redeeming device, not the
+/// operator, chooses the name and it is printed in a terminal.
 pub const DISPLAY_NAME_MAX_CHARS: usize = 64;
 /// A revoked device stays listed this long, then [`DeviceRepo::prune`]
 /// removes it.
 pub const REVOKED_RETENTION_MS: i64 = 90 * 24 * 60 * 60 * 1000;
+
+/// Equal-length byte strings compared without an early exit, so the time
+/// taken does not say how long a matching prefix was (the digests and keys
+/// compared here are fixed-width, so the length says nothing either).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 /// The base of a stored scope. The wire type is
 /// `ainb_hangar_proto::devices::BaseScope`; the daemon maps between the two.
@@ -265,6 +275,17 @@ impl DeviceRepo {
         pool: &SqlitePool,
         redeem: &Redeem<'_>,
     ) -> Result<RedeemOutcome, sqlx::Error> {
+        // An invite id nobody issued is answered without the store's write
+        // lock: an unauthenticated peer must not be able to hold it by
+        // redeeming random ids. Only a real invite takes the lock, and a
+        // wrong secret burns it after MAX_INVITE_ATTEMPTS.
+        let known = sqlx::query("SELECT 1 FROM device_invite WHERE invite_id = ?")
+            .bind(redeem.invite_id)
+            .fetch_optional(pool)
+            .await?;
+        if known.is_none() {
+            return Ok(RedeemOutcome::Refused(RedeemRefusal::Unknown));
+        }
         let mut tx = pool.begin_with(crate::repo::fleet::IMMEDIATE_TRANSACTION).await?;
         let Some(invite) = sqlx::query(
             "SELECT secret_sha256, scope_base, scope_admin, expires_at, attempts, burned_at, consumed_at \
@@ -285,7 +306,10 @@ impl DeviceRepo {
         if redeem.now_ms > invite.try_get::<i64, _>("expires_at")? + REDEEM_LEEWAY_MS {
             return Ok(RedeemOutcome::Refused(RedeemRefusal::Expired));
         }
-        if invite.try_get::<String, _>("secret_sha256")? != redeem.secret_sha256 {
+        if !constant_time_eq(
+            invite.try_get::<String, _>("secret_sha256")?.as_bytes(),
+            redeem.secret_sha256.as_bytes(),
+        ) {
             let attempts = invite.try_get::<i64, _>("attempts")? + 1;
             let burned = attempts >= MAX_INVITE_ATTEMPTS;
             sqlx::query("UPDATE device_invite SET attempts = ?, burned_at = ? WHERE invite_id = ?")
@@ -370,18 +394,22 @@ impl DeviceRepo {
         remote_static: &[u8; 32],
         now_ms: i64,
     ) -> Result<HelloCheck, sqlx::Error> {
-        let mut tx = pool.begin_with(crate::repo::fleet::IMMEDIATE_TRANSACTION).await?;
+        // Checked without the store's write lock: a hello is unauthenticated
+        // until these pass, and a flood of bad tokens must not queue every
+        // other writer behind it. Only an accepted hello writes, and its
+        // UPDATE re-checks revocation and expiry so a revoke that lands in
+        // between still wins.
         let Some(row) = sqlx::query(&format!(
             "SELECT {COLUMNS} FROM device WHERE token_sha256 = ?"
         ))
         .bind(token_sha256)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(pool)
         .await?
         else {
             return Ok(HelloCheck::UnknownToken);
         };
         let mut record = record_from(&row)?;
-        if record.static_pubkey != remote_static {
+        if !constant_time_eq(&record.static_pubkey, remote_static) {
             return Ok(HelloCheck::KeyMismatch {
                 device_id: record.device_id,
             });
@@ -398,13 +426,22 @@ impl DeviceRepo {
         }
         record.last_seen_at = record.last_seen_at.max(now_ms);
         record.expires_at = record.last_seen_at + IDLE_EXPIRY_MS;
-        sqlx::query("UPDATE device SET last_seen_at = ?, expires_at = ? WHERE device_id = ?")
-            .bind(record.last_seen_at)
-            .bind(record.expires_at)
-            .bind(&record.device_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        let slid = sqlx::query(
+            "UPDATE device SET last_seen_at = ?, expires_at = ? \
+             WHERE device_id = ? AND revoked_at IS NULL AND expires_at > ?",
+        )
+        .bind(record.last_seen_at)
+        .bind(record.expires_at)
+        .bind(&record.device_id)
+        .bind(now_ms)
+        .execute(pool)
+        .await?;
+        if slid.rows_affected() == 0 {
+            // Revoked (or expired) between the read and the write.
+            return Ok(HelloCheck::Revoked {
+                device_id: record.device_id,
+            });
+        }
         Ok(HelloCheck::Accepted(record))
     }
 
@@ -491,6 +528,7 @@ impl DeviceRepo {
         device_id: &str,
         scope: StoredScope,
         fence: Option<i64>,
+        now_ms: i64,
     ) -> Result<Fenced, sqlx::Error> {
         let mut tx = pool.begin_with(crate::repo::fleet::IMMEDIATE_TRANSACTION).await?;
         let version = version_on(&mut tx).await?;
@@ -498,9 +536,11 @@ impl DeviceRepo {
             return Ok(Fenced::Conflict { version });
         }
         let Some(row) = sqlx::query(
-            "SELECT scope_base, scope_admin FROM device WHERE device_id = ? AND revoked_at IS NULL",
+            "SELECT scope_base, scope_admin FROM device \
+             WHERE device_id = ? AND revoked_at IS NULL AND expires_at > ?",
         )
         .bind(device_id)
+        .bind(now_ms)
         .fetch_optional(&mut *tx)
         .await?
         else {
@@ -660,12 +700,24 @@ mod tests {
     }
 
     /// DECISIONS: the first schema PR proves that an older binary refuses a
-    /// database a newer one migrated. A v1.29.0 daemon embeds the chain up to
-    /// 0102; run exactly that chain against a database this build migrated,
-    /// and it must stop with `VersionMissing(103)` rather than serve a schema
-    /// it does not know. This is why the registry merges only after the tag.
+    /// database a newer one migrated. A binary built before the registry
+    /// embeds the chain up to 0103; run exactly that chain against a database
+    /// this build migrated, and it must stop with `VersionMissing(104)`
+    /// rather than serve a schema it does not know.
+    /// The registry's migration number. The older chain stops just below it,
+    /// so `VersionMissing` names the registry whatever comes after it.
+    const REGISTRY_MIGRATION: u32 = 104;
+
     #[tokio::test]
     async fn an_older_migrator_refuses_a_database_migrated_past_it() {
+        assert!(
+            std::fs::metadata(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/migrations/0104_device_registry.sql"
+            ))
+            .is_ok(),
+            "the registry is migration {REGISTRY_MIGRATION}"
+        );
         let (_home, store) = store().await;
         let older = tempfile::tempdir().expect("older chain");
         for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
@@ -674,19 +726,22 @@ mod tests {
             let path = entry.expect("entry").path();
             let name = path.file_name().expect("name").to_string_lossy().into_owned();
             let version: u32 = name[..4].parse().expect("numbered migration");
-            if version < 103 {
+            if version < REGISTRY_MIGRATION {
                 std::fs::copy(&path, older.path().join(&name)).expect("copy");
             }
         }
         let migrator = sqlx::migrate::Migrator::new(older.path()).await.expect("older migrator");
         assert!(
-            migrator.iter().all(|m| m.version < 103),
-            "the stand-in for the older binary must not know 0103"
+            migrator.iter().all(|m| m.version < i64::from(REGISTRY_MIGRATION)),
+            "the stand-in for the older binary must not know the registry"
         );
 
         let refused = migrator.run(store.pool()).await.expect_err("must refuse");
         assert!(
-            matches!(refused, sqlx::migrate::MigrateError::VersionMissing(103)),
+            matches!(
+                refused,
+                sqlx::migrate::MigrateError::VersionMissing(v) if v == i64::from(REGISTRY_MIGRATION)
+            ),
             "{refused:?}"
         );
     }
@@ -853,7 +908,7 @@ mod tests {
             admin: false,
         };
         assert_eq!(
-            DeviceRepo::rescope(pool, &device.device_id, narrower, Some(0))
+            DeviceRepo::rescope(pool, &device.device_id, narrower, Some(0), T0)
                 .await
                 .expect("rescope"),
             Fenced::Conflict { version: 1 },
@@ -864,13 +919,13 @@ mod tests {
             PHONE
         );
         assert_eq!(
-            DeviceRepo::rescope(pool, &device.device_id, narrower, Some(1))
+            DeviceRepo::rescope(pool, &device.device_id, narrower, Some(1), T0)
                 .await
                 .expect("rescope"),
             Fenced::Applied { version: 2 }
         );
         assert_eq!(
-            DeviceRepo::rescope(pool, &device.device_id, narrower, None)
+            DeviceRepo::rescope(pool, &device.device_id, narrower, None, T0)
                 .await
                 .expect("rescope"),
             Fenced::Applied { version: 2 },
@@ -902,7 +957,7 @@ mod tests {
         );
 
         assert_eq!(
-            DeviceRepo::rescope(pool, &device.device_id, PHONE, None)
+            DeviceRepo::rescope(pool, &device.device_id, PHONE, None, T0)
                 .await
                 .expect("rescope"),
             Fenced::NotFound,
@@ -914,9 +969,38 @@ mod tests {
         );
     }
 
+    /// #67 review: a device past its idle expiry cannot authenticate, so it
+    /// is not live, and rescoping it neither applies nor bumps the version.
+    #[tokio::test]
+    async fn an_idle_expired_device_is_not_rescoped() {
+        let (_home, store) = store().await;
+        let pool = store.pool();
+        let device = paired(pool, 1, PHONE).await;
+        let (_, before) = DeviceRepo::list(pool).await.expect("list");
+        let later = device.expires_at + 1;
+        assert_eq!(
+            DeviceRepo::rescope(
+                pool,
+                &device.device_id,
+                StoredScope {
+                    base: ScopeBase::Mobile,
+                    admin: false,
+                },
+                None,
+                later,
+            )
+            .await
+            .expect("rescope"),
+            Fenced::NotFound
+        );
+        let (_, after) = DeviceRepo::list(pool).await.expect("list");
+        assert_eq!(before, after, "the registry version is untouched");
+    }
+
     /// The redeeming device chooses its name, so storage bounds it: an
-    /// over-long, blank or multi-line name is refused, and the refused redeem
-    /// leaves the invite unspent for a well-formed retry.
+    /// over-long, blank, multi-line, NUL-carrying, control or bidi name is
+    /// refused, and the refused redeem leaves the invite unspent for a
+    /// well-formed retry.
     #[tokio::test]
     async fn a_device_name_is_bounded_and_a_refused_redeem_spends_nothing() {
         let (_home, store) = store().await;
@@ -944,6 +1028,16 @@ mod tests {
             "   ".to_string(),
             "two\nlines".to_string(),
             "carriage\rreturn".to_string(),
+            // #67 review: SQLite's length() stops at a NUL, so a NUL ahead
+            // of a long tail used to pass the 64-character bound.
+            format!("a\0{}", "x".repeat(10_000)),
+            // A terminal escape (OSC 52 writes the clipboard) and bidi
+            // overrides are refused: the name is printed in a terminal.
+            "\u{1b}]52;c;aGk=\u{7}Desktop".to_string(),
+            "\u{202e}enotsktop".to_string(),
+            "\u{2066}isolated".to_string(),
+            "\t".to_string(),
+            "\u{a0}".to_string(),
         ] {
             assert!(
                 redeem_named(bad.clone()).await.is_err(),
@@ -1003,7 +1097,9 @@ mod tests {
 
         let device = paired(pool, 2, PHONE).await;
         assert!(
-            DeviceRepo::rescope(pool, &device.device_id, admin_phone, None).await.is_err(),
+            DeviceRepo::rescope(pool, &device.device_id, admin_phone, None, T0)
+                .await
+                .is_err(),
             "an admin phone rescope must not store"
         );
         assert_eq!(
@@ -1016,7 +1112,7 @@ mod tests {
             admin: true,
         };
         assert!(matches!(
-            DeviceRepo::rescope(pool, &device.device_id, admin_desktop, None)
+            DeviceRepo::rescope(pool, &device.device_id, admin_desktop, None, T0)
                 .await
                 .expect("rescope"),
             Fenced::Applied { .. }
