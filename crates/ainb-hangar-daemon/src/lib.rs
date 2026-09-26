@@ -40,6 +40,10 @@ mod acp_transcript;
 /// exactly once (first-answer-wins), into the right session (C1 misroute guard),
 /// via the one verified send path. Backs the `attention/answer` RPC.
 pub mod answer;
+/// The kind-based scope gate inside `attention/answer`: an approval, or an
+/// ask that resolves a live hook hold, takes `fleet/action` Approve's column
+/// verdict (hooks-and-answers, review F2).
+pub mod answer_scope;
 /// ATC on the daemon (D12, spec P9 §4.7): the instance registry, the heartbeat
 /// cron (the launchd/systemd timer's daemon-native replacement — reusing the
 /// autopilot scheduler's DB-durable tick loop), the store-backed retry cap, and
@@ -1476,6 +1480,8 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
                     dir.join("hangar").join("attention_ingest.offset"),
                 ),
                 dir.clone(),
+                store.pool().clone(),
+                broker.sink(),
             );
             match crate::hook_ingress::start(&dir, std::sync::Arc::new(sink)).await {
                 Ok(running) => {
