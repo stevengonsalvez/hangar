@@ -87,7 +87,7 @@ async fn every_v2_method_is_method_not_found_by_default() {
     }
 }
 
-/// The hello reply advertises `catalogue_strings()`, and none of the eight
+/// The hello reply advertises `catalogue_strings()`, and none of the nine
 /// dark capabilities is in it.
 #[test]
 fn no_v2_capability_is_advertised() {
@@ -112,7 +112,7 @@ fn no_v2_method_is_in_the_mutation_registry() {
     }
 }
 
-/// The switches are the two names the owner decided (DV16): boot-time
+/// The switches are the names the owner decided (DV16): boot-time
 /// environment variables, never `daemon_config` keys a connected surface could
 /// set through `hangar/daemon_config_set`.
 #[test]
