@@ -213,8 +213,16 @@ describe("the palette over a terminal", () => {
     await browser.keys(QUERY);
     assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the composer took the draft");
 
+    // The chord for this session's own tab: another spec's tab may sit ahead
+    // of it in the strip, and the strip and the mounted terminals share one
+    // order.
+    const index = await browser.execute(
+      (key) => [...document.querySelectorAll(".terminal[data-tab]")].findIndex((el) => el.getAttribute("data-tab") === key),
+      session.tmux,
+    );
+    assert.ok(index >= 0, `the session's terminal is mounted`);
     const before = linesRead(session);
-    await browser.keys([...MOD, "1"]);
+    await browser.keys([...MOD, String(index + 1)]);
     await browser.pause(300);
     await browser.keys(["Enter"]);
     await browser.waitUntil(() => linesRead(session) > before, {
