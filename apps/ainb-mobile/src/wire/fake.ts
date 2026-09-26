@@ -155,11 +155,12 @@ export class FakeWire implements WireClient {
   }
 
   /** The agent moved on: the session's lifecycle clock advances under the reader. */
-  advanceTurn(hostId: HostId, sessionKey: SessionKey) {
+  advanceTurn(hostId: HostId, sessionKey: SessionKey, silent = true) {
     const host = this.host(hostId);
     host.sessions = host.sessions.map((s) =>
       s.sessionKey === sessionKey ? { ...s, lifecycleUpdatedAt: s.lifecycleUpdatedAt + 1, version: s.version + 1 } : s,
     );
+    if (!silent && host.connected) this.emit({ kind: "fleet_revision", hostId, revision: (host.revision += 1) });
   }
 
   /** Someone else answered: the row retires and the event says who. */
@@ -520,8 +521,9 @@ export class FakeWire implements WireClient {
     const s = host.sessions.find((x) => x.sessionKey === req.sessionKey);
     let ack: MutationAck;
     if (!s) ack = { outcome: "created", status: "rejected", reason: "no_target" };
-    else if (s.sessionIncarnation !== req.sessionIncarnation) ack = { outcome: "created", status: "rejected", reason: "incarnation_mismatch" };
-    else if (s.version !== req.version) ack = { outcome: "created", status: "rejected", reason: "turn_advanced" };
+    else if (s.sessionIncarnation !== req.sessionIncarnation) ack = { outcome: "created", status: "rejected", reason: "incarnation_mismatch", code: -32008 };
+    // A stale row version is a MUTATION_REJECTED (-32008) with reason `conflict`, as the daemon answers it.
+    else if (s.version !== req.version) ack = { outcome: "created", status: "rejected", reason: "conflict", code: -32008 };
     else ack = { outcome: "created", status: "accepted" };
     this.opLedger.set(req.opId, ack);
     return ack;
