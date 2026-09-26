@@ -25,6 +25,8 @@ const term = new Terminal({
   fontFamily: "Menlo, monospace",
   scrollback: 2000,
   theme: { background: "#191923", foreground: "#DCDCE6" },
+  // OSC 8 links in pane output never activate: the webview must not navigate.
+  linkHandler: { activate: () => undefined },
 });
 term.loadAddon(new Unicode11Addon());
 term.unicode.activeVersion = "11";
