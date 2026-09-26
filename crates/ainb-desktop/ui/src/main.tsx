@@ -230,18 +230,6 @@ function Shell() {
     if (!inboxOpen()) return;
     void run(CLOSE_INBOX);
   };
-  /**
-   * The answer banner's sends. The banner is drawn over every page, but its
-   * rows (the Ask tab, the pick, the composer) are the session list's, and
-   * the reducer refuses them while a page has it: a pick over the inbox went
-   * nowhere (#121). So a page the reducer is on is closed first, the way its
-   * own close button does it, and then the answer is sent.
-   */
-  const answer = (intents: RendererIntent[]) => {
-    if (intents.length === 0) return run(intents);
-    const leave = inboxOpen() ? CLOSE_INBOX : settings() ? CLOSE_SETTINGS : [];
-    return run([...leave, ...intents]);
-  };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
     void invoke<boolean>("setup_write", { write }).then((ran) => {
@@ -622,7 +610,7 @@ function Shell() {
           </nav>
           {/* One banner per open request, latched for a short grace across
               frames that carry none (#1266): `AnswerSlot`. */}
-          <AnswerSlot question={question()} ask={ask()} run={answer} />
+          <AnswerSlot question={question()} ask={ask()} run={run} />
           <Show when={transcriptKey()}>
             {(key) => (
               <AcpCard
