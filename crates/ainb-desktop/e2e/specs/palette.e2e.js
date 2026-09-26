@@ -231,20 +231,54 @@ describe("the palette over a terminal", () => {
     );
     assert.ok(index >= 0, `the session's terminal is mounted`);
     const before = linesRead(session);
+    // Every key the page sees, stamped in page time, so a key the driver held
+    // back can be told from one the pane took late.
+    await browser.execute(() => {
+      window.__keys = [];
+      window.__t0 = Math.round(performance.now());
+      window.addEventListener("keydown", (e) => window.__keys.push(`${e.key}@${Math.round(performance.now() - window.__t0)}`), true);
+    });
     await browser.keys([...MOD, String(index + 1)]);
     await browser.pause(300);
+    const sentAt = Date.now();
     await browser.keys(["Enter"]);
-    await browser.waitUntil(() => linesRead(session) > before, {
-      timeout: 30_000,
-      timeoutMsg: `the terminal never took the keyboard from the composer: ${JSON.stringify({
-        before,
-        now: linesRead(session),
-        session: session.tmux,
-        index,
-        ...(await focusState()),
-        panes: paneTails(),
-      })}`,
-    });
+    // The line the agent read, counted or seen fresh at the bottom of the
+    // pane: an older one may have scrolled out while this one arrived.
+    const landed = () =>
+      linesRead(session) > before ||
+      paneText(session.tmux).split("\n").filter(Boolean).slice(-3).some((line) => line.trim() === "agent read:");
+    // The first ten seconds poll the pane alone; after that each poll also
+    // sends the page a driver command, which flushes a key the driver holds.
+    let polls = 0;
+    let pumped = null;
+    const outcome = await browser
+      .waitUntil(
+        async () => {
+          polls += 1;
+          if (Date.now() - sentAt > 10_000) {
+            if (pumped === null) pumped = Date.now() - sentAt;
+            await browser.execute(() => 0);
+          }
+          return landed();
+        },
+        { timeout: 30_000, interval: 500 },
+      )
+      .then(() => "landed", (error) => `timeout: ${error.message}`);
+    const report = {
+      outcome,
+      afterMs: Date.now() - sentAt,
+      polls,
+      pumpedAtMs: pumped,
+      pageKeys: await browser.execute(() => ({ keys: window.__keys, now: Math.round(performance.now() - window.__t0) })),
+      before,
+      now: linesRead(session),
+      session: session.tmux,
+      index,
+      ...(await focusState()),
+      panes: paneTails(),
+    };
+    console.log(`case3: ${JSON.stringify(report)}`);
+    assert.equal(outcome, "landed", `the terminal never took the keyboard from the composer: ${JSON.stringify(report)}`);
     await shot("composer-draft-after-tab-chord");
     assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the draft stayed in the composer");
     assert.ok(!paneText(session.tmux).includes(QUERY), "the draft never reached the pane");
