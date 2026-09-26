@@ -6,6 +6,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
 import { tauriTransport } from "./transport.ts";
+import { TERMINAL_COLORS } from "./theme/theme.ts";
 
 interface Props {
   tab: Tab;
@@ -34,10 +35,10 @@ export function TerminalView(props: Props) {
   onMount(() => {
     const term = new Terminal({
       cursorBlink: true,
-      fontFamily: "ui-monospace, monospace",
+      fontFamily: '"SF Mono", Menlo, "JetBrains Mono", ui-monospace, monospace',
       fontSize: 13,
       scrollback: 5000,
-      theme: { background: "rgb(25, 25, 35)", foreground: "rgb(220, 220, 230)" },
+      theme: TERMINAL_COLORS,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
