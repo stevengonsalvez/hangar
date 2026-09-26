@@ -42,7 +42,7 @@ use ainb_hangar_proto::connections::ConnectionRow;
 use ainb_hangar_proto::events::HangarEvent;
 use ainb_hangar_proto::mutation::{Fence, ReceiptState};
 use ainb_hangar_proto::snapshots::{AnswerParams, AnswerResult};
-use ainb_hangar_store::repo::attention::{AttentionRepo, AttentionRow};
+use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, AttentionRow};
 use ainb_hangar_store::repo::mutation_ledger::MutationLedgerRepo;
 use sqlx::SqlitePool;
 use std::time::{Duration, Instant};
@@ -193,6 +193,20 @@ pub async fn answer(
         });
     }
 
+    // A live hook hold is the one exact, structured reply path: the decision
+    // goes back to the held hook, never as keystrokes (hooks-and-answers).
+    if let Some(request) = crate::hook_ingress::hold::registry().request_for(&row.id) {
+        return answer_hold(pool, events, params, now_ms, &request).await;
+    }
+    // An approval raised for a hook hold that has since ended: Claude's own
+    // prompt owns it now, and typing keys at that prompt from here is never
+    // safe (a stray `1` approves).
+    if row.kind == AttentionKind::Approval && is_hook_hold_payload(&row.payload) {
+        return Ok(AnswerResult::NoTarget {
+            reason: "the hold ended; the agent is asking at its own prompt".to_string(),
+        });
+    }
+
     // An ACP permission has no pane: it is routed by the row's OWN session key
     // to the responder the pool parked, so neither the C1 guard nor tmux applies.
     // Branch on the KIND, not on a successful parse: an ACP row carries the
@@ -276,6 +290,50 @@ pub async fn answer(
             }
         }
     }
+}
+
+/// Answer a row whose request a hook is holding open: check the answer
+/// against what was asked, claim the row (first answer wins), then hand the
+/// daemon-built decision to the hold.
+async fn answer_hold(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    request: &crate::hook_ingress::hold::HeldRequest,
+) -> Result<AnswerResult, sqlx::Error> {
+    let decision = match request.decide_label(&params.answer) {
+        Ok(decision) => decision,
+        // Refused before any claim: the row stays open for a valid answer.
+        Err(reason) => return Ok(AnswerResult::NoTarget { reason }),
+    };
+    if let Some(lost) = claim(pool, params, now_ms).await? {
+        return Ok(lost);
+    }
+    mark_receipt(pool, params, ReceiptState::Writing, None, now_ms).await;
+    if crate::hook_ingress::hold::registry().resolve(&params.attention_id, decision) {
+        let via = "hook hold".to_string();
+        mark_receipt(pool, params, ReceiptState::Delivered, Some(&via), now_ms).await;
+        emit_answered(events, params);
+        Ok(AnswerResult::Delivered { via })
+    } else {
+        // The hook went away between the claim and the hand-off.
+        let reason = "the held request ended before the answer reached it".to_string();
+        mark_receipt(pool, params, ReceiptState::Failed, Some(&reason), now_ms).await;
+        if let Some(row) = AttentionRepo::get(pool, &params.attention_id).await? {
+            reopen_on_failed_delivery(pool, events, &row, params, now_ms).await?;
+        }
+        Ok(AnswerResult::DeliveryFailed { reason })
+    }
+}
+
+/// Whether a row was raised for a hook hold (its payload says so).
+fn is_hook_hold_payload(payload: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|v| v.get("source").and_then(serde_json::Value::as_str).map(str::to_owned))
+        .as_deref()
+        == Some("hook_hold")
 }
 
 /// The attention row `version` this answer claims to be acting on (D18).
