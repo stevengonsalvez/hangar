@@ -51,8 +51,12 @@ export class FakeWire implements WireClient {
   private nextOp = 1;
   /** Every `answer` call, for tests: `[opId, attentionId, answer, version]`. */
   readonly answers: { opId: string; attentionId: string; answer: string; version: number }[] = [];
-  /** When set, the next `answer` throws instead of replying (lost reply). */
+  /** When set, the next `answer` is APPLIED and then its reply is lost (throws). */
   dropNextAnswer = false;
+  /** The op-id ledger: a retry under a known id replays the stored reply. */
+  private ledger = new Map<string, { outcome: AnswerOutcome; ack: MutationAck }>();
+  /** How many answers actually reached a row (the effect count). */
+  deliveries = 0;
 
   constructor(seed = true) {
     if (seed) {
@@ -127,6 +131,11 @@ export class FakeWire implements WireClient {
     if (this.host(hostId).connected) this.emit({ kind: "attention_answered", hostId, attentionId, by });
   }
 
+  /** The row disappears on the daemon without an event (session gone). */
+  vanish(hostId: HostId, attentionId: string) {
+    this.host(hostId).attention.delete(attentionId);
+  }
+
   isConnected(hostId: HostId) {
     return this.host(hostId).connected;
   }
@@ -187,13 +196,11 @@ export class FakeWire implements WireClient {
   async answer(req: { hostId: HostId; attentionId: string; answer: string; version: number; opId: string }) {
     const { opId } = req;
     this.answers.push({ opId, attentionId: req.attentionId, answer: req.answer, version: req.version });
-    if (this.dropNextAnswer) {
-      this.dropNextAnswer = false;
-      throw new Error("reply lost");
-    }
+    const replay = this.ledger.get(opId);
+    if (replay) return { outcome: replay.outcome, ack: { ...replay.ack, outcome: "replayed" as const } };
     const host = this.host(req.hostId);
     const row = host.attention.get(req.attentionId);
-    const ack: MutationAck = { status: "accepted", receipt: "delivered" };
+    const ack: MutationAck = { outcome: "created", status: "accepted", receipt: "delivered" };
     let outcome: AnswerOutcome;
     if (!row) outcome = { kind: "no_target", reason: "no_target" };
     else if (row.answeredBy) outcome = { kind: "already_answered", by: row.answeredBy };
@@ -203,7 +210,14 @@ export class FakeWire implements WireClient {
       outcome = { kind: "rejected", reason: "already_answered_by" };
     } else {
       row.answeredBy = "device:fake";
+      this.deliveries += 1;
       outcome = { kind: "delivered", via: "fake" };
+    }
+    this.ledger.set(opId, { outcome, ack });
+    if (this.dropNextAnswer) {
+      // The daemon did its work; only the reply never made it back.
+      this.dropNextAnswer = false;
+      throw new Error("reply lost");
     }
     return { outcome, ack };
   }
