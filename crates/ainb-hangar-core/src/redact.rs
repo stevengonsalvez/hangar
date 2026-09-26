@@ -150,13 +150,32 @@ static URL_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@")
         .expect("valid url userinfo regex")
 });
+/// An HTTP `Authorization` (or `Proxy-Authorization`) header's credential,
+/// as a curl flag, a header dump or a JSON field carries it. Group 1 keeps the
+/// header name so the scrubbed text still says what was there. The value is
+/// a scheme and a token of 8 or more characters, or, with no scheme, 20 or
+/// more, so prose such as "authorization: required" is left alone.
+static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b((?:proxy-)?authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{20,})"#,
+    )
+    .expect("valid authorization header regex")
+});
+/// A bearer token outside a header (`Bearer <opaque>` in a config, a log, a
+/// variable). Group 1 keeps the scheme word; 16 or more token characters, so
+/// "bearer of bad news" is left alone.
+static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}").expect("valid bearer token regex")
+});
 
 /// Every credential shape [`scrub`] removes, by name, in the order it runs.
 ///
 /// PEM runs first so a key block is removed whole before a narrower pattern
 /// eats a line of its body, and the Anthropic shape runs before the `sk-` one
-/// so an `sk-ant-` key is named for what it is.
-fn shapes() -> [(&'static str, &'static Regex); 20] {
+/// so an `sk-ant-` key is named for what it is. The header and bearer shapes
+/// run last, after every named token shape, so a known token inside a header
+/// is still named for what it is.
+fn shapes() -> [(&'static str, &'static Regex); 22] {
     [
         ("pem private key", &PEM_PRIVATE_KEY),
         ("telegram bot token", &TELEGRAM_TOKEN),
@@ -178,6 +197,8 @@ fn shapes() -> [(&'static str, &'static Regex); 20] {
         ("sendgrid key", &SENDGRID_KEY),
         ("jwt", &JWT),
         ("url userinfo", &URL_USERINFO),
+        ("authorization header", &AUTHORIZATION_HEADER),
+        ("bearer token", &BEARER_TOKEN),
     ]
 }
 
@@ -297,7 +318,10 @@ fn scrub_shapes(input: &str) -> String {
         }
         let replaced = if name == "url userinfo" {
             re.replace_all(&out, format!("${{1}}{REDACTED}@").as_str()).into_owned()
-        } else if name == "aws secret key" {
+        } else if matches!(
+            name,
+            "aws secret key" | "authorization header" | "bearer token"
+        ) {
             re.replace_all(&out, format!("${{1}}{REDACTED}").as_str()).into_owned()
         } else {
             re.replace_all(&out, REDACTED).into_owned()
@@ -486,6 +510,8 @@ mod tests {
                 fake("", 'e', 7),
                 fake("", 'f', 27)
             ),
+            fake("Authorization: Bearer ", 'o', 40),
+            fake("Bearer ", 'b', 32),
         ];
         for shape in &shapes {
             let text = format!("before {shape} after");
@@ -505,6 +531,48 @@ mod tests {
             value, first,
             "a second scrub_json pass changed the document"
         );
+    }
+
+    /// An opaque bearer token matches no named shape, so before these two
+    /// patterns `Authorization: Bearer <opaque>` passed through verbatim. The
+    /// header's credential goes in every spelling a transcript carries it; the
+    /// header name and a bearer scheme word stay, and prose is left alone.
+    #[test]
+    fn scrubs_authorization_headers_and_bearer_tokens() {
+        let opaque = "a8Fz0Qk2LrT9vYx7Wm3Nc5Pd";
+        for (text, kept) in [
+            (
+                format!("curl -H 'Authorization: Bearer {opaque}' https://api.example"),
+                "curl -H 'Authorization: <redacted>' https://api.example",
+            ),
+            (
+                format!("authorization: Basic {opaque}=="),
+                "authorization: <redacted>",
+            ),
+            (
+                format!(r#"{{"Authorization": "Token {opaque}"}}"#),
+                r#"{"Authorization": "<redacted>"}"#,
+            ),
+            (
+                format!("Proxy-Authorization={opaque}"),
+                "Proxy-Authorization=<redacted>",
+            ),
+            (
+                format!("export API_AUTH=\"Bearer {opaque}\""),
+                "export API_AUTH=\"Bearer <redacted>\"",
+            ),
+        ] {
+            assert_eq!(scrub(&text), kept, "{text}");
+            assert!(find_secret(&text).is_some(), "{text}");
+        }
+        for prose in [
+            "authorization: required",
+            "Authorization: Bearer <token>",
+            "the bearer of bad news",
+            "a bearer instrument",
+        ] {
+            assert_eq!(scrub(prose), prose);
+        }
     }
 
     #[test]

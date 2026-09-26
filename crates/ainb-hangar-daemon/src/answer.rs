@@ -64,6 +64,25 @@ pub fn answered_by(connection: &ConnectionRow) -> String {
     format!("{}@{}", connection.attributed_kind(), connection.host)
 }
 
+/// The `answered_by` stamp for an answer from `caller`, checked in this order:
+///
+/// 1. a paired device is `device:<device_id>`, from its credential: never
+///    from its connection row's surface kind or its hello's `DeviceInfo`,
+///    both of which the client declares (RECONCILED T11, S3);
+/// 2. any other caller on a live connection is [`answered_by`];
+/// 3. with neither, `None`, and the request's own value stands (the
+///    connection-free unit harnesses).
+#[must_use]
+pub fn answered_by_caller(
+    caller: &crate::rpc::auth::Caller,
+    connection: Option<&ConnectionRow>,
+) -> Option<String> {
+    if let Some(device_id) = caller.device_id() {
+        return Some(format!("device:{device_id}"));
+    }
+    connection.map(answered_by)
+}
+
 /// Test seam: whether [`answer`] parks forever at the `writing` boundary.
 ///
 /// A crash between the claim and `send-keys` is the case D18's receipt exists
@@ -1213,6 +1232,32 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TRANSCRIPT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// RECONCILED T11/S3: a device's answer is stamped from its credential,
+    /// whatever its connection row declared; any other caller keeps the
+    /// connection stamp, and with no connection the request's value stands.
+    #[test]
+    fn a_device_answer_is_stamped_from_its_credential() {
+        use crate::rpc::auth::Caller;
+        let device = Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        assert_eq!(
+            answered_by_caller(&device, None).as_deref(),
+            Some("device:01J0PHONE")
+        );
+        assert_eq!(answered_by_caller(&Caller::Operator, None), None);
+        assert_eq!(
+            answered_by_caller(
+                &Caller::Pal {
+                    scope_key: "channel:x".to_string()
+                },
+                None
+            ),
+            None
+        );
+    }
 
     /// The payload shape the hook ingest stores for a real `AskUserQuestion`
     /// (captured live from Claude Code 2.1.257).
