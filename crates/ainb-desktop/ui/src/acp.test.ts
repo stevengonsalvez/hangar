@@ -10,6 +10,7 @@ import type {
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
 import { CHUNK_LABELS, transcriptIntent, transcriptView } from "./acp.ts";
+import { NO_ACKS } from "./acks.ts";
 import { boardColumns } from "./board.ts";
 
 const KINDS: ChunkKind[] = ["Message", "UserMessage", "Thought", "ToolCall", "Plan", "Permission", "Usage", "Lifecycle"];
@@ -104,7 +105,7 @@ test("an ACP card has no session row, so it offers its transcript intent, open a
     },
   };
   const sessions = { workspaces: [] } as unknown as SessionsView_Serialize;
-  const card = boardColumns(status, {} as FleetView_Serialize, sessions)
+  const card = boardColumns(status, {} as FleetView_Serialize, sessions, NO_ACKS)
     .flatMap((column) => column.cards)
     .find((c) => c.key === "acp:s-1")!;
   assert.equal(card.sessionId, null, "no session list row");
