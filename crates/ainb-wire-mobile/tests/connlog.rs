@@ -5,6 +5,7 @@ mod common;
 use ainb_wire_mobile::api::{ConnectParams, backoff_delay_ms, connect_host, read_connection_log};
 use ainb_wire_mobile::connlog::{LOG_FILE, digest};
 use ainb_wire_mobile::custody::{DeviceKey, KEY_FILE};
+use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use common::{HOST_ID, PeerOpts, hello_then, method_not_found, spawn};
 
 const TOKEN: &str = "mdd_SECRETTOKENVALUE0123456789";
@@ -18,25 +19,42 @@ async fn a_real_run_logs_events_with_digests_and_never_a_secret() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let dir_s = dir.path().to_string_lossy().into_owned();
-    let params = ConnectParams {
-        url: peer.url.clone(),
-        carrier: "lan".into(),
+    let record = |url: &str, key: Vec<u8>| PairingRecord {
         host_id: HOST_ID.into(),
-        host_static_pubkey: peer.host_pubkey.to_vec(),
-        custody_dir: dir_s.clone(),
-        log_dir: dir_s.clone(),
-        device_token: TOKEN.into(),
+        host_static_pubkey: key,
+        endpoints: vec![EndpointRecord {
+            carrier: "lan".into(),
+            url: url.to_owned(),
+        }],
         device_id: "01K5A0000000000000000DEV01".into(),
         display_name: "test phone".into(),
+        scope: "mobile".into(),
+        admin: false,
+        expires_at_ms: 1_800_000_000_000,
+        paired_at_ms: 1,
+    };
+    let params = ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
     };
 
     // A failed dial, a wrong pinned key, then a good session that closes.
-    let mut dead = params.clone();
-    dead.url = "ws://127.0.0.1:1/peer".into();
-    assert!(connect_host(dead).await.is_err());
-    let mut wrong = params.clone();
-    wrong.host_static_pubkey = vec![9u8; 32];
-    assert!(connect_host(wrong).await.is_err());
+    pairing::save(
+        dir.path(),
+        record("ws://127.0.0.1:1/peer", peer.host_pubkey.to_vec()),
+        TOKEN,
+    )
+    .unwrap();
+    assert!(connect_host(params.clone()).await.is_err());
+    pairing::save(dir.path(), record(&peer.url, vec![9u8; 32]), TOKEN).unwrap();
+    assert!(connect_host(params.clone()).await.is_err());
+    pairing::save(
+        dir.path(),
+        record(&peer.url, peer.host_pubkey.to_vec()),
+        TOKEN,
+    )
+    .unwrap();
     let host = connect_host(params.clone()).await.unwrap();
     host.close();
     while !host.is_closed() {
