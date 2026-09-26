@@ -109,6 +109,8 @@ jobs:
         shell: bash
       - name: Hook script parses
         run: bash -n plugins/ainb-hooks/hooks/notify.sh
+      - name: HTTP hook script parses under POSIX sh
+        run: sh -n plugins/ainb-hooks/hooks/ainb-hook.sh && bash -n plugins/ainb-hooks/hooks/ainb-hook.sh
       - name: Stall guard compiles and its self-check passes
         run: |
           python3 -m py_compile plugins/ainb-hooks/hooks/stall_guard.py
