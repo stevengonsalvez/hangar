@@ -44,13 +44,14 @@ test("elsewhere the shell's mod is ctrl+shift and plain ctrl reaches the pane", 
   assert.equal(accelerator(key("Digit1", { meta: true }), false), null);
 });
 
-test("Mod+N opens the composer: plain Mod, no Shift needed, on either platform", () => {
+test("the composer opens on Cmd+N on macOS and Ctrl+Shift+N elsewhere", () => {
   assert.deepEqual(accelerator(key("KeyN", { meta: true }), true), { kind: "new" });
-  assert.deepEqual(accelerator(key("KeyN", { ctrl: true }), false), { kind: "new" });
+  assert.deepEqual(accelerator(key("KeyN", { ctrl: true, shift: true }), false), { kind: "new" });
 
-  // Shift, Alt, or the wrong modifier for the platform: not the chord.
+  // Plain Ctrl+N is the pane's (next-history, vim completion): never taken.
+  assert.equal(accelerator(key("KeyN", { ctrl: true }), false), null);
+  // Shift on macOS, Alt, or the other platform's modifier: not the chord.
   assert.equal(accelerator(key("KeyN", { meta: true, shift: true }), true), null);
-  assert.equal(accelerator(key("KeyN", { ctrl: true, shift: true }), false), null);
   assert.equal(accelerator(key("KeyN", { meta: true, alt: true }), true), null);
   assert.equal(accelerator(key("KeyN", { ctrl: true }), true), null);
   assert.equal(accelerator(key("KeyN", { meta: true }), false), null);
