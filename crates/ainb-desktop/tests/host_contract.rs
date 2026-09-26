@@ -424,6 +424,47 @@ fn a_chord_or_a_name_on_a_key_only_row_is_refused() {
     assert_eq!(host.refused_from_renderer(&key("s")), None);
 }
 
+/// A name sent off its row's screen is refused for the webview with the
+/// reason, not dropped on the way to the reducer and logged as dispatched
+/// (#121); a name no row has is refused too. Judged after the host's own
+/// reasons, so a row refused for what it writes keeps that reason wherever
+/// it is sent from.
+#[test]
+fn a_name_off_its_screen_or_with_no_row_is_refused_with_the_reason() {
+    let log = Log::default();
+    let mut host = host(&[SectionId::Shell], &log);
+    let name = |id: &str| Intent::Command(CommandId::new(id), serde_json::Value::Null);
+
+    // OPEN_INBOX in inbox.ts: the inbox's own sweep runs there, the session
+    // list's `open` does not.
+    let _ = host.dispatch(name("global.go_home"));
+    let _ = host.dispatch(name("home.inbox"));
+    assert_eq!(host.state().shell.current_screen, "inbox");
+    assert_eq!(
+        host.refused_from_renderer(&name("inbox.mark_all_read")),
+        None
+    );
+    let refusal = host
+        .refused_from_renderer(&name("session_list.refresh"))
+        .expect("the session list's row is not the inbox screen's");
+    assert_eq!(refusal.command.as_str(), "session_list.refresh");
+    assert_eq!(refusal.reason, "it is not active on this screen");
+
+    let unknown = host
+        .refused_from_renderer(&name("session_list.no_such_row"))
+        .expect("a name no row has");
+    assert_eq!(unknown.reason, "the host has no such row");
+
+    // CLOSE_INBOX in inbox.ts.
+    let _ = host.dispatch(name("inbox.back"));
+    let _ = host.dispatch(name("home.sessions"));
+    assert_eq!(host.state().shell.current_screen, "session_list");
+    assert_eq!(
+        host.refused_from_renderer(&name("session_list.refresh")),
+        None
+    );
+}
+
 /// Enter confirms whatever the open dialog holds, so it is judged by that
 /// action: on the abtop setup offer, whose selected "Enable" edits Claude
 /// Code's settings, the webview's Enter is refused.
@@ -706,6 +747,7 @@ fn acp_roster() -> ainb_hangar_proto::agent_status::RosterStatusResult {
         discovered_at: 1,
         last_observed_at: 1,
         lifecycle_updated_at: 1,
+        session_incarnation: None,
         attention_updated_at: 1,
         model: None,
         reasoning_effort: None,
@@ -787,6 +829,7 @@ mod transcript {
             .collect();
         TranscriptOutcome::Page(FleetTranscriptListResult {
             next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+            next_before_order: None,
             chunks,
             truncated: false,
         })
