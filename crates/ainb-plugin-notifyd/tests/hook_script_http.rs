@@ -282,7 +282,8 @@ fn a_hold_that_gets_no_decision_prints_empty_so_the_agent_prompts() {
 }
 
 #[test]
-fn a_stalled_daemon_costs_a_status_hook_under_two_seconds_and_spools_it() {
+fn a_stalled_daemon_costs_a_status_hook_under_two_seconds_and_is_not_replayed() {
+    // A timeout may have been recorded, so it is never spooled for replay.
     let f = fake(Reply::Stall(Duration::from_secs(10)));
     let home = home_for(f.port);
     let (out, took) = fire(
@@ -293,11 +294,30 @@ fn a_stalled_daemon_costs_a_status_hook_under_two_seconds_and_spools_it() {
     );
     assert_eq!(out, "{}\n");
     assert!(took < Duration::from_millis(2500), "took {took:?}");
+    assert!(spool_lines(home.path()).is_empty());
+}
+
+#[test]
+fn nothing_listening_on_a_live_daemons_port_spools_a_status_event() {
+    // curl exit 7: the daemon is alive but its listener is not, so the event
+    // certainly was not recorded.
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let home = home_for(port);
+    let (out, _) = fire(
+        home.path(),
+        "SessionStart",
+        r#"{"hook_event_name":"SessionStart","session_id":"s7"}"#,
+        &[],
+    );
+    assert_eq!(out, "{}\n");
     let lines = spool_lines(home.path());
     assert_eq!(lines.len(), 1, "{lines:?}");
     let v: serde_json::Value = serde_json::from_str(&lines[0].1).unwrap();
     assert_eq!(v["event"], "SessionStart");
-    assert_eq!(v["payload"]["session_id"], "s2");
+    assert_eq!(v["payload"]["session_id"], "s7");
 }
 
 #[test]
@@ -518,31 +538,110 @@ fn dead_pid() -> u32 {
 }
 
 #[test]
-fn only_a_file_named_hook_headers_is_ever_sent_as_headers() {
+fn the_endpoint_file_cannot_redirect_the_headers_file() {
     let f = fake(Reply::NoContent);
     let home = home_for(f.port);
     let dir = home.path().join("hangar").canonicalize().unwrap();
-    // A private key the user owns, at a path that passes the charset rule.
+    // A private key the user owns, named by the endpoint file.
     let secret = dir.join("id_ed25519");
-    std::fs::write(&secret, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+    std::fs::write(&secret, "X-Secret: -----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
     let mut endpoint = HookEndpoint::parse_env_file(
         &std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap(),
     )
     .unwrap();
     endpoint.headers_path = secret;
-    // Render by hand: the proto renderer is not the attacker.
-    let text = endpoint.render_env_file();
-    std::fs::write(dir.join(ENDPOINT_FILE_NAME), text).unwrap();
-    let (out, _) = fire(
+    std::fs::write(dir.join(ENDPOINT_FILE_NAME), endpoint.render_env_file()).unwrap();
+    fire(
         home.path(),
         "Notification",
         r#"{"hook_event_name":"Notification"}"#,
         &[],
     );
-    assert_eq!(out, "{}\n");
+    let seen = f.seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        seen.header("X-Ainb-Hook-Token"),
+        Some(TOKEN),
+        "the fixed file"
+    );
+    assert_eq!(
+        seen.header("X-Secret"),
+        None,
+        "the named file was never read"
+    );
+}
+
+#[test]
+fn a_symlinked_headers_file_is_never_sent() {
+    let f = fake(Reply::NoContent);
+    let home = home_for(f.port);
+    let dir = home.path().join("hangar").canonicalize().unwrap();
+    let real = dir.join("elsewhere");
+    std::fs::rename(dir.join(HEADERS_FILE_NAME), &real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join(HEADERS_FILE_NAME)).unwrap();
+    fire(
+        home.path(),
+        "Notification",
+        r#"{"hook_event_name":"Notification"}"#,
+        &[],
+    );
+    assert!(f.seen.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+#[test]
+fn pid_zero_and_a_foreign_version_send_nothing() {
+    let f = fake(Reply::NoContent);
+    let home = home_for(f.port);
+    let dir = home.path().join("hangar").canonicalize().unwrap();
+    let text = std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap();
+    let pid_line = text.lines().find(|l| l.starts_with("AINB_HOOK_PID=")).unwrap();
+    // `kill -0 0` always succeeds, so a pid of 0 must be refused outright.
+    std::fs::write(
+        dir.join(ENDPOINT_FILE_NAME),
+        text.replace(pid_line, "AINB_HOOK_PID=0"),
+    )
+    .unwrap();
+    fire(
+        home.path(),
+        "Notification",
+        r#"{"hook_event_name":"Notification"}"#,
+        &[],
+    );
     assert!(
         f.seen.recv_timeout(Duration::from_millis(300)).is_err(),
-        "a file not named hook-headers was sent as headers"
+        "pid 0"
+    );
+    std::fs::write(
+        dir.join(ENDPOINT_FILE_NAME),
+        text.replace("AINB_HOOK_VERSION=1", "AINB_HOOK_VERSION=2"),
+    )
+    .unwrap();
+    fire(
+        home.path(),
+        "Notification",
+        r#"{"hook_event_name":"Notification"}"#,
+        &[],
+    );
+    assert!(
+        f.seen.recv_timeout(Duration::from_millis(300)).is_err(),
+        "version 2"
+    );
+}
+
+#[test]
+fn only_the_managed_event_name_opens_a_hold() {
+    // With no AINB_HOOK_EVENT, a payload that says PermissionRequest is status.
+    let f = fake(Reply::Daemon);
+    let home = home_for(f.port);
+    let (out, _) = fire(
+        home.path(),
+        "",
+        r#"{"hook_event_name":"PermissionRequest","tool_name":"Bash"}"#,
+        &[],
+    );
+    assert_eq!(out, "{}\n");
+    assert_eq!(
+        f.seen.recv_timeout(Duration::from_secs(5)).unwrap().path,
+        "/hook/claude"
     );
 }
 
