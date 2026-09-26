@@ -1295,17 +1295,6 @@ impl FleetRepo {
         }))
     }
 
-    /// Superseded by [`Self::pane_for_provider_session`]; kept until the
-    /// daemon has moved.
-    pub async fn tmux_target_for_provider_session(
-        pool: &SqlitePool,
-        provider_session_id: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        Ok(Self::pane_for_provider_session(pool, provider_session_id)
-            .await?
-            .and_then(|(target, _)| target))
-    }
-
     /// The ERR roster: every visible, still-running session the read model
     /// currently projects as `attention_state = 'ERROR'`, key-ordered.
     ///
