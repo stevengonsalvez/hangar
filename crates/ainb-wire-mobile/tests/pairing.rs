@@ -391,6 +391,82 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
 }
 
 #[tokio::test]
+async fn an_unknown_close_code_parks_a_notice_that_a_good_hello_clears() {
+    let peer = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let dir_s = dir.path().to_string_lossy().into_owned();
+    pair(
+        offer_for(&peer, peer.host_pubkey, vec![live(&peer)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap();
+
+    // The same host, closing 1001 (a code this build does not know) at hello.
+    let odd = spawn(
+        issuing_host(Arc::new(AtomicBool::new(true)), Some(1001)),
+        PeerOpts::default(),
+    )
+    .await;
+    let mut record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    record.endpoints[0].url = odd.url.clone();
+    record.host_static_pubkey = odd.host_pubkey.to_vec();
+    ainb_wire_mobile::pairing::save(dir.path(), record.clone(), TOKEN).unwrap();
+    let params = ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    };
+    let err = connect_host(params.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(1001),
+                retryable: false,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    let parked = list_pairings(dir_s.clone()).unwrap().remove(0);
+    assert_eq!(parked.notice.as_deref(), Some("unknown_code"));
+    assert_eq!(
+        parked.repair, None,
+        "an unknown code is a notice, not a re-pair"
+    );
+
+    // The host answers hello again: the notice clears, repair stays as it was.
+    ainb_wire_mobile::pairing::mark_refusal(dir.path(), HOST_ID, &WireError::PeerChanged).unwrap();
+    let good = spawn(
+        issuing_host(Arc::new(AtomicBool::new(true)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    record.endpoints[0].url = good.url.clone();
+    record.host_static_pubkey = good.host_pubkey.to_vec();
+    record.notice = Some("unknown_code".into());
+    record.repair = Some("peer_changed".into());
+    ainb_wire_mobile::pairing::save(dir.path(), record, TOKEN).unwrap();
+    let host = connect_host(params).await.unwrap();
+    assert!(host.hello().host_id.is_some());
+    let cleared = list_pairings(dir_s.clone()).unwrap().remove(0);
+    assert_eq!(cleared.notice, None, "a good hello clears the notice");
+    assert_eq!(
+        cleared.repair.as_deref(),
+        Some("peer_changed"),
+        "only a pair clears repair"
+    );
+    host.close();
+}
+
+#[tokio::test]
 async fn an_offer_with_another_key_is_peer_changed_and_an_expired_one_is_refused() {
     let redeemed = Arc::new(AtomicBool::new(false));
     let peer = spawn(

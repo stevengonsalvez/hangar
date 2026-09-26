@@ -219,6 +219,27 @@ pub fn mark_refusal(custody_dir: &Path, host_id: &str, err: &WireError) -> Resul
     })
 }
 
+/// Clear `notice` on `host_id`, under the index lock: a successful hello
+/// proves the host and this build agree again. `repair` is untouched; only
+/// a successful pair clears that.
+pub fn clear_notice(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {
+    with_index(custody_dir, |records| {
+        for r in records.iter_mut().filter(|r| r.host_id == host_id) {
+            r.notice = None;
+        }
+    })
+}
+
+/// The five latch strings the app mirrors, in one place: `repair` values
+/// first, then `notice` values.
+pub const LATCH_VALUES: [&str; 5] = [
+    REPAIR_REVOKED,
+    REPAIR_UNAUTHENTICATED,
+    REPAIR_PEER_CHANGED,
+    NOTICE_INCOMPATIBLE,
+    NOTICE_UNKNOWN_CODE,
+];
+
 /// Clear both flags on `host_id`, under the index lock (tests and the
 /// successful-pair path use `save`, which replaces the record whole).
 pub fn clear_flags(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {

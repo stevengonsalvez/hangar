@@ -146,6 +146,15 @@ pub fn device_key_fingerprint(custody_dir: String) -> Result<String, WireError> 
     DeviceKey::load_or_create(Path::new(&custody_dir)).map(|k| k.fingerprint())
 }
 
+/// The five latch strings the app mirrors (`HostRow.repair`, `HostRow.notice`):
+/// `revoked`, `unauthenticated`, `peer_changed`, then `incompatible`,
+/// `unknown_code`. The app compares its literals to these in a test and
+/// keeps no copy of the meaning.
+#[uniffi::export]
+pub fn latch_values() -> Vec<String> {
+    pairing::LATCH_VALUES.iter().map(|s| (*s).to_owned()).collect()
+}
+
 /// Which backend holds the device secrets on this target, and whether that
 /// is the degraded (file) one.
 #[uniffi::export]
@@ -345,7 +354,13 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             }
         };
         let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
-            Ok(hello) => hello,
+            Ok(hello) => {
+                // The host and this build agree again: a parked notice
+                // (incompatible, unknown code) is over. The re-pair latch is
+                // not: only a successful pair clears that.
+                pairing::clear_notice(custody_dir, &params.host_id)?;
+                hello
+            }
             Err(e) => {
                 session.close();
                 latch_repair(custody_dir, &params.host_id, &e);
