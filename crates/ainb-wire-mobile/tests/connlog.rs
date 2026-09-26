@@ -32,6 +32,7 @@ async fn a_real_run_logs_events_with_digests_and_never_a_secret() {
         admin: false,
         expires_at_ms: 1_800_000_000_000,
         paired_at_ms: 1,
+        repair: false,
     };
     let params = ConnectParams {
         host_id: HOST_ID.into(),
