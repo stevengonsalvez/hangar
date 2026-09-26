@@ -82,13 +82,6 @@ interface KeyLike {
  * spec's cmd+shift+h is Ctrl+Shift+H.
  */
 export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
-  // Mod+N: the new-worktree composer. Plain Mod, with no Shift, on every
-  // platform (unlike the rest of this function's chords): Ctrl+N is not a
-  // shell or terminal default the pane would otherwise own, so it needs no
-  // Shift to stay clear of it, and the spec (`Mod+N`) means it literally.
-  if (!event.altKey && !event.shiftKey && event.code === "KeyN") {
-    if (mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey) return { kind: "new" };
-  }
   const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey && !event.metaKey;
   if (!mod || event.altKey) return null;
   if (event.code === "KeyH" && (!mac || event.shiftKey)) return { kind: "hosts" };
@@ -109,6 +102,11 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
       return { kind: "close" };
     case "KeyK":
       return { kind: "palette" };
+    // The new-worktree composer: Cmd+N on macOS, Ctrl+Shift+N elsewhere, like
+    // every chord here. Plain Ctrl+N belongs to the pane (next-history in a
+    // shell, completion in vim), so off macOS it needs the Shift.
+    case "KeyN":
+      return { kind: "new" };
     case "KeyU":
       return { kind: "attention" };
     default:
