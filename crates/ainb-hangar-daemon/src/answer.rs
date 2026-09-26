@@ -42,6 +42,7 @@ use ainb_hangar_proto::events::HangarEvent;
 use ainb_hangar_proto::mutation::{Fence, ReceiptState};
 use ainb_hangar_proto::snapshots::{AnswerParams, AnswerResult};
 use ainb_hangar_store::repo::attention::{AttentionRepo, AttentionRow};
+use ainb_hangar_store::repo::fleet::FleetRepo;
 use ainb_hangar_store::repo::mutation_ledger::MutationLedgerRepo;
 use sqlx::SqlitePool;
 use std::time::{Duration, Instant};
@@ -206,7 +207,7 @@ pub async fn answer(
 
     // C1: resolve the delivery target BEFORE claiming, so an ambiguous / dead
     // target leaves the row open and answerable later.
-    match resolve_target(&row.session_id, params.is_answer).await {
+    match resolve_target(&row.session_id).await {
         // A row whose session has no pane bound (D14, issue #916) fails here
         // with the router's generic "no live session matched". Replace that
         // with the binding's own sentence so the operator is told which pane is
@@ -217,6 +218,7 @@ pub async fn answer(
                 .unwrap_or(reason),
         }),
         Target::Send(session) => {
+            let session = with_exact_pane(pool, session, &row.session_id).await;
             // Claim the answer. A second surface that also resolved a target loses
             // this flip (0 rows) and delivers nothing.
             if let Some(lost) = claim(pool, params, now_ms).await? {
@@ -1075,23 +1077,38 @@ pub(crate) fn pick_target(ainb: &[Session], peers: &[Session], session_id: &str)
         .map_or(Pick::None, Pick::Exact)
 }
 
-async fn resolve_target(session_id: &str, is_answer: bool) -> Target {
+async fn resolve_target(session_id: &str) -> Target {
     let ainb_fut = discover_from_ainb();
     let peers_fut = tokio::task::spawn_blocking(discover_from_peers);
     let (ainb, peers_join) = tokio::join!(ainb_fut, peers_fut);
     let ainb: Vec<Session> = ainb.unwrap_or_default();
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
-    let label = if is_answer {
-        "cannot safely answer"
-    } else {
-        "refusing to send"
-    };
     match pick_target(&ainb, &peers, session_id) {
         Pick::Exact(session) => Target::Send(session),
-        Pick::None => Target::NoTarget(format!(
-            "no live session runs under this id — {label} (target may have exited)"
-        )),
+        Pick::None => Target::NoTarget(ainb_fleet_core::types::NO_LIVE_TARGET.to_string()),
     }
+}
+
+/// `session` with its delivery target narrowed to the hook's own pane.
+///
+/// Discovery names the tmux SESSION, and a send to a session lands in its
+/// active pane: with the session split, that is whichever pane the person
+/// last used, not the agent's. The fleet row the hook registered under the
+/// agent's session id carries the exact target (`session:window.pane`), and
+/// that is what the answer is typed into. A row that names none leaves the
+/// session as discovered.
+async fn with_exact_pane(pool: &SqlitePool, mut session: Session, session_id: &str) -> Session {
+    if session_id.is_empty() {
+        return session;
+    }
+    match FleetRepo::tmux_target_for_provider_session(pool, session_id).await {
+        Ok(Some(target)) => session.tmux_session = Some(target),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "the hook's pane could not be read; sending to the session")
+        }
+    }
+    session
 }
 
 #[cfg(test)]
