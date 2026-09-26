@@ -106,6 +106,7 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
       { id: "att-1", sessionId: "s-1", kind: "approval", version: 4n, payload: { question: "deploy?", options: [{ label: "yes", description: "" }], text: undefined, message: undefined }, degraded: false, createdAt: 7n },
     ],
     answer: async (_a, _b, version, opId) => {
+      if (typeof version !== "bigint") throw new Error(`version lowered as ${typeof version}`);
       calls.answer.push({ version: Number(version), opId });
       refuse();
       return { opId, outcome: { tag: "Delivered", inner: { via: "tmux (x)" } }, ack: { status: "accepted", outcome: "created", receipt: "delivered" } };
@@ -134,7 +135,9 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
     terminalDetach: async () => undefined,
     terminalInput: async (_s, _d, floorGen, opId) => {
       calls.terminalInput.push(opId);
-      return floorGen === 5 ? { tag: "Typed", inner: { opId, floorGen: 5n } } : { tag: "FloorDenied", inner: { holder: { principal: "local", label: "desktop", streamId: 1n }, floorGen: 3n } };
+      // The binding lowers the app's numbers as BigInt.
+      if (floorGen !== undefined && typeof floorGen !== "bigint") throw new Error(`floorGen lowered as ${typeof floorGen}`);
+      return floorGen === 5n ? { tag: "Typed", inner: { opId, floorGen: 5n } } : { tag: "FloorDenied", inner: { holder: { principal: "local", label: "desktop", streamId: 1n }, floorGen: 3n } };
     },
     terminalFloor: async (_s, action, opId) => {
       calls.terminalFloor.push(opId);
@@ -224,9 +227,11 @@ describe("native adapter", () => {
     const { host } = scriptedHost([]);
     const wire = wireOver(host);
     await expect(wire.rosterStatus("h1")).rejects.toMatchObject({ kind: "not_connected", retryable: true });
+    // Through a mutation's catch too: the kind survives the second mapping.
+    await expect(wire.sendPrompt({ hostId: "h1", sessionKey: "k", text: "x", lifecycleUpdatedAt: 1, opId: "o" })).rejects.toMatchObject({ kind: "not_connected", retryable: true });
     await wire.connect("h1");
     await wire.close("h1");
-    for (let i = 0; i < 10 && !host.isClosed(); i++) await flush();
+    expect(host.isClosed()).toBe(true);
     await expect(wire.hostInfo("h1")).rejects.toMatchObject({ kind: "not_connected" });
     // The crate's own not_paired (no record) still maps to not_paired.
     expect(toPeerCloseError({ tag: "NotPaired", inner: { hostId: "h9" } }).kind).toBe("not_paired");
@@ -251,6 +256,7 @@ describe("native adapter", () => {
       { tag: "FleetRevision", inner: { event: { revision: 7n } } },
       { tag: "AttentionRaised", inner: { attentionId: "att-2", sessionId: "s-1", kind: "ask_user_question", createdAt: 4n } },
       { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 12n, eventId: "e12", sessionKey: "claude:s-1", eventType: "acp.user_message", role: "user", text: "go", observedAt: 3n } } },
+      { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 13n, eventId: "e13", sessionKey: "claude:s-1", eventType: "acp.usage", role: "system", text: undefined, observedAt: 3n } } },
       { tag: "TerminalFrame", inner: { streamId: 7n, seq: 105n, frame: { tag: "Output", inner: { data: new Uint8Array([104, 105]).buffer } } } },
       { tag: "Closed", inner: { code: 4503n, reason: "draining", retryable: true } },
     ];
@@ -260,18 +266,22 @@ describe("native adapter", () => {
     wire.onEvent((ev) => seen.push(ev));
     await wire.connect("h1");
     for (let i = 0; i < 20 && seen.length < 5; i++) await flush();
-    expect(seen.map((e) => e.kind)).toEqual(["fleet_revision", "attention_raised", "transcript_line", "terminal_frame", "closed"]);
-    const raised = must(seen[1], "attention event");
+    // The raised row is read off the loop, so it lands after the frames it
+    // would otherwise have held back; the textless usage chunk is no line.
+    const kinds = seen.map((e) => e.kind);
+    expect(kinds.filter((k) => k !== "attention_raised")).toEqual(["fleet_revision", "transcript_line", "terminal_frame", "closed"]);
+    expect(kinds).toContain("attention_raised");
+    const raised = must(seen.find((e) => e.kind === "attention_raised"), "attention event");
     if (raised.kind !== "attention_raised") throw new Error("not a raise");
     expect(raised.row).toMatchObject({ id: "att-2", version: 9, payload: { question: "which?" } });
     expect(calls.attentionList).toBe(1);
-    const line = must(seen[2], "transcript event");
+    const line = must(seen.find((e) => e.kind === "transcript_line"), "transcript event");
     if (line.kind !== "transcript_line") throw new Error("not a line");
     expect(line.entry).toEqual({ seq: 12, role: "user", text: "go", atMs: 3 });
-    const frame = must(seen[3], "frame event");
+    const frame = must(seen.find((e) => e.kind === "terminal_frame"), "frame event");
     if (frame.kind !== "terminal_frame" || frame.frame.kind !== "output") throw new Error(`not an output frame: ${JSON.stringify(frame)}`);
     expect(Array.from(frame.frame.data)).toEqual([104, 105]);
-    const closed = must(seen[4], "close event");
+    const closed = must(seen.find((e) => e.kind === "closed"), "close event");
     if (closed.kind !== "closed") throw new Error(`not a close: ${JSON.stringify(closed)}`);
     expect(closed.code).toBe(4503);
     expect(closed.retryable).toBe(true);
@@ -288,6 +298,20 @@ describe("native adapter", () => {
     expect(seen).toEqual([{ kind: "fleet_resync_required", hostId: "h1" }]);
   });
 
+  test("a binding error on any host call arrives as a PeerCloseError", async () => {
+    const { host } = scriptedHost([]);
+    host.rosterStatus = async () => {
+      throw { tag: "Closed", inner: { code: undefined, reason: "eof", retryable: true } };
+    };
+    host.terminalAttach = async () => {
+      throw { tag: "Rpc", inner: { code: -32602, message: "invalid params", reason: "cols" } };
+    };
+    const wire = wireOver(host);
+    await wire.connect("h1");
+    await expect(wire.rosterStatus("h1")).rejects.toMatchObject({ kind: "closed", retryable: true });
+    await expect(wire.terminalAttach({ hostId: "h1", sessionKey: "k" })).rejects.toMatchObject({ kind: "rpc", reason: "invalid params: cols" });
+  });
+
   test("an RPC refusal carries the daemon's reason beside its message", () => {
     const e = toPeerCloseError({ tag: "Rpc", inner: { code: -32602, message: "invalid params", reason: "session_key: unknown" } });
     expect(e.kind).toBe("rpc");
@@ -295,13 +319,15 @@ describe("native adapter", () => {
     expect(toPeerCloseError({ tag: "Rpc", inner: { code: -32601, message: "no such method" } }).reason).toBe("no such method");
   });
 
-  test("a failed event pull closes the host with retryable false", async () => {
-    const wire = wireOver(scriptedHost([], { pumpFails: true }).host);
+  test("a failed event pull closes the host with retryable false, and closes the socket", async () => {
+    const { host } = scriptedHost([], { pumpFails: true });
+    const wire = wireOver(host);
     const seen: WireEvent[] = [];
     wire.onEvent((ev) => seen.push(ev));
     await wire.connect("h1");
     for (let i = 0; i < 10 && seen.length < 1; i++) await flush();
     expect(seen[0]).toMatchObject({ kind: "closed", hostId: "h1", retryable: false });
+    expect(host.isClosed()).toBe(true);
     expect(must((await wire.hosts())[0], "host row").reachability).toBe("unreachable");
   });
 
@@ -312,6 +338,11 @@ describe("native adapter", () => {
     expect(await wire.subscribeFleet("h1")).toEqual({ revision: 6, replayState: "complete" });
     expect(await wire.subscribeFleet("h1", 4)).toEqual({ revision: 6, replayState: "complete" });
     expect(calls.subscribeFleet).toEqual([11, 4]);
+    // After the app read a roster, the first subscribe starts at that read,
+    // not at a second read the app never rendered.
+    await wire.rosterStatus("h1");
+    await wire.subscribeFleet("h1");
+    expect(calls.subscribeFleet).toEqual([11, 4, 11]);
   });
 
   test("a -32008 answers as the rejected outcome the app renders, -32009 as unknown, never a throw", async () => {
