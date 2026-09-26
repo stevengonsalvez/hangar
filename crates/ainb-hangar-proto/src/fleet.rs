@@ -1782,10 +1782,29 @@ pub struct FleetTranscriptChunk {
     pub session_key: String,
     /// Normalized discriminator, `acp.<kind>`.
     pub event_type: String,
-    /// Normalized chunk body.
+    /// Normalized chunk body, scrubbed of known credential shapes. `null` for a
+    /// paired device, which reads [`Self::lines`] instead.
     pub payload: serde_json::Value,
     /// Observation time in epoch milliseconds.
     pub observed_at: i64,
+    /// The chunk as render-ready lines, for a paired device: the daemon's own
+    /// transcript classification (`ainb_hangar_proto::transcript::AcpClassifier`,
+    /// the one the board timeline and the desktop use), each body scrubbed and
+    /// capped there. A phone draws these directly and never parses a payload
+    /// or runs a secret filter of its own. Empty (and absent on the wire) for
+    /// other callers, which keep reading `payload`; also empty for a chunk the
+    /// classification renders as nothing (usage, prompt echo, bookkeeping).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<FleetTranscriptLine>,
+}
+
+/// One render-ready transcript line for a paired device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetTranscriptLine {
+    /// The lane: `agent`, `thinking`, `tool_call`, `tool_result` or `error`.
+    pub kind: crate::events::MessageKind,
+    /// The line's text, scrubbed and length-capped by the daemon.
+    pub text: String,
 }
 
 /// Parameters for `fleet/transcript_list`.
@@ -2797,6 +2816,7 @@ mod tests {
             event_type: "acp.message".to_string(),
             payload: serde_json::json!({ "text": "thinking" }),
             observed_at: 1_700_000_000_100,
+            lines: Vec::new(),
         }
     }
 
