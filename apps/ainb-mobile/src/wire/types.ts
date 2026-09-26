@@ -219,7 +219,8 @@ export type WireErrorKind =
   | "closed"
   | "offer"
   | "custody"
-  | "not_paired";
+  | "not_paired"
+  | "not_connected";
 
 /**
  * A failed `connect` (or any facade call), carrying the crate's own verdict
@@ -237,6 +238,7 @@ export type WireErrorKind =
  * | Offer { message }                          | `offer`        | false     |                |
  * | Custody { message }                        | `custody`      | false     |                |
  * | NotPaired { host_id }                      | `not_paired`   | false     |                |
+ * | NotConnected { host_id } (no live session) | `not_connected`| true      |                |
  *
  * `Closed` with `code: None, retryable: true` is a network loss and redials;
  * the crate alone decides `retryable` (peer_close.rs T9 for a coded close,
@@ -261,7 +263,7 @@ export class PeerCloseError extends Error {
     this.kind = kind;
     this.code = opts.code;
     this.reason = opts.reason;
-    this.retryable = opts.retryable ?? (kind === "connect" || kind === "timeout");
+    this.retryable = opts.retryable ?? (kind === "connect" || kind === "timeout" || kind === "not_connected");
     this.retryAfterMs = opts.retryAfterMs;
   }
 }
