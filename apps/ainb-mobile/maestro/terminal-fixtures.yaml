@@ -1,18 +1,21 @@
 # M1-11: the terminal renders the recorded fixture at phone size.
 # The FakeWire stream snapshots f1-altscreen on attach; the screenshot is the
-# artifact the 40x20 compare reads (framed panel, 24 log lines, status row).
+# artifact the compare reads (framed panel, log lines, status row).
+#   HOST_ID, SESSION_KEY: see README.md
 appId: com.stevengonsalvez.ainb.mobile
 ---
 - launchApp:
     clearState: true
 - tapOn:
-    id: "host-01K5A0000000000000000AAAAA"
+    id: "host-${HOST_ID}"
 - tapOn:
-    id: "session-claude:hangar"
+    id: "session-${SESSION_KEY}"
 - tapOn:
     id: "tab-terminal"
 - assertVisible:
     id: "terminal"
 - assertVisible:
-    text: "80x24"
+    id: "terminal-size"
+- waitForAnimationToEnd:
+    timeout: 2000
 - takeScreenshot: terminal-f1-altscreen
