@@ -26,7 +26,12 @@
 //! they wait with it; to keep a stalled viewer's memory bounded, a new
 //! `floor`, `presence`, `resize` or `data_gap` REPLACES any unsent one of
 //! the same kind (the latest state is all the client needs), so at most
-//! four control frames plus one `closed` ever wait.
+//! four control frames plus one `closed` ever wait. The same holds for
+//! snapshots: only `output` bytes count against the pending cap, and a new
+//! snapshot replaces any unsent one, so a viewer that never acks holds at
+//! most one snapshot, one cap of output and the control frames. When the
+//! replaced snapshot was already partly sent, a `data_gap{dropped}` goes
+//! ahead of the new one so the client discards the torn half and waits.
 //!
 //! `seq` is the pane-feed offset at emit time (T16): each `output` chunk
 //! carries the offset of ITS first byte, every frame of one snapshot
@@ -177,6 +182,8 @@ pub struct ViewerQueue {
     pending: VecDeque<Sequenced>,
     /// Payload bytes in `pending`.
     pending_bytes: u64,
+    /// `output` bytes in `pending`: what the cap counts.
+    pending_output_bytes: u64,
     /// Cumulative payload bytes handed to the writer.
     sent_bytes: u64,
     /// The highest `consumed` acked.
@@ -210,6 +217,7 @@ impl ViewerQueue {
             },
             pending: VecDeque::new(),
             pending_bytes: 0,
+            pending_output_bytes: 0,
             sent_bytes: 0,
             consumed: 0,
             in_gap: true,
@@ -270,9 +278,16 @@ impl ViewerQueue {
         }
     }
 
-    /// Payload bytes pending beyond what the credit can send now.
+    /// `output` bytes pending beyond what the credit can send now: what
+    /// the cap counts. Snapshot bytes are excluded; a snapshot is bounded
+    /// to one pending at a time instead.
     pub const fn backlog(&self) -> u64 {
-        self.pending_bytes.saturating_sub(self.credit())
+        self.pending_output_bytes.saturating_sub(self.credit())
+    }
+
+    /// `output` bytes waiting for credit.
+    pub const fn pending_output_bytes(&self) -> u64 {
+        self.pending_output_bytes
     }
 
     /// Live pane bytes starting at feed offset `seq`. Discarded while a gap
@@ -286,7 +301,7 @@ impl ViewerQueue {
             self.dropped_since_gap += bytes.len() as u64;
             return;
         }
-        let after = (self.pending_bytes + bytes.len() as u64).saturating_sub(self.credit());
+        let after = (self.pending_output_bytes + bytes.len() as u64).saturating_sub(self.credit());
         if after > self.cfg.max_pending_bytes {
             let discarded = self.discard_output() + bytes.len() as u64;
             self.open_gap(seq, GapReason::Dropped, Some(discarded));
@@ -338,13 +353,53 @@ impl ViewerQueue {
             }
         });
         self.pending_bytes -= discarded;
+        self.pending_output_bytes -= discarded;
         discarded
+    }
+
+    /// Drop every unsent frame of the snapshot now pending. Returns whether
+    /// part of it had already gone out, in which case the client holds a
+    /// torn snapshot and must be told to wait for the next one.
+    fn discard_snapshot(&mut self) -> bool {
+        let mut removed_bytes = 0;
+        let mut had_start = false;
+        let mut had_any = false;
+        self.pending.retain(|s| match &s.frame {
+            Frame::SnapshotStart { .. } => {
+                had_start = true;
+                had_any = true;
+                false
+            }
+            Frame::SnapshotChunk(data) => {
+                removed_bytes += data.len() as u64;
+                had_any = true;
+                false
+            }
+            Frame::SnapshotEnd => {
+                had_any = true;
+                false
+            }
+            _ => true,
+        });
+        self.pending_bytes -= removed_bytes;
+        had_any && !had_start
     }
 
     /// The snapshot taken at feed offset `seq`: closes the gap and resumes
     /// output. Chunked; not subject to the pending cap, because it is the
-    /// recovery, but still paced by credit.
+    /// recovery, but still paced by credit. It replaces any snapshot still
+    /// unsent, so at most one is ever pending; if the replaced one was
+    /// partly sent, a `data_gap{dropped}` goes first.
     pub fn push_snapshot(&mut self, seq: u64, cols: u16, rows: u16, epoch: u64, repaint: &[u8]) {
+        if self.discard_snapshot() {
+            self.enqueue(
+                seq,
+                Frame::DataGap {
+                    reason: GapReason::Dropped,
+                    dropped_bytes: None,
+                },
+            );
+        }
         let chunks: Vec<&[u8]> = repaint.chunks(self.cfg.chunk_bytes).collect();
         self.enqueue(
             seq,
@@ -377,6 +432,9 @@ impl ViewerQueue {
             self.pending.retain(|s| s.frame.coalesce_key() != Some(key));
         }
         self.pending_bytes += frame.payload_len();
+        if let Frame::Output(data) = &frame {
+            self.pending_output_bytes += data.len() as u64;
+        }
         self.pending.push_back(Sequenced { seq, frame });
     }
 
@@ -397,6 +455,9 @@ impl ViewerQueue {
             }
             let s = self.pending.pop_front().expect("front exists");
             self.pending_bytes -= len;
+            if matches!(s.frame, Frame::Output(_)) {
+                self.pending_output_bytes -= len;
+            }
             self.sent_bytes += len;
             out.push(s);
         }
@@ -900,5 +961,104 @@ mod tests {
         let last = q.take_ready(usize::MAX);
         assert_eq!(sent_payload(&last), 4 * KIB as u64);
         assert!(matches!(last.last().unwrap().frame, Frame::SnapshotEnd));
+    }
+
+    /// The lead's reproduction: a viewer that never acks, fed output and a
+    /// snapshot whenever it owes one, held 430 MiB of snapshots after 400
+    /// pushes. Now only output counts against the cap and one snapshot is
+    /// pending at most.
+    #[test]
+    fn a_stalled_viewer_holds_at_most_one_snapshot_and_one_cap_of_output() {
+        let cfg = small();
+        let mut q = attached(cfg);
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        let snapshot = vec![b's'; 3 * KIB];
+        let mut seq = 0u64;
+        let mut worst_bytes = 0;
+        let mut worst_frames = 0;
+        for _ in 0..400 {
+            q.push_output(seq, &[b'o'; KIB]);
+            seq += KIB as u64;
+            if q.needs_snapshot() {
+                q.push_snapshot(seq, 40, 20, 1, &snapshot);
+            }
+            q.take_ready(usize::MAX);
+            worst_bytes = worst_bytes.max(q.pending_bytes());
+            worst_frames = worst_frames.max(q.pending_frames());
+            let starts = q
+                .pending
+                .iter()
+                .filter(|s| matches!(s.frame, Frame::SnapshotStart { .. }))
+                .count();
+            assert!(starts <= 1, "{starts} snapshots pending");
+        }
+        assert!(
+            worst_bytes <= cfg.max_pending_bytes + snapshot.len() as u64,
+            "{worst_bytes} bytes pending"
+        );
+        assert!(worst_frames <= 16, "{worst_frames} frames pending");
+        assert_eq!(
+            q.in_flight(),
+            8 * KIB as u64,
+            "one window went out, then nothing"
+        );
+    }
+
+    #[test]
+    fn a_new_snapshot_replaces_an_unsent_one_and_a_torn_one_gets_a_gap() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        // Fill the window so nothing more goes out.
+        q.push_output(0, &[b'a'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        q.gap(8 * KIB as u64, GapReason::Paused);
+        q.push_snapshot(8 * KIB as u64, 40, 20, 1, &[b'1'; 3 * KIB]);
+        q.push_snapshot(9 * KIB as u64, 40, 20, 1, &[b'2'; 3 * KIB]);
+        // The gap and the second snapshot only: no torn first one, no
+        // extra gap, because none of the first one had gone out.
+        q.ack(u64::MAX);
+        let frames = q.take_ready(usize::MAX);
+        let kinds: Vec<String> = frames
+            .iter()
+            .map(|s| match &s.frame {
+                Frame::DataGap { reason, .. } => format!("gap:{reason:?}"),
+                Frame::SnapshotStart { .. } => "start".to_string(),
+                Frame::SnapshotChunk(d) => format!("chunk:{}", d[0] as char),
+                Frame::SnapshotEnd => "end".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["gap:Paused", "start", "chunk:2", "chunk:2", "end"]
+        );
+        // A snapshot partly sent when the next arrives: its remainder is
+        // dropped and a gap tells the client to wait for the new one.
+        q.push_output(9 * KIB as u64, &[b'b'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        q.gap(17 * KIB as u64, GapReason::Paused);
+        q.push_snapshot(17 * KIB as u64, 40, 20, 1, &[b'3'; 5 * KIB]);
+        let first = q.take_ready(2); // gap, start
+        assert!(matches!(
+            first[1].frame,
+            Frame::SnapshotStart { chunks: 3, .. }
+        ));
+        q.push_snapshot(18 * KIB as u64, 40, 20, 1, &[b'4'; 2 * KIB]);
+        q.ack(u64::MAX);
+        let frames = q.take_ready(usize::MAX);
+        let kinds: Vec<String> = frames
+            .iter()
+            .map(|s| match &s.frame {
+                Frame::DataGap { reason, .. } => format!("gap:{reason:?}"),
+                Frame::SnapshotStart { .. } => "start".to_string(),
+                Frame::SnapshotChunk(d) => format!("chunk:{}", d[0] as char),
+                Frame::SnapshotEnd => "end".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["gap:Dropped", "start", "chunk:4", "end"]);
+        assert_eq!(q.pending_bytes(), 0);
     }
 }
