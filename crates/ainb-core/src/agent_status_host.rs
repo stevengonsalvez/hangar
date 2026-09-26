@@ -408,6 +408,7 @@ mod tests {
             discovered_at: 1,
             last_observed_at: 1,
             lifecycle_updated_at: 1,
+            session_incarnation: None,
             attention_updated_at: 1,
             model: None,
             reasoning_effort: None,

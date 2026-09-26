@@ -706,6 +706,7 @@ fn acp_roster() -> ainb_hangar_proto::agent_status::RosterStatusResult {
         discovered_at: 1,
         last_observed_at: 1,
         lifecycle_updated_at: 1,
+        session_incarnation: None,
         attention_updated_at: 1,
         model: None,
         reasoning_effort: None,
