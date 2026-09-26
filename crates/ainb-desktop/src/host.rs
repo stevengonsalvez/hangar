@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ainb_app::app::RendererHost;
 use ainb_app::app::intent::{Btn, Pos};
-use ainb_app::app::keymap::{HostAction, active_contexts, command_on_screen};
+use ainb_app::app::keymap::{HostAction, active_contexts, judge_command};
 use ainb_app::app::state::WorkspaceRescan;
 use ainb_app::config::AppConfig;
 use ainb_app::fleet::agent_status_reader::{AgentStatusReader, Dialer};
@@ -112,6 +112,14 @@ pub fn inbox_dialer() -> InboxDialer {
 
 /// The home sidebar's `select` row, the one Enter runs on a focused item.
 const HOME_SIDEBAR_SELECT: &str = "home.sidebar.select";
+/// The row that leaves any screen for the home screen; always active.
+const GLOBAL_GO_HOME: &str = "global.go_home";
+
+/// The answer banner's rows: the Ask tab and everything under `ask`.
+fn is_answer_row(id: &CommandId) -> bool {
+    id.as_str().starts_with("session_list.ask.")
+        || id.as_str() == ainb_app::app::pointer::ids::SESSION_LIST_SELECT_TAB
+}
 
 /// One `AppState` hosted for the desktop renderer.
 pub struct DesktopHost<S: FrameSink> {
@@ -437,6 +445,31 @@ impl<S: FrameSink> DesktopHost<S> {
         );
     }
 
+    /// Leave the page the reducer is on for the answer banner's rows.
+    ///
+    /// The banner is drawn over every page, but its rows (the Ask tab, the
+    /// pick, the composer) are the session list's, and from the inbox, the
+    /// settings or the git view the reducer refuses them as off screen: the
+    /// answer went nowhere (#121). Decided by the reducer's own screen, not by
+    /// the frame the window last drew, and the same for every page: home
+    /// first, which is always open, then the session list the way the sidebar
+    /// opens it. Nothing else moves the reducer for a name sent off screen.
+    pub fn bring_answer_home(&mut self, intent: &Intent, executor: &mut impl Executor) {
+        let Intent::Command(id, _) = intent else {
+            return;
+        };
+        if !is_answer_row(id)
+            || self.state.shell.current_screen == ainb_app::app::screens::ids::SESSION_LIST
+        {
+            return;
+        }
+        self.run(
+            Intent::Command(CommandId::new(GLOBAL_GO_HOME), serde_json::Value::Null),
+            executor,
+        );
+        self.open_sessions(executor);
+    }
+
     /// Every command the palette may offer, in the keymap's own order.
     ///
     /// Built from [`crate::intent::refused_from_webview`], the list the
@@ -494,30 +527,20 @@ impl<S: FrameSink> DesktopHost<S> {
                 };
                 (id, row.action.clone())
             }
-            // Judged with its payload: a pointer row's action is what the
-            // arguments name (the settings row a `config.set_row` edits,
-            // #1224), not the placeholder the table wrote. A payload the row
-            // cannot parse is refused here, closed, rather than judged on the
-            // placeholder and left for the reducer to drop.
+            // The reducer's own judgement, asked before the dispatch so the
+            // window hears every reason the reducer would drop the name for:
+            // no such row, a key-only row, a payload that does not fit, what
+            // the row would write (judged with its payload, #1224), and last
+            // the screen gate. A name the reducer dropped was logged here as
+            // dispatched (#121).
             Intent::Command(id, args) => {
-                let row = self.keymap.command(id)?;
-                let Some(action) = row.action.with_args(args) else {
-                    return Some(Refusal {
+                return match judge_command(&self.state, &self.keymap, id, args) {
+                    Ok(_) => None,
+                    Err(refusal) => Some(Refusal {
+                        reason: crate::setup::desktop_path(id).unwrap_or(refusal.reason()),
                         command: id.clone(),
-                        reason: "its payload does not fit the row",
-                    });
+                    }),
                 };
-                // The reducer's own screen gate, asked here so the window
-                // hears the refusal: a name it sends off the row's screen
-                // (the answer banner's pick over the inbox page, #121) was
-                // dropped by the reducer and logged as dispatched.
-                if !command_on_screen(&self.state, id, &row.ctx) {
-                    return Some(Refusal {
-                        command: id.clone(),
-                        reason: "it is not active on this screen",
-                    });
-                }
-                (id.clone(), action)
             }
             _ => return None,
         };
