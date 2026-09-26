@@ -135,44 +135,251 @@ fn the_phase_switches_are_env_only() {
 /// Every method the daemon's dispatch matches on has a scope verdict: the
 /// no-default rule, enforced from the daemon's side. Parsed from source so a
 /// handler added without a registry entry fails here, not in production.
+///
+/// The parse runs over the whole dispatch file as one token stream, so an arm
+/// is found wherever it sits: first on its line, on a `| methods::X`
+/// continuation line of a multi-line or-pattern, behind an `if` guard, or as
+/// a string literal (`"fleet/x" =>`) that never went through `methods.rs`.
 #[test]
 fn every_dispatched_method_is_classified() {
     let consts = method_consts(include_str!("../../ainb-hangar-proto/src/methods.rs"));
-    let dispatch = include_str!("../src/rpc/mod.rs");
-    let mut arms = std::collections::BTreeSet::new();
-    for line in dispatch.lines() {
-        let line = line.trim_start();
-        let Some(rest) = line.strip_prefix("methods::") else {
-            continue;
-        };
-        let name: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
-            .collect();
-        let tail = rest[name.len()..].trim_start();
-        if tail.starts_with("=>") || tail.starts_with('|') {
-            arms.insert(name);
-        }
-    }
+    let arms = dispatch_arms(include_str!("../src/rpc/mod.rs"));
     assert!(
         arms.len() > 100,
         "the dispatch parse found {} arms",
         arms.len()
     );
     let mut unclassified = Vec::new();
-    for name in &arms {
-        let Some((_, value)) = consts.iter().find(|(n, _)| n == name) else {
-            unclassified.push(format!("{name} (no const)"));
-            continue;
+    for arm in &arms {
+        let value = match arm {
+            Arm::Const(name) => {
+                let Some((_, value)) = consts.iter().find(|(n, _)| n == name) else {
+                    unclassified.push(format!("{name} (no const)"));
+                    continue;
+                };
+                value.clone()
+            }
+            Arm::Literal(value) => value.clone(),
         };
-        if ainb_hangar_proto::devices::scope_row(value).is_none() {
-            unclassified.push(format!("{name} = {value:?}"));
+        if ainb_hangar_proto::devices::scope_row(&value).is_none() {
+            unclassified.push(format!("{arm:?} = {value:?}"));
         }
     }
     assert!(
         unclassified.is_empty(),
         "dispatched methods with no scope verdict: {unclassified:?}"
     );
+}
+
+/// The arm parser itself: multi-line or-patterns, guards, parenthesised
+/// alternatives and string-literal arms are found; comments, strings that
+/// merely mention an arm, and comparisons are not.
+#[test]
+fn the_arm_parser_sees_every_arm_shape() {
+    let source = r##"
+        match req.method.as_str() {
+            methods::SINGLE => a(),
+            methods::FIRST
+            | methods::MIDDLE
+            | methods::LAST => b(),
+            methods::GUARDED if ready => c(),
+            m @ (methods::PAREN_A | methods::PAREN_B) => d(m),
+            "fleet/literal" => e(),
+            "fleet/lit_a"
+            | "fleet/lit_b" => f(),
+            // methods::IN_COMMENT => never,
+            /* methods::IN_BLOCK => never */
+            _ if req.method == methods::COMPARED || x => g("methods::IN_STRING =>"),
+            _ => h(r#"methods::IN_RAW => "quoted""#, 'x', '"', "no/arm"),
+        }
+    "##;
+    let found: Vec<Arm> = dispatch_arms(source).into_iter().collect();
+    let want: std::collections::BTreeSet<Arm> = [
+        "SINGLE", "FIRST", "MIDDLE", "LAST", "GUARDED", "PAREN_A", "PAREN_B",
+    ]
+    .into_iter()
+    .map(|n| Arm::Const(n.to_string()))
+    .chain(
+        ["fleet/literal", "fleet/lit_a", "fleet/lit_b"]
+            .into_iter()
+            .map(|v| Arm::Literal(v.to_string())),
+    )
+    .collect();
+    assert_eq!(found, want.into_iter().collect::<Vec<_>>());
+}
+
+/// A method named by a dispatch arm.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Arm {
+    /// `methods::NAME`.
+    Const(String),
+    /// A string literal that looks like a method (`family/name`).
+    Literal(String),
+}
+
+/// One lexical token of Rust source, as coarse as the arm parse needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Tok {
+    Method(String),
+    Literal(String),
+    Arrow,
+    Pipe,
+    OrOr,
+    If,
+    CloseParen,
+    Other,
+}
+
+/// Every method-naming arm pattern in `source`: a `methods::NAME` path or a
+/// `family/name` string literal followed by `=>`, `|` or an `if` guard, or
+/// closing a parenthesised or-pattern.
+fn dispatch_arms(source: &str) -> std::collections::BTreeSet<Arm> {
+    let toks = lex(source);
+    let mut arms = std::collections::BTreeSet::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let arm = match tok {
+            Tok::Method(name) => Arm::Const(name.clone()),
+            Tok::Literal(value) if looks_like_method(value) => Arm::Literal(value.clone()),
+            _ => continue,
+        };
+        let next = toks.get(i + 1);
+        let prev = i.checked_sub(1).and_then(|p| toks.get(p));
+        let is_arm = matches!(next, Some(Tok::Arrow | Tok::Pipe | Tok::If))
+            || (prev == Some(&Tok::Pipe) && next == Some(&Tok::CloseParen));
+        if is_arm {
+            arms.insert(arm);
+        }
+    }
+    arms
+}
+
+fn looks_like_method(value: &str) -> bool {
+    let mut parts = value.split('/');
+    let ok = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), None) if ok(a) && ok(b))
+}
+
+/// Tokenise Rust source: comments dropped; string, raw string and char
+/// literals consumed whole (so text inside them is never a token); a
+/// `methods::NAME` path becomes one token.
+fn lex(source: &str) -> Vec<Tok> {
+    let b = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let ident = |at: usize| {
+        let mut end = at;
+        while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+            end += 1;
+        }
+        end
+    };
+    while i < b.len() {
+        let c = b[i];
+        let rest = &b[i..];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if rest.starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if rest.starts_with(b"/*") {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == b'"' {
+            let start = i + 1;
+            i = start;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            out.push(Tok::Literal(source[start..i.min(b.len())].to_string()));
+            i += 1;
+        } else if (c == b'r' || c == b'b')
+            && raw_string_open(&b[i..]).is_some()
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+        {
+            let (skip, hashes) = raw_string_open(&b[i..]).unwrap_or((1, 0));
+            let start = i + skip;
+            let mut close = vec![b'"'];
+            close.extend(std::iter::repeat_n(b'#', hashes));
+            let len = b[start..]
+                .windows(close.len())
+                .position(|w| w == close.as_slice())
+                .unwrap_or(b.len() - start);
+            out.push(Tok::Literal(source[start..start + len].to_string()));
+            i = start + len + close.len();
+        } else if c == b'\'' {
+            // A char literal ('x', '\n', '"'), else a lifetime ('a).
+            if b.get(i + 1) == Some(&b'\\') {
+                i += 3;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            } else if let Some(len) = source[i + 1..].chars().next().map(char::len_utf8) {
+                if b.get(i + 1 + len) == Some(&b'\'') {
+                    i += len + 2;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            out.push(Tok::Other);
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let end = ident(i);
+            let word = &source[i..end];
+            if word == "methods" && b[end..].starts_with(b"::") {
+                let name_end = ident(end + 2);
+                out.push(Tok::Method(source[end + 2..name_end].to_string()));
+                i = name_end;
+            } else {
+                out.push(if word == "if" { Tok::If } else { Tok::Other });
+                i = end;
+            }
+        } else if rest.starts_with(b"=>") {
+            out.push(Tok::Arrow);
+            i += 2;
+        } else if rest.starts_with(b"||") {
+            out.push(Tok::OrOr);
+            i += 2;
+        } else if c == b'|' {
+            out.push(Tok::Pipe);
+            i += 1;
+        } else if c == b')' {
+            out.push(Tok::CloseParen);
+            i += 1;
+        } else {
+            out.push(Tok::Other);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `r"`, `r#"`, `br##"` and so on: the bytes up to and including the quote,
+/// and the number of hashes.
+fn raw_string_open(b: &[u8]) -> Option<(usize, usize)> {
+    let mut i = usize::from(b.first() == Some(&b'b'));
+    if b.get(i) != Some(&b'r') {
+        return None;
+    }
+    i += 1;
+    let hashes = b[i..].iter().take_while(|&&c| c == b'#').count();
+    i += hashes;
+    (b.get(i) == Some(&b'"')).then_some((i + 1, hashes))
 }
 
 /// `pub const NAME: &str = "value"` pairs from `methods.rs` source.
