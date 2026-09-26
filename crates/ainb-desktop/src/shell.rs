@@ -53,6 +53,7 @@ impl<S: FrameSink> Shell<S> {
     pub fn dispatch_renderer(&self, intent: Intent) -> Option<Refusal> {
         let mut core = self.core();
         let Core { host, executor } = &mut *core;
+        host.bring_answer_home(&intent, executor);
         if let Some(refusal) = host.refused_from_renderer(&intent) {
             tracing::warn!(
                 "`{}` refused from the webview: {}",
