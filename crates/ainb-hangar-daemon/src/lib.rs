@@ -923,7 +923,7 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         // leg without a key for this boot, never the daemon down.
         if crate::peer_listener::switched_on() {
             let secrets = crate::claude_cred::default_backend();
-            match crate::host_key::ensure(store.pool(), secrets.as_ref(), &dir).await {
+            match crate::host_key::ensure(store.pool(), secrets, &dir).await {
                 Ok(loaded) => tracing::info!(
                     custody = ?loaded.custody,
                     minted = loaded.minted,

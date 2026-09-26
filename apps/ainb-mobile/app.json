@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "ainb",
+    "slug": "ainb-mobile",
+    "version": "0.1.0",
+    "scheme": "ainb",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.stevengonsalvez.ainb.mobile",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.stevengonsalvez.ainb.mobile",
+      "allowBackup": false
+    },
+    "plugins": ["expo-router", "expo-status-bar"]
+  }
+}

@@ -7,7 +7,7 @@
 // executable it runs from, and killed by its pid.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,13 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 /** The file a world records its owning process in. */
 export const OWNER_FILE = "owner.pid";
+
+/**
+ * Where worlds are made: /tmp rather than the OS temp directory. A world holds
+ * the fixture tmux server's socket, and a macOS temp directory alone takes
+ * about half of the 103 bytes a unix socket address allows.
+ */
+export const WORLD_PARENT = "/tmp";
 
 /** A world with no owner file is only removed once it is at least this old. */
 const UNOWNED_GRACE_MS = 60 * 60 * 1000;
@@ -37,7 +44,7 @@ function alive(pid) {
  * possibly another lane's on the same box, and is left alone. Returns the
  * worlds removed.
  */
-export function removeStaleWorlds(dir = tmpdir(), now = Date.now()) {
+export function removeStaleWorlds(dir = WORLD_PARENT, now = Date.now()) {
   const removed = [];
   for (const name of readdirSync(dir)) {
     if (!name.startsWith("ainb-e2e-")) continue;
@@ -48,12 +55,16 @@ export function removeStaleWorlds(dir = tmpdir(), now = Date.now()) {
       stale = !Number.isInteger(owner) || !alive(owner);
     } catch {
       try {
-        stale = now - statSync(world).mtimeMs > UNOWNED_GRACE_MS;
+        // The entry itself, not what it points at: a world root is a symlink
+        // (world.js), and one left dangling by a half-finished remove must
+        // still count as stale rather than be skipped for good.
+        stale = now - lstatSync(world).mtimeMs > UNOWNED_GRACE_MS;
       } catch {
         continue;
       }
     }
     if (!stale) continue;
+    endTmuxServer(world);
     try {
       rmSync(world, { recursive: true, force: true });
       removed.push(world);
@@ -64,6 +75,28 @@ export function removeStaleWorlds(dir = tmpdir(), now = Date.now()) {
     }
   }
   return removed;
+}
+
+/**
+ * End the tmux server a world's sessions ran on, through that world's own
+ * socket path and with TMUX and TMUX_PANE removed, before the world is removed:
+ * a run that died left it serving from a directory about to disappear. The
+ * socket is the default server tmux makes under the world's TMUX_TMPDIR
+ * (world.js), so only that world's server can be reached; none is a no-op.
+ */
+function endTmuxServer(world) {
+  const socket = join(world, "tmux", `tmux-${process.getuid()}`, "default");
+  try {
+    lstatSync(socket);
+  } catch {
+    return;
+  }
+  const { TMUX: _client, TMUX_PANE: _pane, ...env } = process.env;
+  try {
+    execFileSync("tmux", ["-S", socket, "kill-server"], { stdio: "ignore", timeout: 10_000, env });
+  } catch {
+    // No server on that socket any more: the file is only left over.
+  }
 }
 
 /**
@@ -113,7 +146,10 @@ export function stopWorktreeDaemons(targets = worktreeTargetDirs()) {
 
 /** Everything suite start clears, logged so a run says what it removed. */
 export function cleanUpBeforeRun() {
-  const worlds = removeStaleWorlds();
+  // Worlds are made under WORLD_PARENT; earlier runs made them in the OS temp
+  // directory, so that is swept too until none are left there.
+  const parents = [...new Set([WORLD_PARENT, tmpdir()])];
+  const worlds = parents.flatMap((parent) => removeStaleWorlds(parent));
   const daemons = stopWorktreeDaemons();
   if (worlds.length > 0) console.log(`e2e: removed stale worlds ${worlds.join(", ")}`);
   if (daemons.length > 0) console.log(`e2e: stopped this worktree's daemons ${daemons.join(", ")}`);

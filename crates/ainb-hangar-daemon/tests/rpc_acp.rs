@@ -1449,7 +1449,13 @@ async fn a_stale_expected_version_is_refused_and_leaves_the_ask_open() {
             }),
         )
         .await;
-    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    // A D18 refusal a surface can render (-32008, reason `conflict`), not a
+    // parameter error: the client's view of the session moved on.
+    assert_eq!(refused["error"]["code"], -32008, "{refused}");
+    assert_eq!(
+        refused["error"]["data"]["mutation"]["reason"], "conflict",
+        "{refused}"
+    );
     assert!(
         refused["error"]["message"].as_str().unwrap_or_default().contains("version is"),
         "the refusal names the version it found: {refused}"

@@ -38,6 +38,7 @@ fn make_session(name: &str) -> SessionMetadata {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 

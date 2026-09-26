@@ -61,6 +61,11 @@ pub const fn is_crockford(c: char) -> bool {
 /// On the wire it is a bare JSON string (the same shape as the app's current
 /// `HostId`, which becomes a re-export of this type). Decoding validates, so a
 /// value that is neither a canonical ULID nor `local` never reaches a handler.
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
+// `transparent` + `inline`: in TypeScript a host id is a bare `string`, as on
+// the wire, and never a second exported `HostId` beside the app's own mirror
+// host key of that name (amendment T1 keeps the two types apart).
+#[cfg_attr(feature = "typescript-bindings", specta(transparent, inline))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct HostId(String);
@@ -136,6 +141,11 @@ impl fmt::Display for HostId {
 }
 
 /// The network path a peer connection rides.
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
+// A `string` in TypeScript: the `#[serde(other)]` catch-all on a plain unit
+// enum has no specta-serde shape, and a newer daemon may send a carrier this
+// build does not name, so the honest TS type is any string.
+#[cfg_attr(feature = "typescript-bindings", specta(type = String))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CarrierKind {
     /// A tailnet address (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`).
@@ -176,6 +186,7 @@ impl fmt::Display for CarrierKind {
 ///
 /// A field of the host, never folded into a row's state: a row from an
 /// unreachable host keeps its last known state and shows this beside it.
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Reachability {
@@ -202,6 +213,7 @@ pub enum Reachability {
 }
 
 /// How completely one host is represented in one census listing.
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum HostCoverage {
@@ -328,6 +340,19 @@ mod tests {
         let ok: Peer = serde_json::from_value(serde_json::json!({"host_id": MINTED})).unwrap();
         assert_eq!(ok.host_id.as_str(), MINTED);
         assert!(serde_json::from_value::<Peer>(serde_json::json!({"host_id": "local"})).is_err());
+    }
+
+    /// The host types reach TypeScript under `typescript-bindings` (amendment
+    /// T1), so a surface can hold them in a mirror section.
+    #[cfg(feature = "typescript-bindings")]
+    #[test]
+    fn the_host_types_derive_their_typescript_shape() {
+        fn typed<T: specta::Type>() {}
+        typed::<HostId>();
+        typed::<CarrierKind>();
+        typed::<Reachability>();
+        typed::<HostCoverage>();
+        typed::<crate::session_ref::SessionRef>();
     }
 
     #[test]

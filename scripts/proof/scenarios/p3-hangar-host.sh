@@ -29,7 +29,7 @@ scenario() {
     pane_text tui | grep -q '▶ headroom proxy' && break
     keys tui Down
   done
-  check "the cursor reaches the headroom proxy row" bash -c "tmux -L proof capture-pane -t '=tui:' -p | grep -q '▶ headroom proxy'"
+  check "the cursor reaches the headroom proxy row" bash -c "env -u TMUX -u TMUX_PANE tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=tui:' -p | grep -q '▶ headroom proxy'"
   keys tui Enter
   check "Enter offers the verbs" wait_screen tui '▶ start' 5
   capture tui daemons-verbs
@@ -45,6 +45,6 @@ scenario() {
   local pid
   pid="$(cat "$HOME/.agents-in-a-box/headroom/proxy.pid" 2>/dev/null)"
   observe "proxy pid file: ${pid:-none}; row: $(pane_text tui | grep -oE 'headroom proxy +process +● running +[0-9]+' | head -1)"
-  check "the row's pid is the proxy's pid" bash -c "tmux -L proof capture-pane -t '=tui:' -p | grep -qE 'headroom proxy +process +● running +${pid:-x} '"
+  check "the row's pid is the proxy's pid" bash -c "env -u TMUX -u TMUX_PANE tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=tui:' -p | grep -qE 'headroom proxy +process +● running +${pid:-x} '"
   check "that proxy answers /health" curl -fsS -o /dev/null "http://127.0.0.1:$PROOF_HEADROOM_PORT/health"
 }
