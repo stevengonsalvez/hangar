@@ -165,13 +165,18 @@ test("a row's dot reads the same UiStatus its card would (P4)", async () => {
   ];
   const fleetMetadata = { "claude-1": { provider_session_id: "p-1" } } as unknown as FleetView_Serialize["fleet_metadata"];
   await open(frame(), undefined, null, { cards, fleetMetadata });
-  const dot = document.querySelector('.session-row[data-session="claude-1"] .ring');
+  const dot = document.querySelector('.session-row[data-session="claude-1"] .status-glyph');
   assert.equal(dot?.getAttribute("data-status"), "needs-approve");
+  // Never colour alone: the row's own name carries the words.
+  assert.match(
+    document.querySelector('.session-row[data-session="claude-1"]')?.textContent ?? "",
+    /Needs you · approve/,
+  );
 });
 
 test("a row with no matching card falls back to its own ring and lifecycle", async () => {
   await open();
-  const dot = document.querySelector('.session-row[data-session="claude-1"] .ring');
+  const dot = document.querySelector('.session-row[data-session="claude-1"] .status-glyph');
   // The fixture session is `Running` (its tmux session is alive) with no
   // attention chips and no card: nothing says the agent is working, so it
   // reads unverifiable, never a spinner.
