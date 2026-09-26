@@ -25,7 +25,7 @@
 //! opcode numbers and close codes.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -181,17 +181,44 @@ impl std::fmt::Debug for PeerHost {
     }
 }
 
-/// Bind the peer leg and serve it until `shutdown` fires, when every open
-/// peer socket closes 4503.
+/// A running peer leg: the token that drains it and its accept-loop task.
+pub struct PeerLeg {
+    cancel: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PeerLeg {
+    fn spawn(listener: TcpListener, carrier: CarrierKind, host: Arc<PeerHost>) -> Self {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(run(listener, carrier, host, cancel.clone()));
+        Self { cancel, task }
+    }
+
+    /// Stop accepting, close every open peer socket 4503, and wait for those
+    /// closes to be sent, bounded by [`DRAIN_BOUND`]. Cancels first, so it
+    /// also drains on the exits no shutdown signal announces (a one-shot boot,
+    /// a boot error), and is harmless after a signal already cancelled it.
+    pub async fn drain(self) {
+        self.cancel.cancel();
+        let bound = DRAIN_BOUND + Duration::from_secs(1);
+        if tokio::time::timeout(bound, self.task).await.is_err() {
+            tracing::warn!("peer leg did not drain in time");
+        }
+    }
+}
+
+/// Bind the peer leg and serve it until `shutdown` fires (or the returned leg
+/// is drained), when every open peer socket closes 4503.
 ///
 /// # Errors
 ///
-/// The bind error.
+/// The bind error, or a Noise responder that cannot be built from this host's
+/// key and id.
 pub async fn start(
     config: ListenConfig,
     host: PeerHost,
     mut shutdown: crate::shutdown::Handle,
-) -> std::io::Result<tokio::task::JoinHandle<()>> {
+) -> std::io::Result<PeerLeg> {
     // Refuse to bind a leg whose every handshake would fail: a bad key or host
     // id is a boot error to report, not a socket that answers 4401 to all.
     ainb_hangar_noise::responder(&host.secret, config.carrier, &host.host_id).map_err(|error| {
@@ -207,19 +234,14 @@ pub async fn start(
         );
     }
     tracing::info!(addr = %config.addr, carrier = %config.carrier, "peer leg listening");
-    let cancel = CancellationToken::new();
-    let on_shutdown = cancel.clone();
+    let leg = PeerLeg::spawn(listener, config.carrier, Arc::new(host));
+    let on_shutdown = leg.cancel.clone();
     tokio::spawn(async move {
         let cause = shutdown.recv().await;
         tracing::info!(?cause, "peer leg draining");
         on_shutdown.cancel();
     });
-    Ok(tokio::spawn(run(
-        listener,
-        config.carrier,
-        Arc::new(host),
-        cancel,
-    )))
+    Ok(leg)
 }
 
 /// The accept loop. Ends when `cancel` fires, then drains every connection
@@ -497,6 +519,11 @@ enum Admission {
 /// One admitted socket's slots, released on drop: its source's socket and
 /// unauthenticated counts (R1-06b releases the unauthenticated one at hello),
 /// and its global slot.
+///
+/// Until R1-06b every socket stays unauthenticated for its whole life, so the
+/// 8-unauthenticated cap always binds first and the 16-socket cap
+/// ([`SOCKETS_PER_SOURCE`]) cannot bite yet; it starts to matter once hellos
+/// are accepted and authenticated sockets stop counting against the 8.
 struct SourceSlot {
     limits: Arc<Mutex<Limits>>,
     ip: IpAddr,
@@ -520,11 +547,32 @@ impl Drop for SourceSlot {
     }
 }
 
+/// The budget a source address counts against. IPv4 and tailnet IPv6 are
+/// keyed by address (tailnet addresses are one per node); any other IPv6 by
+/// its /64, which one host can hand itself freely, so rotating the low bits
+/// never buys a fresh budget. An IPv4-mapped address counts as its IPv4.
+fn source_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            if carrier_of(ip) == Some(CarrierKind::Tailnet) || v6.is_loopback() {
+                return ip;
+            }
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        IpAddr::V4(_) => ip,
+    }
+}
+
 impl Limits {
     /// Count one new socket from `ip`. Every `ssh -L` client arrives as
     /// loopback, so loopback shares one budget (RECONCILED S11: accepted for
     /// v1, and logged when it bites).
     fn admit(limits: &Arc<Mutex<Self>>, ip: IpAddr, now: Instant) -> Admission {
+        let ip = source_key(ip);
         let mut guard = limits.lock().unwrap_or_else(PoisonError::into_inner);
         guard.sources.retain(|_, s| {
             s.sockets > 0
@@ -847,6 +895,80 @@ mod tests {
             done.err()
         );
         drop(silent);
+    }
+
+    /// IPv6 sources outside the tailnet count per /64, so rotating the low
+    /// bits buys no fresh budget; tailnet, loopback and IPv4 keep their
+    /// address, and an IPv4-mapped address counts as its IPv4.
+    #[test]
+    fn ipv6_sources_share_a_budget_per_slash_64() {
+        let key = |s: &str| source_key(s.parse().unwrap());
+        assert_eq!(key("2001:db8:1:2:aaaa::1"), key("2001:db8:1:2:bbbb::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(
+            key("fd7a:115c:a1e0::1"),
+            key("fd7a:115c:a1e0::2"),
+            "tailnet per node"
+        );
+        assert_eq!(key("::1"), "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(key("192.0.2.7"), "192.0.2.7".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            key("::ffff:192.0.2.7"),
+            "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    /// The reviewer's probe, kept as the regression test for the drain: the
+    /// leg runs on its own current-thread runtime, a peer holds an open
+    /// socket, and the runtime is dropped. Dropped straight away, the
+    /// connection task dies with it and the peer never reads 4503; drained
+    /// first ([`PeerLeg::drain`]), the peer reads 4503. So the drain, not
+    /// scheduling luck, is what gets the close out before exit.
+    #[test]
+    fn draining_before_the_runtime_drops_is_what_sends_4503() {
+        let close_code_with = |drain: bool| -> Option<u16> {
+            let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            std_listener.set_nonblocking(true).expect("nonblocking");
+            let addr = std_listener.local_addr().expect("addr");
+            let keypair = generate_keypair().expect("host key");
+            let host = Arc::new(PeerHost::new(
+                HostId::parse_minted(HOST_ID).expect("host id"),
+                &keypair.private,
+            ));
+            let (connected_tx, connected_rx) = std::sync::mpsc::channel::<()>();
+            let leg_thread = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async move {
+                    let listener = TcpListener::from_std(std_listener).expect("listener");
+                    let leg = PeerLeg::spawn(listener, CarrierKind::SshL, host);
+                    while connected_rx.try_recv().is_err() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    if drain {
+                        leg.drain().await;
+                    }
+                });
+                // Without a drain this drops the connection task mid-wait.
+                drop(runtime);
+            });
+            let client = tokio::runtime::Runtime::new().expect("client runtime");
+            let code = client.block_on(async move {
+                let mut ws = connect(addr, ainb_hangar_noise::PEER_PATH).await.expect("upgrade");
+                connected_tx.send(()).expect("signal");
+                close_code(&mut ws).await
+            });
+            leg_thread.join().expect("leg thread");
+            code
+        };
+        assert_eq!(close_code_with(true), Some(peer_close::DRAINING));
+        assert_ne!(
+            close_code_with(false),
+            Some(peer_close::DRAINING),
+            "without the drain the runtime drop kills the close: this probe must see the difference"
+        );
     }
 
     /// Nine unauthenticated sockets from one source: the ninth closes 1013
