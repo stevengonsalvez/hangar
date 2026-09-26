@@ -24,7 +24,6 @@ use ainb_hangar_proto::fleet::{
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
 use ainb_hangar_proto::mutation::{ACK_KEY, Fence, MutationAck, MutationEnvelope, OpId};
-use ainb_hangar_proto::peer_close;
 use ainb_hangar_proto::protocol::{ProtocolRange, catalogue_strings};
 use ainb_hangar_proto::snapshots::{
     AnswerParams, AnswerResult, AttentionListResult, AttentionSubscribeParams,
@@ -219,9 +218,9 @@ pub fn list_pairings(custody_dir: String) -> Result<Vec<PairingRecord>, WireErro
 }
 
 /// Forget a pairing: the token and the record. Only an explicit user action
-/// calls this (the owner removes a host). A 4401 or 4403 never forgets: it
-/// sets the re-pair latch (`PairingRecord.repair`) and the app shows
-/// "re-pair" while keeping the pairing.
+/// calls this (the owner removes a host). A refusal never forgets: it sets
+/// `PairingRecord.repair` (or `notice`) and the app shows "re-pair" while
+/// keeping the pairing.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireError> {
@@ -285,19 +284,13 @@ pub struct MobileHost {
     host_id: String,
 }
 
-/// The re-pair latch: a 4401 or 4403 close from the host sets it on the
-/// pairing record; only a successful pair clears it.
+/// A refusal from the host goes on the pairing record: `repair` for an
+/// identity refusal (peer changed, 4401, 4403), `notice` for an incompatible
+/// or unknown close; only a successful pair clears them. Retryable closes,
+/// including a network loss, set nothing: `Closed { retryable, retry_after_ms }`
+/// stays the app's only source of truth for a redial.
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
-    if matches!(
-        err,
-        WireError::PeerChanged
-            | WireError::Closed {
-                code: Some(peer_close::UNAUTHENTICATED | peer_close::REVOKED),
-                ..
-            }
-    ) {
-        let _ = pairing::mark_repair(custody_dir, host_id, true);
-    }
+    let _ = pairing::mark_refusal(custody_dir, host_id, err);
 }
 
 impl std::fmt::Debug for MobileHost {
