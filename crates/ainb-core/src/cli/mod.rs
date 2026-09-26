@@ -150,6 +150,22 @@ pub struct RunArgs {
     #[arg(long)]
     pub worktree: bool,
 
+    /// Base ref the new worktree branch starts from (needs --worktree or --create-branch)
+    //
+    // Default (flag absent): the repository's default branch, which is what
+    // `WorktreeManager::create_worktree` picks when handed no base.
+    #[arg(long, value_name = "REF")]
+    pub base: Option<String>,
+
+    /// Set from the global `--format json`, not a flag of its own.
+    //
+    // For callers that drive `ainb run` as a subprocess (the hangar daemon's
+    // `worktree/create`): stdout carries exactly one JSON object and every
+    // human-readable line moves to stderr. Filled in by the registry from the
+    // parsed `--format`, so `run --help` gains no second JSON switch.
+    #[arg(skip)]
+    pub json: bool,
+
     /// AI tool to use
     #[arg(long, value_enum, default_value_t = Tool::Claude)]
     pub tool: Tool,
