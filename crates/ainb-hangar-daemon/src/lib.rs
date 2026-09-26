@@ -785,34 +785,38 @@ async fn start_peer_leg(
     pool: &sqlx::SqlitePool,
     loaded: &crate::host_key::Loaded,
     shutdown: crate::shutdown::Handle,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     let host_id =
         match ainb_hangar_store::repo::daemon_identity::DaemonIdentityRepo::read(pool).await {
             Ok(Some(identity)) => identity.host_id,
             Ok(None) => {
                 tracing::error!("peer leg not bound: this daemon has no minted host id");
-                return;
+                return None;
             }
             Err(error) => {
                 tracing::error!(%error, "peer leg not bound: the host id could not be read");
-                return;
+                return None;
             }
         };
     let Ok(host_id) = ainb_hangar_proto::hosts::HostId::parse_minted(&host_id) else {
         tracing::error!("peer leg not bound: the host id is not a minted id");
-        return;
+        return None;
     };
     let value = std::env::var(peer_listener::LISTEN_ENV).unwrap_or_default();
     let config = match peer_listener::listen_config(&value) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(%error, "peer leg not bound");
-            return;
+            return None;
         }
     };
     let host = peer_listener::PeerHost::new(host_id, loaded.key.secret());
-    if let Err(error) = peer_listener::start(config, host, shutdown).await {
-        tracing::error!(%error, addr = %config.addr, "peer leg bind failed");
+    match peer_listener::start(config, host, shutdown).await {
+        Ok(leg) => Some(leg),
+        Err(error) => {
+            tracing::error!(%error, addr = %config.addr, "peer leg bind failed");
+            None
+        }
     }
 }
 
@@ -910,6 +914,14 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
     // orphaning the shutdown path exists to prevent.
     let (running_tx, running_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // The peer leg's listener task, kept OUTSIDE the boot future so it is
+    // drained on every exit, including a shutdown mid-boot that drops that
+    // future: draining is what lets every open peer socket close 4503 before
+    // the process exits.
+    let peer_leg: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        std::sync::Arc::default();
+    let peer_leg_slot = std::sync::Arc::clone(&peer_leg);
+
     // The rest of boot, raced against that seam. Dropping this future on a
     // shutdown unwinds the partially built daemon; `_ownership` lives OUTSIDE it,
     // so the lock is released either way.
@@ -968,7 +980,11 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
                         minted = loaded.minted,
                         "peer leg host key"
                     );
-                    start_peer_leg(store.pool(), &loaded, shutdown.clone()).await;
+                    if let Some(leg) = start_peer_leg(store.pool(), &loaded, shutdown.clone()).await
+                    {
+                        *peer_leg_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(leg);
+                    }
                 }
                 // No key, no bind: the leg never listens without the key
                 // devices pin.
@@ -1535,7 +1551,7 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         run(store.pool().clone(), cfg, stats, broker.sink(), shutdown).await
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         result = booted => result,
         cause = async move {
             let raced = tokio::select! {
@@ -1555,7 +1571,16 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
             );
             Ok(())
         }
+    };
+    // The shutdown handle already told the peer leg to drain; wait for it,
+    // bounded, so its 4503 closes are sent before the process exits.
+    let leg = peer_leg.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(leg) = leg {
+        if tokio::time::timeout(peer_listener::DRAIN_BOUND, leg).await.is_err() {
+            tracing::warn!("peer leg did not drain in time");
+        }
     }
+    result
 }
 
 #[cfg(test)]
