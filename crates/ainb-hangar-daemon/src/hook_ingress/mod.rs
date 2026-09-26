@@ -32,7 +32,7 @@ use ainb_hangar_proto::hooks::{
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
-pub use endpoint::EndpointFiles;
+pub use endpoint::{EndpointFiles, remove_stale};
 pub use guard::{Judge, MAX_BODY, MAX_CONNECTIONS, MAX_HEAD, Refusal, Route};
 
 use crate::local_http::{read_body, read_head, write_response};
@@ -101,6 +101,30 @@ impl HookSink for DiscardSink {
     }
 }
 
+/// How long the listener waits on its sink before answering `204` itself,
+/// and how many holds it serves at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// A status event's sink call; past it the hook gets `204`.
+    pub event_deadline: Duration,
+    /// A hold's sink call (a human deciding); past it the hook gets `204`,
+    /// so Claude shows its own prompt. Under the script's 610s curl budget.
+    pub hold_deadline: Duration,
+    /// Holds served at once. A hold past this is recorded as status and
+    /// answered `204` at once.
+    pub max_holds: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            event_deadline: Duration::from_secs(10),
+            hold_deadline: Duration::from_secs(600),
+            max_holds: 32,
+        }
+    }
+}
+
 /// A running listener. Dropping it stops accepting and removes the files.
 #[derive(Debug)]
 pub struct Running {
@@ -134,13 +158,25 @@ impl Drop for Running {
 /// # Errors
 /// A bind or file-publish failure. The caller logs it; the daemon boots on.
 pub async fn start(hangar_home: &Path, sink: Arc<dyn HookSink>) -> std::io::Result<Running> {
+    start_with(hangar_home, sink, Limits::default()).await
+}
+
+/// [`start`] with explicit [`Limits`].
+///
+/// # Errors
+/// As [`start`].
+pub async fn start_with(
+    hangar_home: &Path,
+    sink: Arc<dyn HookSink>,
+    limits: Limits,
+) -> std::io::Result<Running> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
     let port = addr.port();
     let token = uuid::Uuid::new_v4().to_string();
     let files = EndpointFiles::publish(hangar_home, port, &token)?;
     let judge = Arc::new(Judge::new(token, port));
-    let task = tokio::spawn(serve(listener, judge, sink));
+    let task = tokio::spawn(serve(listener, judge, sink, limits));
     Ok(Running {
         addr,
         task,
@@ -148,13 +184,16 @@ pub async fn start(hangar_home: &Path, sink: Arc<dyn HookSink>) -> std::io::Resu
     })
 }
 
-async fn serve(listener: TcpListener, judge: Arc<Judge>, sink: Arc<dyn HookSink>) {
+async fn serve(listener: TcpListener, judge: Arc<Judge>, sink: Arc<dyn HookSink>, limits: Limits) {
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let holds = Arc::new(Semaphore::new(limits.max_holds));
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
+                // EMFILE and friends: back off instead of spinning on accept.
                 tracing::warn!(error = %e, "hook ingress: accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -164,16 +203,23 @@ async fn serve(listener: TcpListener, judge: Arc<Judge>, sink: Arc<dyn HookSink>
         };
         let judge = judge.clone();
         let sink = sink.clone();
+        let holds = holds.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = handle(&mut stream, &judge, &*sink).await {
+            if let Err(e) = handle(&mut stream, &judge, &*sink, &holds, limits).await {
                 tracing::debug!(error = %e, "hook ingress: connection error");
             }
         });
     }
 }
 
-async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> std::io::Result<()> {
+async fn handle(
+    stream: &mut TcpStream,
+    judge: &Judge,
+    sink: &dyn HookSink,
+    holds: &Arc<Semaphore>,
+    limits: Limits,
+) -> std::io::Result<()> {
     let mut head = match tokio::time::timeout(HEAD_DEADLINE, read_head(stream, MAX_HEAD)).await {
         Err(_) => return write_response(stream, 408, "text/plain", b"timeout").await,
         Ok(r) => match r? {
@@ -181,7 +227,7 @@ async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> s
             None => return write_response(stream, 400, "text/plain", b"bad request").await,
         },
     };
-    let route = match judge.admit(&head.method, &head.path, &head.headers) {
+    let route = match judge.admit(&head.method, &head.path, &head.headers, head.content_length) {
         Ok(route) => route,
         Err(Refusal { status, reason }) => {
             tracing::debug!(status, "hook ingress: refused");
@@ -226,10 +272,19 @@ async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> s
         Ok(v) if v.is_object() => v,
         _ => return write_response(stream, 400, "text/plain", b"body is not a JSON object").await,
     };
-    let (source, hold) = match route {
-        Route::Event(s) => (s, false),
-        Route::Hold(s) => (s, true),
+    // A hold takes a hold slot for as long as a human may take; past the
+    // cap it is recorded as plain status and the hook gets `204` at once.
+    let (source, hold_permit) = match route {
+        Route::Event(s) => (s, None),
+        Route::Hold(s) => match holds.clone().try_acquire_owned() {
+            Ok(p) => (s, Some(p)),
+            Err(_) => {
+                tracing::warn!("hook ingress: hold cap reached; answering at once");
+                (s, None)
+            }
+        },
     };
+    let hold = hold_permit.is_some();
     let event = HookEvent {
         source,
         hold,
@@ -238,7 +293,17 @@ async fn handle(stream: &mut TcpStream, judge: &Judge, sink: &dyn HookSink) -> s
         parent,
         payload,
     };
-    match sink.ingest(event).await {
+    let deadline = if hold {
+        limits.hold_deadline
+    } else {
+        limits.event_deadline
+    };
+    let reply = tokio::time::timeout(deadline, sink.ingest(event)).await.unwrap_or_else(|_| {
+        tracing::warn!(hold, "hook ingress: sink past its deadline; answering 204");
+        HookReply::NoContent
+    });
+    drop(hold_permit);
+    match reply {
         HookReply::NoContent => write_response(stream, 204, "text/plain", b"").await,
         HookReply::Json(body) => write_response(stream, 200, "application/json", &body).await,
     }
