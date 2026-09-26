@@ -340,7 +340,8 @@ fn sweep_interval() -> Duration {
 /// and `continue` typed at the controller is not a retry, it is the daemon
 /// talking to the thing that talks to the fleet.
 fn owned_by_atc(atc: &[AtcInstanceRow], session: &FleetSessionRow) -> bool {
-    atc.iter().any(|inst| !inst.cwd.is_empty() && inst.cwd == session.cwd)
+    atc.iter()
+        .any(|inst| ainb_fleet_core::read::jsonl_tail::same_dir(&inst.cwd, &session.cwd))
 }
 
 /// The transient API-error class in a session's recent output, or `None` when

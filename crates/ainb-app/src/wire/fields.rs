@@ -180,25 +180,36 @@ pub fn scrub_lines<S: Serializer>(value: &[String], serializer: S) -> Result<S::
     serializer.collect_seq(scrub_text_lines(value))
 }
 
-/// Arbitrary JSON a plugin or daemon published: every string (keys included)
-/// scrubbed, the structure kept.
+/// Arbitrary JSON a plugin or daemon published, through the shared
+/// [`redact::scrub_json`](crate::fleet::bridge::redact::scrub_json): every
+/// string value scrubbed, and every value under a key that names a
+/// credential (`X-Api-Key`, `CLIENT_SECRET`, `password`, ...) redacted, by the
+/// same rule the daemon applies. Keys are then scrubbed as text too, since a
+/// published map can be keyed by captured text. The structure is kept.
 pub fn scrub_json<S: Serializer>(
     value: &serde_json::Value,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    fn walk(value: &serde_json::Value) -> serde_json::Value {
+    fn scrub_keys(value: &mut serde_json::Value) {
         match value {
-            serde_json::Value::String(text) => serde_json::Value::String(scrub(text)),
-            serde_json::Value::Array(items) => {
-                serde_json::Value::Array(items.iter().map(walk).collect())
+            serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_keys),
+            serde_json::Value::Object(map) => {
+                *map = std::mem::take(map)
+                    .into_iter()
+                    .map(|(key, mut item)| {
+                        scrub_keys(&mut item);
+                        (scrub(&key), item)
+                    })
+                    .collect();
             }
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.iter().map(|(key, item)| (scrub(key), walk(item))).collect(),
-            ),
-            other => other.clone(),
+            _ => {}
         }
     }
-    walk(value).serialize(serializer)
+    let mut scrubbed = value.clone();
+    // Key names are read before any key is rewritten.
+    crate::fleet::bridge::redact::scrub_json(&mut scrubbed);
+    scrub_keys(&mut scrubbed);
+    scrubbed.serialize(serializer)
 }
 
 /// A multi-line editor's text, scrubbed line by line; the cursor stays private.
@@ -287,6 +298,44 @@ pub fn compact_json_len(value: &serde_json::Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Serialize)]
+    struct Published {
+        #[serde(serialize_with = "scrub_json")]
+        arguments: serde_json::Value,
+    }
+
+    /// A tool call's arguments reach the web dashboard and mirror frames with
+    /// the daemon's key-name rule: a bare value under a credential key is
+    /// redacted though no text shape could see it, a known token anywhere is
+    /// scrubbed, a key that is itself a token is scrubbed, and everything
+    /// else keeps its value and shape.
+    #[test]
+    fn published_json_reads_key_names_like_the_daemon() {
+        let github = format!("ghp_{}", "C".repeat(36));
+        let value = Published {
+            arguments: serde_json::json!({
+                "headers": { "X-Api-Key": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6", "Accept": "text/plain" },
+                "env": { "CLIENT_SECRET": "s3cr3t", "password": "hunter", "HOME": "/home/dev" },
+                "note": format!("pushed with {github}"),
+                github.clone(): "keyed by a token",
+                "count": 3,
+            }),
+        };
+        let frame = serde_json::to_value(&value).unwrap();
+        assert_eq!(
+            frame,
+            serde_json::json!({
+                "arguments": {
+                    "headers": { "X-Api-Key": REDACTED, "Accept": "text/plain" },
+                    "env": { "CLIENT_SECRET": REDACTED, "password": REDACTED, "HOME": "/home/dev" },
+                    "note": format!("pushed with {REDACTED}"),
+                    REDACTED: "keyed by a token",
+                    "count": 3,
+                }
+            })
+        );
+    }
 
     #[derive(Serialize)]
     struct Persisted {

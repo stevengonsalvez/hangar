@@ -17,7 +17,7 @@ scenario() {
   pid="$(tui_pid tui)"
 
   keys tui a
-  check "a opens a writable tmux client on the fixture session" wait_for 10 bash -c "[ \$(tmux list-clients -t '=$FIXTURE_TMUX' -F '#{client_flags}' | grep -vc read-only) -ge 1 ]"
+  check "a opens a writable tmux client on the fixture session" wait_for 10 bash -c "[ \$(env -u TMUX -u TMUX_PANE tmux -S '$PROOF_FIXTURE_SOCK' list-clients -t '=$FIXTURE_TMUX' -F '#{client_flags}' | grep -vc read-only) -ge 1 ]"
   check "the pane now shows the agent full screen" wait_gone tui 'Workspaces \(' 5
   capture tui attached-full-screen
   keys tui C-b d

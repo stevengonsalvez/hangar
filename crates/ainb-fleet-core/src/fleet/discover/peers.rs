@@ -75,6 +75,7 @@ pub fn discover_from_peers() -> Result<Vec<Session>> {
         .into_iter()
         .map(|p| Session {
             id: p.id.clone(),
+            provider_session_id: None,
             cwd: p.cwd,
             pid: Some(p.pid),
             git_root: p.git_root,

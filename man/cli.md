@@ -127,6 +127,7 @@ Options:
       --repo <REPO>                    Local repository path
       --create-branch <CREATE_BRANCH>  Create a new branch with this name
       --worktree                       Use git worktree for isolation
+      --base <REF>                     Base ref the new worktree branch starts from (needs --worktree or --create-branch)
       --tool <TOOL>                    AI tool to use [default: claude] [possible values: claude, codex, gemini, copilot, antigravity]
       --model <MODEL>                  Provider model ID to pass through unchanged
   -p, --prompt <PROMPT>                Initial prompt to send
@@ -150,6 +151,20 @@ EXAMPLES:
 Without --worktree (or --create-branch) the session runs directly in the
 checkout you point at: it shares that branch, index and working tree with your
 editor and with every other session started there. Prefer --worktree.
+
+JSON OUTPUT (ainb --format json run --worktree ...):
+  For programs that start sessions. Needs --worktree or --create-branch, and
+  refuses --attach and --interactive. On success stdout is exactly one JSON
+  object on one line, and every progress message goes to stderr:
+    session_id          string   the ainb session id (UUID)
+    tmux_session_name   string   the tmux session running the agent
+    worktree_path       string   the worktree directory
+    branch              string   the branch the worktree is on
+    claude_session_id   string   the id Claude runs under (Claude only)
+    model               string   the model passed with --model
+  A field with no value is omitted, never null. Fields are only ever added,
+  never renamed or removed. Exit status 0 means the session exists; non-zero
+  means nothing is printed on stdout and the reason is on stderr.
 ```
 
 ## `ainb list`
