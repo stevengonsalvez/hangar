@@ -184,11 +184,17 @@ const HTTP_HOLD_HOOK_TIMEOUT: u64 = 620;
 /// Build the HTTP-transport managed entry for `event`, pointing at
 /// `hook_script` (`ainb-hook.sh`). Keeps `AINB_MANAGED=atc` in the command and
 /// the bool [`ATC_MANAGED_KEY`], so every older strip rule still matches it.
+///
+/// Pins `AINB_HANGAR_HOME` to the hangar home setup found the daemon's
+/// endpoint under, so a Claude process with a different (or no) environment
+/// still reaches that daemon.
 #[must_use]
-pub fn http_managed_entry(event: &str, hook_script: &str) -> Value {
+pub fn http_managed_entry(event: &str, hook_script: &str, hangar_home: &str) -> Value {
     let hook_script = shell_quote(hook_script);
-    let command =
-        format!("AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc {hook_script}");
+    let hangar_home = shell_quote(hangar_home);
+    let command = format!(
+        "AINB_HANGAR_HOME={hangar_home} AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc {hook_script}"
+    );
     let timeout = match event {
         "PermissionRequest" | "PreToolUse" => HTTP_HOLD_HOOK_TIMEOUT,
         _ => DEFAULT_HOOK_TIMEOUT,
@@ -224,7 +230,7 @@ pub fn installed_transport(settings: &Value) -> Option<HookTransport> {
 /// Replace every managed entry with the 15-event HTTP set. Every other hook
 /// (user, reflect, notifyd, the ainb-hooks plugin) is kept verbatim.
 #[must_use]
-pub fn merge_http_into(settings: Value, hook_script: &str) -> Value {
+pub fn merge_http_into(settings: Value, hook_script: &str, hangar_home: &str) -> Value {
     let mut settings = strip_managed(settings);
     let root = settings.as_object_mut().expect("strip_managed returns an object");
     let hooks = root.entry("hooks").or_insert_with(|| Value::Object(Map::new()));
@@ -237,9 +243,11 @@ pub fn merge_http_into(settings: Value, hook_script: &str) -> Value {
         if !arr.is_array() {
             *arr = Value::Array(Vec::new());
         }
-        arr.as_array_mut()
-            .expect("ensured array")
-            .push(http_managed_entry(event, hook_script));
+        arr.as_array_mut().expect("ensured array").push(http_managed_entry(
+            event,
+            hook_script,
+            hangar_home,
+        ));
     }
     settings
 }
@@ -613,7 +621,7 @@ mod tests {
     #[test]
     fn http_set_is_the_fifteen_events_and_keeps_every_other_hook() {
         let legacy = merge_into(settings_with_reflect_and_notifyd(), "/x/notify.sh");
-        let http = merge_http_into(legacy, "/x/ainb-hook.sh");
+        let http = merge_http_into(legacy, "/x/ainb-hook.sh", "/x/hangar home");
         let mut events = managed_events(&http);
         events.sort();
         let mut want: Vec<String> = ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS
@@ -652,7 +660,7 @@ mod tests {
 
     #[test]
     fn http_entries_block_only_on_the_two_holding_events() {
-        let http = merge_http_into(json!({}), "/x/ainb-hook.sh");
+        let http = merge_http_into(json!({}), "/x/ainb-hook.sh", "/x/hangar home");
         for event in ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS {
             let entry = &http["hooks"][event][0];
             let want = if matches!(event, "PermissionRequest" | "PreToolUse") {
@@ -665,7 +673,7 @@ mod tests {
             assert_eq!(
                 cmd,
                 format!(
-                    "AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc '/x/ainb-hook.sh'"
+                    "AINB_HANGAR_HOME='/x/hangar home' AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc '/x/ainb-hook.sh'"
                 )
             );
         }
@@ -674,7 +682,11 @@ mod tests {
     #[test]
     fn an_older_binarys_strip_rule_removes_http_entries() {
         // v1.29.0 strips by the bool tag or the AINB_MANAGED=atc marker.
-        let http = merge_http_into(settings_with_reflect_and_notifyd(), "/x/ainb-hook.sh");
+        let http = merge_http_into(
+            settings_with_reflect_and_notifyd(),
+            "/x/ainb-hook.sh",
+            "/x/hangar home",
+        );
         let stripped = strip_from(http);
         assert_eq!(installed_transport(&stripped), None);
         assert_eq!(stripped, strip_from(settings_with_reflect_and_notifyd()));
@@ -683,7 +695,7 @@ mod tests {
     #[test]
     fn legacy_after_http_equals_a_fresh_legacy_install() {
         let fresh = merge_into(settings_with_reflect_and_notifyd(), "/x/notify.sh");
-        let there = merge_http_into(fresh.clone(), "/x/ainb-hook.sh");
+        let there = merge_http_into(fresh.clone(), "/x/ainb-hook.sh", "/x/hangar home");
         let back = merge_legacy_into(there, "/x/notify.sh");
         assert_eq!(
             serde_json::to_string_pretty(&back).unwrap(),
@@ -694,8 +706,12 @@ mod tests {
 
     #[test]
     fn http_install_is_idempotent() {
-        let once = merge_http_into(settings_with_reflect_and_notifyd(), "/x/ainb-hook.sh");
-        let twice = merge_http_into(once.clone(), "/x/ainb-hook.sh");
+        let once = merge_http_into(
+            settings_with_reflect_and_notifyd(),
+            "/x/ainb-hook.sh",
+            "/x/hangar home",
+        );
+        let twice = merge_http_into(once.clone(), "/x/ainb-hook.sh", "/x/hangar home");
         assert_eq!(once, twice);
     }
 
