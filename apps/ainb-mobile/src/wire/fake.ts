@@ -3,7 +3,7 @@
 
 import { fromBase64 } from "../terminal/engine/protocol";
 import { FIXTURES } from "../terminal/fixtures";
-import { PEER_CHANGED } from "./types";
+import { PEER_CHANGED, PeerCloseError } from "./types";
 import type {
   AnswerOutcome,
   AttentionRow,
@@ -233,8 +233,10 @@ export class FakeWire implements WireClient {
   snapshotBeforeReply = false;
   /** How many attaches this fake has served. */
   attaches = 0;
-  /** When set, the next N `connect` calls fail (the redials that must be rescheduled). */
+  /** When set, the next N `connect` calls fail as a network error (the redials that must be rescheduled). */
   failNextConnect = 0;
+  /** When set, the next `connect` is refused by the peer with this close code (no close event, like lane E). */
+  refuseNextConnectWith?: { code: number; reason?: string };
   /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
   failNextSubscribe = 0;
   /** Deterministic backoff for tests: no jitter; a host's retry-after is a floor under the backoff. */
@@ -309,6 +311,17 @@ export class FakeWire implements WireClient {
       this.failNextConnect -= 1;
       this.record(hostId, "dial-failed");
       throw new Error("dial failed");
+    }
+    const refuse = this.refuseNextConnectWith;
+    if (refuse) {
+      this.refuseNextConnectWith = undefined;
+      if (refuse.code === 4403) host.row.repair = "revoked";
+      else if (refuse.code === 4401) host.row.repair = "identity";
+      else if (refuse.code === 4409) host.row.notice = "update_required";
+      else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_close";
+      this.record(hostId, "refused", String(refuse.code));
+      this.emit({ kind: "reachability", hostId, reachability: host.row.reachability, sinceMs: host.row.sinceMs });
+      throw new PeerCloseError(refuse.code, refuse.reason);
     }
     host.connected = true;
     this.record(hostId, "hello", "scope=mobile");
