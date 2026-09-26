@@ -822,7 +822,10 @@ body {
 .composer input:focus-visible,
 .composer select:focus-visible,
 .composer textarea:focus-visible,
-.composer-agent:focus-visible {
+.composer-agent:focus-visible,
+.composer-cancel:focus-visible,
+.composer-create:focus-visible,
+.composer-advanced summary:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: -1px;
 }
@@ -1986,4 +1989,10 @@ body {
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* The shell behind the composer: made inert while it is open. A wrapper
+   that draws no box, so the page's own flex layout is unchanged. */
+.shell-content {
+  display: contents;
 }
