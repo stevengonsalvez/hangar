@@ -20,7 +20,7 @@ import type {
   WaitKind,
 } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
-import { isAcked } from "./acks.ts";
+import { isAcked, rowAckKey } from "./acks.ts";
 import { providerId, ringFor, rowStatus } from "./sessions.ts";
 import type { TabTarget } from "./tabs.ts";
 
@@ -28,15 +28,24 @@ import type { TabTarget } from "./tabs.ts";
 export type Need = "ask" | "approve" | "wait" | "elicitation" | "error";
 
 /**
- * The vocabulary itself. Exactly the five words the spec's table names;
- * a surface that cannot draw one of these has nothing left to invent.
+ * The vocabulary itself: the spec table's five words, plus `exited` for a
+ * session whose process is gone. The board hides an exited agent (nobody
+ * acts on it), but a sidebar row or a tab for one still exists and must not
+ * look idle: idle is a live agent at rest, exited is nothing running.
  */
 export type UiStatus =
   | { kind: "needs"; need: Need }
   | { kind: "working" }
   | { kind: "done" }
   | { kind: "idle" }
-  | { kind: "unverifiable" };
+  | { kind: "unverifiable" }
+  | { kind: "exited" };
+
+/** A value the type system says cannot happen: a new wire variant added in
+ * Rust fails to compile here instead of falling into a silent default. */
+export function assertNever(value: never): never {
+  throw new Error(`unhandled status input: ${String(value)}`);
+}
 
 /** The `AgentCardFrame` fields the mapping reads. A fixture only has to carry
  * these, not a whole roster row. */
@@ -62,8 +71,10 @@ export interface DeriveStatusOptions {
 
 /** `wait_kind` onto the need it names; `"waiting"` reads as `"elicitation"`
  * only when the caller's own chip-detail scan (`elicitationDetail`) found
- * that word, and as `"wait"` otherwise, which is every case today. */
+ * that word, and as `"wait"` otherwise, which is every case today. A card
+ * that is `waiting` with no `wait_kind` still needs a person: `"wait"`. */
 function needFromWaitKind(waitKind: WaitKind | null, elicitation: boolean): Need {
+  if (waitKind === null) return "wait";
   switch (waitKind) {
     case "ask":
       return "ask";
@@ -73,9 +84,8 @@ function needFromWaitKind(waitKind: WaitKind | null, elicitation: boolean): Need
       return "error";
     case "waiting":
       return elicitation ? "elicitation" : "wait";
-    case null:
     default:
-      return "wait";
+      return assertNever(waitKind);
   }
 }
 
@@ -91,9 +101,8 @@ export function elicitationDetail(attention: readonly Pick<AttentionMark_Seriali
 
 /**
  * The vocabulary for one card, from the host's own `state`/`wait_kind`/
- * `turn_complete` plus its row's attention chips. `null` for an exited
- * agent: a process that is gone is not a status a person acts on, and every
- * surface hides it rather than drawing a column for it.
+ * `turn_complete` plus its row's attention chips. An exited agent reads
+ * `exited`; the board leaves it out, the sidebar and tabs mark it.
  *
  * `has_open_request` and `tier` ride on `card` (the shape a caller
  * destructures straight off `AgentCardFrame`) but never change the kind
@@ -103,21 +112,33 @@ export function elicitationDetail(attention: readonly Pick<AttentionMark_Seriali
  * `waiting` at all (`Tier`'s own doc comment), so by the time `state` reads
  * `waiting` here the daemon has already enforced that invariant.
  */
-export function deriveStatus(card: CardStatusInput, opts: DeriveStatusOptions = {}): UiStatus | null {
-  if (card.state === "exited") return null;
-  if (card.state === "waiting") {
-    return { kind: "needs", need: needFromWaitKind(card.wait_kind, opts.elicitation ?? false) };
+export function deriveStatus(card: CardStatusInput, opts: DeriveStatusOptions = {}): UiStatus {
+  switch (card.state) {
+    case "exited":
+      return { kind: "exited" };
+    case "waiting":
+      return { kind: "needs", need: needFromWaitKind(card.wait_kind, opts.elicitation ?? false) };
+    case "working":
+    case "idle":
+    case "unverifiable":
+      break;
+    default:
+      return assertNever(card.state);
   }
-  const hasErrorAttention = (opts.attention ?? []).includes("Err") || card.wait_kind === "error";
-  if (hasErrorAttention) return { kind: "needs", need: "error" };
-  if (card.state === "working") return { kind: "working" };
-  if (card.state === "idle") {
-    return card.turn_complete && !(opts.acked ?? false) ? { kind: "done" } : { kind: "idle" };
+  // An error chip (or an error wait_kind) outranks what the card was doing.
+  if ((opts.attention ?? []).includes("Err") || card.wait_kind === "error") {
+    return { kind: "needs", need: "error" };
   }
-  // card.state === "unverifiable": we hold the session but nothing has told
-  // us its state, which is never the same fact as "idle" (AgentState's own
-  // doc comment).
-  return { kind: "unverifiable" };
+  switch (card.state) {
+    case "working":
+      return { kind: "working" };
+    case "idle":
+      return card.turn_complete && !(opts.acked ?? false) ? { kind: "done" } : { kind: "idle" };
+    case "unverifiable":
+      // We hold the session but nothing has told us its state, which is never
+      // the same fact as "idle" (AgentState's own doc comment).
+      return { kind: "unverifiable" };
+  }
 }
 
 /**
@@ -154,7 +175,7 @@ export function statusForSession(
   cards: readonly AgentCardFrame[],
   metadata: Readonly<Record<string, SessionFleetMetadata>> | undefined,
   acks: AckMap,
-): UiStatus | null {
+): UiStatus {
   const card = cardForSession(session, cards, metadata);
   if (card !== undefined) {
     const attention = (session.attention ?? []).map((mark) => mark.kind);
@@ -176,10 +197,16 @@ export function statusForSession(
       case "Err":
         return { kind: "needs", need: "error" };
       case "Done":
-        return { kind: "done" };
+        // A chip-only Done has no card turn to ack; it is acked by row, and
+        // the ack is pruned once the chip clears (`main.tsx`), so the next
+        // Done on this row shows again.
+        return isAcked(acks, rowAckKey(session.id), 0) ? { kind: "idle" } : { kind: "done" };
+      default:
+        return assertNever(ring);
     }
   }
-  switch (rowStatus(session.status)) {
+  const lifecycle = rowStatus(session.status);
+  switch (lifecycle) {
     // "Running" is the tmux session being alive, not the agent doing work: a
     // shell tab and an agent waiting at its prompt both read it. With no card
     // and no chip, nothing has said what the agent is doing, which is
@@ -190,9 +217,13 @@ export function statusForSession(
     case "error":
       return { kind: "needs", need: "error" };
     case "idle":
-    case "stopped":
-    default:
       return { kind: "idle" };
+    // Stopped: the session's tmux is gone. Nothing runs, which is `exited`,
+    // not a resting `idle`.
+    case "stopped":
+      return { kind: "exited" };
+    default:
+      return assertNever(lifecycle);
   }
 }
 
@@ -225,10 +256,9 @@ export function statusKey(status: UiStatus): string {
 
 /** The operator-facing label for `status`, in the spec table's own words. */
 export function statusLabel(status: UiStatus): string {
-  if (status.kind === "needs") {
-    return `Needs you · ${status.need}`;
-  }
   switch (status.kind) {
+    case "needs":
+      return `Needs you · ${status.need}`;
     case "working":
       return "Working";
     case "done":
@@ -237,5 +267,9 @@ export function statusLabel(status: UiStatus): string {
       return "Idle";
     case "unverifiable":
       return "Unverifiable";
+    case "exited":
+      return "Exited";
+    default:
+      return assertNever(status);
   }
 }
