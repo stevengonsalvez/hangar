@@ -457,7 +457,7 @@ impl ViewerQueue {
                 {
                     slot.frame = Frame::DataGap {
                         reason: *reason,
-                        dropped_bytes: Some(earlier + dropped_bytes.unwrap_or(0)),
+                        dropped_bytes: Some(earlier.saturating_add(dropped_bytes.unwrap_or(0))),
                     };
                     return;
                 }
