@@ -328,9 +328,13 @@ impl HookEndpoint {
                     );
                 }
                 "AINB_HOOK_PID" => {
+                    // 0 and 1 never name the daemon: `kill -0 0` always
+                    // succeeds and 1 is init, so a liveness check on either
+                    // would prove nothing.
                     pid = Some(
                         digits(value)
                             .and_then(|v| v.parse::<u32>().ok())
+                            .filter(|p| *p > 1)
                             .ok_or(EndpointParseError::BadValue("AINB_HOOK_PID"))?,
                     );
                 }
@@ -435,6 +439,20 @@ mod tests {
                 "AINB_HOOK_PORT=1\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID=1\nAINB_HOOK_HEADERS={bad}\n"
             );
             assert!(HookEndpoint::parse_env_file(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pid_zero_and_one_are_refused() {
+        for pid in ["0", "1"] {
+            let text = format!(
+                "AINB_HOOK_PORT=5\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID={pid}\nAINB_HOOK_HEADERS=/h/hook-headers\n"
+            );
+            assert_eq!(
+                HookEndpoint::parse_env_file(&text),
+                Err(EndpointParseError::BadValue("AINB_HOOK_PID")),
+                "{pid}"
+            );
         }
     }
 
