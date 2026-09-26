@@ -34,9 +34,9 @@
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
-    REASON_ALREADY_ANSWERED_BY, REASON_EFFECTS_AMBIGUOUS, REASON_INCARNATION_MISMATCH,
-    REASON_LEDGER_SATURATED, REASON_NO_TARGET, REASON_NOT_DELIVERED, REASON_OP_EXPIRED,
-    REASON_OP_ID_FOREIGN, REASON_REPLY_LOST, REASON_TURN_ADVANCED, ReceiptState,
+    REASON_ALREADY_ANSWERED_BY, REASON_CONFLICT, REASON_EFFECTS_AMBIGUOUS,
+    REASON_INCARNATION_MISMATCH, REASON_LEDGER_SATURATED, REASON_NO_TARGET, REASON_NOT_DELIVERED,
+    REASON_OP_EXPIRED, REASON_OP_ID_FOREIGN, REASON_REPLY_LOST, REASON_TURN_ADVANCED, ReceiptState,
 };
 use ainb_hangar_proto::{RpcError, RpcRequest, methods};
 use ainb_hangar_store::repo::mutation_ledger::{
@@ -656,6 +656,9 @@ fn fence_refusal(error: &RpcError) -> Option<&'static str> {
     match handler_reason(error)?.as_str() {
         REASON_TURN_ADVANCED => Some(REASON_TURN_ADVANCED),
         REASON_INCARNATION_MISMATCH => Some(REASON_INCARNATION_MISMATCH),
+        // A stale `expected_version` on `fleet/action`: the same retry
+        // workflow, re-read and resend under the same request id.
+        REASON_CONFLICT => Some(REASON_CONFLICT),
         _ => None,
     }
 }
