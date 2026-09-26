@@ -481,6 +481,7 @@ dependencies = [
  "ainb-hangar-client",
  "ainb-hangar-core",
  "ainb-hangar-daemon",
+ "ainb-hangar-noise",
  "ainb-hangar-proto",
  "ainb-hangar-sandbox",
  "ainb-hangar-secrets",
@@ -490,6 +491,7 @@ dependencies = [
  "ainb-plugin-notifyd",
  "ainb-plugin-session-reader",
  "ainb-plugin-types-sessions",
+ "ainb-term",
  "ainb-web",
  "anyhow",
  "assert_cmd",
@@ -872,7 +874,10 @@ dependencies = [
 name = "ainb-term"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "tattoy-wezterm-escape-parser",
  "tattoy-wezterm-term",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -7890,6 +7895,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

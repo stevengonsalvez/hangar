@@ -396,6 +396,7 @@ mod tests {
             event_type: event_type.to_string(),
             payload,
             observed_at: order,
+            lines: Vec::new(),
         }
     }
 
