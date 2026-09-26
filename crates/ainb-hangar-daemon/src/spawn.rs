@@ -19,7 +19,7 @@
 //! daemon. An environment variable, never a `daemon_config` key, so no
 //! connected surface can switch it on.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -74,11 +74,9 @@ pub fn run_argv(params: &WorktreeCreateParams) -> Vec<String> {
     if let Some(base) = &params.base {
         argv.extend(["--base".into(), base.clone()]);
     }
+    // Glued `--flag=value`: a value starting with `-` stays a value.
     if let Some(model) = &params.model {
-        argv.extend(["--model".into(), model.clone()]);
-    }
-    if let Some(name) = &params.name {
-        argv.extend(["--name".into(), name.clone()]);
+        argv.push(format!("--model={model}"));
     }
     if params.skip_permissions {
         argv.push("--dangerously-skip-permissions".into());
@@ -108,36 +106,143 @@ pub fn parse_run_output(stdout: &str) -> Result<WorktreeCreateResult, String> {
         .map_err(|e| format!("`ainb run` output is not the created session: {e}"))
 }
 
+/// The folders a repository may be created from: the user's configured
+/// workspace scan paths and onboarding git directories, the same roots the
+/// desktop's project list comes from, canonicalized. Read fresh per call (a
+/// person may add one at any time); a missing or unreadable file adds none.
+fn registered_roots(home: &Path) -> Vec<PathBuf> {
+    let config = home.join(".agents-in-a-box").join("config");
+    let read = |file: &str| {
+        std::fs::read_to_string(config.join(file))
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut push_all = |value: Option<&toml::Value>| {
+        for entry in value.and_then(toml::Value::as_array).into_iter().flatten() {
+            if let Some(path) = entry.as_str() {
+                let expanded = path
+                    .strip_prefix("~/")
+                    .map_or_else(|| PathBuf::from(path), |rest| home.join(rest));
+                if let Ok(canonical) = std::fs::canonicalize(expanded) {
+                    roots.push(canonical);
+                }
+            }
+        }
+    };
+    if let Some(table) = read("config.toml") {
+        push_all(
+            table
+                .get("workspace_defaults")
+                .and_then(|defaults| defaults.get("workspace_scan_paths")),
+        );
+    }
+    if let Some(table) = read("onboarding.toml") {
+        push_all(table.get("git_directories"));
+    }
+    roots
+}
+
+/// `repo_path` as the canonical top of a git repository inside a registered
+/// root, or why not. Refuses `.` and `..` components before resolving
+/// anything, so a path cannot walk out of the root it names.
+fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
+    let path = Path::new(repo_path);
+    if path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+        return Err(SpawnError::Invalid(
+            "repo_path must not contain . or .. components".into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        SpawnError::Invalid(format!(
+            "repo_path is not a directory on this host: {repo_path}"
+        ))
+    })?;
+    let roots = registered_roots(home);
+    if !roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err(SpawnError::Invalid(
+            "repo_path is not under a registered workspace folder: add its folder to \
+             workspace_defaults.workspace_scan_paths"
+                .into(),
+        ));
+    }
+    let top = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| std::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim()).ok());
+    if top.as_deref() != Some(canonical.as_path()) {
+        return Err(SpawnError::Invalid(
+            "repo_path is not the top of a git repository".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Whether `branch` already exists in the repository at `repo`. Checked
+/// before spawning: an existing branch is checked out as it is, which would
+/// silently ignore `base`, and a second agent on a live branch is not a new
+/// worktree.
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .stdin(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Create a worktree with an agent in it by running `ainb run`.
+///
+/// The child is never killed: on timeout, or if the daemon stops, `ainb run`
+/// runs to its own end, including its rollback, and the session (or its
+/// cleanup) lands on its own. A timeout is reported as "may still be
+/// creating", not as a failure that already undid anything.
 ///
 /// # Errors
 /// [`SpawnError::Invalid`] for a request refused before anything ran,
-/// [`SpawnError::Failed`] when `ainb run` failed or timed out.
+/// [`SpawnError::Failed`] when `ainb run` failed or outlived the bound.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
-    if !Path::new(&params.repo_path).is_dir() {
-        return Err(SpawnError::Invalid(format!(
-            "repo_path is not a directory on this host: {}",
-            params.repo_path
-        )));
+    let home = dirs::home_dir()
+        .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
+    let repo = resolve_repo(&params.repo_path, &home)?;
+    if let Some(branch) = &params.branch {
+        if branch_exists(&repo, branch) {
+            return Err(SpawnError::Invalid(format!(
+                "branch '{branch}' already exists: pick a new name"
+            )));
+        }
     }
+    let mut resolved = params.clone();
+    resolved.repo_path = repo.to_string_lossy().into_owned();
     let bin = crate::atc::ainb_bin();
-    let mut cmd = tokio::process::Command::new(&bin);
-    cmd.args(run_argv(params))
+    let child = tokio::process::Command::new(&bin)
+        .args(run_argv(&resolved))
         .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         // The daemon may itself run inside a tmux pane; an inherited $TMUX
         // would point `ainb run`'s tmux calls at that client's server
         // context instead of the default one sessions live on.
-        .env_remove("TMUX");
-    let output = match tokio::time::timeout(RUN_TIMEOUT, cmd.output()).await {
+        .env_remove("TMUX")
+        .spawn()
+        .map_err(|e| SpawnError::Failed(format!("could not run {bin}: {e}")))?;
+    // Dropping the wait on timeout leaves the child running; tokio reaps it.
+    let output = match tokio::time::timeout(RUN_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run {bin}: {e}"))),
+        Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
         Err(_) => {
             return Err(SpawnError::Failed(format!(
-                "`ainb run` did not finish within {}s",
+                "`ainb run` is still running after {}s: the worktree may still be creating; check the sidebar",
                 RUN_TIMEOUT.as_secs()
             )));
         }
@@ -165,7 +270,6 @@ mod tests {
             model: None,
             prompt: None,
             skip_permissions: false,
-            name: None,
             mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
         }
     }
@@ -193,8 +297,7 @@ mod tests {
             branch: Some("feat/x".into()),
             base: Some("origin/main".into()),
             agent: SpawnAgent::Codex,
-            model: Some("gpt-5".into()),
-            name: Some("x".into()),
+            model: Some("-gpt-5".into()),
             skip_permissions: true,
             prompt: Some("-y do it".into()),
             ..params()
@@ -206,11 +309,17 @@ mod tests {
             ("--tool", "codex"),
             ("--create-branch", "feat/x"),
             ("--base", "origin/main"),
-            ("--model", "gpt-5"),
-            ("--name", "x"),
         ] {
             assert!(pairs.contains(&pair), "missing {pair:?} in {argv:?}");
         }
+        assert!(
+            argv.contains(&"--model=-gpt-5".to_string()),
+            "a dash-led model stays one glued value: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--name")),
+            "no tmux name is ever sent"
+        );
         assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
         assert_eq!(argv.last().map(String::as_str), Some("--prompt=-y do it"));
     }
@@ -254,5 +363,82 @@ mod tests {
             worktree_create(&p).await,
             Err(SpawnError::Invalid(_))
         ));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A home whose config registers `root`, and a repo inside it.
+    fn world() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("code");
+        let repo = root.join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let config = home.path().join(".agents-in-a-box/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join("config.toml"),
+            format!(
+                "[workspace_defaults]\nworkspace_scan_paths = [\"{}\"]\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        (home, repo)
+    }
+
+    #[test]
+    fn a_repo_under_a_registered_root_resolves_to_its_canonical_top() {
+        let (home, repo) = world();
+        let resolved = resolve_repo(&repo.display().to_string(), home.path()).expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&repo).unwrap());
+    }
+
+    #[test]
+    fn dot_components_unregistered_roots_and_subdirs_are_refused() {
+        let (home, repo) = world();
+        let dotted = format!("{}/../app", repo.display());
+        assert!(
+            matches!(resolve_repo(&dotted, home.path()), Err(SpawnError::Invalid(m)) if m.contains(".."))
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        git(outside.path(), &["init", "-q"]);
+        assert!(matches!(
+            resolve_repo(&outside.path().display().to_string(), home.path()),
+            Err(SpawnError::Invalid(m)) if m.contains("registered")
+        ));
+
+        let sub = repo.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(matches!(
+            resolve_repo(&sub.display().to_string(), home.path()),
+            Err(SpawnError::Invalid(m)) if m.contains("top of a git repository")
+        ));
+    }
+
+    #[test]
+    fn an_existing_branch_is_seen_before_any_spawn() {
+        let (_home, repo) = world();
+        git(&repo, &["branch", "taken"]);
+        assert!(branch_exists(&repo, "taken"));
+        assert!(!branch_exists(&repo, "fresh"));
     }
 }
