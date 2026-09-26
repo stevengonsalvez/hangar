@@ -272,6 +272,7 @@ mod tests {
             discovered_at: 1,
             last_observed_at: 10,
             lifecycle_updated_at: 5,
+            session_incarnation: None,
             attention_updated_at: 7,
             model: Some("claude-sonnet-4-5".to_string()),
             reasoning_effort: None,
