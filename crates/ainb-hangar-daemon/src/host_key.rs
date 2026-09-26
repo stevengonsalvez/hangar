@@ -9,7 +9,8 @@
 //!                              │                        └─▶ refused: 0600 file
 //!                              │ NotImplemented ──▶ mint ──▶ 0600 file
 //!                              └─ locked, denied, fault ──▶ refuse (no second key)
-//! then ──▶ daemon_identity.host_static_pubkey = the public half
+//! then ──▶ daemon_identity.host_static_pubkey: recorded if unset,
+//!           refused (never overwritten) if a different key is recorded
 //! ```
 //!
 //! One key per home, minted once and kept: every paired device pins its public
@@ -24,12 +25,12 @@
 //! ([`crate::peer_listener::switched_on`]), so a default boot touches no
 //! keychain item, writes no file and leaves the column NULL, as v1.29.0 does.
 
-use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use ainb_hangar_secrets::{Scope, SecretBackend, SecretError};
-use ainb_hangar_store::repo::daemon_identity::DaemonIdentityRepo;
+use ainb_hangar_store::repo::daemon_identity::{DaemonIdentityRepo, PubkeyRecord};
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use rand::RngCore as _;
 use sqlx::SqlitePool;
@@ -56,13 +57,14 @@ impl HostStaticKey {
     /// The pair for a stored secret. Clamping happens in the scalar multiply,
     /// exactly as the Noise X25519 DH does it, so any 32 bytes are a valid
     /// secret and the public half matches what the handshake derives.
+    ///
+    /// The secret arrives already `Zeroizing` and never leaves it here, so no
+    /// copy this module makes outlives its use. The one copy it cannot reach is
+    /// the by-value argument `mul_base_clamped` takes.
     #[must_use]
-    pub fn from_secret(secret: [u8; 32]) -> Self {
-        let public = MontgomeryPoint::mul_base_clamped(secret).to_bytes();
-        Self {
-            secret: Zeroizing::new(secret),
-            public,
-        }
+    pub fn from_secret(secret: Zeroizing<[u8; 32]>) -> Self {
+        let public = MontgomeryPoint::mul_base_clamped(*secret).to_bytes();
+        Self { secret, public }
     }
 
     /// A fresh pair from the operating system's CSPRNG.
@@ -70,7 +72,7 @@ impl HostStaticKey {
     pub fn generate() -> Self {
         let mut secret = Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(secret.as_mut());
-        Self::from_secret(*secret)
+        Self::from_secret(secret)
     }
 
     /// The public half: what `daemon_identity` records and a pairing offer
@@ -87,8 +89,11 @@ impl HostStaticKey {
     }
 
     fn from_stored(bytes: &[u8]) -> Result<Self, HostKeyError> {
-        let secret: [u8; 32] =
-            bytes.try_into().map_err(|_| HostKeyError::Malformed(bytes.len()))?;
+        if bytes.len() != 32 {
+            return Err(HostKeyError::Malformed(bytes.len()));
+        }
+        let mut secret = Zeroizing::new([0u8; 32]);
+        secret.copy_from_slice(bytes);
         Ok(Self::from_secret(secret))
     }
 }
@@ -145,6 +150,33 @@ pub enum HostKeyError {
         path: PathBuf,
         /// Its permission bits.
         mode: u32,
+    },
+    /// The fallback file is a symlink or not a regular file.
+    #[error("host key file {} is not a regular file; refusing it", path.display())]
+    NotRegular {
+        /// The path.
+        path: PathBuf,
+    },
+    /// The fallback file is owned by another user.
+    #[error("host key file {} is owned by uid {uid}, not this user; refusing it", path.display())]
+    NotOwned {
+        /// The file.
+        path: PathBuf,
+        /// Its owner.
+        uid: u32,
+    },
+    /// `daemon_identity` records a different public key than the key in force.
+    /// Nothing was changed: every paired device pins the recorded key.
+    #[error(
+        "the host key in force ({in_force}) is not the recorded one ({recorded}); \
+         nothing was changed. Restore the original key, or change it deliberately \
+         with `ainb hangar host-key rotate`"
+    )]
+    KeyChanged {
+        /// The recorded public key, hex.
+        recorded: String,
+        /// The public key of the key in force, hex.
+        in_force: String,
     },
     /// A stored key is not 32 bytes.
     #[error("the stored host key is {0} bytes, not 32")]
@@ -204,10 +236,11 @@ pub fn load_or_mint(
 
 /// Load or mint the key, then record its public half in `daemon_identity`.
 ///
-/// A recorded public key that differs from the key in force is overwritten
-/// and logged: the row follows the key, and every device paired against the
-/// old one has to pair again (a planned change goes through the rotation in
-/// R1-17 instead, which never reaches this branch).
+/// A recorded public key that differs from the key in force is REFUSED, not
+/// overwritten: every paired device pins the recorded key, so a boot that
+/// found a different key (a restored keychain, a swapped file) must not
+/// silently re-identify the host. The operator restores the key or rotates it
+/// deliberately (R1-17).
 ///
 /// `backend` is `Sync` because the borrow lives across the store write, and
 /// the boot future that awaits this must stay `Send`.
@@ -221,40 +254,79 @@ pub async fn ensure(
     hangar_home: &Path,
 ) -> Result<Loaded, HostKeyError> {
     let loaded = load_or_mint(backend, hangar_home)?;
-    let previous = DaemonIdentityRepo::set_host_static_pubkey(pool, loaded.key.public()).await?;
-    if previous.as_deref().is_some_and(|previous| previous != loaded.key.public()) {
-        tracing::warn!(
-            public = %hex(loaded.key.public()),
-            "hangar host key: the recorded public key changed; paired devices must pair again"
-        );
+    match DaemonIdentityRepo::record_host_static_pubkey(pool, loaded.key.public()).await? {
+        PubkeyRecord::Recorded | PubkeyRecord::Unchanged => Ok(loaded),
+        PubkeyRecord::Differs { recorded } => Err(HostKeyError::KeyChanged {
+            recorded: hex(&recorded),
+            in_force: hex(loaded.key.public()),
+        }),
     }
-    Ok(loaded)
 }
 
 /// The key in the fallback file, `None` when there is no file.
+///
+/// Opened with `O_NOFOLLOW`, then vetted and read through the SAME descriptor,
+/// so a symlink is refused and the file checked is the file read.
 fn read_file(path: &Path) -> Result<Option<HostStaticKey>, HostKeyError> {
     let file_error = |source| HostKeyError::File {
         path: path.to_path_buf(),
         source,
     };
-    let metadata = match std::fs::metadata(path) {
-        Ok(metadata) => metadata,
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => {
+            return Err(HostKeyError::NotRegular {
+                path: path.to_path_buf(),
+            });
+        }
         Err(error) => return Err(file_error(error)),
     };
-    let mode = metadata.permissions().mode() & 0o777;
+    let metadata = file.metadata().map_err(file_error)?;
+    vet(
+        path,
+        metadata.is_file(),
+        metadata.permissions().mode(),
+        metadata.uid(),
+        nix::unistd::geteuid().as_raw(),
+    )?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(32));
+    file.read_to_end(&mut bytes).map_err(file_error)?;
+    HostStaticKey::from_stored(&bytes).map(Some)
+}
+
+/// Refuse a key file that is not a regular file, is not owned by `euid`, or
+/// grants any group or other permission bit.
+fn vet(path: &Path, is_file: bool, mode: u32, uid: u32, euid: u32) -> Result<(), HostKeyError> {
+    if !is_file {
+        return Err(HostKeyError::NotRegular {
+            path: path.to_path_buf(),
+        });
+    }
+    if uid != euid {
+        return Err(HostKeyError::NotOwned {
+            path: path.to_path_buf(),
+            uid,
+        });
+    }
+    let mode = mode & 0o777;
     if mode & 0o077 != 0 {
         return Err(HostKeyError::Permissions {
             path: path.to_path_buf(),
             mode,
         });
     }
-    let bytes = Zeroizing::new(std::fs::read(path).map_err(file_error)?);
-    HostStaticKey::from_stored(&bytes).map(Some)
+    Ok(())
 }
 
 /// Write `key` to the fallback file: a `0600` temporary beside it, synced,
-/// then renamed over the path, so a crash never leaves a short key behind.
+/// renamed over the path, then the directory synced so the rename itself is
+/// durable. A crash never leaves a short key behind, and a key a boot reported
+/// as minted is still there after a power loss.
 fn mint_to_file(key: HostStaticKey, path: PathBuf) -> Result<Loaded, HostKeyError> {
     let file_error = |source| HostKeyError::File {
         path: path.clone(),
@@ -277,6 +349,11 @@ fn mint_to_file(key: HostStaticKey, path: PathBuf) -> Result<Loaded, HostKeyErro
     if let Err(error) = written {
         let _ = std::fs::remove_file(&temporary);
         return Err(file_error(error));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(file_error)?;
     }
     Ok(Loaded {
         key,
@@ -338,9 +415,9 @@ mod tests {
     /// multiple a Noise peer derives from the same secret.
     #[test]
     fn the_public_half_is_the_rfc_7748_x25519_public_key() {
-        let key = HostStaticKey::from_secret(unhex(
+        let key = HostStaticKey::from_secret(Zeroizing::new(unhex(
             "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
-        ));
+        )));
         assert_eq!(
             key.public(),
             &unhex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
@@ -350,7 +427,7 @@ mod tests {
     #[test]
     fn debug_never_prints_the_secret() {
         let secret = [0xAB; 32];
-        let printed = format!("{:?}", HostStaticKey::from_secret(secret));
+        let printed = format!("{:?}", HostStaticKey::from_secret(Zeroizing::new(secret)));
         assert!(printed.contains("<redacted>"), "{printed}");
         assert!(!printed.contains(&hex(&secret)), "{printed}");
     }
@@ -460,8 +537,46 @@ mod tests {
         assert!(matches!(refused, HostKeyError::Malformed(3)), "{refused:?}");
     }
 
+    /// A symlink at the key path is refused, even one pointing at a valid
+    /// `0600` key: the path is opened `O_NOFOLLOW`.
+    #[test]
+    fn a_symlinked_key_file_is_refused() {
+        let home = tempfile::tempdir().expect("home");
+        load_or_mint(&NO_KEYCHAIN, home.path()).expect("mint");
+        let file = key_file_in(home.path());
+        let real = file.with_file_name("elsewhere.key");
+        std::fs::rename(&file, &real).expect("move");
+        std::os::unix::fs::symlink(&real, &file).expect("symlink");
+
+        let refused = load_or_mint(&NO_KEYCHAIN, home.path()).expect_err("symlink");
+        assert!(
+            matches!(refused, HostKeyError::NotRegular { .. }),
+            "{refused:?}"
+        );
+    }
+
+    /// Ownership, type and mode are vetted on the opened descriptor's own
+    /// metadata; the rules themselves, without needing a second user.
+    #[test]
+    fn a_key_file_must_be_a_regular_file_owned_by_this_user_and_0600() {
+        let path = Path::new("hangar/host_static.key");
+        assert!(vet(path, true, 0o100_600, 501, 501).is_ok());
+        assert!(matches!(
+            vet(path, true, 0o100_600, 0, 501),
+            Err(HostKeyError::NotOwned { uid: 0, .. })
+        ));
+        assert!(matches!(
+            vet(path, false, 0o040_700, 501, 501),
+            Err(HostKeyError::NotRegular { .. })
+        ));
+        assert!(matches!(
+            vet(path, true, 0o100_640, 501, 501),
+            Err(HostKeyError::Permissions { mode: 0o640, .. })
+        ));
+    }
+
     /// The public half lands in `daemon_identity`, a second boot leaves it
-    /// alone, and a different key in force replaces it.
+    /// alone, and a different key in force is REFUSED with the row untouched.
     #[tokio::test]
     async fn ensure_records_the_public_half_on_the_identity_row() {
         let home = tempfile::tempdir().expect("home");
@@ -487,11 +602,17 @@ mod tests {
         let again = ensure(store.pool(), &keychain, home.path()).await.expect("ensure");
         assert_eq!(again.key.public(), first.key.public());
 
-        let replaced = ensure(store.pool(), &InMemoryBackend::new(), home.path())
+        // A different keychain holds a different key: refused, not adopted.
+        let refused = ensure(store.pool(), &InMemoryBackend::new(), home.path())
             .await
-            .expect("ensure");
-        assert_ne!(replaced.key.public(), first.key.public());
-        let recorded = DaemonIdentityRepo::host_static_pubkey(store.pool()).await.expect("read");
-        assert_eq!(recorded.as_deref(), Some(&replaced.key.public()[..]));
+            .expect_err("a different key must not replace the recorded one");
+        let HostKeyError::KeyChanged { recorded, in_force } = &refused else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(recorded, &hex(first.key.public()));
+        assert_ne!(in_force, recorded);
+        assert!(refused.to_string().contains("host-key rotate"), "{refused}");
+        let still = DaemonIdentityRepo::host_static_pubkey(store.pool()).await.expect("read");
+        assert_eq!(still.as_deref(), Some(&first.key.public()[..]));
     }
 }
