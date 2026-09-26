@@ -120,7 +120,12 @@ async fn via_http(dir: &Path, cwd: &str) -> Store {
         dir.join("unused-events.jsonl"),
         dir.join("unused-cursor"),
     );
-    let sink = Arc::new(IngestSink::new(ingest, dir.to_path_buf()));
+    let sink = Arc::new(IngestSink::new(
+        ingest,
+        dir.to_path_buf(),
+        store.pool().clone(),
+        broker.sink(),
+    ));
     let running = hook_ingress::start(dir, sink).await.unwrap();
     let token_line = format!(
         "{}\r\n",
