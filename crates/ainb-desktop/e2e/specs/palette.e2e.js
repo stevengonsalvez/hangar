@@ -5,7 +5,7 @@
 // keystroke is caught where it does damage rather than where it was typed.
 
 import assert from "node:assert/strict";
-import { click } from "../support.js";
+import { click, setPaletteQuery } from "../support.js";
 import { hook, paneText, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
@@ -96,6 +96,39 @@ async function ready(session) {
     timeoutMsg: "the sidecar never connected: the window still shows a banner",
   });
   await $(`.session-row[data-session="${session.id}"]`).waitForExist({ timeout: 30_000 });
+  await backToSessionList();
+}
+
+/**
+ * Bring the reducer back to its session list when another spec in this
+ * world left it on the git view: a row chosen there is refused, so no tab
+ * opens and no terminal takes the keyboard. Asked through the palette, the
+ * way a person leaves the view; a greyed row means the list is already up.
+ */
+async function backToSessionList() {
+  if (!(await $(".palette-query").isExisting())) {
+    await browser.keys([...MOD, "k"]);
+    await $(".palette-query").waitForExist({ timeout: 30_000 });
+  }
+  await setPaletteQuery("git_view.back");
+  const row = await $('.palette-row[data-row="command:git_view.back"]');
+  const drawn = await row.waitForExist({ timeout: 5_000 }).catch(() => false);
+  if (drawn !== false && (await row.isEnabled())) {
+    await browser.waitUntil(
+      async () =>
+        (await browser.execute(
+          () => document.querySelector('.palette-row[aria-selected="true"]')?.getAttribute("data-row") ?? "",
+        )) === "command:git_view.back",
+      { timeout: 30_000 },
+    );
+    await browser.keys(["Enter"]);
+  } else {
+    await browser.keys(["Escape"]);
+  }
+  await browser.waitUntil(async () => !(await $(".palette-query").isExisting()), {
+    timeout: 30_000,
+    timeoutMsg: "the palette stayed open while leaving the git view",
+  });
 }
 
 describe("the palette over a terminal", () => {
