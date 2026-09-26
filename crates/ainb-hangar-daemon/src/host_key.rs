@@ -178,6 +178,13 @@ pub enum HostKeyError {
         /// The public key of the key in force, hex.
         in_force: String,
     },
+    /// A public key is recorded but no key is stored: the key was lost or
+    /// moved. Nothing was minted, so restoring it is still possible.
+    #[error(
+        "a host public key is recorded but the host key is missing; nothing was minted. \
+         Restore the key, or replace it deliberately with `ainb hangar host-key rotate`"
+    )]
+    KeyMissing,
     /// A stored key is not 32 bytes.
     #[error("the stored host key is {0} bytes, not 32")]
     Malformed(usize),
@@ -196,6 +203,16 @@ pub fn load_or_mint(
     backend: &dyn SecretBackend,
     hangar_home: &Path,
 ) -> Result<Loaded, HostKeyError> {
+    load(backend, hangar_home, true)
+}
+
+/// [`load_or_mint`], except that with `may_mint` false a home with no key is
+/// [`HostKeyError::KeyMissing`] and nothing is minted or written.
+fn load(
+    backend: &dyn SecretBackend,
+    hangar_home: &Path,
+    may_mint: bool,
+) -> Result<Loaded, HostKeyError> {
     let file = key_file_in(hangar_home);
     if let Some(key) = read_file(&file)? {
         return Ok(Loaded {
@@ -210,6 +227,7 @@ pub fn load_or_mint(
             custody: Custody::Keychain,
             minted: false,
         }),
+        Ok(None) if !may_mint => Err(HostKeyError::KeyMissing),
         Ok(None) => {
             let key = HostStaticKey::generate();
             match backend.put(&Scope::Global, KEYCHAIN_ACCOUNT, key.secret()) {
@@ -229,6 +247,7 @@ pub fn load_or_mint(
                 }
             }
         }
+        Err(SecretError::NotImplemented) if !may_mint => Err(HostKeyError::KeyMissing),
         Err(SecretError::NotImplemented) => mint_to_file(HostStaticKey::generate(), file),
         Err(error) => Err(HostKeyError::Keychain(error)),
     }
@@ -253,7 +272,11 @@ pub async fn ensure(
     backend: &(dyn SecretBackend + Sync),
     hangar_home: &Path,
 ) -> Result<Loaded, HostKeyError> {
-    let loaded = load_or_mint(backend, hangar_home)?;
+    // The recorded key decides whether a key may be minted at all: with one
+    // recorded, a missing key is a loss to restore, and a freshly minted and
+    // persisted key beside it would only shadow the restore.
+    let recorded = DaemonIdentityRepo::host_static_pubkey(pool).await?;
+    let loaded = load(backend, hangar_home, recorded.is_none())?;
     match DaemonIdentityRepo::record_host_static_pubkey(pool, loaded.key.public()).await? {
         PubkeyRecord::Recorded | PubkeyRecord::Unchanged => Ok(loaded),
         PubkeyRecord::Differs { recorded } => Err(HostKeyError::KeyChanged {
@@ -265,8 +288,11 @@ pub async fn ensure(
 
 /// The key in the fallback file, `None` when there is no file.
 ///
-/// Opened with `O_NOFOLLOW`, then vetted and read through the SAME descriptor,
-/// so a symlink is refused and the file checked is the file read.
+/// Opened with `O_NOFOLLOW` (a symlink is refused) and `O_NONBLOCK` (opening a
+/// FIFO does not wait for a writer), then vetted and read through the SAME
+/// descriptor, so anything but a regular file is refused and the file checked
+/// is the file read. At most 33 bytes are read: enough to tell a 32-byte key
+/// from a longer file without reading an unbounded one into memory.
 fn read_file(path: &Path) -> Result<Option<HostStaticKey>, HostKeyError> {
     let file_error = |source| HostKeyError::File {
         path: path.to_path_buf(),
@@ -274,7 +300,7 @@ fn read_file(path: &Path) -> Result<Option<HostStaticKey>, HostKeyError> {
     };
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
     {
         Ok(file) => file,
@@ -294,8 +320,8 @@ fn read_file(path: &Path) -> Result<Option<HostStaticKey>, HostKeyError> {
         metadata.uid(),
         nix::unistd::geteuid().as_raw(),
     )?;
-    let mut bytes = Zeroizing::new(Vec::with_capacity(32));
-    file.read_to_end(&mut bytes).map_err(file_error)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(33));
+    (&mut file).take(33).read_to_end(&mut bytes).map_err(file_error)?;
     HostStaticKey::from_stored(&bytes).map(Some)
 }
 
@@ -539,6 +565,50 @@ mod tests {
 
     /// A symlink at the key path is refused, even one pointing at a valid
     /// `0600` key: the path is opened `O_NOFOLLOW`.
+    /// A FIFO at the key path is refused, and opening it does not wait for a
+    /// writer (`O_NONBLOCK`).
+    #[test]
+    fn a_fifo_at_the_key_path_is_refused_without_blocking() {
+        let home = tempfile::tempdir().expect("home");
+        let file = key_file_in(home.path());
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("dir");
+        let made = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&file)
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+
+        let home_path = home.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_or_mint(&NO_KEYCHAIN, &home_path).map(|_| ()));
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("opening a FIFO must not block")
+            .expect_err("a FIFO is not a key file");
+        assert!(
+            matches!(refused, HostKeyError::NotRegular { .. }),
+            "{refused:?}"
+        );
+    }
+
+    /// An oversized key file is refused after reading at most 33 bytes.
+    #[test]
+    fn an_oversized_key_file_is_refused_on_a_bounded_read() {
+        let home = tempfile::tempdir().expect("home");
+        load_or_mint(&NO_KEYCHAIN, home.path()).expect("mint");
+        std::fs::write(key_file_in(home.path()), vec![7u8; 1 << 20]).expect("grow");
+
+        let refused = load_or_mint(&NO_KEYCHAIN, home.path()).expect_err("1 MiB");
+        assert!(
+            matches!(refused, HostKeyError::Malformed(33)),
+            "{refused:?}"
+        );
+    }
+
     #[test]
     fn a_symlinked_key_file_is_refused() {
         let home = tempfile::tempdir().expect("home");
@@ -602,8 +672,33 @@ mod tests {
         let again = ensure(store.pool(), &keychain, home.path()).await.expect("ensure");
         assert_eq!(again.key.public(), first.key.public());
 
+        // A keychain that holds NO key, with one recorded: a loss to restore.
+        // Nothing is minted into it, so the restore is still possible.
+        let empty = InMemoryBackend::new();
+        let missing = ensure(store.pool(), &empty, home.path())
+            .await
+            .expect_err("a recorded key that is gone must not be replaced by a new one");
+        assert!(matches!(missing, HostKeyError::KeyMissing), "{missing:?}");
+        assert!(missing.to_string().contains("host-key rotate"), "{missing}");
+        assert!(
+            empty.get(&Scope::Global, KEYCHAIN_ACCOUNT).expect("get").is_none(),
+            "nothing was minted into the keychain"
+        );
+        assert!(
+            !key_file_in(home.path()).exists(),
+            "nothing was minted into a file"
+        );
+
         // A different keychain holds a different key: refused, not adopted.
-        let refused = ensure(store.pool(), &InMemoryBackend::new(), home.path())
+        let other = InMemoryBackend::new();
+        other
+            .put(
+                &Scope::Global,
+                KEYCHAIN_ACCOUNT,
+                HostStaticKey::generate().secret(),
+            )
+            .expect("put");
+        let refused = ensure(store.pool(), &other, home.path())
             .await
             .expect_err("a different key must not replace the recorded one");
         let HostKeyError::KeyChanged { recorded, in_force } = &refused else {
