@@ -227,13 +227,12 @@ describe("answering from the window", () => {
     // list's, and the reducer refused them while it was on its Inbox screen:
     // the pick went nowhere and the window logged it as dispatched (#121).
     const target = seeded()[0];
-    const stamp = Date.now();
     const chosen = 2;
     const readBefore = paneText(target.tmux).split(`agent read: ${OPTIONS[chosen]}`).length - 1;
 
     await click(".inbox-button");
     await $(".inbox").waitForExist({ timeout: 60_000 });
-    hook(askLine(`e2e-ask-inbox-${stamp}`, "", target.cwd));
+    raiseHook(target, ASK);
     await click(`.session-row[data-session="${target.id}"]`);
     // The question just raised, not the one the case before answered, whose
     // banner lingers as delivered.
