@@ -70,6 +70,60 @@ pub fn install_claude_hooks(home: &Path, hook_script: &Path) -> Result<PathBuf> 
     Ok(path)
 }
 
+/// Path of the one-time backup written before a hook transport change.
+#[must_use]
+pub fn settings_backup_path(home: &Path) -> PathBuf {
+    home.join(".claude").join("settings.json.ainb.bak")
+}
+
+/// Install the managed hooks for `transport` into
+/// `<home>/.claude/settings.json`, pointing every managed event at
+/// `hook_script`. Every non-managed hook is kept.
+///
+/// When the settings already hold the OTHER transport's entries (or none, on
+/// the way to `Http`), the file as it was is first copied to
+/// [`settings_backup_path`]. Same lock, same atomic write, same refusal of a
+/// malformed file as [`install_claude_hooks`].
+pub fn install_claude_hooks_for(
+    home: &Path,
+    hook_script: &Path,
+    transport: hooks::HookTransport,
+) -> Result<PathBuf> {
+    let _guard = lock_settings(home)?;
+    let path = claude_settings_path(home);
+    let existing = read_settings(&path)?;
+    let before = hooks::installed_transport(&existing);
+    let changing = match transport {
+        hooks::HookTransport::Http => before != Some(hooks::HookTransport::Http),
+        hooks::HookTransport::Legacy => before == Some(hooks::HookTransport::Http),
+    };
+    if changing && path.exists() {
+        std::fs::copy(&path, settings_backup_path(home))
+            .with_context(|| format!("backing up {}", path.display()))?;
+    }
+    let script = hook_script.to_string_lossy();
+    let merged = match transport {
+        hooks::HookTransport::Http => hooks::merge_http_into(existing, &script),
+        hooks::HookTransport::Legacy => hooks::merge_legacy_into(existing, &script),
+    };
+    let bytes = serde_json::to_vec_pretty(&merged).context("serializing settings.json")?;
+    write_atomic(&path, &bytes)?;
+    Ok(path)
+}
+
+/// Record which transport the managed hooks use, in
+/// `<ainb_home>/hooks/transport`. `notify.sh` reads it: under `http` it stands
+/// down so a plugin-registered copy never races the daemon's hold.
+pub fn record_transport(ainb_home: &Path, transport: hooks::HookTransport) -> Result<PathBuf> {
+    let path = ainb_home.join("hooks").join("transport");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    write_atomic(&path, format!("{}\n", transport.as_str()).as_bytes())?;
+    Ok(path)
+}
+
 /// Strip the ATC lifecycle hooks from `<home>/.claude/settings.json`, leaving
 /// every other hook intact. No-op when the file is absent. Idempotent. The
 /// read-merge-write is performed under the same advisory lock as install.
@@ -266,4 +320,65 @@ mod tests {
         assert!(stop.iter().any(|c| c.contains("stop_reflect.py")));
         assert!(stop.iter().any(|c| c.contains("notify.sh")));
     }
+
+    #[test]
+    fn http_then_legacy_round_trips_to_the_bytes_of_a_fresh_install() {
+        let fresh_home = TempDir::new().unwrap();
+        write_reflect_and_notifyd(fresh_home.path());
+        install_claude_hooks(fresh_home.path(), Path::new("/x/notify.sh")).unwrap();
+        let fresh = std::fs::read(claude_settings_path(fresh_home.path())).unwrap();
+
+        let home = TempDir::new().unwrap();
+        write_reflect_and_notifyd(home.path());
+        install_claude_hooks(home.path(), Path::new("/x/notify.sh")).unwrap();
+        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
+            .unwrap();
+        let http = read(home.path());
+        assert_eq!(hooks::installed_transport(&http), Some(hooks::HookTransport::Http));
+        assert_eq!(http["otherUserSetting"], 42);
+        install_claude_hooks_for(home.path(), Path::new("/x/notify.sh"), hooks::HookTransport::Legacy)
+            .unwrap();
+        assert_eq!(std::fs::read(claude_settings_path(home.path())).unwrap(), fresh);
+    }
+
+    #[test]
+    fn a_backup_is_taken_once_per_transport_change() {
+        let home = TempDir::new().unwrap();
+        write_reflect_and_notifyd(home.path());
+        install_claude_hooks(home.path(), Path::new("/x/notify.sh")).unwrap();
+        let before = std::fs::read(claude_settings_path(home.path())).unwrap();
+        let backup = settings_backup_path(home.path());
+        assert!(!backup.exists(), "a legacy install never backs up");
+
+        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), before, "the pre-change file");
+        std::fs::remove_file(&backup).unwrap();
+        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
+            .unwrap();
+        assert!(!backup.exists(), "a re-install of the same transport is not a change");
+    }
+
+    #[test]
+    fn http_install_refuses_a_malformed_settings_file() {
+        let home = TempDir::new().unwrap();
+        let path = claude_settings_path(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(
+            install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn the_transport_marker_is_one_word() {
+        let ainb = TempDir::new().unwrap();
+        let path = record_transport(ainb.path(), hooks::HookTransport::Http).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "http\n");
+        record_transport(ainb.path(), hooks::HookTransport::Legacy).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "legacy\n");
+    }
+
 }
