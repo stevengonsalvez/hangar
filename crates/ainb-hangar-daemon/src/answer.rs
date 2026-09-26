@@ -35,7 +35,6 @@
 //! (`answer_acp`) with the same first-answer-wins claim and no tmux at all.
 
 use ainb_fleet_core::discover::{discover_from_ainb, discover_from_peers, merge_sessions};
-use ainb_fleet_core::read::jsonl_tail::latest_transcript_for_cwd;
 use ainb_fleet_core::send::send;
 use ainb_fleet_core::types::{SendOutcome, Session};
 use ainb_hangar_proto::connections::ConnectionRow;
@@ -157,8 +156,6 @@ const fn forced_delivery() -> Option<SendOutcome> {
 enum Target {
     /// A single, unambiguous live session to deliver into.
     Send(Session),
-    /// The C1 guard refused: the target could not be resolved unambiguously.
-    Ambiguous(String),
     /// No live session matched (the target may have exited).
     NoTarget(String),
 }
@@ -209,15 +206,7 @@ pub async fn answer(
 
     // C1: resolve the delivery target BEFORE claiming, so an ambiguous / dead
     // target leaves the row open and answerable later.
-    match resolve_target(
-        &row.session_id,
-        &row.cwd,
-        row.raise_transcript.as_deref(),
-        params.is_answer,
-    )
-    .await
-    {
-        Target::Ambiguous(reason) => Ok(AnswerResult::Ambiguous { reason }),
+    match resolve_target(&row.session_id, params.is_answer).await {
         // A row whose session has no pane bound (D14, issue #916) fails here
         // with the router's generic "no live session matched". Replace that
         // with the binding's own sentence so the operator is told which pane is
@@ -1063,69 +1052,30 @@ async fn reopen_on_failed_delivery(
 pub(crate) enum Pick {
     /// The hook's session id matched a discovered session outright.
     Exact(Session),
-    /// One session's root is the raise cwd (`nested == false`) or its nearest
-    /// ancestor (`nested == true`).
-    ByCwd { session: Session, nested: bool },
-    /// More than one session claims the raise cwd at the same depth.
-    Ambiguous(usize),
     /// No discovered session matched.
     None,
 }
 
-/// Resolve which discovered session an attention row belongs to.
+/// Resolve which discovered session an attention row belongs to: the one
+/// whose id, or whose agent's own session id (the Claude id ainb minted, a
+/// Codex thread), is the row's `session_id`, exactly.
 ///
-/// Exact id first. Otherwise the hook's cwd, which drifts BELOW the session
-/// root as soon as the agent `cd`s into a subproject (`<worktree>/api`) while
-/// discovery lists the session at its root: the most specific session whose
-/// root contains the raise cwd wins, and two sessions at that same depth are
-/// ambiguous (a merged session that aggregated 2+ sources counts as two).
-pub(crate) fn pick_target(
-    ainb: &[Session],
-    peers: &[Session],
-    session_id: &str,
-    cwd: &str,
-) -> Pick {
-    let root_len = |s: &Session| {
-        if session_owns_cwd(&s.cwd, cwd) {
-            s.cwd.trim_end_matches('/').len()
-        } else {
-            0
-        }
-    };
-    let deepest = ainb.iter().chain(peers.iter()).map(root_len).max().unwrap_or(0);
-    let raw_cwd_count = if cwd.is_empty() || deepest == 0 {
-        0
-    } else {
-        ainb.iter().chain(peers.iter()).filter(|s| root_len(s) == deepest).count()
-    };
-
-    let merged = merge_sessions(vec![ainb.to_vec(), peers.to_vec()]);
-    if let Some(session) = merged.iter().find(|s| s.id == session_id) {
-        return Pick::Exact(session.clone());
-    }
-    let Some(by_cwd) = merged
-        .iter()
-        .filter(|s| !cwd.is_empty() && session_owns_cwd(&s.cwd, cwd))
-        .max_by_key(|s| s.cwd.trim_end_matches('/').len())
-    else {
+/// Nothing else. The cwd the row was raised in is not a fallback: two agents
+/// can share a directory, and the path Claude reports (canonical, through
+/// every symlink) is not the path ainb was given, so a match on it was both
+/// unsafe and unreliable (#132). A row nothing matches stays open.
+pub(crate) fn pick_target(ainb: &[Session], peers: &[Session], session_id: &str) -> Pick {
+    if session_id.is_empty() {
         return Pick::None;
-    };
-    if raw_cwd_count > 1 || by_cwd.sources.len() > 1 {
-        return Pick::Ambiguous(raw_cwd_count.max(by_cwd.sources.len()));
     }
-    let nested = by_cwd.cwd.trim_end_matches('/') != cwd.trim_end_matches('/');
-    Pick::ByCwd {
-        session: by_cwd.clone(),
-        nested,
-    }
+    let merged = merge_sessions(vec![ainb.to_vec(), peers.to_vec()]);
+    merged
+        .into_iter()
+        .find(|s| s.id == session_id || s.provider_session_id.as_deref() == Some(session_id))
+        .map_or(Pick::None, Pick::Exact)
 }
 
-async fn resolve_target(
-    session_id: &str,
-    cwd: &str,
-    raise_transcript: Option<&str>,
-    is_answer: bool,
-) -> Target {
+async fn resolve_target(session_id: &str, is_answer: bool) -> Target {
     let ainb_fut = discover_from_ainb();
     let peers_fut = tokio::task::spawn_blocking(discover_from_peers);
     let (ainb, peers_join) = tokio::join!(ainb_fut, peers_fut);
@@ -1136,72 +1086,12 @@ async fn resolve_target(
     } else {
         "refusing to send"
     };
-
-    let (by_cwd, nested) = match pick_target(&ainb, &peers, session_id, cwd) {
-        Pick::Exact(session) => return Target::Send(session),
-        Pick::None => {
-            return Target::NoTarget(
-                "no live session matched (target may have exited)".to_string(),
-            );
-        }
-        Pick::Ambiguous(n) => {
-            return Target::Ambiguous(format!(
-                "ambiguous target — {label} ({n} sessions in this cwd)"
-            ));
-        }
-        Pick::ByCwd { session, nested } => (session, nested),
-    };
-
-    // Attention rows are DURABLE and outlive the raising agent. If the original
-    // session has exited and a DIFFERENT agent now occupies the cwd (its
-    // transcript is newer), refuse rather than answer an agent that never asked.
-    // A NESTED match (session root above the raise cwd) is only ever accepted
-    // when the raise transcript confirms the owner: without that check a session
-    // rooted at a broad ancestor ($HOME, a repos root) would become the delivery
-    // target for every row raised anywhere beneath it.
-    match raise_transcript.filter(|t| !t.is_empty()) {
-        Some(raise_tx) => {
-            // Transcripts are keyed by the session's ROOT cwd, not the
-            // subdirectory the agent happened to be in when it asked.
-            if !transcript_still_owns_cwd(&by_cwd.cwd, raise_tx) {
-                return Target::Ambiguous(format!(
-                    "stale target — {label} (the raising session no longer owns this cwd)"
-                ));
-            }
-        }
-        None if nested => {
-            return Target::Ambiguous(format!(
-                "nested target — {label} (the raise cwd is below the session root and no raise transcript confirms the owner)"
-            ));
-        }
-        None => {}
+    match pick_target(&ainb, &peers, session_id) {
+        Pick::Exact(session) => Target::Send(session),
+        Pick::None => Target::NoTarget(format!(
+            "no live session runs under this id — {label} (target may have exited)"
+        )),
     }
-
-    Target::Send(by_cwd)
-}
-
-/// Is `raise_cwd` the session root `root` itself, or a directory below it?
-/// Exact path-component containment, never a bare string prefix, so
-/// `/w/app` does not own `/w/app2`.
-fn session_owns_cwd(root: &str, raise_cwd: &str) -> bool {
-    if root.is_empty() || raise_cwd.is_empty() {
-        return false;
-    }
-    let root = root.trim_end_matches('/');
-    let raise_cwd = raise_cwd.trim_end_matches('/');
-    raise_cwd == root || raise_cwd.strip_prefix(root).is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Does the session that raised the request still OWN `cwd`? True when the newest
-/// transcript in the cwd's project dir is still the one captured at raise time.
-///
-/// Compared by file NAME — the session-unique transcript id — so the hook's
-/// absolute path and the discovered path never disagree over formatting. A
-/// missing current transcript (dir gone) is treated as NOT owning (refuse).
-fn transcript_still_owns_cwd(cwd: &str, raise_transcript: &str) -> bool {
-    let raise_name = std::path::Path::new(raise_transcript).file_name();
-    raise_name.is_some()
-        && latest_transcript_for_cwd(cwd).is_some_and(|current| current.file_name() == raise_name)
 }
 
 #[cfg(test)]
@@ -1217,20 +1107,6 @@ mod tests {
     /// The payload shape the hook ingest stores for a real `AskUserQuestion`
     /// (captured live from Claude Code 2.1.257).
     const ASK_PAYLOAD: &str = r#"{"kind":"ASK","context":{"question":"Where should Boxtrack's sqlite file live by default?","header":"DB path","options":[{"label":"data/boxtrack.db (Recommended)","description":"Repo-root data/ dir"},{"label":"api/app.db","description":"Beside the api"}],"multi_select":false}}"#;
-
-    /// The hook's cwd drifts below the session root the moment the agent `cd`s
-    /// into a subproject; the session still owns it. Containment is by path
-    /// component, so a sibling with a shared name prefix never matches.
-    #[test]
-    fn session_owns_cwd_is_component_wise_containment() {
-        assert!(session_owns_cwd("/w/app", "/w/app"));
-        assert!(session_owns_cwd("/w/app", "/w/app/api"));
-        assert!(session_owns_cwd("/w/app/", "/w/app/api/src"));
-        assert!(!session_owns_cwd("/w/app", "/w/app2"));
-        assert!(!session_owns_cwd("/w/app", "/w"));
-        assert!(!session_owns_cwd("", "/w/app"));
-        assert!(!session_owns_cwd("/w/app", ""));
-    }
 
     fn labels() -> Vec<String> {
         picker().labels
@@ -1718,6 +1594,7 @@ mod tests {
     fn session(id: &str, cwd: &str, src: SessionSource) -> Session {
         Session {
             id: id.to_string(),
+            provider_session_id: None,
             cwd: cwd.to_string(),
             pid: None,
             git_root: None,
@@ -1740,166 +1617,38 @@ mod tests {
             session("other", "/work/x", SessionSource::Peers),
         ];
         assert!(matches!(
-            pick_target(&raw, &[], "hook-sid", "/work/x"),
+            pick_target(&raw, &[], "hook-sid"),
             Pick::Exact(s) if s.id == "hook-sid"
         ));
     }
 
+    /// An ainb session is listed under ainb's own id; the hook names the id
+    /// the agent runs under, which ainb minted and stored on the record. That
+    /// id delivers, exactly (#132).
     #[test]
-    fn unambiguous_cwd_match_delivers() {
+    fn the_agents_own_session_id_delivers_to_the_ainb_session() {
+        let mut ainb = session("ainb-row", "/work/x", SessionSource::Ainb);
+        ainb.provider_session_id = Some("claude-uuid".to_string());
+        let other = session("other-row", "/work/x", SessionSource::Ainb);
+        assert!(matches!(
+            pick_target(&[ainb, other], &[], "claude-uuid"),
+            Pick::Exact(s) if s.id == "ainb-row"
+        ));
+    }
+
+    /// The cwd is no fallback: a session in the row's directory that does not
+    /// run under the row's id is not the target, however alone it is there.
+    #[test]
+    fn a_session_sharing_the_cwd_but_not_the_id_is_no_target() {
         let raw = vec![session("discovered-id", "/work/x", SessionSource::Ainb)];
         assert!(matches!(
-            pick_target(&raw, &[], "hook-session-differs", "/work/x"),
-            Pick::ByCwd { session, nested: false } if session.id == "discovered-id"
-        ));
-    }
-
-    #[test]
-    fn ambiguous_cwd_two_raw_sessions_refuses() {
-        let raw = vec![
-            session("a", "/work/x", SessionSource::Ainb),
-            session("b", "/work/x", SessionSource::Ainb),
-        ];
-        assert!(matches!(
-            pick_target(&raw, &[], "hook-sid", "/work/x"),
-            Pick::Ambiguous(2)
-        ));
-    }
-
-    #[test]
-    fn ambiguous_cwd_multi_source_merge_refuses() {
-        let ainb = vec![session("a", "/work/x", SessionSource::Ainb)];
-        let peers = vec![session("a", "/work/x", SessionSource::Peers)];
-        assert!(matches!(
-            pick_target(&ainb, &peers, "hook-sid", "/work/x"),
-            Pick::Ambiguous(2)
-        ));
-    }
-
-    /// The hook's cwd drifted below the session root (the agent `cd`'d into
-    /// `api/`): the session still resolves, flagged nested so the router can
-    /// demand the raise transcript before trusting it.
-    #[test]
-    fn nested_cwd_resolves_to_the_session_root_as_nested() {
-        let raw = vec![session("wt", "/w/app", SessionSource::Ainb)];
-        assert!(matches!(
-            pick_target(&raw, &[], "hook-sid", "/w/app/api"),
-            Pick::ByCwd { session, nested: true } if session.id == "wt"
-        ));
-        assert!(
-            matches!(pick_target(&raw, &[], "hook-sid", "/w/app2"), Pick::None),
-            "sibling prefix"
-        );
-    }
-
-    /// A session with its own tmux identity, so two of them are two sessions to
-    /// `merge_sessions` (which folds sessions sharing a tmux target into one).
-    fn distinct_session(id: &str, cwd: &str) -> Session {
-        let mut s = session(id, cwd, SessionSource::Ainb);
-        s.tmux_session = Some(format!("tmux-{id}"));
-        s
-    }
-
-    /// Two ancestors: the most specific root wins outright (no ambiguity), and a
-    /// trailing slash on a discovered cwd changes neither depth nor the count.
-    #[test]
-    fn deepest_ancestor_wins_and_trailing_slash_is_ignored() {
-        let raw = vec![
-            distinct_session("broad", "/w"),
-            distinct_session("narrow", "/w/app/"),
-        ];
-        assert!(matches!(
-            pick_target(&raw, &[], "hook-sid", "/w/app/api"),
-            Pick::ByCwd { session, nested: true } if session.id == "narrow"
-        ));
-        let twins = vec![
-            distinct_session("a", "/w/app"),
-            distinct_session("b", "/w/app/"),
-        ];
-        assert!(
-            matches!(
-                pick_target(&twins, &[], "hook-sid", "/w/app/sub"),
-                Pick::Ambiguous(2)
-            ),
-            "same directory with and without the trailing slash is one depth"
-        );
-    }
-
-    /// Plant a transcript `<name>` under a UNIQUE cwd's `~/.claude/projects`
-    /// slug dir. Returns the cwd, the planted file path, and a cleanup guard.
-    struct TxFixture {
-        cwd: String,
-        dir: std::path::PathBuf,
-    }
-    impl Drop for TxFixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-    fn plant_transcript(name: &str) -> (TxFixture, std::path::PathBuf) {
-        use std::io::Write;
-        let fixture_id = NEXT_TRANSCRIPT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let cwd = format!(
-            "/ainb-test-answer-c1/{}/{}/{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            fixture_id,
-        );
-        let mut dir = dirs::home_dir().expect("home dir");
-        dir.push(".claude");
-        dir.push("projects");
-        dir.push(ainb_fleet_core::read::jsonl_tail::cwd_to_project_slug(&cwd));
-        std::fs::create_dir_all(&dir).expect("create project dir");
-        let file = dir.join(name);
-        writeln!(std::fs::File::create(&file).unwrap(), "{{}}").unwrap();
-        (TxFixture { cwd, dir }, file)
-    }
-
-    #[test]
-    fn transcript_owns_cwd_when_it_is_the_newest() {
-        let (fx, file) = plant_transcript("session-a.jsonl");
-        // The captured transcript IS the newest in the cwd → the raiser owns it.
-        assert!(transcript_still_owns_cwd(&fx.cwd, file.to_str().unwrap()));
-        // A stale/never-there transcript name → not owning.
-        assert!(!transcript_still_owns_cwd(
-            &fx.cwd,
-            "/anywhere/session-gone.jsonl"
-        ));
-    }
-
-    #[test]
-    fn transcript_does_not_own_cwd_after_a_newer_session_takes_over() {
-        let (fx, original) = plant_transcript("session-original.jsonl");
-        // A DIFFERENT agent starts in the same cwd, writing a newer transcript.
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let newcomer = fx.dir.join("session-newcomer.jsonl");
-        std::fs::write(&newcomer, "{}\n").unwrap();
-
-        // The original raiser's transcript is no longer the newest → refuse.
-        assert!(
-            !transcript_still_owns_cwd(&fx.cwd, original.to_str().unwrap()),
-            "a newer session in the cwd means the original no longer owns it"
-        );
-        // The newcomer (had it been the raiser) would own it.
-        assert!(transcript_still_owns_cwd(
-            &fx.cwd,
-            newcomer.to_str().unwrap()
-        ));
-    }
-
-    #[test]
-    fn no_session_in_cwd_is_no_match_not_refuse() {
-        let raw = vec![session("a", "/other", SessionSource::Ainb)];
-        assert!(matches!(
-            pick_target(&raw, &[], "hook-sid", "/work/x"),
+            pick_target(&raw, &[], "hook-session-differs"),
             Pick::None
         ));
-    }
-
-    #[test]
-    fn empty_cwd_without_exact_match_is_no_match() {
-        let raw = vec![session("a", "", SessionSource::Ainb)];
-        assert!(matches!(pick_target(&raw, &[], "hook-sid", ""), Pick::None));
+        assert!(
+            matches!(pick_target(&raw, &[], ""), Pick::None),
+            "an empty id names nothing"
+        );
     }
 
     // --- answer() store-integration paths that need no live discovery ---------
