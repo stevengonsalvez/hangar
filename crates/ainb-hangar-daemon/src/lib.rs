@@ -1466,12 +1466,18 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         // loop returns, so a clean shutdown removes the endpoint files. A bind
         // failure is logged, never fatal.
         let _hook_ingress = if crate::hook_ingress::enabled_from_env() {
-            match crate::hook_ingress::start(
-                &dir,
-                std::sync::Arc::new(crate::hook_ingress::DiscardSink),
-            )
-            .await
-            {
+            // Its own AttentionIngest over the same pool, event sink and
+            // paths as the tail: one reduction for both transports.
+            let sink = crate::hook_ingress::IngestSink::new(
+                crate::attention_ingest::AttentionIngest::new(
+                    store.pool().clone(),
+                    broker.sink(),
+                    dir.join("events.jsonl"),
+                    dir.join("hangar").join("attention_ingest.offset"),
+                ),
+                dir.clone(),
+            );
+            match crate::hook_ingress::start(&dir, std::sync::Arc::new(sink)).await {
                 Ok(running) => {
                     tracing::info!(
                         port = running.port(),
