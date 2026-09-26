@@ -24,7 +24,6 @@ use ainb_hangar_proto::fleet::{
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
 use ainb_hangar_proto::mutation::{ACK_KEY, Fence, MutationAck, MutationEnvelope, OpId};
-use ainb_hangar_proto::peer_close;
 use ainb_hangar_proto::protocol::{ProtocolRange, catalogue_strings};
 use ainb_hangar_proto::snapshots::{
     AnswerParams, AnswerResult, AttentionListResult, AttentionSubscribeParams,
@@ -219,9 +218,9 @@ pub fn list_pairings(custody_dir: String) -> Result<Vec<PairingRecord>, WireErro
 }
 
 /// Forget a pairing: the token and the record. Only an explicit user action
-/// calls this (the owner removes a host). A 4401 or 4403 never forgets: it
-/// sets the re-pair latch (`PairingRecord.repair`) and the app shows
-/// "re-pair" while keeping the pairing.
+/// calls this (the owner removes a host). A refusal never forgets: it sets
+/// `PairingRecord.repair` (or `notice`) and the app shows "re-pair" while
+/// keeping the pairing.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireError> {
@@ -285,18 +284,13 @@ pub struct MobileHost {
     host_id: String,
 }
 
-/// The re-pair latch: a 4401 or 4403 close from the host sets it on the
-/// pairing record; only a successful pair clears it.
+/// A refusal from the host goes on the pairing record: `repair` for an
+/// identity refusal (peer changed, 4401, 4403), `notice` for an incompatible
+/// or unknown close; only a successful pair clears them. Retryable closes,
+/// including a network loss, set nothing: `Closed { retryable, retry_after_ms }`
+/// stays the app's only source of truth for a redial.
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
-    if matches!(
-        err,
-        WireError::Closed {
-            code: Some(peer_close::UNAUTHENTICATED | peer_close::REVOKED),
-            ..
-        }
-    ) {
-        let _ = pairing::mark_repair(custody_dir, host_id, true);
-    }
+    let _ = pairing::mark_refusal(custody_dir, host_id, err);
 }
 
 impl std::fmt::Debug for MobileHost {
@@ -333,14 +327,23 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             })?;
         let key = DeviceKey::load_or_create(custody_dir)?;
         let log = open_log(&params.log_dir)?;
-        let session = pairing::dial(
+        let session = match pairing::dial(
             &record.endpoints,
             &host_id,
             host_static_pubkey,
             &key,
             Some(log),
         )
-        .await?;
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                // A wrong pinned host key, or 4401 before message 2, is the
+                // host refusing this device's identity: latch re-pair.
+                latch_repair(custody_dir, &params.host_id, &e);
+                return Err(e);
+            }
+        };
         let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
             Ok(hello) => hello,
             Err(e) => {
@@ -651,10 +654,23 @@ impl MobileHost {
                 SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
                 SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
                 SessionEvent::Closed { code, reason } => {
-                    if let Some(closed) = self.session.closed() {
-                        latch_repair(&self.custody_dir, &self.host_id, &closed.error());
-                    }
-                    let (retryable, retry_after_ms) = classify_close(code, &reason);
+                    // The session's own record says whether this side closed
+                    // on purpose (never retryable) or the host did.
+                    let (retryable, retry_after_ms) = match self.session.closed() {
+                        Some(closed) => {
+                            let err = closed.error();
+                            latch_repair(&self.custody_dir, &self.host_id, &err);
+                            match err {
+                                WireError::Closed {
+                                    retryable,
+                                    retry_after_ms,
+                                    ..
+                                } => (retryable, retry_after_ms),
+                                _ => classify_close(code, &reason),
+                            }
+                        }
+                        None => classify_close(code, &reason),
+                    };
                     WireEvent::Closed {
                         code,
                         reason,

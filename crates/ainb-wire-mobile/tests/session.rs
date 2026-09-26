@@ -86,7 +86,8 @@ fn params_for(peer: &FakePeer, dir: &std::path::Path) -> ConnectParams {
             admin: false,
             expires_at_ms: 1_800_000_000_000,
             paired_at_ms: 1,
-            repair: false,
+            repair: None,
+            notice: None,
         },
         "mdd_test",
     )
@@ -345,7 +346,18 @@ async fn subscribe_replays_after_revision_and_events_arrive_in_order() {
 
     host.close();
     let closed = Arc::clone(&host).next_event().await;
-    assert!(matches!(closed, WireEvent::Closed { .. }), "{closed:?}");
+    assert!(
+        matches!(
+            closed,
+            WireEvent::Closed {
+                code: None,
+                retryable: false,
+                retry_after_ms: None,
+                ..
+            }
+        ),
+        "the app's own close is never retryable: {closed:?}"
+    );
 }
 
 #[tokio::test]
