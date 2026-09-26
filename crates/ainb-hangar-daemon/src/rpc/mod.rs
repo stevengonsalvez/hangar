@@ -14283,7 +14283,8 @@ mod tests {
     }
 
     /// F-1: a prompt fenced on a lifecycle clock the session has moved past
-    /// is refused `turn_advanced` and writes nothing; the current clock sends.
+    /// is refused `turn_advanced` and writes nothing; a retry under the same
+    /// request_id with the current clock sends.
     #[tokio::test]
     async fn a_stale_lifecycle_fence_refuses_the_prompt_and_a_current_one_sends() {
         let (_home, store) = fenced_session_store().await;
@@ -14307,16 +14308,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0, "a refused send persists nothing");
-        // The refusal is this op id's answer: a retry replays the same reason.
-        let replay = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 5)).await;
-        assert_eq!(
-            rejection_reason(&replay).as_deref(),
-            Some(ainb_hangar_proto::mutation::REASON_TURN_ADVANCED),
-            "{replay:?}"
-        );
+        // A fence refusal is NOT this op id's answer: the fingerprint strips
+        // the fence, so the phone re-reads the clock and retries under the
+        // SAME request_id, and that retry sends.
+        let retried = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 10)).await;
+        assert!(retried.error.is_none(), "{:?}", retried.error);
 
-        let current = call(&store, methods::FLEET_MESSAGE_SEND, send("req-current", 10)).await;
-        assert!(current.error.is_none(), "{:?}", current.error);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the retry delivered exactly once");
     }
 
     /// F-1: a fenced send names one session, and the fence kind must be the
@@ -14389,7 +14391,9 @@ mod tests {
         .unwrap();
         assert_eq!(receipts, 0, "a refused action claims no receipt");
 
-        let same = call(&store, methods::FLEET_ACTION, action("req-same", "proc-a")).await;
+        // The same request_id with the fence re-read passes the fence: the
+        // refusal was not recorded as that op id's answer.
+        let same = call(&store, methods::FLEET_ACTION, action("req-other", "proc-a")).await;
         assert_ne!(
             rejection_reason(&same).as_deref(),
             Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
