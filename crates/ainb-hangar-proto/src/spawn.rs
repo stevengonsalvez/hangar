@@ -15,8 +15,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The agent CLI a new session runs. Mirrors `ainb run --tool`.
+/// The agent CLI a new session runs. Mirrors `ainb run --tool`. The one
+/// list of agents: the desktop's command takes it and its TypeScript is
+/// generated from it, so no surface keeps a copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
 pub enum SpawnAgent {
     /// Claude Code.
@@ -45,7 +48,7 @@ impl SpawnAgent {
     }
 }
 
-/// Longest accepted `name`, `branch` or `base` value, in bytes.
+/// Longest accepted `model`, `branch` or `base` value, in bytes.
 pub const SPAWN_FIELD_MAX: usize = 200;
 
 /// Longest accepted first prompt, in bytes.
@@ -74,9 +77,6 @@ pub struct WorktreeCreateParams {
     /// Start the agent with its permission prompts skipped.
     #[serde(default)]
     pub skip_permissions: bool,
-    /// Tmux session name. Absent: `<workspace>-<id8>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
     /// The D18 mutation envelope, flattened so the wire object stays
     /// `{ ..fields.., op_id?, fence? }`. Unused while the method is dark.
     #[serde(flatten)]
@@ -121,9 +121,6 @@ impl WorktreeCreateParams {
             return Err(SpawnParamsError::RepoPathNotAbsolute);
         }
         text_ok("repo_path", &self.repo_path, 4096)?;
-        if let Some(name) = &self.name {
-            text_ok("name", name, SPAWN_FIELD_MAX)?;
-        }
         if let Some(model) = &self.model {
             text_ok("model", model, SPAWN_FIELD_MAX)?;
         }
@@ -192,6 +189,9 @@ pub struct WorktreeCreateResult {
     /// The id ainb minted for a Claude launch (`claude --session-id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_session_id: Option<String>,
+    /// The model the agent was launched with, when one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[cfg(test)]
@@ -207,7 +207,6 @@ mod tests {
             model: None,
             prompt: Some("fix the login bug".into()),
             skip_permissions: false,
-            name: None,
             mutation: crate::mutation::MutationEnvelope::default(),
         }
     }
@@ -252,11 +251,6 @@ mod tests {
 
     #[test]
     fn control_characters_and_oversize_fields_are_refused() {
-        let p = WorktreeCreateParams {
-            name: Some("a\nb".into()),
-            ..params()
-        };
-        assert_eq!(p.validate(), Err(SpawnParamsError::BadField("name")));
         let p = WorktreeCreateParams {
             model: Some("m".repeat(SPAWN_FIELD_MAX + 1)),
             ..params()
