@@ -40,6 +40,7 @@ import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar
 import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
   accelerator,
+  keyboardTaken,
   openRowIntent,
   rowOf,
   stepTab,
@@ -138,16 +139,18 @@ function Shell() {
 
   /**
    * Give the keyboard to `key`'s terminal, on the next frame so a tab that
-   * was just listed has mounted. Not while the palette is open: the host
-   * answers a tab open on its own schedule, and an accelerator lands whenever
-   * it is pressed, so either can arrive after the chord that opened the
-   * palette. Focus taken then leaves the palette up with its keystrokes,
-   * Escape among them, going to the agent's pane (#47). The palette gives the
-   * keyboard back to the active tab when it closes.
+   * was just listed has mounted. Not while the palette is open, and not
+   * while another text field has the keyboard (the answer banner's composer,
+   * the settings search): the host answers a tab open on its own schedule,
+   * and an accelerator lands whenever it is pressed, so either can arrive
+   * after the chord that opened the palette or the click that put the cursor
+   * in the composer. Focus taken then sends the keystrokes meant for that
+   * field, Escape among them, to the agent's pane (#47). The palette gives
+   * the keyboard back to the active tab when it closes.
    */
   const focusTab = (key: string) =>
     requestAnimationFrame(() => {
-      if (!palette()) focusers.get(key)?.();
+      if (!palette() && !keyboardTaken(document.activeElement)) focusers.get(key)?.();
     });
   const activate = (key: string | null) => {
     setActive(key);
