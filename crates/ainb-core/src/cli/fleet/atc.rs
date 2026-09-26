@@ -2754,7 +2754,6 @@ This is ATC's durable, human-readable memory. Append one dated line per action\n
     )
 }
 
-
 /// The hangar home a hook script resolves: `$AINB_HANGAR_HOME`, else
 /// `$AINB_HOME`, else `~/.agents-in-a-box` (the same order `ainb-hook.sh`
 /// applies).
@@ -2775,9 +2774,7 @@ fn hook_hangar_home() -> Option<std::path::PathBuf> {
 fn install_http_hooks() -> anyhow::Result<()> {
     let home = dirs::home_dir().context("no home directory")?;
     let hangar_home = hook_hangar_home().context("no hangar home")?;
-    let endpoint = hangar_home
-        .join("hangar")
-        .join(ainb_hangar_proto::hooks::ENDPOINT_FILE_NAME);
+    let endpoint = hangar_home.join("hangar").join(ainb_hangar_proto::hooks::ENDPOINT_FILE_NAME);
     let text = std::fs::read_to_string(&endpoint).with_context(|| {
         format!(
             "the hangar daemon is not publishing a hook endpoint at {}; start it with AINB_HANGAR_HOOK_LISTEN=1",
