@@ -59,7 +59,7 @@ test("an answer made elsewhere while backgrounded retires the row on foreground"
   });
   await screen.findByTestId("banner-att-1");
   await act(() => onAppState(fake, "background"));
-  fake.answeredElsewhere(FAKE_HOST_A, "att-1", "desktop@mbp");
+  fake.answeredElsewhere(FAKE_HOST_A, "att-1", "desktop@laptop");
   await act(() => onAppState(fake, "active"));
   expect(screen.queryByTestId("banner-att-1")).toBeNull();
 });
