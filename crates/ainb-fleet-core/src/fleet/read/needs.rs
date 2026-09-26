@@ -388,6 +388,7 @@ mod tests {
     fn mk_session(cwd: &str) -> Session {
         Session {
             id: "test".to_string(),
+            provider_session_id: None,
             cwd: cwd.to_string(),
             pid: None,
             git_root: None,
@@ -779,6 +780,7 @@ mod wait_marker_tests {
     fn session_with_summary(summary: &str) -> Session {
         Session {
             id: "s1".into(),
+            provider_session_id: None,
             cwd: "/w/s1".into(),
             pid: None,
             git_root: None,
