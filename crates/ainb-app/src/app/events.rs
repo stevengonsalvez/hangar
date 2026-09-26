@@ -1637,11 +1637,7 @@ impl EventHandler {
                     tracing::warn!("command `{id}` refused: {why}");
                     return None;
                 }
-                let host_authored = crate::app::reports::ids::ALL.contains(&id.as_str())
-                    || crate::app::plugin_action::ids::ALL.contains(&id.as_str());
-                if !host_authored
-                    && !crate::app::keymap::command_contexts(state).contains(&binding.ctx)
-                {
+                if !crate::app::keymap::command_on_screen(state, &id, &binding.ctx) {
                     tracing::warn!("command `{id}` is not active on this screen");
                     return None;
                 }
