@@ -5,3 +5,4 @@ android/
 ios/
 dist/
 *.log
+bundle.generated.ts
