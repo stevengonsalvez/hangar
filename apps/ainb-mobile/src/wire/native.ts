@@ -5,7 +5,8 @@
 // interface the screens use. Every record is mapped here, one function per
 // record, so nothing outside src/wire/ reads a wire shape and the app keeps
 // no copy of the crate's meaning: latch strings come from `latchValues()`,
-// the redial verdict from `Closed { retryable, retry_after_ms }`.
+// the redial verdict from `Closed { retryable, retry_after_ms }`, transcript
+// text and role from the crate's own decoding. The app parses no JSON.
 //
 // The generated module is loaded lazily through `loadBindings` so a build
 // without it fails at first use with one clear message, not at import.
@@ -105,6 +106,18 @@ export interface NativeMutationReceipt {
   receipt?: string;
 }
 
+/** `TranscriptChunkRecord`: `role` and `text` are decoded by the crate. */
+export interface NativeTranscriptChunk {
+  ingestOrder: bigint | number;
+  eventId: string;
+  sessionKey: string;
+  eventType: string;
+  role: string;
+  text?: string;
+  payload: string;
+  observedAt: bigint | number;
+}
+
 export interface NativeMobileHost {
   hello(): NativeHelloSummary;
   advertises(capability: string): boolean;
@@ -115,6 +128,7 @@ export interface NativeMobileHost {
     replayComplete: boolean;
     resetReason?: string;
   }>;
+  attentionList(): Promise<NativeAttentionRecord[]>;
   subscribeAttention(): Promise<NativeAttentionRecord[]>;
   answer(attentionId: string, answer: string, version: bigint | number, opId: string): Promise<{
     opId: string;
@@ -132,7 +146,7 @@ export interface NativeMobileHost {
     ack?: NativeMutationReceipt;
   }>;
   transcriptPage(sessionKey: string, afterOrder: bigint | number | undefined, limit: number): Promise<{
-    chunks: { ingestOrder: bigint | number; eventId: string; sessionKey: string; eventType: string; payload: string; observedAt: bigint | number }[];
+    chunks: NativeTranscriptChunk[];
     nextAfterOrder?: bigint | number;
     truncated: boolean;
   }>;
@@ -201,6 +215,26 @@ export const num = (v: bigint | number | undefined): number | undefined =>
 const n0 = (v: bigint | number): number => Number(v);
 const bytes = (b: ArrayBuffer | Uint8Array): Uint8Array => (b instanceof Uint8Array ? b : new Uint8Array(b));
 
+/** The D18 codes a mutation answers with instead of a result. */
+export const MUTATION_REJECTED = -32008;
+export const MUTATION_UNKNOWN = -32009;
+
+/**
+ * A thrown `Rpc` error that is really a mutation verdict: `-32008` with its
+ * `reason` is the ledger rejecting (turn advanced, already answered, floor
+ * denied ...), `-32009` is the ledger unable to say. Both are outcomes the
+ * app renders, never throws.
+ */
+export function mutationVerdict(e: unknown): MutationAck | undefined {
+  const err = e as { tag?: string; inner?: { code?: number | bigint; reason?: string; message?: string } };
+  if (err?.tag !== "Rpc") return undefined;
+  const code = Number(err.inner?.code);
+  const reason = err.inner?.reason ?? err.inner?.message;
+  if (code === MUTATION_REJECTED) return { status: "rejected", reason };
+  if (code === MUTATION_UNKNOWN) return { status: "unknown", reason };
+  return undefined;
+}
+
 /** The crate's `WireError` (a thrown uniffi error) as a `PeerCloseError`, one to one. */
 export function toPeerCloseError(e: unknown): PeerCloseError {
   const err = e as { tag?: string; inner?: Record<string, unknown>; message?: string };
@@ -232,19 +266,24 @@ export function toPeerCloseError(e: unknown): PeerCloseError {
   });
 }
 
+type ScopeBase = NonNullable<HostRow["scope"]>["base"];
+
 export function toHostRow(r: NativePairingRecord, reachable: boolean, sinceMs?: number): HostRow {
   return {
     hostId: r.hostId,
     displayName: r.displayName,
     reachability: reachable ? "reachable" : "unreachable",
     sinceMs: reachable ? undefined : sinceMs,
-    scope: { base: r.scope as HostRow["scope"] extends infer S ? (S extends { base: infer B } ? B : never) : never, admin: r.admin },
+    scope: { base: r.scope as ScopeBase, admin: r.admin },
     repair: r.repair,
     notice: r.notice,
-  } as HostRow;
+  };
 }
 
-export function toSessionRow(hostId: HostId, r: NativeRosterRow): SessionRow {
+/** A session row plus the optimistic `version` the crate's `interrupt` fences on. */
+export type SessionRowWithVersion = SessionRow & { version: number };
+
+export function toSessionRow(hostId: HostId, r: NativeRosterRow): SessionRowWithVersion {
   return {
     hostId,
     sessionKey: r.sessionKey,
@@ -254,7 +293,8 @@ export function toSessionRow(hostId: HostId, r: NativeRosterRow): SessionRow {
     tier: r.tier,
     lifecycleUpdatedAt: n0(r.lifecycleUpdatedAt),
     sessionIncarnation: r.processStartFingerprint ?? "",
-  } as SessionRow;
+    version: n0(r.version),
+  };
 }
 
 export function toAttentionRow(hostId: HostId, r: NativeAttentionRecord): AttentionRow {
@@ -322,6 +362,8 @@ export function toResizeOutcome(t: Tagged): TerminalResizeOutcome {
   return { outcome: "unknown" };
 }
 
+type GapReason = Extract<TerminalFrame, { kind: "data_gap" }>["reason"];
+
 export function toTerminalFrame(t: Tagged): TerminalFrame {
   const inner = (t.inner ?? {}) as Record<string, unknown>;
   switch (t.tag) {
@@ -336,7 +378,7 @@ export function toTerminalFrame(t: Tagged): TerminalFrame {
     case "Resize":
       return { kind: "resize", cols: Number(inner.cols), rows: Number(inner.rows) };
     case "DataGap":
-      return { kind: "data_gap", reason: String(inner.reason) as TerminalFrame extends { kind: "data_gap"; reason: infer R } ? R : never, droppedBytes: num(inner.droppedBytes as bigint | number | undefined) } as TerminalFrame;
+      return { kind: "data_gap", reason: String(inner.reason) as GapReason, droppedBytes: num(inner.droppedBytes as bigint | number | undefined) };
     case "Floor":
       return { kind: "floor", holder: toHolder(inner.holder as { principal: string; label: string; streamId: bigint | number } | undefined), floorGen: Number(inner.floorGen) };
     case "Presence":
@@ -348,22 +390,17 @@ export function toTerminalFrame(t: Tagged): TerminalFrame {
   }
 }
 
-/** One decoded transcript chunk as a transcript entry; the role is the ACP kind's last segment. */
-export function toTranscriptEntry(c: { ingestOrder: bigint | number; eventType: string; payload: string; observedAt: bigint | number }): TranscriptEntry {
-  const kind = c.eventType.split(".").pop() ?? "";
-  const role: TranscriptEntry["role"] = kind.includes("user") ? "user" : kind.includes("tool") ? "tool" : kind.includes("agent") ? "agent" : "system";
-  let text = c.payload;
-  try {
-    const p = JSON.parse(c.payload) as Record<string, unknown>;
-    const candidate = p.text ?? p.content ?? p.message;
-    if (typeof candidate === "string") text = candidate;
-  } catch {
-    // The chunk body is shown as it came.
-  }
-  return { seq: n0(c.ingestOrder), role, text, atMs: n0(c.observedAt) };
+/** One chunk as the crate decoded it: no JSON is parsed here. */
+export function toTranscriptEntry(c: NativeTranscriptChunk): TranscriptEntry {
+  const role = (["user", "agent", "tool", "system"] as const).find((r) => r === c.role) ?? "system";
+  return { seq: n0(c.ingestOrder), role, text: c.text ?? c.eventType, atMs: n0(c.observedAt) };
 }
 
-/** A crate `WireEvent` (from `nextEvent`) as an app event, or `undefined` for one the app ignores. */
+/**
+ * A crate `WireEvent` (from `nextEvent`) as an app event, or `undefined` for
+ * one the app ignores. `AttentionRaised` is not mapped here: the crate's
+ * nudge carries no version, so the pump fetches the real row instead.
+ */
 export function toWireEvent(hostId: HostId, t: Tagged): WireEvent | undefined {
   const inner = (t.inner ?? {}) as Record<string, unknown>;
   switch (t.tag) {
@@ -371,23 +408,12 @@ export function toWireEvent(hostId: HostId, t: Tagged): WireEvent | undefined {
       return { kind: "fleet_revision", hostId, revision: Number((inner.event as { revision: bigint | number }).revision) };
     case "FleetResyncRequired":
       return { kind: "fleet_resync_required", hostId };
-    case "AttentionRaised":
-      return {
-        kind: "attention_raised",
-        row: {
-          hostId,
-          id: String(inner.attentionId),
-          sessionId: String(inner.sessionId),
-          kind: String(inner.kind),
-          version: 0,
-          createdAt: Number(inner.createdAt),
-          payload: {},
-        },
-      };
     case "AttentionAnswered":
       return { kind: "attention_answered", hostId, attentionId: String(inner.attentionId), by: String(inner.by) };
-    case "TranscriptChunk":
-      return { kind: "transcript_line", hostId, sessionKey: String((inner.chunk as { sessionKey: string }).sessionKey), entry: toTranscriptEntry(inner.chunk as Parameters<typeof toTranscriptEntry>[0]) };
+    case "TranscriptChunk": {
+      const chunk = inner.chunk as NativeTranscriptChunk;
+      return { kind: "transcript_line", hostId, sessionKey: chunk.sessionKey, entry: toTranscriptEntry(chunk) };
+    }
     case "TerminalFrame":
       return { kind: "terminal_frame", hostId, streamId: Number(inner.streamId), seq: Number(inner.seq), frame: toTerminalFrame(inner.frame as Tagged) };
     case "Lagged":
@@ -423,12 +449,17 @@ interface Live {
   pumping: boolean;
 }
 
+/** The page the transcript screen asks for. */
+export const TRANSCRIPT_PAGE = 200;
+
 /** `WireClient` over the linked `ainb-wire-mobile` binding. */
 export class NativeWire implements WireClient {
   private readonly b: Bindings;
   private readonly custodyDir: string;
   private readonly logDir: string;
   private readonly live = new Map<HostId, Live>();
+  /** A dial in flight per host: concurrent `connect` callers share it. */
+  private readonly dialing = new Map<HostId, Promise<void>>();
   private readonly lastSeen = new Map<HostId, number>();
   private readonly listeners = new Set<(ev: WireEvent) => void>();
   private readonly transcriptTaps = new Map<string, Set<(entry: TranscriptEntry) => void>>();
@@ -452,7 +483,13 @@ export class NativeWire implements WireClient {
     return l.host;
   }
 
-  /** Pull the crate's events for one host until it closes; every one is pushed to the listeners. */
+  /**
+   * Pull the crate's events for one host until it closes; every one is
+   * pushed to the listeners. A raised attention row is fetched whole so the
+   * banner carries its real `version`. A pull that fails is a broken loop,
+   * not a network loss: the close it reports is not retryable, the app
+   * reconnects deliberately.
+   */
   private async pump(hostId: HostId, l: Live) {
     if (l.pumping) return;
     l.pumping = true;
@@ -461,8 +498,19 @@ export class NativeWire implements WireClient {
       try {
         ev = await l.host.nextEvent();
       } catch (e) {
-        this.emit({ kind: "closed", hostId, reason: String(e), retryable: true });
+        this.emit({ kind: "closed", hostId, reason: `event loop failed: ${String(e)}`, retryable: false });
         break;
+      }
+      if (ev.tag === "AttentionRaised") {
+        const id = String((ev.inner ?? {}).attentionId);
+        try {
+          const row = (await l.host.attentionList()).find((r) => r.id === id);
+          // A row already answered by the time we look is not news.
+          if (row) this.emit({ kind: "attention_raised", row: toAttentionRow(hostId, row) });
+        } catch {
+          // The list read failed; the next subscribeAttention snapshot carries the row.
+        }
+        continue;
       }
       const mapped = toWireEvent(hostId, ev);
       if (mapped) this.emit(mapped);
@@ -492,7 +540,7 @@ export class NativeWire implements WireClient {
   async pair(uri: string, displayName: string): Promise<PairedHost> {
     try {
       const r = await this.b.pair(uri, displayName, this.custodyDir, this.logDir);
-      return { hostId: r.hostId, deviceId: r.deviceId, scope: { base: r.scope as PairedHost["scope"]["base"], admin: r.admin } };
+      return { hostId: r.hostId, deviceId: r.deviceId, scope: { base: r.scope as ScopeBase, admin: r.admin } };
     } catch (e) {
       throw toPeerCloseError(e);
     }
@@ -503,19 +551,30 @@ export class NativeWire implements WireClient {
     this.b.forgetPairing(this.custodyDir, hostId);
   }
 
+  /** One socket per host: a connect while a dial is in flight joins that dial. */
   async connect(hostId: HostId): Promise<void> {
     const existing = this.live.get(hostId);
     if (existing && !existing.host.isClosed()) return;
-    let host: NativeMobileHost;
+    const inFlight = this.dialing.get(hostId);
+    if (inFlight) return inFlight;
+    const dial = (async () => {
+      let host: NativeMobileHost;
+      try {
+        host = await this.b.connectHost({ hostId, custodyDir: this.custodyDir, logDir: this.logDir });
+      } catch (e) {
+        this.lastSeen.set(hostId, Date.now());
+        throw toPeerCloseError(e);
+      }
+      const l: Live = { host, pumping: false };
+      this.live.set(hostId, l);
+      void this.pump(hostId, l);
+    })();
+    this.dialing.set(hostId, dial);
     try {
-      host = await this.b.connectHost({ hostId, custodyDir: this.custodyDir, logDir: this.logDir });
-    } catch (e) {
-      this.lastSeen.set(hostId, Date.now());
-      throw toPeerCloseError(e);
+      await dial;
+    } finally {
+      this.dialing.delete(hostId);
     }
-    const l: Live = { host, pumping: false };
-    this.live.set(hostId, l);
-    void this.pump(hostId, l);
   }
 
   async close(hostId: HostId): Promise<void> {
@@ -526,16 +585,23 @@ export class NativeWire implements WireClient {
 
   async hostInfo(hostId: HostId): Promise<HostInfo> {
     const h = this.hostOf(hostId).hello();
-    return { scope: h.scope ? { base: h.scope as HostInfo["scope"] extends infer S ? (S extends { base: infer B } ? B : never) : never, admin: h.admin } as HostInfo["scope"] : undefined, capabilities: h.capabilities };
+    return { scope: h.scope ? { base: h.scope as ScopeBase, admin: h.admin } : undefined, capabilities: h.capabilities };
   }
 
-  async rosterStatus(hostId: HostId): Promise<SessionRow[]> {
+  async rosterStatus(hostId: HostId): Promise<SessionRowWithVersion[]> {
     const r = await this.hostOf(hostId).rosterStatus();
     return r.rows.map((row) => toSessionRow(hostId, row));
   }
 
+  /**
+   * No `afterRevision` is the first connect: it asks for the snapshot, that
+   * is the roster's `read_revision` as the cursor, so nothing is replayed
+   * from 0. With a cursor, the daemon replays from it.
+   */
   async subscribeFleet(hostId: HostId, afterRevision?: number): Promise<FleetCursor> {
-    const r = await this.hostOf(hostId).subscribeFleet(afterRevision ?? 0);
+    const host = this.hostOf(hostId);
+    const from = afterRevision ?? n0((await host.rosterStatus()).readRevision);
+    const r = await host.subscribeFleet(from);
     return { revision: n0(r.headRevision), replayState: r.replayComplete ? "complete" : "snapshot_reset" };
   }
 
@@ -549,27 +615,65 @@ export class NativeWire implements WireClient {
   }
 
   async answer(req: { hostId: HostId; attentionId: string; answer: string; version: number; opId: string }) {
-    const r = await this.hostOf(req.hostId).answer(req.attentionId, req.answer, req.version, req.opId);
-    return { outcome: toAnswerOutcome(r.outcome), ack: toAck(r.ack) };
+    try {
+      const r = await this.hostOf(req.hostId).answer(req.attentionId, req.answer, req.version, req.opId);
+      return { outcome: toAnswerOutcome(r.outcome), ack: toAck(r.ack) };
+    } catch (e) {
+      const verdict = mutationVerdict(e);
+      if (!verdict) throw toPeerCloseError(e);
+      const outcome: AnswerOutcome =
+        verdict.status === "rejected"
+          ? { kind: "rejected", reason: verdict.reason ?? "" }
+          : { kind: "unknown", reason: verdict.reason ?? "" };
+      return { outcome, ack: verdict };
+    }
   }
 
   async sendPrompt(req: { hostId: HostId; sessionKey: SessionKey; text: string; lifecycleUpdatedAt: number; opId: string }): Promise<MutationAck> {
-    const r = await this.hostOf(req.hostId).sendPrompt(req.sessionKey, req.text, req.lifecycleUpdatedAt, req.opId);
-    return toAck(r.ack) ?? { status: "accepted" };
+    try {
+      const r = await this.hostOf(req.hostId).sendPrompt(req.sessionKey, req.text, req.lifecycleUpdatedAt, req.opId);
+      return toAck(r.ack) ?? { status: "accepted" };
+    } catch (e) {
+      const verdict = mutationVerdict(e);
+      if (!verdict) throw toPeerCloseError(e);
+      return verdict;
+    }
   }
 
-  async interrupt(req: { hostId: HostId; sessionKey: SessionKey; sessionIncarnation: string; opId: string }): Promise<MutationAck> {
-    // The row's optimistic version rides with the roster; the crate's
-    // interrupt takes it explicitly, so the adapter reads it back first.
-    const rows = await this.hostOf(req.hostId).rosterStatus();
-    const row = rows.rows.find((r) => r.sessionKey === req.sessionKey);
-    const r = await this.hostOf(req.hostId).interrupt(req.sessionKey, row ? row.version : 0, req.sessionIncarnation, req.opId);
-    return toAck(r.ack) ?? { status: "accepted" };
+  /** `fleet/action { interrupt }` fenced on the row the user saw: its `version` and incarnation. */
+  async interrupt(req: { hostId: HostId; sessionKey: SessionKey; sessionIncarnation: string; version: number; opId: string }): Promise<MutationAck> {
+    try {
+      const r = await this.hostOf(req.hostId).interrupt(req.sessionKey, req.version, req.sessionIncarnation, req.opId);
+      return toAck(r.ack) ?? { status: "accepted" };
+    } catch (e) {
+      const verdict = mutationVerdict(e);
+      if (!verdict) throw toPeerCloseError(e);
+      return verdict;
+    }
   }
 
+  /**
+   * Without `beforeSeq`: the newest page. With it: the page of entries older
+   * than `beforeSeq`, ascending. The wire pages forward only (`after_order`),
+   * so the older page is read from a window below `beforeSeq` and cut.
+   * ponytail: a `before_order` cursor on `fleet/transcript_list` would make
+   * this one call; until then a sparse `ingest_order` (it is global across
+   * sessions) can return a short page, which the screen treats as "older
+   * rows may exist" by asking again with a smaller `beforeSeq`.
+   */
   async transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]> {
-    const page = await this.hostOf(hostId).transcriptPage(sessionKey, beforeSeq, 200);
-    return page.chunks.map(toTranscriptEntry);
+    const host = this.hostOf(hostId);
+    if (beforeSeq === undefined) {
+      const tail = await host.transcriptPage(sessionKey, undefined, TRANSCRIPT_PAGE);
+      return tail.chunks.map(toTranscriptEntry);
+    }
+    const window = 4 * TRANSCRIPT_PAGE;
+    const after = Math.max(0, beforeSeq - 1 - window);
+    const page = await host.transcriptPage(sessionKey, after, window);
+    return page.chunks
+      .map(toTranscriptEntry)
+      .filter((e) => e.seq < beforeSeq)
+      .slice(-TRANSCRIPT_PAGE);
   }
 
   subscribeTranscript(hostId: HostId, sessionKey: SessionKey, cb: (entry: TranscriptEntry) => void): Unsubscribe {
@@ -593,8 +697,9 @@ export class NativeWire implements WireClient {
     await this.hostOf(hostId).terminalDetach(streamId);
   }
 
-  async terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string }): Promise<{ floorGen: number } | FloorDenied> {
-    const t = await this.hostOf(req.hostId).terminalInput(req.streamId, new TextEncoder().encode(req.data), req.floorGen, this.b.mintOpId());
+  /** Receipt tier: `opId` is the app's, minted before the first send and reused on a retry. */
+  async terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string; opId: string }): Promise<{ floorGen: number } | FloorDenied> {
+    const t = await this.hostOf(req.hostId).terminalInput(req.streamId, new TextEncoder().encode(req.data), req.floorGen, req.opId);
     return toFloorDenied(t) ?? { floorGen: Number(((t.inner ?? {}) as { floorGen: bigint | number }).floorGen) };
   }
 
@@ -602,8 +707,9 @@ export class NativeWire implements WireClient {
     return toResizeOutcome(await this.hostOf(req.hostId).terminalResize(req.streamId, req.cols, req.rows));
   }
 
-  async terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied> {
-    const t = await this.hostOf(req.hostId).terminalFloor(req.streamId, req.action, this.b.mintOpId());
+  /** Dedupe tier: `opId` is the app's, reused on a retry. */
+  async terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take"; opId: string }): Promise<FloorState | FloorDenied> {
+    const t = await this.hostOf(req.hostId).terminalFloor(req.streamId, req.action, req.opId);
     return toFloorDenied(t) ?? toFloorState(((t.inner ?? {}) as { floor: Parameters<typeof toFloorState>[0] }).floor);
   }
 
