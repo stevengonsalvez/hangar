@@ -50,23 +50,58 @@ test("a mobile scope is read only: no toggle, no key bar, keys never reach the w
   expect(fake.inputs).toEqual([]);
 });
 
-test("mobile+type: the toggle acquires the floor, keys go out under its generation, a taken floor is denied and take-over wins it back", async () => {
+const tick = () => act(async () => void jest.advanceTimersByTime(20));
+
+test("mobile+type: the toggle acquires the floor and resizes to the phone's fit; keys batch per frame under the floor generation; a taken floor blocks keys locally; take-over wins it back", async () => {
   fake.info = { scope: { base: "mobile+type", admin: false }, capabilities: ["terminal.stream", "terminal.input"] };
   const screen = await openTerminal();
+  await act(async () => bridge.engineMessage!(encode({ t: "fit", cols: 40, rows: 20 })));
+  expect(await screen.findByText("80x24")).toBeTruthy(); // not the holder yet: no resize
   fireEvent.press(await screen.findByTestId("type-toggle"));
   await screen.findByText("typing");
-  fireEvent.press(await screen.findByTestId("key-esc"));
-  await waitFor(() => expect(fake.inputs).toEqual([{ streamId: 1, floorGen: 1, data: "\x1b" }]));
+  expect(await screen.findByText("40x20")).toBeTruthy(); // floor granted, geometry followed
+
+  fireEvent.press(screen.getByTestId("key-esc"));
+  fireEvent.press(screen.getByTestId("key-tab"));
+  expect(fake.inputs).toEqual([]);
+  await tick();
+  await waitFor(() => expect(fake.inputs).toEqual([{ streamId: 1, floorGen: 1, data: "\x1b\t" }]));
 
   await act(async () => fake.floorTakenBy("claude:hangar", "desktop"));
   fireEvent.press(screen.getByTestId("key-tab"));
+  await tick();
   expect(await screen.findByText("desktop has the floor")).toBeTruthy();
-  expect(fake.inputs.at(-1)).toEqual({ streamId: 1, floorGen: undefined, data: "\t" });
+  expect(fake.inputs).toHaveLength(1); // nothing left the phone without the floor
 
   fireEvent.press(screen.getByTestId("take-over"));
   await waitFor(() => expect(screen.queryByTestId("floor-denied")).toBeNull());
   fireEvent.press(screen.getByTestId("key-tab"));
+  await tick();
   await waitFor(() => expect(fake.inputs.at(-1)).toEqual({ streamId: 1, floorGen: 3, data: "\t" }));
+});
+
+test("a snapshot that lands before the engine is ready is painted once it is", async () => {
+  const screen = renderRouter("./app", { initialUrl: URL });
+  await screen.findAllByText(/Which runner/);
+  fireEvent.press(screen.getByTestId("tab-terminal"));
+  await screen.findByTestId("terminal");
+  let frames = 0;
+  const off = fake.onEvent((ev) => ev.kind === "terminal_frame" && frames++);
+  await waitFor(() => expect(frames).toBeGreaterThanOrEqual(3)); // the snapshot has been sent
+  expect(sinkCalls()).toEqual([]); // and queued: the engine has not said ready
+  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
+  expect(sinkCalls()).toEqual(["clear", `write:${FIXTURES["f1-altscreen"].length}`]);
+  off();
+});
+
+test("background detaches and foreground re-attaches a fresh stream", async () => {
+  const screen = await openTerminal();
+  await waitFor(() => expect(sinkCalls()).toHaveLength(2));
+  await act(() => onAppState(fake, "background"));
+  expect(fake.detached).toEqual([1]);
+  await act(() => onAppState(fake, "active"));
+  await waitFor(() => expect(sinkCalls()).toHaveLength(4)); // a second clear + snapshot
+  expect(await screen.findByText("80x24")).toBeTruthy();
 });
 
 test("a data gap clears the screen and the fresh snapshot follows", async () => {
