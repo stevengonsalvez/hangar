@@ -35,7 +35,7 @@
 //! (`answer_acp`) with the same first-answer-wins claim and no tmux at all.
 
 use ainb_fleet_core::discover::{discover_from_ainb, discover_from_peers, merge_sessions};
-use ainb_fleet_core::send::{PaneHint, resolve_send_target, send};
+use ainb_fleet_core::send::{PaneHint, resolve_send_pane, send};
 use ainb_fleet_core::types::{SendOutcome, Session};
 use ainb_hangar_proto::connections::ConnectionRow;
 use ainb_hangar_proto::events::HangarEvent;
@@ -1165,7 +1165,7 @@ async fn pane_hint(pool: &SqlitePool, session_id: &str) -> (PaneHint, Option<Str
 /// last used, not the agent's. The fleet row the hook registered under the
 /// agent's session id carries the pane's fingerprint, whose id tmux never
 /// renumbers, and the index target it was observed at, which tmux does
-/// renumber when a lower pane closes; [`resolve_send_target`] takes the id
+/// renumber when a lower pane closes; [`resolve_send_pane`] takes the id
 /// first. A row that names no pane, or a store that could not be asked, is
 /// typed into only while the session has exactly one pane.
 ///
@@ -1197,11 +1197,14 @@ async fn with_exact_pane(
     if let Some(error) = &lookup_failed {
         tracing::warn!(%error, "the hook's pane could not be looked up; only a single-pane session is typed into");
     }
-    match resolve_send_target(&name, &hint).await {
-        Ok(pane) => {
+    match resolve_send_pane(&name, &hint).await {
+        Ok(Some(pane)) => {
             session.tmux_session = Some(pane);
             Ok(session)
         }
+        // No tmux session by that name at all: nothing to narrow, and the
+        // route decides between a refusal and a broker peer.
+        Ok(None) => Ok(session),
         Err(reason) => Err(match lookup_failed {
             Some(error) => format!("the agent's pane could not be looked up ({error}); {reason}"),
             None => reason,
