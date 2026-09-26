@@ -11,7 +11,7 @@
 //! the one outcome R2 must never cause).
 //!
 //! ```text
-//! feed ──push_output(seq, bytes)──▶ pending ──take_ready()──▶ writer ──▶ socket
+//! feed ──push_output(seq, bytes)──▶ pending ──take_ready(usize::MAX)──▶ writer ──▶ socket
 //!                                     │  ▲                      │
 //!            cap hit: drop, DataGap ──┘  │    ack(consumed) ◀───┘ client
 //!            needs_snapshot ──▶ daemon ──push_snapshot()
@@ -22,10 +22,20 @@
 //! snapshot frames included; a value lower than one already seen is ignored,
 //! which makes a retried ack idempotent. Control frames (`resize`, `floor`,
 //! `presence`, `closed`, `data_gap`) carry no payload and never wait for
-//! credit, so a floor change reaches a stalled viewer.
+//! credit. They keep their place in the order, so behind unsent output
+//! they wait with it; to keep a stalled viewer's memory bounded, a new
+//! `floor`, `presence`, `resize` or `data_gap` REPLACES any unsent one of
+//! the same kind (the latest state is all the client needs), so at most
+//! four control frames plus one `closed` ever wait.
 //!
-//! `seq` is the pane-feed offset at emit time (T16); the caller supplies it,
-//! this queue only carries it.
+//! `seq` is the pane-feed offset at emit time (T16): each `output` chunk
+//! carries the offset of ITS first byte, every frame of one snapshot
+//! carries the offset N the snapshot was taken at. The caller supplies the
+//! offset of a push, this queue adds the chunk offsets.
+//!
+//! The writer takes with [`ViewerQueue::take_ready`]`(max_frames)` no more
+//! than its channel can accept, because a taken frame is counted as sent
+//! and cannot be returned.
 
 use std::collections::VecDeque;
 
@@ -113,6 +123,17 @@ impl Frame {
             _ => 0,
         }
     }
+
+    /// The kind a later frame of the same kind supersedes while unsent.
+    const fn coalesce_key(&self) -> Option<u8> {
+        match self {
+            Self::Resize { .. } => Some(0),
+            Self::DataGap { .. } => Some(1),
+            Self::Floor { .. } => Some(2),
+            Self::Presence { .. } => Some(3),
+            _ => None,
+        }
+    }
 }
 
 /// A frame with the feed offset it was emitted at.
@@ -131,7 +152,8 @@ pub struct ViewerConfig {
     pub window_bytes: u64,
     /// Largest payload per frame.
     pub chunk_bytes: usize,
-    /// Payload bytes waiting for credit before the viewer is cut loose.
+    /// Payload bytes waiting BEYOND the credit before the viewer is cut
+    /// loose: what is pending minus what the next `take_ready` can send.
     pub max_pending_bytes: u64,
 }
 
@@ -176,9 +198,14 @@ impl Default for ViewerQueue {
 impl ViewerQueue {
     /// An empty queue that owes the viewer its first snapshot.
     pub fn new(cfg: ViewerConfig) -> Self {
+        let window_bytes = cfg.window_bytes.max(1);
+        // A chunk larger than the window could never fit the credit.
+        let chunk_bytes =
+            cfg.chunk_bytes.max(1).min(usize::try_from(window_bytes).unwrap_or(usize::MAX));
         Self {
             cfg: ViewerConfig {
-                chunk_bytes: cfg.chunk_bytes.max(1),
+                window_bytes,
+                chunk_bytes,
                 ..cfg
             },
             pending: VecDeque::new(),
@@ -243,8 +270,14 @@ impl ViewerQueue {
         }
     }
 
-    /// Live pane bytes at feed offset `seq`. Discarded while a gap is open.
-    /// Opens a `dropped` gap when the backlog would pass the cap.
+    /// Payload bytes pending beyond what the credit can send now.
+    pub const fn backlog(&self) -> u64 {
+        self.pending_bytes.saturating_sub(self.credit())
+    }
+
+    /// Live pane bytes starting at feed offset `seq`. Discarded while a gap
+    /// is open. Opens a `dropped` gap when the backlog (pending beyond the
+    /// credit) would pass the cap. Each chunk carries its own offset.
     pub fn push_output(&mut self, seq: u64, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -253,14 +286,16 @@ impl ViewerQueue {
             self.dropped_since_gap += bytes.len() as u64;
             return;
         }
-        if self.pending_bytes + bytes.len() as u64 > self.cfg.max_pending_bytes {
-            let discarded = self.discard_payload() + bytes.len() as u64;
+        let after = (self.pending_bytes + bytes.len() as u64).saturating_sub(self.credit());
+        if after > self.cfg.max_pending_bytes {
+            let discarded = self.discard_output() + bytes.len() as u64;
             self.open_gap(seq, GapReason::Dropped, Some(discarded));
             self.dropped_since_gap = discarded;
             return;
         }
-        for chunk in bytes.chunks(self.cfg.chunk_bytes) {
-            self.enqueue(seq, Frame::Output(chunk.to_vec()));
+        for (i, chunk) in bytes.chunks(self.cfg.chunk_bytes).enumerate() {
+            let offset = (i * self.cfg.chunk_bytes) as u64;
+            self.enqueue(seq + offset, Frame::Output(chunk.to_vec()));
         }
     }
 
@@ -268,7 +303,7 @@ impl ViewerQueue {
     /// `session_gone`. Pending output is discarded; a snapshot is owed
     /// unless the session is gone.
     pub fn gap(&mut self, seq: u64, reason: GapReason) {
-        let discarded = self.discard_payload();
+        let discarded = self.discard_output();
         self.open_gap(seq, reason, None);
         self.dropped_since_gap = discarded;
         if matches!(reason, GapReason::SessionGone) {
@@ -288,13 +323,22 @@ impl ViewerQueue {
         );
     }
 
-    /// Drop every payload frame still pending, keeping control frames in
-    /// order. Returns the payload bytes discarded.
-    fn discard_payload(&mut self) -> u64 {
-        let before = self.pending_bytes;
-        self.pending.retain(|s| s.frame.payload_len() == 0);
-        self.pending_bytes = 0;
-        before
+    /// Drop every `output` frame still pending, keeping control frames and
+    /// a snapshot in flight in order: a snapshot is the recovery and its
+    /// `snapshot_start{chunks}` promise must hold. Returns the output bytes
+    /// discarded.
+    fn discard_output(&mut self) -> u64 {
+        let mut discarded = 0;
+        self.pending.retain(|s| {
+            if let Frame::Output(data) = &s.frame {
+                discarded += data.len() as u64;
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_bytes -= discarded;
+        discarded
     }
 
     /// The snapshot taken at feed offset `seq`: closes the gap and resumes
@@ -321,23 +365,32 @@ impl ViewerQueue {
     }
 
     /// A control frame: `resize`, `floor`, `presence` or `closed`. Never
-    /// discarded and never waits for credit.
+    /// discarded and never waits for credit; a new `resize`, `floor` or
+    /// `presence` replaces any unsent one of the same kind.
     pub fn push_control(&mut self, seq: u64, frame: Frame) {
         debug_assert_eq!(frame.payload_len(), 0, "control frames carry no payload");
         self.enqueue(seq, frame);
     }
 
     fn enqueue(&mut self, seq: u64, frame: Frame) {
+        if let Some(key) = frame.coalesce_key() {
+            self.pending.retain(|s| s.frame.coalesce_key() != Some(key));
+        }
         self.pending_bytes += frame.payload_len();
         self.pending.push_back(Sequenced { seq, frame });
     }
 
-    /// Frames the writer may send now, in order: control frames always, a
-    /// payload frame only while it fits the credit. Stops at the first
-    /// payload frame that does not fit, so order is preserved.
-    pub fn take_ready(&mut self) -> Vec<Sequenced> {
+    /// Frames the writer may send now, in order, at most `max_frames` of
+    /// them: control frames always, a payload frame only while it fits the
+    /// credit. Stops at the first payload frame that does not fit, so order
+    /// is preserved. A taken frame is counted as sent, so take no more than
+    /// the outbound channel will accept.
+    pub fn take_ready(&mut self, max_frames: usize) -> Vec<Sequenced> {
         let mut out = Vec::new();
-        while let Some(front) = self.pending.front() {
+        while out.len() < max_frames {
+            let Some(front) = self.pending.front() else {
+                break;
+            };
             let len = front.frame.payload_len();
             if len > self.credit() {
                 break;
@@ -392,7 +445,7 @@ mod tests {
     #[test]
     fn a_fast_viewer_gets_every_byte_in_order_and_chunked() {
         let mut q = attached(small());
-        let first = q.take_ready();
+        let first = q.take_ready(usize::MAX);
         assert!(matches!(
             first.as_slice(),
             [
@@ -425,11 +478,14 @@ mod tests {
             q.push_output(seq, &bytes);
             seq += bytes.len() as u64;
             want.extend_from_slice(&bytes);
-            let ready = q.take_ready();
-            // Every frame respects the chunk size and carries its seq.
+            let ready = q.take_ready(usize::MAX);
+            // Every frame respects the chunk size and carries the offset
+            // of its own first byte.
+            let mut expect = seq - bytes.len() as u64;
             for s in &ready {
                 assert!(s.frame.payload_len() <= 2 * KIB as u64);
-                assert_eq!(s.seq, seq - bytes.len() as u64);
+                assert_eq!(s.seq, expect);
+                expect += s.frame.payload_len();
             }
             all.extend(ready);
             // A fast viewer acks everything it was sent.
@@ -445,7 +501,7 @@ mod tests {
     fn a_slow_viewer_is_cut_loose_with_dropped_then_gets_a_snapshot() {
         let cfg = small();
         let mut q = attached(cfg);
-        let opening = q.take_ready();
+        let opening = q.take_ready(usize::MAX);
         q.ack(sent_payload(&opening));
         // Never acks again: 8 KiB goes out on credit, 8 KiB queues, the
         // next byte trips the cap.
@@ -458,7 +514,7 @@ mod tests {
                 q.pending_bytes() <= cfg.max_pending_bytes,
                 "pending never passes the cap"
             );
-            sent.extend(q.take_ready());
+            sent.extend(q.take_ready(usize::MAX));
         }
         assert_eq!(seq, 17 * KIB as u64, "the 17th KiB opened the gap");
         assert_eq!(
@@ -488,7 +544,7 @@ mod tests {
         q.push_snapshot(seq + 5 * KIB as u64, 40, 20, 1, &[b's'; 3 * KIB]);
         assert!(!q.needs_snapshot());
         assert!(!q.in_gap());
-        let start = q.take_ready();
+        let start = q.take_ready(usize::MAX);
         assert!(
             matches!(
                 start.as_slice(),
@@ -501,29 +557,29 @@ mod tests {
         );
         assert_eq!(start[0].seq, seq + 5 * KIB as u64);
         q.ack(sent_payload(&opening) + 8 * KIB as u64);
-        let snap = q.take_ready();
+        let snap = q.take_ready(usize::MAX);
         assert_eq!(snap.len(), 3, "two chunks, end");
         assert_eq!(payload(&snap), vec![b's'; 3 * KIB]);
         q.push_output(seq + 5 * KIB as u64, b"after");
-        assert_eq!(payload(&q.take_ready()), b"after");
+        assert_eq!(payload(&q.take_ready(usize::MAX)), b"after");
     }
 
     #[test]
     fn credit_returned_mid_window_keeps_the_stream_flowing() {
         let mut q = attached(small());
-        let opening = q.take_ready();
+        let opening = q.take_ready(usize::MAX);
         q.ack(sent_payload(&opening));
         q.push_output(0, &[b'a'; 8 * KIB]);
-        let first = q.take_ready();
+        let first = q.take_ready(usize::MAX);
         assert_eq!(sent_payload(&first), 8 * KIB as u64, "one window");
         assert_eq!(q.credit(), 0);
         q.push_output(8 * KIB as u64, &[b'a'; 4 * KIB]);
-        assert!(q.take_ready().is_empty());
+        assert!(q.take_ready(usize::MAX).is_empty());
         // Ack the first 2 KiB of the stream (after the snapshot's bytes).
         let snap = sent_payload(&opening);
         q.ack(snap + 2 * KIB as u64);
         assert_eq!(q.credit(), 2 * KIB as u64);
-        let more = q.take_ready();
+        let more = q.take_ready(usize::MAX);
         assert_eq!(
             sent_payload(&more),
             2 * KIB as u64,
@@ -535,17 +591,17 @@ mod tests {
         assert_eq!(q.credit(), 0);
         q.ack(u64::MAX);
         assert_eq!(q.in_flight(), 0);
-        assert_eq!(sent_payload(&q.take_ready()), 2 * KIB as u64);
+        assert_eq!(sent_payload(&q.take_ready(usize::MAX)), 2 * KIB as u64);
         assert!(!q.in_gap());
     }
 
     #[test]
     fn control_frames_bypass_credit_and_survive_a_gap() {
         let mut q = attached(small());
-        let opening = q.take_ready();
+        let opening = q.take_ready(usize::MAX);
         q.ack(sent_payload(&opening));
         q.push_output(0, &[b'a'; 8 * KIB]);
-        q.take_ready();
+        q.take_ready(usize::MAX);
         q.push_output(8 * KIB as u64, &[b'b'; 4 * KIB]);
         assert_eq!(q.credit(), 0);
         q.push_control(
@@ -556,11 +612,11 @@ mod tests {
             },
         );
         // The floor frame waits behind the 4 KiB of output that has no credit.
-        assert!(q.take_ready().is_empty(), "order is preserved");
+        assert!(q.take_ready(usize::MAX).is_empty(), "order is preserved");
         q.gap(12 * KIB as u64, GapReason::Paused);
         // The output was discarded, so the floor frame and the gap go now.
         assert_eq!(
-            q.take_ready(),
+            q.take_ready(usize::MAX),
             vec![
                 Sequenced {
                     seq: 12 * KIB as u64,
@@ -585,7 +641,7 @@ mod tests {
     #[test]
     fn session_gone_owes_no_snapshot_and_closed_follows() {
         let mut q = attached(small());
-        q.take_ready();
+        q.take_ready(usize::MAX);
         q.push_output(0, b"tail");
         q.gap(4, GapReason::SessionGone);
         assert!(!q.needs_snapshot());
@@ -596,7 +652,7 @@ mod tests {
                 reason: "session_gone".to_string(),
             },
         );
-        let frames = q.take_ready();
+        let frames = q.take_ready(usize::MAX);
         assert!(matches!(
             frames.as_slice(),
             [
@@ -620,12 +676,12 @@ mod tests {
     #[test]
     fn a_feed_lost_gap_replays_from_the_new_epoch() {
         let mut q = attached(small());
-        let opening = q.take_ready();
+        let opening = q.take_ready(usize::MAX);
         q.ack(sent_payload(&opening));
         q.push_output(100, b"old epoch");
         q.gap(100, GapReason::FeedLost);
         q.push_snapshot(0, 40, 20, 2, b"fresh");
-        let frames = q.take_ready();
+        let frames = q.take_ready(usize::MAX);
         let kinds: Vec<&Frame> = frames.iter().map(|s| &s.frame).collect();
         assert!(matches!(
             kinds.as_slice(),
@@ -653,12 +709,196 @@ mod tests {
         assert_eq!(cfg.chunk_bytes, 48 * 1024);
         let mut q = ViewerQueue::default();
         q.push_snapshot(0, 1, 1, 1, &[0u8; 100 * 1024]);
-        let frames = q.take_ready();
+        let frames = q.take_ready(usize::MAX);
         assert_eq!(frames.len(), 5, "start, three 48 KiB-or-less chunks, end");
         assert!(matches!(
             frames[0].frame,
             Frame::SnapshotStart { chunks: 3, .. }
         ));
         assert_eq!(q.in_flight(), 100 * 1024);
+    }
+
+    #[test]
+    fn each_output_chunk_carries_the_offset_of_its_first_byte() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        q.push_output(1000, &[b'z'; 6000]);
+        let seqs: Vec<u64> = q.take_ready(usize::MAX).iter().map(|s| s.seq).collect();
+        assert_eq!(seqs, vec![1000, 1000 + 2048, 1000 + 4096]);
+        // Snapshot frames all carry the offset the snapshot was taken at.
+        q.ack(u64::MAX);
+        q.gap(7000, GapReason::Paused);
+        q.push_snapshot(7000, 40, 20, 1, &[b's'; 5000]);
+        let frames = q.take_ready(usize::MAX);
+        assert!(frames.iter().all(|s| s.seq == 7000), "{frames:?}");
+        assert_eq!(frames.len(), 1 + 1 + 3 + 1, "gap, start, three chunks, end");
+    }
+
+    #[test]
+    fn a_cap_trip_never_tears_a_snapshot_in_flight() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        // A 6 KiB snapshot: with 8 KiB credit only its start and chunks go
+        // out once taken; leave it pending and flood output behind it.
+        q.gap(0, GapReason::Paused);
+        q.push_snapshot(0, 40, 20, 2, &[b's'; 6 * KIB]);
+        let first = q.take_ready(3); // gap, start, one chunk
+        assert!(matches!(
+            first.as_slice(),
+            [
+                Sequenced {
+                    frame: Frame::DataGap { .. },
+                    ..
+                },
+                Sequenced {
+                    frame: Frame::SnapshotStart { chunks: 3, .. },
+                    ..
+                },
+                Sequenced {
+                    frame: Frame::SnapshotChunk(_),
+                    ..
+                },
+            ]
+        ));
+        let mut seq = 0u64;
+        while !q.in_gap() {
+            q.push_output(seq, &[b'x'; KIB]);
+            seq += KIB as u64;
+        }
+        // The two remaining chunks and the end are still there, in order,
+        // ahead of the gap; the output behind them was dropped.
+        let rest = q.take_ready(usize::MAX);
+        let kinds: Vec<String> = rest
+            .iter()
+            .map(|s| match &s.frame {
+                Frame::SnapshotChunk(_) => "chunk".to_string(),
+                Frame::SnapshotEnd => "end".to_string(),
+                Frame::DataGap { reason, .. } => format!("gap:{reason:?}"),
+                Frame::Output(_) => "output".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, vec!["chunk", "chunk", "end", "gap:Dropped"]);
+        assert!(q.needs_snapshot());
+    }
+
+    #[test]
+    fn unsent_control_frames_coalesce_so_a_stalled_viewer_stays_bounded() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        // Fill the window and stall: nothing acks any more.
+        q.push_output(0, &[b'a'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        q.push_output(8 * KIB as u64, &[b'b'; KIB]);
+        for gen in 0..100_001u64 {
+            q.push_control(
+                9 * KIB as u64,
+                Frame::Floor {
+                    holder: None,
+                    floor_gen: gen,
+                },
+            );
+            q.push_control(9 * KIB as u64, Frame::Presence { native_clients: 1 });
+            q.push_control(9 * KIB as u64, Frame::Resize { cols: 40, rows: 20 });
+        }
+        assert_eq!(
+            q.pending_frames(),
+            4,
+            "one output plus one of each control kind"
+        );
+        // Repeated feed gaps do not pile up either.
+        for _ in 0..10 {
+            q.gap(9 * KIB as u64, GapReason::FeedLost);
+        }
+        assert_eq!(
+            q.pending_frames(),
+            4,
+            "the output went with the first gap; one gap remains"
+        );
+        // Once released, the latest state is what goes out.
+        q.ack(u64::MAX);
+        let frames = q.take_ready(usize::MAX);
+        assert!(matches!(
+            frames.iter().find(|s| matches!(s.frame, Frame::Floor { .. })),
+            Some(Sequenced {
+                frame: Frame::Floor {
+                    floor_gen: 100_000,
+                    ..
+                },
+                ..
+            })
+        ));
+        assert_eq!(frames.len(), 4);
+    }
+
+    #[test]
+    fn take_ready_takes_no_more_than_the_writer_asked_for() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        q.push_output(0, &[b'a'; 6 * KIB]);
+        q.push_control(6 * KIB as u64, Frame::Presence { native_clients: 2 });
+        let two = q.take_ready(2);
+        assert_eq!(two.len(), 2);
+        assert_eq!(
+            q.pending_frames(),
+            2,
+            "one chunk and the presence frame remain"
+        );
+        assert_eq!(q.sent_bytes(), sent_payload(&opening) + 4 * KIB as u64);
+        assert!(q.take_ready(0).is_empty());
+        assert_eq!(q.take_ready(usize::MAX).len(), 2);
+    }
+
+    #[test]
+    fn the_cap_counts_only_the_backlog_beyond_the_credit() {
+        let cfg = small();
+        let mut q = attached(cfg);
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        // A fast viewer with a full window of credit is pushed 12 KiB
+        // between two takes: 8 KiB can go now, 4 KiB is backlog, under
+        // the 8 KiB cap, so it is not cut loose.
+        q.push_output(0, &[b'a'; 12 * KIB]);
+        assert!(!q.in_gap());
+        assert_eq!(q.backlog(), 4 * KIB as u64);
+        assert_eq!(sent_payload(&q.take_ready(usize::MAX)), 8 * KIB as u64);
+        // With the window full, the cap applies to everything pending.
+        q.push_output(12 * KIB as u64, &[b'b'; 4 * KIB]);
+        assert!(!q.in_gap());
+        q.push_output(16 * KIB as u64, &[b'b'; KIB]);
+        assert!(
+            q.in_gap(),
+            "8 KiB pending beyond zero credit, plus one more"
+        );
+    }
+
+    #[test]
+    fn a_chunk_larger_than_the_window_is_clamped_to_it() {
+        let mut q = ViewerQueue::new(ViewerConfig {
+            window_bytes: 8 * KIB as u64,
+            chunk_bytes: 100 * KIB,
+            max_pending_bytes: 64 * KIB as u64,
+        });
+        q.push_snapshot(0, 40, 20, 1, &[b's'; 20 * KIB]);
+        let frames = q.take_ready(usize::MAX);
+        assert!(matches!(
+            frames[0].frame,
+            Frame::SnapshotStart { chunks: 3, .. }
+        ));
+        assert_eq!(
+            sent_payload(&frames),
+            8 * KIB as u64,
+            "the first chunk fits exactly"
+        );
+        q.ack(8 * KIB as u64);
+        assert_eq!(sent_payload(&q.take_ready(usize::MAX)), 8 * KIB as u64);
+        q.ack(16 * KIB as u64);
+        let last = q.take_ready(usize::MAX);
+        assert_eq!(sent_payload(&last), 4 * KIB as u64);
+        assert!(matches!(last.last().unwrap().frame, Frame::SnapshotEnd));
     }
 }
