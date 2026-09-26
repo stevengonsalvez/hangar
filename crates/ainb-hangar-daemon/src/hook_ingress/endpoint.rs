@@ -4,7 +4,9 @@
 //! port), each by temp file and rename, so a script that reads both never pairs
 //! a new port with an old token. Both are removed on clean shutdown, but only
 //! while they still name this process: a newer daemon's files are never
-//! deleted by an older one's exit.
+//! deleted by an older one's exit. A crash, a SIGKILL or a second signal
+//! skips that; [`remove_stale`] runs at every boot, switch or no switch, once
+//! the daemon owns the home, so leftovers never outlive the next start.
 
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -34,24 +36,12 @@ impl EndpointFiles {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let headers = dir.join(HEADERS_FILE_NAME);
         let endpoint = dir.join(ENDPOINT_FILE_NAME);
-        let headers_abs = std::fs::canonicalize(&dir)?.join(HEADERS_FILE_NAME);
-
         let rendered = HookEndpoint {
             port,
             version: HOOK_ENDPOINT_VERSION,
             pid: std::process::id(),
-            headers_path: headers_abs,
         }
         .render_env_file();
-        // The hook script applies the same allowlist, so a home path it would
-        // refuse (a space, a quote, `..`) would publish an endpoint no hook can
-        // use. Refuse to bind instead, loudly, before any file is written.
-        if let Err(e) = HookEndpoint::parse_env_file(&rendered) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("hangar home path is not usable by the hook script: {e}"),
-            ));
-        }
         write_private(&headers, render_headers_file(token).as_bytes())?;
         write_private(&endpoint, rendered.as_bytes())?;
         Ok(Self {
@@ -81,6 +71,23 @@ impl Drop for EndpointFiles {
         if ours {
             let _ = std::fs::remove_file(&self.endpoint);
             let _ = std::fs::remove_file(&self.headers);
+        }
+    }
+}
+
+/// Remove the endpoint and headers files a previous daemon left behind.
+///
+/// Called at boot once this process owns the home (and before the listener,
+/// if any, publishes its own), and best-effort on a forced exit. With the
+/// switch off a leftover would otherwise stay forever; with it on it would
+/// name a dead pid until the new files replace it.
+pub fn remove_stale(hangar_home: &Path) {
+    let dir = hangar_home.join("hangar");
+    for name in [ENDPOINT_FILE_NAME, HEADERS_FILE_NAME] {
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => tracing::info!(file = name, "removed a stale hook endpoint file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(file = name, error = %e, "could not remove a stale hook file"),
         }
     }
 }
@@ -120,7 +127,7 @@ mod tests {
         let parsed = HookEndpoint::parse_env_file(&endpoint).unwrap();
         assert_eq!(parsed.port, 4321);
         assert_eq!(
-            std::fs::read_to_string(&parsed.headers_path).unwrap(),
+            std::fs::read_to_string(files.headers_path()).unwrap(),
             "X-Ainb-Hook-Token: tok-123\n"
         );
     }
@@ -150,13 +157,29 @@ mod tests {
     }
 
     #[test]
-    fn a_home_the_script_would_refuse_is_refused_before_any_file_is_written() {
+    fn a_home_with_a_space_publishes_normally() {
+        // The script reads the fixed headers path, so any home it can name
+        // works; nothing is refused for its characters.
         let base = tempfile::tempdir().unwrap();
         let home = base.path().join("with space");
         std::fs::create_dir_all(&home).unwrap();
-        let err = EndpointFiles::publish(&home, 1234, "tok").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(!home.join("hangar").join(HEADERS_FILE_NAME).exists());
-        assert!(!home.join("hangar").join(ENDPOINT_FILE_NAME).exists());
+        let files = EndpointFiles::publish(&home, 1234, "tok").unwrap();
+        assert!(files.endpoint_path().exists());
+        assert!(files.headers_path().exists());
+    }
+
+    #[test]
+    fn remove_stale_clears_leftovers_and_tolerates_none() {
+        let home = tempfile::tempdir().unwrap();
+        let leftover = EndpointFiles::publish(home.path(), 1111, "old").unwrap();
+        let (endpoint, headers) = (
+            leftover.endpoint_path().to_path_buf(),
+            leftover.headers_path().to_path_buf(),
+        );
+        std::mem::forget(leftover); // a crash: no Drop
+        remove_stale(home.path());
+        assert!(!endpoint.exists());
+        assert!(!headers.exists());
+        remove_stale(home.path()); // nothing left: no panic
     }
 }
