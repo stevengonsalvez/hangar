@@ -11,22 +11,31 @@
 //!
 //! This crate holds the frozen byte layouts: the [`frame`] header, the
 //! [`opcode`] registry, the [`prologue`] encoding and the pairing [`offer`]
-//! codec. The IK handshake itself arrives in R1-01; no listener or client in
-//! this tree uses the crate yet, so it changes no runtime behaviour.
+//! codec; [`noise`] holds the IK handshake and the transport session, and
+//! [`reassembly`] the whole [`Frame`] and the Rpc fragment codec. No listener
+//! or client in this tree uses the crate yet, so it changes no runtime
+//! behaviour.
 //!
 //! Golden bytes for every layout are committed in
 //! `tests/fixtures/peer_v1.json` and checked by `tests/wire_contract.rs` in the
 //! Contracts job. Changing a layout is a `PROTOCOL_VERSION` bump.
 
 pub mod frame;
+pub mod noise;
 pub mod offer;
 pub mod opcode;
 pub mod prologue;
+pub mod reassembly;
 
 pub use frame::{FrameHeader, HEADER_LEN, MAGIC, VERSION};
+pub use noise::{
+    Handshake, Keypair, NoiseError, Opener, Sealer, Session, generate_keypair, initiator,
+    public_key, responder,
+};
 pub use offer::{Endpoint, OfferError, PairingOffer};
 pub use opcode::Opcode;
 pub use prologue::{PrologueError, prologue};
+pub use reassembly::{Frame, Reassembler, ReassemblyError, lsp_body, lsp_encode, rpc_frames};
 
 /// The WebSocket path of the peer leg.
 pub const PEER_PATH: &str = "/peer";

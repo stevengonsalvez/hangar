@@ -25,6 +25,7 @@ export const config = {
     "./specs/review.e2e.js",
     "./specs/inbox.e2e.js",
     "./specs/commits.e2e.js",
+    "./specs/palette.e2e.js",
   ],
   maxInstances: 1,
   framework: "mocha",

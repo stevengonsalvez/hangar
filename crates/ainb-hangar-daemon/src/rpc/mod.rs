@@ -414,15 +414,25 @@ pub async fn serve(
     }
 }
 
-/// Serve one plugin connection: gate it (same-uid peer credentials, then the
-/// `auth/hello` token handshake on the first frame), then read framed
-/// requests, dispatch, write responses, until EOF.
+/// What a leg's transport proved about the other end of a connection before
+/// its first frame was read.
 ///
-/// All outbound frames — responses AND pushed `hangar/event` notifications —
-/// flow through one writer task so they never interleave mid-frame. A
-/// `workspace/subscribe` for a known workspace (re)registers this connection's
-/// event forwarder; EOF tears the forwarder and writer down, which is the
-/// subscription's deregistration.
+/// This is the seam between a leg and the one request loop every leg shares.
+/// The unix leg proves a same-uid local process; the off-box peer leg (R1-06)
+/// adds the arm for a Noise-authenticated device. Past the hello nothing reads
+/// it: dispatch trusts only the caller the hello settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerIdentity {
+    /// A same-uid local process on the unix socket.
+    Local {
+        /// The kernel's pid for the peer, which is what a plugin's host claim
+        /// is checked against before its connection may fold (#1040).
+        pid: Option<u32>,
+    },
+}
+
+/// Serve one plugin connection on the unix leg: gate it on same-uid peer
+/// credentials, then hand the stream to [`serve_stream`].
 async fn serve_conn(
     stream: UnixStream,
     pool: SqlitePool,
@@ -451,16 +461,51 @@ async fn serve_conn(
         }
     }
 
-    // The kernel's pid for the peer, which is what a plugin's host claim is
-    // checked against before its connection may fold (#1040).
-    let peer_pid = stream
+    let pid = stream
         .peer_cred()
         .ok()
         .and_then(|cred| cred.pid())
         .and_then(|pid| u32::try_from(pid).ok());
-    let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let (read_half, write_half) = stream.into_split();
+    serve_stream(
+        BufReader::new(read_half),
+        write_half,
+        PeerIdentity::Local { pid },
+        pool,
+        health,
+        broker,
+        registry,
+    )
+    .await
+}
 
+/// Serve one connection whose transport is already gated: the `auth/hello`
+/// token handshake on the first frame, then read framed requests, dispatch,
+/// write responses, until the read loop ends.
+///
+/// Generic over the byte stream so every leg shares this loop: the unix leg
+/// passes its socket halves, and the peer leg passes the plaintext side of its
+/// Noise session. Each leg keeps its own gate in front; nothing here knows
+/// which leg it serves beyond `identity`.
+///
+/// All outbound frames (responses AND pushed `hangar/event` notifications)
+/// flow through one writer task so they never interleave mid-frame. A
+/// `workspace/subscribe` for a known workspace (re)registers this connection's
+/// event forwarder; EOF tears the forwarder and writer down, which is the
+/// subscription's deregistration.
+async fn serve_stream<R, W>(
+    mut reader: R,
+    mut write_half: W,
+    identity: PeerIdentity,
+    pool: SqlitePool,
+    health: DaemonHealth,
+    broker: EventBroker,
+    registry: connections::ConnectionRegistry,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     // The single writer: every outbound frame is queued here so a pushed event
     // can never split a response frame (or vice versa).
     let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
@@ -501,7 +546,10 @@ async fn serve_conn(
             // unauthenticated, same as a rejected one: no caller identity.
             return Ok(None);
         };
-        match auth::authenticate_first_frame(&pool, &first).await {
+        let hello = match identity {
+            PeerIdentity::Local { .. } => auth::authenticate_first_frame(&pool, &first).await,
+        };
+        match hello {
             Ok((ack, authenticated)) => {
                 let _ = out_tx.send(encode_frame(&ack)).await;
                 Ok(Some(authenticated))
@@ -537,36 +585,18 @@ async fn serve_conn(
             authenticated.surface,
             authenticated.transient,
             authenticated.host,
-            peer_pid,
+            match identity {
+                PeerIdentity::Local { pid } => pid,
+            },
         )
         .await;
     if listed {
         emit_connections_changed(&events, &registry).await;
     }
-    // The connection's event subscription: at most one forwarder; a
-    // re-subscribe replaces it (last subscribe wins, no duplicate delivery).
-    let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    // The TRANSCRIPT half of the same workspace subscription (track A step A2),
-    // on its own broadcast so a run's line volume cannot evict the lifecycle
-    // events `forwarder` carries. Registered and replaced with it.
-    let mut task_stream_forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    // The connection's FLEET-WIDE attention subscription (spec P2), independent
-    // of the workspace forwarder: a connection may hold both (workspace events +
-    // attention nudges) or either. A re-subscribe replaces it.
-    let mut attention_forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    // Fleet uses a durable global revision stream, independent from workspace
-    // and attention subscriptions. Re-subscribing replaces the prior cursor.
-    let mut fleet_forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    // The chat bus and the ACP transcript are two more durable logs with their
-    // own cursors; a connection may hold either, both, or neither.
-    let mut message_forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    let mut transcript_forwarder: Option<tokio::task::JoinHandle<()>> = None;
-    // Part 2's confirm cards and activity rows ride the chat-bus subscription
-    // rather than a subscribe verb of their own: a client watching the bus is
-    // by definition the client that wants to see what Pal asked for and
-    // what it did, and the frozen part-2 surface has no third subscribe method
-    // to add one to.
-    let mut notification_forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    // The connection's event subscriptions: at most one forwarder per stream,
+    // and a re-subscribe replaces it (last subscribe wins, no duplicate
+    // delivery). See [`Subscriptions`] for what each one carries.
+    let mut subscriptions = Subscriptions::default();
 
     // Idle read timeout so an abandoned / half-open client connection cannot pin
     // this per-connection task (and its fd) forever. Request/response clients
@@ -583,15 +613,7 @@ async fn serve_conn(
         idle_timeout_from_env(SUBSCRIBED_IDLE_TIMEOUT_ENV, DEFAULT_SUBSCRIBED_IDLE_TIMEOUT);
     let served: std::io::Result<()> = async {
         while let Some(body) = {
-            let live = |h: &Option<tokio::task::JoinHandle<()>>| {
-                h.as_ref().is_some_and(|h| !h.is_finished())
-            };
-            let subscribed = live(&forwarder)
-                || live(&task_stream_forwarder)
-                || live(&attention_forwarder)
-                || live(&fleet_forwarder)
-                || live(&message_forwarder)
-                || live(&transcript_forwarder);
+            let subscribed = subscriptions.any_live();
             let window = if subscribed {
                 subscribed_idle_timeout
             } else {
@@ -672,7 +694,7 @@ async fn serve_conn(
             if let Ok(req) = &req {
                 if acked && req.method == methods::WORKSPACE_SUBSCRIBE {
                     if let Ok(Some(ws)) = resolve(&pool, req).await {
-                        if let Some(old) = forwarder.take() {
+                        if let Some(old) = subscriptions.workspace.take() {
                             old.abort();
                         }
                         // Register the LIVE forwarder FIRST so no event emitted
@@ -689,7 +711,8 @@ async fn serve_conn(
                         // with no durable replay behind it, so one missed in
                         // that window is gone, not merely late.
                         let ws_rx = pending_workspace_rx.unwrap_or_else(|| broker.subscribe());
-                        forwarder = Some(spawn_event_forwarder(ws_rx, ws.clone(), out_tx.clone()));
+                        subscriptions.workspace =
+                            Some(spawn_event_forwarder(ws_rx, ws.clone(), out_tx.clone()));
                         // A2: the same subscription's TRANSCRIPT half, drained
                         // from its own broadcast so a chatty run cannot evict the
                         // lifecycle events above it (see `EventBroker`). Two
@@ -703,12 +726,12 @@ async fn serve_conn(
                         // by `banner_hides_on_task_finished_event`); the visible
                         // effect is a banner clearing a beat early, or a first
                         // transcript line missed before it opens.
-                        if let Some(old) = task_stream_forwarder.take() {
+                        if let Some(old) = subscriptions.task_stream.take() {
                             old.abort();
                         }
                         let rx = pending_task_stream_rx
                             .unwrap_or_else(|| broker.subscribe_task_stream());
-                        task_stream_forwarder =
+                        subscriptions.task_stream =
                             Some(spawn_event_forwarder(rx, ws.clone(), out_tx.clone()));
                         // T1 resume: a client that carried a `since_seq` catches
                         // up on every durable event after that cursor before it
@@ -726,15 +749,15 @@ async fn serve_conn(
                     // by workspace — it carries the no-workspace host sessions —
                     // with an OPTIONAL narrowing when the client passed a
                     // workspace_id.
-                    if let Some(old) = attention_forwarder.take() {
+                    if let Some(old) = subscriptions.attention.take() {
                         old.abort();
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    attention_forwarder =
+                    subscriptions.attention =
                         Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
-                    if let Some(old) = fleet_forwarder.take() {
+                    if let Some(old) = subscriptions.fleet.take() {
                         old.abort();
                     }
                     let head_revision = resp
@@ -745,14 +768,14 @@ async fn serve_conn(
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or_default();
                     let rx = pending_fleet_rx.unwrap_or_else(|| broker.subscribe_fleet());
-                    fleet_forwarder = Some(spawn_fleet_forwarder(
+                    subscriptions.fleet = Some(spawn_fleet_forwarder(
                         pool.clone(),
                         rx,
                         head_revision,
                         out_tx.clone(),
                     ));
                 } else if acked && req.method == methods::FLEET_MESSAGE_SUBSCRIBE {
-                    if let Some(old) = message_forwarder.take() {
+                    if let Some(old) = subscriptions.message.take() {
                         old.abort();
                     }
                     // An explicit after_id wins; otherwise start from the head
@@ -766,21 +789,21 @@ async fn serve_conn(
                             .map(ToString::to_string)
                     });
                     let rx = pending_message_rx.unwrap_or_else(|| broker.subscribe_message());
-                    message_forwarder = Some(spawn_message_forwarder(
+                    subscriptions.message = Some(spawn_message_forwarder(
                         pool.clone(),
                         rx,
                         start_id,
                         out_tx.clone(),
                     ));
-                    if let Some(old) = notification_forwarder.take() {
+                    if let Some(old) = subscriptions.notification.take() {
                         old.abort();
                     }
                     let notify_rx =
                         pending_notification_rx.unwrap_or_else(|| broker.subscribe_notifications());
-                    notification_forwarder =
+                    subscriptions.notification =
                         Some(spawn_notification_forwarder(notify_rx, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_TRANSCRIPT_SUBSCRIBE {
-                    if let Some(old) = transcript_forwarder.take() {
+                    if let Some(old) = subscriptions.transcript.take() {
                         old.abort();
                     }
                     if let Ok(params) = serde_json::from_value::<
@@ -796,7 +819,7 @@ async fn serve_conn(
                         });
                         let rx =
                             pending_transcript_rx.unwrap_or_else(|| broker.subscribe_transcript());
-                        transcript_forwarder = Some(spawn_transcript_forwarder(
+                        subscriptions.transcript = Some(spawn_transcript_forwarder(
                             pool.clone(),
                             rx,
                             params.session_key,
@@ -811,33 +834,102 @@ async fn serve_conn(
     }
     .await;
 
-    if let Some(f) = forwarder {
-        f.abort();
+    teardown(
+        subscriptions,
+        &registry,
+        connection.conn_id,
+        &events,
+        out_tx,
+        writer,
+    )
+    .await;
+    served
+}
+
+/// A connection's live event forwarders, at most one per stream.
+#[derive(Default)]
+struct Subscriptions {
+    /// Workspace lifecycle events for the subscribed workspace.
+    workspace: Option<tokio::task::JoinHandle<()>>,
+    /// The TRANSCRIPT half of the same workspace subscription (track A step
+    /// A2), on its own broadcast so a run's line volume cannot evict the
+    /// lifecycle events `workspace` carries. Registered and replaced with it.
+    task_stream: Option<tokio::task::JoinHandle<()>>,
+    /// The FLEET-WIDE attention subscription (spec P2), independent of the
+    /// workspace forwarder: a connection may hold both (workspace events +
+    /// attention nudges) or either.
+    attention: Option<tokio::task::JoinHandle<()>>,
+    /// The durable global fleet revision stream, independent from workspace
+    /// and attention subscriptions.
+    fleet: Option<tokio::task::JoinHandle<()>>,
+    /// The chat bus, a durable log with its own cursor.
+    message: Option<tokio::task::JoinHandle<()>>,
+    /// The ACP transcript, a durable log with its own cursor.
+    transcript: Option<tokio::task::JoinHandle<()>>,
+    /// Part 2's confirm cards and activity rows ride the chat-bus subscription
+    /// rather than a subscribe verb of their own: a client watching the bus is
+    /// by definition the client that wants to see what Pal asked for and what
+    /// it did, and the frozen part-2 surface has no third subscribe method to
+    /// add one to.
+    notification: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Subscriptions {
+    /// Whether the connection holds a live push subscription, which earns it
+    /// the long idle window. A forwarder that has already exited no longer
+    /// counts, and the notification forwarder never counts on its own: it is
+    /// registered and replaced with `message`.
+    fn any_live(&self) -> bool {
+        let live =
+            |h: &Option<tokio::task::JoinHandle<()>>| h.as_ref().is_some_and(|h| !h.is_finished());
+        live(&self.workspace)
+            || live(&self.task_stream)
+            || live(&self.attention)
+            || live(&self.fleet)
+            || live(&self.message)
+            || live(&self.transcript)
     }
-    if let Some(f) = task_stream_forwarder {
-        f.abort();
+
+    /// Stop every forwarder. Each holds a clone of the connection's outbound
+    /// sender, so the writer cannot exit while any of them runs.
+    fn abort_all(self) {
+        for forwarder in [
+            self.workspace,
+            self.task_stream,
+            self.attention,
+            self.fleet,
+            self.message,
+            self.transcript,
+            self.notification,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            forwarder.abort();
+        }
     }
-    if let Some(f) = attention_forwarder {
-        f.abort();
-    }
-    if let Some(f) = fleet_forwarder {
-        f.abort();
-    }
-    if let Some(f) = message_forwarder {
-        f.abort();
-    }
-    if let Some(f) = transcript_forwarder {
-        f.abort();
-    }
-    if let Some(f) = notification_forwarder {
-        f.abort();
-    }
-    if registry.remove(connection.conn_id).await {
-        emit_connections_changed(&events, &registry).await;
+}
+
+/// Close an authenticated connection: stop its forwarders, drop its registry
+/// row, then let the writer drain what is queued and exit.
+///
+/// The one teardown for every leg and every way the read loop ends (EOF, the
+/// idle bound, a read fault). A revoke (R1-08) ends the same loop, so it runs
+/// this too, and R2 hangs its floor release here once rather than per leg.
+async fn teardown(
+    subscriptions: Subscriptions,
+    registry: &connections::ConnectionRegistry,
+    conn_id: u64,
+    events: &EventSink,
+    out_tx: mpsc::Sender<Vec<u8>>,
+    writer: tokio::task::JoinHandle<()>,
+) {
+    subscriptions.abort_all();
+    if registry.remove(conn_id).await {
+        emit_connections_changed(events, registry).await;
     }
     drop(out_tx);
     let _ = writer.await;
-    served
 }
 
 /// Outbound frame queue depth per connection (responses + pushed events).
@@ -14144,6 +14236,122 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    /// The request loop is transport-generic: an in-memory duplex stream, with
+    /// no unix socket and no peer credentials, is served exactly like the
+    /// unix leg. A good hello is listed and answered, a request dispatches,
+    /// and the client's EOF runs the one teardown that removes the row. A bad
+    /// token on the same seam gets the UNAUTHORIZED envelope and never lists.
+    ///
+    /// This is the seam the peer leg (R1-06) plugs its Noise session into, so
+    /// it must not depend on anything only a `UnixStream` provides.
+    #[tokio::test]
+    async fn a_duplex_stream_is_served_and_torn_down_like_the_unix_leg() {
+        use tokio::io::AsyncWriteExt as _;
+
+        async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, request: &RpcRequest) {
+            let body = serde_json::to_vec(request).expect("request serializes");
+            let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+            frame.extend_from_slice(&body);
+            writer.write_all(&frame).await.expect("write request");
+            writer.flush().await.expect("flush request");
+        }
+
+        async fn next<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
+            let body = tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(reader))
+                .await
+                .expect("daemon writes a frame")
+                .expect("read frame")
+                .expect("connection stays open");
+            serde_json::from_slice(&body).expect("frame is JSON")
+        }
+
+        let home = tempfile::tempdir().expect("temporary Hangar home");
+        let store = Store::open_in(home.path()).await.expect("open store");
+        auth::ensure_socket_token(store.pool(), home.path())
+            .await
+            .expect("ensure socket token");
+        let token = std::fs::read_to_string(ainb_hangar_proto::auth::token_file_in(home.path()))
+            .expect("read socket token");
+        let registry = connections::ConnectionRegistry::new();
+
+        let serve = |server: tokio::io::DuplexStream| {
+            let (read_half, write_half) = tokio::io::split(server);
+            tokio::spawn(serve_stream(
+                BufReader::new(read_half),
+                write_half,
+                PeerIdentity::Local { pid: None },
+                store.pool().clone(),
+                health(),
+                EventBroker::new(),
+                registry.clone(),
+            ))
+        };
+
+        // A good hello, one request, then EOF.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connection = serve(server);
+        let (read_half, mut write_half) = tokio::io::split(client);
+        let mut reader = BufReader::new(read_half);
+        send(
+            &mut write_half,
+            &req(
+                methods::AUTH_HELLO,
+                serde_json::json!({ "token": token.trim() }),
+            ),
+        )
+        .await;
+        let hello = next(&mut reader).await;
+        assert!(hello["error"].is_null(), "auth/hello must succeed: {hello}");
+        assert_eq!(
+            registry.list().await.connections.len(),
+            1,
+            "an authenticated duplex connection is listed"
+        );
+        send(&mut write_half, &req(methods::PING, serde_json::json!({}))).await;
+        let pong = next(&mut reader).await;
+        assert!(pong["error"].is_null(), "ping must dispatch: {pong}");
+        drop(write_half);
+        drop(reader);
+        tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+            .await
+            .expect("client EOF must finish the stream")
+            .expect("the stream task must not panic")
+            .expect("client EOF is a clean close");
+        assert!(
+            registry.list().await.connections.is_empty(),
+            "teardown removes the row"
+        );
+
+        // A wrong token on the same seam.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connection = serve(server);
+        let (read_half, mut write_half) = tokio::io::split(client);
+        let mut reader = BufReader::new(read_half);
+        send(
+            &mut write_half,
+            &req(
+                methods::AUTH_HELLO,
+                serde_json::json!({ "token": "not-the-token" }),
+            ),
+        )
+        .await;
+        let refused = next(&mut reader).await;
+        assert_eq!(
+            refused["error"]["code"],
+            ainb_hangar_proto::auth::UNAUTHORIZED,
+            "{refused}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+            .await
+            .expect("a refused hello closes the stream")
+            .expect("the stream task must not panic")
+            .expect("a refused hello is a clean close");
+        assert!(
+            registry.list().await.connections.is_empty(),
+            "a refused hello is never listed"
+        );
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
