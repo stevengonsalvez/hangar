@@ -16,18 +16,24 @@
 //! Rules this actor keeps:
 //!
 //! * The target (a session name is operator data) is resolved through argv
-//!   before the attach; the control stream only ever names the pane as `%N`.
+//!   ONCE, with tmux's `=` exact match for a name, to a pane id; every later
+//!   lookup and every reattach uses that pane id, so a feed never drifts to
+//!   a similarly named session or to the session's newly active pane. The
+//!   control stream only ever names the pane as `%N`.
 //! * `refresh-client -f pause-after=N` is the first command on every attach,
 //!   and a refused reply closes the feed with `pause_after_unsupported`
 //!   rather than watching a pane tmux may throttle the agent for (S4).
 //! * Every attach and every resume seeds the emulator from tmux's own grid
 //!   with four commands on the SAME control stream (`display-message` flags,
-//!   `display-message` title, `display-message` size, `capture-pane -p -e`),
-//!   so the seed is ordered against the tail: pane output that arrives
-//!   before the capture reply is already inside the capture and is dropped;
-//!   output after it is new (S3). A layout change read while a seed is in
-//!   flight is still asked about; its reply lands after the capture and
-//!   either confirms the seeded size or resizes the fresh emulator.
+//!   `display-message` title, `display-message` size and window,
+//!   `capture-pane -p -e`), so the seed is ordered against the tail: pane
+//!   output that arrives before the capture reply is already inside the
+//!   capture and is dropped; output after it is new (S3). A layout change
+//!   read while a seed is in flight is still asked about; its reply lands
+//!   after the capture and either confirms the seeded size or resizes the
+//!   fresh emulator. A capture row that reads `%pause %N` or `%continue %N`
+//!   is lifted out of the reply body by the parser; the actor puts it back
+//!   at its row, so the repaint never shifts a line.
 //! * `%pause` is acted on only at top level. A `%continue` is acted on only
 //!   while this pane is recorded as paused AND it arrives inside the reply
 //!   block of this actor's own `refresh-client -A"%N:continue"` (the oldest
@@ -41,17 +47,21 @@
 //!   never report an offset older than the bytes it holds.
 //! * The last grapheme of a feed is held by the emulator; the actor flushes
 //!   it after [`FeedConfig::idle_flush`] of silence.
-//! * Feed loss (EOF, `%exit`, a dead client) sends `Gap{feed_lost}`, stamps
-//!   the fleet row `restored_unconfirmed` (CRITIQUE 13) and reattaches with
-//!   backoff. A session that no longer exists sends `Gap{session_gone}` then
-//!   `Closed`. An emulator poisoned by a panic is re-seeded, at most
-//!   [`MAX_POISON_RESEEDS`] times per attach, then the feed closes.
+//! * Feed loss (EOF, `%exit`, a dead client) sends `Gap{feed_lost}` once,
+//!   stamps the fleet row `restored_unconfirmed` once (CRITIQUE 13) and
+//!   reattaches with backoff. A pane that no longer resolves (killed, or its
+//!   session gone) sends `Gap{session_gone}` then `Closed{pane_gone}` or
+//!   `Closed{session_gone}`. A blank size reply on the stream is how a dead
+//!   pane shows up mid-attach. An emulator poisoned by a panic is re-seeded,
+//!   at most [`MAX_POISON_RESEEDS`] times per attach, then the feed closes.
 //!
 //! Every command written to the client is recorded (the last
 //! [`COMMAND_LOG_CAP`]) in [`FeedHandle::commands`] so a test can assert what
 //! was, and was not, sent.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -100,7 +110,7 @@ pub struct FeedConfig {
     pub socket: Option<PathBuf>,
     /// A tmux target that resolves to exactly one pane
     /// (`fleet_session.tmux_target`, or a bare `%N`). Operator data: it is
-    /// only ever passed through argv.
+    /// only ever passed through argv, once.
     pub target: String,
     /// Whole seconds; see [`DEFAULT_PAUSE_AFTER_S`].
     pub pause_after_s: u32,
@@ -172,8 +182,8 @@ pub enum FeedEvent {
     },
     /// The feed is over; nothing follows.
     Closed {
-        /// `session_gone`, `pause_after_unsupported`, `emulator_poisoned`
-        /// or `stopped`.
+        /// `session_gone`, `pane_gone`, `pause_after_unsupported`,
+        /// `seed_unreadable`, `emulator_poisoned` or `stopped`.
         reason: String,
     },
 }
@@ -189,7 +199,7 @@ pub struct Pane {
     pub seq: u64,
 }
 
-/// Live counters a caller may read.
+/// Live counters a caller may read; `epoch` and `seq` come from [`Pane`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeedStatus {
     /// The current epoch; 0 until the first seed.
@@ -206,49 +216,69 @@ pub struct FeedStatus {
     pub attaches: u32,
 }
 
+/// The part of the status the actor owns; the offset lives in [`Pane`].
+#[derive(Debug, Default)]
+struct Counters {
+    paused: bool,
+    client_pid: Option<u32>,
+    pane: Option<PaneId>,
+    attaches: u32,
+}
+
 /// A running feed.
 pub struct FeedHandle {
     events: broadcast::Sender<FeedEvent>,
+    /// The receiver created before the actor started, so the first
+    /// subscriber sees every event from the start (a fast `session_gone` or
+    /// the first `Seeded` would otherwise be sent to nobody).
+    first: Mutex<Option<broadcast::Receiver<FeedEvent>>>,
     pane: Arc<Mutex<Pane>>,
     commands: Arc<Mutex<VecDeque<String>>>,
-    status: Arc<Mutex<FeedStatus>>,
+    counters: Arc<Mutex<Counters>>,
     stop: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl FeedHandle {
-    /// Start a feed. Returns at once; the first event is `Seeded` (or
-    /// `Gap{session_gone}` and `Closed`).
+    /// Start a feed. Returns at once; the first subscriber sees the events
+    /// from the start: `Seeded`, or `Gap{session_gone}` and `Closed`.
     pub fn spawn(cfg: FeedConfig) -> Self {
-        let (events, _) = broadcast::channel(EVENT_CAPACITY);
+        let (events, first) = broadcast::channel(EVENT_CAPACITY);
         let pane = Arc::new(Mutex::new(Pane::default()));
         let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let status = Arc::new(Mutex::new(FeedStatus::default()));
+        let counters = Arc::new(Mutex::new(Counters::default()));
         let stop = Arc::new(Notify::new());
         let actor = Actor {
             cfg,
             events: events.clone(),
             pane: Arc::clone(&pane),
             commands: Arc::clone(&commands),
-            status: Arc::clone(&status),
+            counters: Arc::clone(&counters),
             stop: Arc::clone(&stop),
         };
         let task = tokio::spawn(actor.run());
         Self {
             events,
+            first: Mutex::new(Some(first)),
             pane,
             commands,
-            status,
+            counters,
             stop,
             task,
         }
     }
 
-    /// A new subscriber. It sees events from now on; a subscriber that lags
-    /// behind [`EVENT_CAPACITY`] events (at most [`EVENT_BUFFER_BYTES`] of
-    /// output) gets `RecvError::Lagged` and must re-snapshot.
+    /// A subscriber. The first call gets the receiver that existed before
+    /// the actor started; later calls see events from now on. A subscriber
+    /// that lags behind [`EVENT_CAPACITY`] events (at most
+    /// [`EVENT_BUFFER_BYTES`] of output) gets `RecvError::Lagged` and must
+    /// re-snapshot.
     pub fn subscribe(&self) -> broadcast::Receiver<FeedEvent> {
-        self.events.subscribe()
+        self.first
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_else(|| self.events.subscribe())
     }
 
     /// The emulator with its epoch and offset. Lock it briefly.
@@ -268,11 +298,19 @@ impl FeedHandle {
 
     /// The live counters.
     pub fn status(&self) -> FeedStatus {
-        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let pane = self.pane.lock().unwrap_or_else(|e| e.into_inner());
-        status.epoch = pane.epoch;
-        status.seq = pane.seq;
-        status
+        let (epoch, seq) = {
+            let pane = self.pane.lock().unwrap_or_else(|e| e.into_inner());
+            (pane.epoch, pane.seq)
+        };
+        let c = self.counters.lock().unwrap_or_else(|e| e.into_inner());
+        FeedStatus {
+            epoch,
+            seq,
+            paused: c.paused,
+            client_pid: c.client_pid,
+            pane: c.pane,
+            attaches: c.attaches,
+        }
     }
 
     /// A snapshot of the emulator with up to `scrollback_rows` of history,
@@ -311,8 +349,9 @@ enum Pending {
     PauseAfter,
     SeedFlags,
     SeedTitle,
-    /// The pane size just before the capture, so a resize between the
-    /// attach and the seed (or during it) is carried by the seed itself.
+    /// The pane size and window just before the capture, so a resize
+    /// between the attach and the seed (or during it) is carried by the
+    /// seed itself, and a pane moved to another window is followed.
     SeedSize,
     SeedCapture,
     Continue,
@@ -321,7 +360,8 @@ enum Pending {
 
 /// What the target resolves to, through argv.
 struct Resolved {
-    session: String,
+    /// The session name as tmux printed it, any bytes: only ever an argv.
+    session: OsString,
     pane: PaneId,
     window: WindowId,
 }
@@ -330,7 +370,8 @@ struct Resolved {
 enum Outcome {
     Stopped,
     FeedLost,
-    SessionGone,
+    /// The pane no longer resolves; its session may or may not exist.
+    PaneGone,
     Fatal(&'static str),
 }
 
@@ -339,7 +380,7 @@ struct Actor {
     events: broadcast::Sender<FeedEvent>,
     pane: Arc<Mutex<Pane>>,
     commands: Arc<Mutex<VecDeque<String>>>,
-    status: Arc<Mutex<FeedStatus>>,
+    counters: Arc<Mutex<Counters>>,
     stop: Arc<Notify>,
 }
 
@@ -358,6 +399,11 @@ struct Attach {
     seeding: Option<(SeedState, Vec<u8>)>,
     /// Re-seeds forced by an emulator panic on this attach.
     poison_reseeds: u32,
+    /// Lines fed into the open reply block so far, and the `%pause` or
+    /// `%continue` rows the parser lifted out of it, with their row index,
+    /// so a capture can be put back together.
+    block_lines: usize,
+    lifted: Vec<(usize, Vec<u8>)>,
 }
 
 impl Actor {
@@ -374,8 +420,8 @@ impl Actor {
         let _ = self.events.send(event);
     }
 
-    fn with_status(&self, f: impl FnOnce(&mut FeedStatus)) {
-        f(&mut self.status.lock().unwrap_or_else(|e| e.into_inner()));
+    fn with_counters(&self, f: impl FnOnce(&mut Counters)) {
+        f(&mut self.counters.lock().unwrap_or_else(|e| e.into_inner()));
     }
 
     fn seq(&self) -> u64 {
@@ -383,17 +429,23 @@ impl Actor {
     }
 
     async fn run(mut self) {
+        // The operator target is resolved once; from here on the pane id
+        // is the only name this feed uses.
+        let Some(first) = self.resolve(&self.cfg.target.clone(), true).await else {
+            self.gone("session_gone");
+            return;
+        };
+        let pane_target = first.pane.to_string();
+        let mut resolved = first;
         let mut attempt = 0usize;
+        let mut lost_announced = false;
         loop {
-            let Some(resolved) = self.resolve().await else {
-                self.session_gone();
-                return;
-            };
+            let epoch_before = self.pane.lock().unwrap_or_else(|e| e.into_inner()).epoch;
             let outcome = match self.attach(&resolved.session).await {
                 Ok(mut child) => {
                     let outcome = self.serve(&mut child, &resolved, &mut attempt).await;
                     let _ = child.kill().await;
-                    self.with_status(|s| s.client_pid = None);
+                    self.with_counters(|c| c.client_pid = None);
                     outcome
                 }
                 Err(error) => {
@@ -401,6 +453,10 @@ impl Actor {
                     Outcome::FeedLost
                 }
             };
+            if self.pane.lock().unwrap_or_else(|e| e.into_inner()).epoch > epoch_before {
+                // This attach seeded: the next loss is a new one.
+                lost_announced = false;
+            }
             match outcome {
                 Outcome::Stopped => {
                     self.emit(FeedEvent::Closed {
@@ -408,8 +464,8 @@ impl Actor {
                     });
                     return;
                 }
-                Outcome::SessionGone => {
-                    self.session_gone();
+                Outcome::PaneGone => {
+                    self.gone(self.gone_reason(&resolved.session).await);
                     return;
                 }
                 Outcome::Fatal(reason) => {
@@ -419,11 +475,20 @@ impl Actor {
                     return;
                 }
                 Outcome::FeedLost => {
-                    if self.resolve().await.is_none() {
-                        self.session_gone();
-                        return;
+                    // The pane, not the operator target: the session's
+                    // active pane may have changed since the first resolve.
+                    match self.resolve(&pane_target, false).await {
+                        Some(again) => resolved = again,
+                        None => {
+                            self.gone(self.gone_reason(&resolved.session).await);
+                            return;
+                        }
                     }
-                    self.feed_lost().await;
+                    if !lost_announced {
+                        // Once per loss, not once per retry.
+                        self.feed_lost().await;
+                        lost_announced = true;
+                    }
                 }
             }
             let delay = REATTACH_BACKOFF[attempt.min(REATTACH_BACKOFF.len() - 1)];
@@ -438,20 +503,47 @@ impl Actor {
         }
     }
 
-    /// The session, pane and window the target names, or `None` when tmux
+    /// `session_gone` when the pane's session is gone too, else `pane_gone`.
+    async fn gone_reason(&self, session: &OsString) -> &'static str {
+        let mut exact = OsString::from("=");
+        exact.push(session);
+        let alive = self
+            .tmux()
+            .args(["has-session", "-t"])
+            .arg(exact)
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success());
+        if alive { "pane_gone" } else { "session_gone" }
+    }
+
+    /// The session, pane and window `target` names, or `None` when tmux
     /// cannot find it. Resolved through argv, never on the control stream:
-    /// a target is operator data (a session name may hold quotes and
-    /// semicolons), and a control-mode line is parsed like a shell command.
-    /// After this, the only target the stream ever sees is the pane id.
-    async fn resolve(&self) -> Option<Resolved> {
+    /// a target is operator data (a session name may hold quotes,
+    /// semicolons, tabs or any byte), and a control-mode line is parsed
+    /// like a shell command.
+    ///
+    /// `exact` spells a NAME target with tmux's `=` so a prefix or pattern
+    /// match can never bind the feed to a similarly named session: a bare
+    /// name becomes `=name:` (a bare `=name` is not a pane target and
+    /// answers blank), `sess:win.pane` becomes `=sess:win.pane`; an id
+    /// target (`%N`, `@N`, `$N`) takes no prefix. The ids come first in the
+    /// reply and the name last, so the name can hold anything.
+    async fn resolve(&self, target: &str, exact: bool) -> Option<Resolved> {
+        let is_id = target.starts_with(['%', '@', '$']);
+        let argv_target = match (exact, is_id, target.contains(':')) {
+            (true, false, true) => format!("={target}"),
+            (true, false, false) => format!("={target}:"),
+            _ => target.to_string(),
+        };
         let out = self
             .tmux()
             .args([
                 "display-message",
                 "-p",
                 "-t",
-                &self.cfg.target,
-                "#{session_name}\t#{pane_id}\t#{window_id}",
+                &argv_target,
+                "#{pane_id}\t#{window_id}\t#{session_name}",
             ])
             .output()
             .await
@@ -459,41 +551,58 @@ impl Actor {
         if !out.status.success() {
             return None;
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut f = text.trim_end_matches(['\r', '\n']).split('\t');
-        let session = f.next()?.to_string();
-        let pane = f.next()?.strip_prefix('%')?.parse().ok().map(PaneId)?;
-        let window = f.next()?.strip_prefix('@')?.parse().ok().map(WindowId)?;
-        (!session.is_empty()).then_some(Resolved {
-            session,
+        let mut line = out.stdout;
+        while line.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+            line.pop();
+        }
+        let mut fields = line.splitn(3, |b| *b == b'\t');
+        let pane = std::str::from_utf8(fields.next()?)
+            .ok()?
+            .strip_prefix('%')?
+            .parse()
+            .ok()
+            .map(PaneId)?;
+        let window = std::str::from_utf8(fields.next()?)
+            .ok()?
+            .strip_prefix('@')?
+            .parse()
+            .ok()
+            .map(WindowId)?;
+        let session = fields.next()?;
+        (!session.is_empty()).then(|| Resolved {
+            session: OsString::from_vec(session.to_vec()),
             pane,
             window,
         })
     }
 
-    async fn attach(&self, session: &str) -> std::io::Result<Child> {
+    async fn attach(&self, session: &OsString) -> std::io::Result<Child> {
+        let mut exact = OsString::from("=");
+        exact.push(session);
         let child = self
             .tmux()
-            .args(["-C", "attach-session", "-t", &format!("={session}")])
+            .args(["-C", "attach-session", "-t"])
+            .arg(exact)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()?;
-        self.with_status(|s| {
-            s.client_pid = child.id();
-            s.attaches += 1;
+        self.with_counters(|c| {
+            c.client_pid = child.id();
+            c.attaches += 1;
         });
         Ok(child)
     }
 
-    fn session_gone(&self) {
+    /// The pane (or its session) is gone: the terminal gap, then `Closed`.
+    fn gone(&self, reason: &'static str) {
         self.emit(FeedEvent::Gap {
             seq: self.seq(),
             reason: GapReason::SessionGone,
         });
         self.emit(FeedEvent::Closed {
-            reason: "session_gone".to_string(),
+            reason: reason.to_string(),
         });
     }
 
@@ -579,8 +688,13 @@ impl Actor {
             paused: false,
             seeding: None,
             poison_reseeds: 0,
+            block_lines: 0,
+            lifted: Vec::new(),
         };
-        self.with_status(|s| s.pane = Some(resolved.pane));
+        self.with_counters(|c| {
+            c.pane = Some(resolved.pane);
+            c.paused = false;
+        });
         at.pending.push_back(Pending::Greeting);
         let boot = async {
             self.send(
@@ -615,14 +729,31 @@ impl Actor {
                     // One line at a time, so `in_block()` answers for THIS
                     // line: a lifted `%pause` or `%continue` is in-block only
                     // while its block is still open after it, and a whole
-                    // chunk may open and close several blocks.
+                    // chunk may open and close several blocks. The line
+                    // count per block lets a lifted capture row go back.
                     let mut rest = &buf[..n];
                     while !rest.is_empty() {
                         let end = rest.iter().position(|b| *b == b'\n').map_or(rest.len(), |i| i + 1);
                         let (line, tail) = rest.split_at(end);
                         rest = tail;
-                        for event in at.parser.feed(line) {
-                            let in_block = at.parser.in_block();
+                        let was_in_block = at.parser.in_block();
+                        let events = at.parser.feed(line);
+                        let in_block = at.parser.in_block();
+                        if !was_in_block && in_block {
+                            at.block_lines = 0;
+                            at.lifted.clear();
+                        } else if was_in_block && in_block && line.ends_with(b"\n") {
+                            // A body line, or a lifted one: both count.
+                            if events.iter().any(|e| matches!(e, Event::Pause(_) | Event::Continue(_))) {
+                                let mut row = line.to_vec();
+                                while row.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                                    row.pop();
+                                }
+                                at.lifted.push((at.block_lines, row));
+                            }
+                            at.block_lines += 1;
+                        }
+                        for event in events {
                             match self.handle(&mut at, event, in_block, attempt).await {
                                 Ok(None) => {}
                                 Ok(Some(outcome)) => return outcome,
@@ -709,12 +840,18 @@ impl Actor {
                 let Some(mut seq) = fed else {
                     return self.poisoned(at).await;
                 };
-                for chunk in data.chunks(OUTPUT_CHUNK) {
-                    self.emit(FeedEvent::Output {
-                        seq,
-                        data: chunk.to_vec(),
-                    });
-                    seq += chunk.len() as u64;
+                if data.len() <= OUTPUT_CHUNK {
+                    // The common case moves the bytes; only an oversize line
+                    // is split and copied.
+                    self.emit(FeedEvent::Output { seq, data });
+                } else {
+                    for chunk in data.chunks(OUTPUT_CHUNK) {
+                        self.emit(FeedEvent::Output {
+                            seq,
+                            data: chunk.to_vec(),
+                        });
+                        seq += chunk.len() as u64;
+                    }
                 }
             }
             Event::Pause(pane) => {
@@ -727,7 +864,7 @@ impl Actor {
                 }
                 if !at.paused {
                     at.paused = true;
-                    self.with_status(|s| s.paused = true);
+                    self.with_counters(|c| c.paused = true);
                     self.emit(FeedEvent::Gap {
                         seq: self.seq(),
                         reason: GapReason::Paused,
@@ -751,21 +888,29 @@ impl Actor {
                 }
                 self.resume(at).await?;
             }
-            Event::Reply { ok, lines, .. } => {
+            Event::Reply { ok, mut lines, .. } => {
                 let kind = at.pending.pop_front();
+                if kind == Some(Pending::SeedCapture) {
+                    // Put the lifted rows back where the pane printed them.
+                    for (index, row) in at.lifted.drain(..) {
+                        let index = index.min(lines.len());
+                        lines.insert(index, row);
+                    }
+                }
                 return self.reply(at, kind, ok, lines, attempt).await;
             }
-            Event::LayoutChange { window, .. } => {
-                // Asked even while a seed is in flight: the reply is ordered
-                // after the capture, so it either confirms the seeded size
-                // or resizes the fresh emulator.
-                if window == at.window {
-                    self.send(at, size_query(at.pane), Pending::SizeQuery).await?;
-                }
+            Event::LayoutChange { .. } => {
+                // Asked for any window, even while a seed is in flight: the
+                // reply carries the pane's current size and window, so it
+                // confirms the seeded size, resizes the fresh emulator, or
+                // follows a pane moved to another window.
+                self.send(at, size_query(at.pane), Pending::SizeQuery).await?;
             }
             Event::WindowClose(window) => {
                 if window == at.window {
-                    return Ok(Some(Outcome::SessionGone));
+                    // Either the pane died with its window, or it was moved
+                    // out first; the size reply tells which.
+                    self.send(at, size_query(at.pane), Pending::SizeQuery).await?;
                 }
             }
             Event::Exit { .. } => return Ok(Some(Outcome::FeedLost)),
@@ -778,7 +923,7 @@ impl Actor {
     /// re-seed.
     async fn resume(&self, at: &mut Attach) -> std::io::Result<()> {
         at.paused = false;
-        self.with_status(|s| s.paused = false);
+        self.with_counters(|c| c.paused = false);
         self.start_seed(at).await
     }
 
@@ -814,9 +959,24 @@ impl Actor {
                 }
             }
             Some(Pending::SeedFlags) => {
-                if let Some((state, _)) = at.seeding.as_mut() {
-                    if let Some(parsed) = lines.first().and_then(|l| SeedState::parse(l)) {
-                        *state = parsed;
+                let Some((state, _)) = at.seeding.as_mut() else {
+                    return Ok(None);
+                };
+                match lines.first().and_then(|l| SeedState::parse(l)) {
+                    Some(parsed) => *state = parsed,
+                    None if lines.first().is_none_or(|l| l.trim_ascii().is_empty()) => {
+                        // A blank reply is how a dead pane answers.
+                        return Ok(Some(Outcome::PaneGone));
+                    }
+                    None => {
+                        // A wrong screen with no diagnostic is worse than no
+                        // feed: this tmux does not render the seed formats.
+                        tracing::error!(
+                            target = %self.cfg.target,
+                            reply = %String::from_utf8_lossy(lines.first().map_or(&[][..], Vec::as_slice)),
+                            "seed flags reply does not parse; closing the feed"
+                        );
+                        return Ok(Some(Outcome::Fatal("seed_unreadable")));
                     }
                 }
             }
@@ -825,22 +985,39 @@ impl Actor {
                     *title = lines.first().cloned().unwrap_or_default();
                 }
             }
-            Some(Pending::SeedSize) => {
-                if !ok {
-                    return Ok(Some(Outcome::SessionGone));
-                }
-                let Some((cols, rows)) = lines.first().and_then(|l| parse_size(l)) else {
-                    return Ok(Some(Outcome::SessionGone));
+            Some(Pending::SeedSize) | Some(Pending::SizeQuery) => {
+                // A blank or refused reply is a dead pane (display-message
+                // answers a missing target with an empty body and `%end`).
+                let Some((cols, rows, window)) =
+                    ok.then(|| lines.first().and_then(|l| parse_size(l))).flatten()
+                else {
+                    return Ok(Some(Outcome::PaneGone));
                 };
+                at.window = window;
+                if (cols, rows) == (at.cols, at.rows) {
+                    return Ok(None);
+                }
                 at.cols = cols;
                 at.rows = rows;
+                if at.seeding.is_some() {
+                    // The capture that follows is taken at this size.
+                    return Ok(None);
+                }
+                let seq = {
+                    let mut guard = self.pane.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(emu) = guard.emulator.as_mut() {
+                        let _ = emu.resize(cols, rows);
+                    }
+                    guard.seq
+                };
+                self.emit(FeedEvent::Resize { seq, cols, rows });
             }
             Some(Pending::SeedCapture) => {
                 let Some((state, title)) = at.seeding.take() else {
                     return Ok(None);
                 };
                 if !ok {
-                    return Ok(Some(Outcome::SessionGone));
+                    return Ok(Some(Outcome::PaneGone));
                 }
                 let repaint = seed_repaint(&lines, &title, &state, at.rows);
                 let mut emu = PaneEmulator::new(at.cols, at.rows, self.cfg.live_rows);
@@ -860,28 +1037,6 @@ impl Actor {
                     cols: at.cols,
                     rows: at.rows,
                 });
-            }
-            Some(Pending::SizeQuery) => {
-                let Some((cols, rows)) = lines.first().and_then(|l| parse_size(l)) else {
-                    return Ok(None);
-                };
-                if (cols, rows) == (at.cols, at.rows) {
-                    return Ok(None);
-                }
-                at.cols = cols;
-                at.rows = rows;
-                if at.seeding.is_some() {
-                    // The capture that follows is taken at this size.
-                    return Ok(None);
-                }
-                let seq = {
-                    let mut guard = self.pane.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(emu) = guard.emulator.as_mut() {
-                        let _ = emu.resize(cols, rows);
-                    }
-                    guard.seq
-                };
-                self.emit(FeedEvent::Resize { seq, cols, rows });
             }
         }
         Ok(None)
@@ -904,17 +1059,22 @@ async fn gated_read(
     stdout.read(buf).await
 }
 
-/// The size query for a pane, newline-terminated. The pane id is digits
-/// after `%`, quoted against the spike 7 parse trap.
+/// The size-and-window query for a pane, newline-terminated. The pane id is
+/// digits after `%`, quoted against the spike 7 parse trap.
 fn size_query(pane: PaneId) -> String {
-    format!("display-message -p -t \"{pane}\" \"#{{pane_width}} #{{pane_height}}\"\n")
+    format!(
+        "display-message -p -t \"{pane}\" \"#{{pane_width}} #{{pane_height}} #{{window_id}}\"\n"
+    )
 }
 
-/// `cols rows`.
-fn parse_size(line: &[u8]) -> Option<(u16, u16)> {
+/// `cols rows @window`.
+fn parse_size(line: &[u8]) -> Option<(u16, u16, WindowId)> {
     let text = std::str::from_utf8(line).ok()?;
     let mut f = text.split_whitespace();
-    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    let cols = f.next()?.parse().ok()?;
+    let rows = f.next()?.parse().ok()?;
+    let window = f.next()?.strip_prefix('@')?.parse().ok().map(WindowId)?;
+    Some((cols, rows, window))
 }
 
 #[cfg(test)]
@@ -923,11 +1083,13 @@ mod tests {
 
     #[test]
     fn the_size_reply_parses() {
-        assert_eq!(parse_size(b"40 20"), Some((40, 20)));
-        assert_eq!(parse_size(b"40"), None);
+        assert_eq!(parse_size(b"40 20 @3"), Some((40, 20, WindowId(3))));
+        assert_eq!(parse_size(b"40 20"), None);
+        assert_eq!(parse_size(b""), None);
+        assert_eq!(parse_size(b" "), None);
         assert_eq!(
             size_query(PaneId(7)),
-            "display-message -p -t \"%7\" \"#{pane_width} #{pane_height}\"\n"
+            "display-message -p -t \"%7\" \"#{pane_width} #{pane_height} #{window_id}\"\n"
         );
     }
 
