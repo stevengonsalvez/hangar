@@ -3,7 +3,7 @@
 
 import { fromBase64 } from "../terminal/engine/protocol";
 import { FIXTURES } from "../terminal/fixtures";
-import { PEER_CHANGED, PeerCloseError } from "./types";
+import { PEER_CHANGED, PeerCloseError, type PeerCloseKind } from "./types";
 import type {
   AnswerOutcome,
   AttentionRow,
@@ -204,7 +204,10 @@ export class FakeWire implements WireClient {
     this.frame(streamId, { kind: "snapshot_end" });
     // A hyperlink in the pane output, the way any program can print one.
     this.frame(streamId, { kind: "output", data: fromBase64(FIXTURES["f4-osc8"]) });
-    if (this.floodBytesAfterSnapshot > 0) this.frame(streamId, { kind: "output", data: new Uint8Array(this.floodBytesAfterSnapshot).fill(0x2e) });
+    if (this.floodBytesAfterSnapshot > 0) {
+      this.frame(streamId, { kind: "output", data: new Uint8Array(this.floodBytesAfterSnapshot).fill(0x2e) });
+      if (this.floodOnce) this.floodBytesAfterSnapshot = 0;
+    }
   }
 
   private denied(sessionKey: SessionKey): FloorDenied {
@@ -227,6 +230,8 @@ export class FakeWire implements WireClient {
 
   /** Extra bytes of output the fake sends right after each snapshot (before the attach reply is processed). */
   floodBytesAfterSnapshot = 0;
+  /** When set, the flood applies to the next snapshot only. */
+  floodOnce = false;
   /** When set, the next `terminalAttach` throws once. */
   failNextAttach = false;
   /** Deliver the snapshot BEFORE the attach reply (what a real socket can do), not on a microtask after it. */
@@ -235,8 +240,8 @@ export class FakeWire implements WireClient {
   attaches = 0;
   /** When set, the next N `connect` calls fail as a network error (the redials that must be rescheduled). */
   failNextConnect = 0;
-  /** When set, the next `connect` is refused by the peer with this close code (no close event, like lane E). */
-  refuseNextConnectWith?: { code: number; reason?: string };
+  /** When set, the next `connect` fails this way (no close event, like lane E): a close code, or a non-close kind. */
+  refuseNextConnectWith?: { code?: number; kind?: PeerCloseKind; reason?: string };
   /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
   failNextSubscribe = 0;
   /** Deterministic backoff for tests: no jitter; a host's retry-after is a floor under the backoff. */
@@ -310,18 +315,21 @@ export class FakeWire implements WireClient {
     if (this.failNextConnect > 0) {
       this.failNextConnect -= 1;
       this.record(hostId, "dial-failed");
-      throw new Error("dial failed");
+      throw PeerCloseError.network("dial failed");
     }
     const refuse = this.refuseNextConnectWith;
     if (refuse) {
       this.refuseNextConnectWith = undefined;
-      if (refuse.code === 4403) host.row.repair = "revoked";
-      else if (refuse.code === 4401) host.row.repair = "identity";
-      else if (refuse.code === 4409) host.row.notice = "update_required";
-      else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_close";
-      this.record(hostId, "refused", String(refuse.code));
+      const kind: PeerCloseKind = refuse.kind ?? "close";
+      if (kind === "close" && refuse.code !== undefined) {
+        if (refuse.code === 4403) host.row.repair = "revoked";
+        else if (refuse.code === 4401) host.row.repair = "identity";
+        else if (refuse.code === 4409) host.row.notice = "update_required";
+        else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_close";
+      } else if (kind === "peer_changed") host.row.repair = "peer_changed";
+      this.record(hostId, "refused", kind === "close" ? String(refuse.code) : kind);
       this.emit({ kind: "reachability", hostId, reachability: host.row.reachability, sinceMs: host.row.sinceMs });
-      throw new PeerCloseError(refuse.code, refuse.reason);
+      throw new PeerCloseError(kind, refuse.code, refuse.reason);
     }
     host.connected = true;
     this.record(hostId, "hello", "scope=mobile");
