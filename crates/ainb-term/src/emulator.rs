@@ -17,29 +17,49 @@
 //! Mouse modes follow tmux, not xterm: `?1000h`, `?1002h` and `?1003h`
 //! replace each other (one tracking mode at a time) and any of their resets
 //! clears tracking, while `?1005` and `?1006` are independent encodings.
-//! Spike 2 section 5 measured `#{mouse_any_flag}` over-reporting, which is why
-//! the tracker, not the tmux formats, is the source of truth after the seed.
+//! tmux's `#{mouse_any_flag}` means "any mouse mode is on" (`mouse_all_flag`
+//! is `?1003`), which is why the tracker, not the tmux formats, is the source
+//! of truth after the seed.
+//!
+//! The tracker mirrors what the emulator saves and restores: DECSC/DECRC and
+//! `CSI s`/`CSI u` save and restore origin mode and the G0/G1 charsets per
+//! screen, and `?1049h`/`?1049l` save on the primary screen and restore on
+//! the way back, exactly as `TerminalState::dec_save_cursor` does. Not
+//! tracked, because the emulator does not expose it: a pending autowrap
+//! (the cursor sits on the last column after a full row); see `snapshot`.
 //!
 //! A panic inside the emulator is contained: the fork lacks upstream's fix for
 //! a divide by zero in inline image placement, and crafted agent output must
 //! not take the daemon down. After a panic the pane is [`Poisoned`] and every
 //! further feed is refused, so the daemon replaces it and re-seeds.
 //!
-//! Printable text at the end of a feed is held back until the next feed or a
+//! The last grapheme cluster of a feed is held back until the next feed or a
 //! [`PaneEmulator::flush`]. Measured on the fork: `a` in one batch and
 //! U+030A in the next leaves a bare `a`, and so does a split inside the
 //! mark's UTF-8 bytes. tmux ends notifications mid-grapheme under load
 //! (spike 2 section 1), so without the hold a phone would show accents,
-//! ZWJ emoji and flags dropping at random. The cost is that the last
-//! printed run of a feed shows a few milliseconds late.
+//! ZWJ emoji and flags dropping at random. Only the last cluster is held
+//! (at most [`MAX_HELD_BYTES`]); everything before it is performed at once,
+//! so a feed with no control byte in it still costs linear time and shows
+//! immediately. The cost is that the last glyph of a feed shows a few
+//! milliseconds late.
+//!
+//! Known ceiling: a mark that arrives AFTER a flush (idle, snapshot or
+//! resize) meets a base that was already performed, and the fork drops it,
+//! so the daemon's grid keeps the bare base until the app repaints. Clients
+//! are unaffected, they get the raw tail bytes; only a later snapshot shows
+//! the bare base. tmux splits mid-grapheme under load, when the feed is not
+//! idle, so this is rare; `a_mark_after_a_flush_is_the_documented_loss` pins
+//! the behaviour.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use unicode_segmentation::UnicodeSegmentation;
 use wezterm_escape_parser::csi::{
     CSI, Cursor, DecPrivateMode, DecPrivateModeCode, Device, Mode, TerminalMode, TerminalModeCode,
 };
 use wezterm_escape_parser::parser::Parser;
-use wezterm_escape_parser::{Action, Esc, EscCode};
+use wezterm_escape_parser::{Action, ControlCode, Esc, EscCode};
 use wezterm_term::{CursorPosition, Terminal, TerminalSize};
 
 use crate::{TermConfig, new_terminal};
@@ -50,6 +70,9 @@ use crate::{TermConfig, new_terminal};
 pub const LIVE_ROWS_ENV: &str = "AINB_TERM_LIVE_ROWS";
 /// Smallest live window the env var can ask for.
 pub const MIN_LIVE_ROWS: usize = 100;
+/// The most bytes [`PaneEmulator::feed`] holds back: one grapheme cluster.
+/// A longer cluster (a pile of combining marks) is performed at once.
+pub const MAX_HELD_BYTES: usize = 64;
 /// Largest live window the env var can ask for.
 pub const MAX_LIVE_ROWS: usize = 5_000;
 
@@ -94,6 +117,38 @@ impl MouseTracking {
     }
 }
 
+/// A designated character set, as the emulator supports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Charset {
+    /// `ESC ( B` / `ESC ) B`.
+    #[default]
+    Ascii,
+    /// `ESC ( A` / `ESC ) A`.
+    Uk,
+    /// `ESC ( 0` / `ESC ) 0`: DEC special graphics, the line-drawing set.
+    DecLineDrawing,
+}
+
+impl Charset {
+    /// The final byte that designates this set.
+    pub const fn designator(self) -> char {
+        match self {
+            Self::Ascii => 'B',
+            Self::Uk => 'A',
+            Self::DecLineDrawing => '0',
+        }
+    }
+}
+
+/// What DECSC saves and DECRC restores, beside the cursor: the emulator
+/// keeps one slot per screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SavedModes {
+    origin: bool,
+    g0: Charset,
+    g1: Charset,
+}
+
 /// The terminal state the snapshot must replay and the grid does not carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Modes {
@@ -119,6 +174,16 @@ pub struct Modes {
     pub mouse_sgr: bool,
     /// DECSTBM as zero-based inclusive rows, or `None` for the whole screen.
     pub scroll_region: Option<(u16, u16)>,
+    /// The set designated to G0.
+    pub g0: Charset,
+    /// The set designated to G1.
+    pub g1: Charset,
+    /// SO (`0x0e`) in effect: G1 is the active set. SI (`0x0f`) clears it.
+    pub shift_out: bool,
+    /// The alternate screen is active (`?1049`, `?1047`, `?47`).
+    pub alt: bool,
+    /// DECSC slots, primary screen then alternate screen.
+    saved: [Option<SavedModes>; 2],
 }
 
 impl Default for Modes {
@@ -135,6 +200,11 @@ impl Default for Modes {
             mouse_utf8: false,
             mouse_sgr: false,
             scroll_region: None,
+            g0: Charset::Ascii,
+            g1: Charset::Ascii,
+            shift_out: false,
+            alt: false,
+            saved: [None, None],
         }
     }
 }
@@ -146,10 +216,36 @@ impl Modes {
         !matches!(self.mouse, MouseTracking::Off)
     }
 
+    /// The set the next printed character is drawn from.
+    pub const fn active_charset(&self) -> Charset {
+        if self.shift_out { self.g1 } else { self.g0 }
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved[usize::from(self.alt)] = Some(SavedModes {
+            origin: self.origin,
+            g0: self.g0,
+            g1: self.g1,
+        });
+    }
+
+    /// DECRC: the emulator restores the slot of the ACTIVE screen, or the
+    /// defaults when nothing was saved there.
+    fn restore_cursor(&mut self) {
+        let saved = self.saved[usize::from(self.alt)].unwrap_or_default();
+        self.origin = saved.origin;
+        self.g0 = saved.g0;
+        self.g1 = saved.g1;
+    }
+
     /// Apply one parsed action, mirroring what the emulator does with it.
     fn observe(&mut self, action: &Action, rows: u16) {
         match action {
             Action::CSI(CSI::Mode(mode)) => self.observe_mode(mode),
+            Action::CSI(CSI::Cursor(Cursor::SaveCursor)) => self.save_cursor(),
+            Action::CSI(CSI::Cursor(Cursor::RestoreCursor)) => self.restore_cursor(),
+            Action::Control(ControlCode::ShiftOut) => self.shift_out = true,
+            Action::Control(ControlCode::ShiftIn) => self.shift_out = false,
             Action::CSI(CSI::Cursor(Cursor::SetTopAndBottomMargins { top, bottom })) => {
                 let top = top.as_zero_based();
                 let bottom = bottom.as_zero_based();
@@ -171,9 +267,20 @@ impl Modes {
                     self.soft_reset();
                 }
             }
-            Action::Esc(Esc::Code(EscCode::DecApplicationKeyPad)) => self.application_keypad = true,
-            Action::Esc(Esc::Code(EscCode::DecNormalKeyPad)) => self.application_keypad = false,
-            Action::Esc(Esc::Code(EscCode::FullReset)) => *self = Self::default(),
+            Action::Esc(Esc::Code(code)) => match code {
+                EscCode::DecApplicationKeyPad => self.application_keypad = true,
+                EscCode::DecNormalKeyPad => self.application_keypad = false,
+                EscCode::DecSaveCursorPosition => self.save_cursor(),
+                EscCode::DecRestoreCursorPosition => self.restore_cursor(),
+                EscCode::AsciiCharacterSetG0 => self.g0 = Charset::Ascii,
+                EscCode::UkCharacterSetG0 => self.g0 = Charset::Uk,
+                EscCode::DecLineDrawingG0 => self.g0 = Charset::DecLineDrawing,
+                EscCode::AsciiCharacterSetG1 => self.g1 = Charset::Ascii,
+                EscCode::UkCharacterSetG1 => self.g1 = Charset::Uk,
+                EscCode::DecLineDrawingG1 => self.g1 = Charset::DecLineDrawing,
+                EscCode::FullReset => *self = Self::default(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -186,6 +293,9 @@ impl Modes {
         self.auto_wrap = true;
         self.insert = false;
         self.scroll_region = None;
+        self.g0 = Charset::Ascii;
+        self.g1 = Charset::Ascii;
+        self.saved = [None, None];
     }
 
     fn observe_mode(&mut self, mode: &Mode) {
@@ -207,6 +317,19 @@ impl Modes {
             DecPrivateModeCode::FocusTracking => self.focus_tracking = on,
             DecPrivateModeCode::Utf8Mouse => self.mouse_utf8 = on,
             DecPrivateModeCode::SGRMouse => self.mouse_sgr = on,
+            // `?1049h` saves on the primary screen and `?1049l` restores
+            // there, as the emulator does; `?47` and `?1047` only switch.
+            DecPrivateModeCode::ClearAndEnableAlternateScreen => {
+                if on && !self.alt {
+                    self.save_cursor();
+                    self.alt = true;
+                } else if !on && self.alt {
+                    self.alt = false;
+                    self.restore_cursor();
+                }
+            }
+            DecPrivateModeCode::EnableAlternateScreen
+            | DecPrivateModeCode::OptEnableAlternateScreen => self.alt = on,
             DecPrivateModeCode::MouseTracking
             | DecPrivateModeCode::HighlightMouseTracking
             | DecPrivateModeCode::ButtonEventMouse
@@ -223,9 +346,14 @@ impl Modes {
     }
 }
 
-/// Pop the trailing run of printable text off `actions`, joined into one
-/// string, so it can be replayed at the head of the next batch.
-fn take_trailing_text(actions: &mut Vec<Action>) -> Option<String> {
+/// Split the last grapheme cluster off the trailing printable text of
+/// `actions`, so it can be replayed at the head of the next batch. The rest
+/// of that text stays in `actions` and is performed now, so the cost is
+/// linear in the bytes fed. A cluster longer than [`MAX_HELD_BYTES`] is not
+/// held at all.
+fn take_trailing_cluster(actions: &mut Vec<Action>) -> Option<String> {
+    // The parser emits one `Print` per character, so gather the whole
+    // trailing run first.
     let mut parts: Vec<String> = Vec::new();
     while let Some(last) = actions.last() {
         match last {
@@ -239,7 +367,20 @@ fn take_trailing_text(actions: &mut Vec<Action>) -> Option<String> {
         return None;
     }
     parts.reverse();
-    Some(parts.concat())
+    let text = parts.concat();
+    let last = text.graphemes(true).next_back()?;
+    if last.len() > MAX_HELD_BYTES {
+        actions.push(Action::PrintString(text));
+        return None;
+    }
+    let head_len = text.len() - last.len();
+    let held = text[head_len..].to_string();
+    if head_len > 0 {
+        let mut head = text;
+        head.truncate(head_len);
+        actions.push(Action::PrintString(head));
+    }
+    Some(held)
 }
 
 /// The emulator panicked on some input and its grid can no longer be
@@ -276,9 +417,10 @@ pub struct PaneEmulator {
     rows: u16,
     bytes_fed: u64,
     poisoned: bool,
-    /// Printable text at the end of the last feed, not yet performed: a
+    /// The last grapheme cluster of the last feed, not yet performed: a
     /// combining mark, ZWJ or variation selector in the next feed must land
-    /// in the same batch as its base, or the emulator drops it.
+    /// in the same batch as its base, or the emulator drops it. At most
+    /// [`MAX_HELD_BYTES`].
     held: Option<String>,
     /// Test-only: make the next feed panic inside the guarded region, so
     /// the containment path is exercised without a crafted image.
@@ -325,10 +467,10 @@ impl PaneEmulator {
     /// escape sequence or a multi-byte grapheme; the parser carries state
     /// across calls.
     ///
-    /// Printable text at the very end of the slice is HELD until the next
-    /// feed or [`flush`](Self::flush): the emulator only joins a combining
-    /// mark, ZWJ or variation selector to its base when both arrive in one
-    /// batch, and a tmux feed splits graphemes wherever it likes. The daemon
+    /// The last grapheme cluster of the slice is HELD until the next feed
+    /// or [`flush`](Self::flush): the emulator only joins a combining mark,
+    /// ZWJ or variation selector to its base when both arrive in one batch,
+    /// and a tmux feed splits graphemes wherever it likes. The daemon
     /// flushes after a few idle milliseconds; a snapshot flushes itself.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Poisoned> {
         if self.poisoned {
@@ -342,7 +484,7 @@ impl PaneEmulator {
             if let Some(held) = self.held.take() {
                 actions.insert(0, Action::PrintString(held));
             }
-            self.held = take_trailing_text(&mut actions);
+            self.held = take_trailing_cluster(&mut actions);
             for action in &actions {
                 self.modes.observe(action, rows);
             }
@@ -384,22 +526,35 @@ impl PaneEmulator {
         self.held.is_some()
     }
 
+    /// Bytes held back, at most [`MAX_HELD_BYTES`].
+    pub fn held_bytes(&self) -> usize {
+        self.held.as_ref().map_or(0, String::len)
+    }
+
     /// Resize the pane. Like the emulator, this drops the scroll region.
     /// Held text is flushed first so it lands at the old width, in order.
-    pub fn resize(&mut self, cols: u16, rows: u16) {
-        let _ = self.flush();
+    /// Refused on a poisoned pane, and a panic inside the resize poisons it.
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), Poisoned> {
+        self.flush()?;
         let cols = cols.max(1);
         let rows = rows.max(1);
-        self.term.resize(TerminalSize {
-            rows: usize::from(rows),
-            cols: usize::from(cols),
-            pixel_width: 0,
-            pixel_height: 0,
-            dpi: 0,
-        });
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.term.resize(TerminalSize {
+                rows: usize::from(rows),
+                cols: usize::from(cols),
+                pixel_width: 0,
+                pixel_height: 0,
+                dpi: 0,
+            });
+        }));
+        if outcome.is_err() {
+            self.poisoned = true;
+            return Err(Poisoned);
+        }
         self.cols = cols;
         self.rows = rows;
         self.modes.scroll_region = None;
+        Ok(())
     }
 
     /// Columns and rows.
@@ -574,8 +729,8 @@ mod tests {
         // A grapheme split mid-sequence lands as one cell.
         p.feed(b"\x1b[H\xe4\xb8").unwrap();
         p.feed(b"\xadX").unwrap();
-        assert!(p.has_held_text(), "the trailing text waits for a flush");
-        assert_eq!(row_text(&p, 0), "");
+        assert!(p.has_held_text(), "the last cluster waits for a flush");
+        assert_eq!(row_text(&p, 0), "\u{4E2D}", "everything before it went in");
         p.flush().unwrap();
         assert!(!p.has_held_text());
         assert_eq!(row_text(&p, 0), "\u{4E2D}X");
@@ -653,7 +808,7 @@ mod tests {
         let mut p = pane(120, 40);
         p.feed(b"\x1b[5;30r").unwrap();
         assert_eq!(p.modes().scroll_region, Some((4, 29)));
-        p.resize(40, 20);
+        p.resize(40, 20).unwrap();
         assert_eq!(p.size(), (40, 20));
         assert_eq!(p.modes().scroll_region, None);
         let size = p.terminal().get_size();
@@ -662,7 +817,7 @@ mod tests {
         p.flush().unwrap();
         assert_eq!(row_text(&p, 1), "X", "wraps at the new width");
         p.feed(b"held").unwrap();
-        p.resize(80, 24);
+        p.resize(80, 24).unwrap();
         assert!(!p.has_held_text(), "resize flushes first");
         // The widened pane reflows the wrapped row back onto row 0.
         assert!(row_text(&p, 0).ends_with("9Xheld"), "{}", row_text(&p, 0));
@@ -704,5 +859,114 @@ mod tests {
             format!("{Poisoned}"),
             "pane emulator poisoned by a panic; replace and re-seed it"
         );
+        assert_eq!(p.resize(80, 24), Err(Poisoned), "resize refused too");
+        assert_eq!(p.size(), (40, 20));
+    }
+
+    /// Only the last cluster is held, so a feed with no control byte in it
+    /// (a minified bundle, a base64 blob) is performed as it arrives and the
+    /// total cost stays linear in the bytes fed.
+    #[test]
+    fn only_the_last_cluster_is_held_and_time_stays_linear() {
+        fn run(kib: usize) -> std::time::Duration {
+            let mut p = PaneEmulator::new(80, 24, 100);
+            let chunk = vec![b'a'; 4096];
+            let start = std::time::Instant::now();
+            for _ in 0..(kib / 4) {
+                p.feed(&chunk).unwrap();
+                assert!(p.held_bytes() <= MAX_HELD_BYTES);
+                assert_eq!(p.held_bytes(), 1, "one `a` waits, the rest went in");
+            }
+            start.elapsed()
+        }
+        // Sizes kept small because the fork performs about 4 KiB of text
+        // per 90 ms in a debug build. Quadratic re-concatenation made 4x
+        // the bytes cost about 16x; linear is about 4x. Generous bound for
+        // a shared CI runner.
+        let quarter = run(256);
+        let one = run(1024);
+        assert!(
+            one < quarter * 10 + std::time::Duration::from_millis(250),
+            "256 KiB {quarter:?}, 1 MiB {one:?}: not linear"
+        );
+        // A trailing multi-byte cluster is the held one; a run of narrow
+        // text before it is already on the grid.
+        let mut p = pane(40, 3);
+        p.feed("abc\u{1F469}\u{200D}\u{1F4BB}".as_bytes()).unwrap();
+        assert_eq!(row_text(&p, 0), "abc");
+        assert_eq!(p.held_bytes(), "\u{1F469}\u{200D}\u{1F4BB}".len());
+        p.flush().unwrap();
+        assert_eq!(row_text(&p, 0), "abc\u{1F469}\u{200D}\u{1F4BB}");
+        // A cluster longer than the cap is not held at all.
+        let mut p = pane(40, 3);
+        let mut pile = String::from("x");
+        for _ in 0..40 {
+            pile.push('\u{0301}');
+        }
+        p.feed(pile.as_bytes()).unwrap();
+        assert_eq!(p.held_bytes(), 0);
+        assert_eq!(row_text(&p, 0), pile);
+    }
+
+    /// The documented residual: a mark that arrives after a flush meets a
+    /// base already on the grid, and the fork drops it. Clients still get
+    /// the raw bytes; only the daemon's grid, and so a later snapshot,
+    /// shows the bare base.
+    #[test]
+    fn a_mark_after_a_flush_is_the_documented_loss() {
+        let mut p = pane(20, 3);
+        p.feed(b"xa").unwrap();
+        p.flush().unwrap();
+        p.feed(b"\xcc\x8a tail").unwrap();
+        p.flush().unwrap();
+        assert_eq!(
+            row_text(&p, 0),
+            "xa tail",
+            "the mark after the flush is lost"
+        );
+        assert_eq!(p.cursor().col, 7);
+    }
+
+    #[test]
+    fn tracker_mirrors_charsets_and_the_saved_cursor_per_screen() {
+        let mut p = pane(40, 20);
+        p.feed(b"\x1b(0\x1b)A\x0e").unwrap();
+        let m = *p.modes();
+        assert_eq!(
+            (m.g0, m.g1, m.shift_out),
+            (Charset::DecLineDrawing, Charset::Uk, true)
+        );
+        assert_eq!(m.active_charset(), Charset::Uk);
+        assert_eq!(Charset::DecLineDrawing.designator(), '0');
+        // DECSC saves origin and charsets; changes after it are undone by DECRC.
+        p.feed(b"\x1b[?6h\x1b7\x1b[?6l\x1b(B\x0f").unwrap();
+        assert!(!p.modes().origin && p.modes().g0 == Charset::Ascii);
+        p.feed(b"\x1b8").unwrap();
+        let m = *p.modes();
+        assert!(m.origin, "DECRC restores origin mode");
+        assert_eq!(m.g0, Charset::DecLineDrawing, "DECRC restores G0");
+        assert!(!m.shift_out, "SO/SI is not part of the saved cursor");
+        // `?1049h` saves on the primary screen; the alternate screen has its
+        // own slot; `?1049l` restores the primary one.
+        p.feed(b"\x1b[?1049h").unwrap();
+        assert!(p.modes().alt);
+        p.feed(b"\x1b[?6l\x1b(B\x1b[s\x1b(A\x1b[u").unwrap();
+        assert_eq!(
+            p.modes().g0,
+            Charset::Ascii,
+            "CSI s/u save and restore on alt"
+        );
+        p.feed(b"\x1b[?1049l").unwrap();
+        let m = *p.modes();
+        assert!(!m.alt && m.origin && m.g0 == Charset::DecLineDrawing);
+        // DECRC with nothing saved on this screen resets to the defaults.
+        p.feed(b"\x1b[!p\x1b(0\x1b[?6h\x1b8").unwrap();
+        let m = *p.modes();
+        assert!(!m.origin && m.g0 == Charset::Ascii);
+        assert!(!m.shift_out);
+        p.feed(b"\x1b[?47h").unwrap();
+        assert!(p.modes().alt, "?47 only switches");
+        p.feed(b"\x1bc").unwrap();
+        assert_eq!(*p.modes(), Modes::default());
     }
 }
