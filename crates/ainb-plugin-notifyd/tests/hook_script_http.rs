@@ -51,6 +51,9 @@ impl Seen {
 enum Reply {
     NoContent,
     Allow,
+    /// What the daemon does: a decision for a hold that waits for a human
+    /// (PermissionRequest, AskUserQuestion), 204 for everything else.
+    Daemon,
     /// Accept, read, then say nothing for this long.
     Stall(Duration),
 }
@@ -97,12 +100,25 @@ fn serve(mut stream: TcpStream, reply: Reply, tx: &mpsc::Sender<Seen>) {
     }
     let mut body = vec![0; len];
     reader.read_exact(&mut body).unwrap();
+    let body_text = String::from_utf8_lossy(&body).into_owned();
     let _ = tx.send(Seen {
-        path,
+        path: path.clone(),
         headers,
-        body: String::from_utf8(body).unwrap(),
+        body: body_text.clone(),
     });
+    let reply = match reply {
+        Reply::Daemon
+            if path.ends_with("/hold")
+                && (body_text.contains("AskUserQuestion")
+                    || body_text.contains("\"PermissionRequest\"")) =>
+        {
+            Reply::Allow
+        }
+        Reply::Daemon => Reply::NoContent,
+        other => other,
+    };
     let response = match reply {
+        Reply::Daemon => unreachable!("resolved above"),
         Reply::NoContent => "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_string(),
         Reply::Allow => format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ALLOW}",
@@ -134,7 +150,8 @@ fn publish(home: &Path, port: u16) {
     let endpoint = HookEndpoint {
         port,
         version: 1,
-        pid: 1,
+        // A live process owned by this user, as the daemon's own pid is.
+        pid: std::process::id(),
         headers_path: headers,
     };
     std::fs::write(dir.join(ENDPOINT_FILE_NAME), endpoint.render_env_file()).unwrap();
@@ -222,8 +239,10 @@ fn a_permission_request_holds_and_prints_the_daemons_decision() {
 }
 
 #[test]
-fn only_ask_user_question_holds_among_pre_tool_use() {
-    let f = fake(Reply::Allow);
+fn every_pre_tool_use_asks_the_daemon_which_decides_what_holds() {
+    // The script routes on the event name only; the daemon answers a
+    // non-holding tool at once with 204, and the script prints `{}`.
+    let f = fake(Reply::Daemon);
     let home = home_for(f.port);
     let (out, _) = fire(
         home.path(),
@@ -234,14 +253,16 @@ fn only_ask_user_question_holds_among_pre_tool_use() {
     assert_eq!(out.trim_end(), ALLOW);
     assert_eq!(f.seen.recv().unwrap().path, "/hook/claude/hold");
 
+    // A payload whose nested input mentions another tool_name still goes to
+    // the daemon unparsed: no greedy client-side guess.
     let (out, _) = fire(
         home.path(),
         "PreToolUse",
-        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#,
+        r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"note":"\"tool_name\":\"Read\""}}"#,
         &[],
     );
-    assert_eq!(out, "{}\n", "a non-ask tool never prints the daemon's body");
-    assert_eq!(f.seen.recv().unwrap().path, "/hook/claude");
+    assert_eq!(out, "{}\n", "the daemon's 204 prints nothing but an empty object");
+    assert_eq!(f.seen.recv().unwrap().path, "/hook/claude/hold");
 }
 
 #[test]
@@ -277,7 +298,7 @@ fn a_stalled_daemon_costs_a_status_hook_under_two_seconds_and_spools_it() {
 }
 
 #[test]
-fn with_no_daemon_non_tool_events_spool_and_tool_events_do_not() {
+fn with_no_daemon_status_spools_and_tool_events_and_holds_do_not() {
     let home = tempfile::tempdir().unwrap(); // no endpoint file at all
     let (out, _) = fire(
         home.path(),
@@ -300,8 +321,19 @@ fn with_no_daemon_non_tool_events_spool_and_tool_events_do_not() {
         out, "{}\n",
         "a hold with no daemon falls to the agent's prompt"
     );
+    assert!(
+        spool_lines(home.path()).is_empty(),
+        "a hold never spools: a replayed approval would be a phantom"
+    );
+    let (out, _) = fire(
+        home.path(),
+        "Notification",
+        r#"{"hook_event_name":"Notification","session_id":"s3"}"#,
+        &[("AINB_PANE_KEY", "v1:p1")],
+    );
+    assert_eq!(out, "{}\n");
     let lines = spool_lines(home.path());
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 1, "status events spool");
     assert_eq!(lines[0].0, "v1:p1.jsonl");
 }
 
@@ -446,5 +478,104 @@ fn notify_sh_stands_down_when_the_transport_is_http() {
     assert!(
         !home.path().join("notify.fallback.jsonl").exists(),
         "no second copy of the event was delivered"
+    );
+}
+
+#[test]
+fn a_dead_daemon_pid_means_nothing_is_sent() {
+    // A crash leaves the endpoint file behind; its port may now be anyone's.
+    let f = fake(Reply::Allow);
+    let home = home_for(f.port);
+    let dir = home.path().join("hangar").canonicalize().unwrap();
+    let mut endpoint = HookEndpoint::parse_env_file(
+        &std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    endpoint.pid = dead_pid();
+    std::fs::write(dir.join(ENDPOINT_FILE_NAME), endpoint.render_env_file()).unwrap();
+    let (out, _) = fire(
+        home.path(),
+        "PermissionRequest",
+        r#"{"hook_event_name":"PermissionRequest"}"#,
+        &[],
+    );
+    assert_eq!(out, "{}\n");
+    assert!(
+        f.seen.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a hold reached a port whose daemon is gone"
+    );
+}
+
+/// A pid that belonged to a process which has exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[test]
+fn only_a_file_named_hook_headers_is_ever_sent_as_headers() {
+    let f = fake(Reply::NoContent);
+    let home = home_for(f.port);
+    let dir = home.path().join("hangar").canonicalize().unwrap();
+    // A private key the user owns, at a path that passes the charset rule.
+    let secret = dir.join("id_ed25519");
+    std::fs::write(&secret, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+    let mut endpoint = HookEndpoint::parse_env_file(
+        &std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap(),
+    )
+    .unwrap();
+    endpoint.headers_path = secret;
+    // Render by hand: the proto renderer is not the attacker.
+    let text = endpoint.render_env_file();
+    std::fs::write(dir.join(ENDPOINT_FILE_NAME), text).unwrap();
+    let (out, _) = fire(
+        home.path(),
+        "Notification",
+        r#"{"hook_event_name":"Notification"}"#,
+        &[],
+    );
+    assert_eq!(out, "{}\n");
+    assert!(
+        f.seen.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a file not named hook-headers was sent as headers"
+    );
+}
+
+#[test]
+fn ainb_home_alone_is_not_the_hangar_home() {
+    // The daemon resolves AINB_HANGAR_HOME, else ~/.agents-in-a-box. The
+    // script must not read files under AINB_HOME that the daemon never wrote.
+    let f = fake(Reply::NoContent);
+    let decoy = home_for(f.port);
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new("sh");
+    cmd.arg(script())
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("HOME", home.path())
+        .env("AINB_HOME", decoy.path())
+        .env("AINB_AGENT", "claude")
+        .env("AINB_HOOK_EVENT", "Notification")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"Notification","session_id":"s"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "{}\n");
+    assert!(
+        f.seen.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the script followed AINB_HOME to a listener"
+    );
+    assert_eq!(
+        spool_lines(&home.path().join(".agents-in-a-box")).len(),
+        1,
+        "it spooled under the default hangar home instead"
     );
 }
