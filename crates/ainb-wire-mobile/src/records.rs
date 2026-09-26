@@ -17,6 +17,13 @@ use ainb_hangar_proto::snapshots::AnswerResult;
 
 /// Why a call failed. Variants are what the app branches on; `message` is
 /// for the connection log and never for control flow.
+///
+/// The redial rule, the whole of it: redial when the error is
+/// [`WireError::Connect`] or [`WireError::Closed`] with `retryable: true`
+/// (see [`WireError::is_retryable`], which also counts `Timeout`); every
+/// other variant waits for a person or a new pairing. A refusal that
+/// latches re-pair or parks a notice does so on the pairing record inside
+/// the crate; the app reads it back and keeps no copy.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum WireError {
     /// The WebSocket did not open.
