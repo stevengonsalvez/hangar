@@ -55,15 +55,6 @@ fn rt() -> &'static Runtime {
     })
 }
 
-/// Mint a 128-bit op id from the crate's CSPRNG, or reuse the one a retry
-/// passes back.
-fn op_id(reuse: Option<String>) -> Result<OpId, WireError> {
-    match reuse {
-        Some(id) => OpId::parse(id).map_err(|e| WireError::Protocol { message: e }),
-        None => Ok(OpId::from_bytes(rand::random::<[u8; 16]>())),
-    }
-}
-
 /// Split a mutation result into its typed half and the ledger ack under
 /// [`ACK_KEY`].
 fn split_ack<R: serde::de::DeserializeOwned>(
@@ -288,7 +279,7 @@ pub(crate) async fn hello(
 pub struct MobileHost {
     session: Arc<Session>,
     hello: HelloSummary,
-    streams: Streams,
+    streams: Arc<Streams>,
     custody_dir: std::path::PathBuf,
     host_id: String,
 }
@@ -354,7 +345,7 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
         Ok(Arc::new(MobileHost {
             session,
             hello,
-            streams: Streams::default(),
+            streams: Arc::new(Streams::default()),
             custody_dir: custody_dir.to_path_buf(),
             host_id: params.host_id.clone(),
         }))
@@ -482,15 +473,17 @@ impl MobileHost {
 
     /// Send a prompt to one session, fenced on the lifecycle clock the app
     /// read. A stale clock comes back as `Rpc { reason: "turn_advanced" }`.
+    /// `op_id` is minted by the app with `mint_op_id` before the send and
+    /// reused on a retry.
     pub async fn send_prompt(
         self: Arc<Self>,
         session_key: String,
         text: String,
         lifecycle_updated_at: i64,
-        retry_op_id: Option<String>,
+        op_id: String,
     ) -> Result<SendPromptReply, WireError> {
         rt().spawn(async move {
-            let op = op_id(retry_op_id)?;
+            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
             let params = FleetMessageSendParams {
                 scope_key: None,
                 // The daemon pins the actor to `device:<id>` (T12).
@@ -526,15 +519,17 @@ impl MobileHost {
 
     /// Interrupt the current turn: `fleet/action {interrupt}`, the only
     /// action the mobile scope may send, fenced on the process incarnation.
+    /// `op_id` is minted by the app with `mint_op_id` before the send and
+    /// reused on a retry.
     pub async fn interrupt(
         self: Arc<Self>,
         session_key: String,
         version: i64,
         process_start_fingerprint: String,
-        retry_op_id: Option<String>,
+        op_id: String,
     ) -> Result<InterruptReply, WireError> {
         rt().spawn(async move {
-            let op = op_id(retry_op_id)?;
+            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
             let params = FleetActionParams {
                 session_key,
                 expected_version: version,
@@ -623,7 +618,11 @@ impl MobileHost {
         rt().spawn(async move {
             match self.session.next_event().await {
                 SessionEvent::Notification(n) if n.method == methods::TERMINAL_FRAME => {
-                    match terminal::on_frame(&self.session, &self.streams, n.params).await {
+                    match terminal::on_frame(
+                        Arc::clone(&self.session),
+                        Arc::clone(&self.streams),
+                        n.params,
+                    ) {
                         Ok((stream_id, seq, frame)) => WireEvent::TerminalFrame {
                             stream_id,
                             seq,
@@ -725,17 +724,18 @@ impl MobileHost {
     }
 
     /// Type `data` on `stream_id` under `floor_gen` (absent: acquire if
-    /// free). Receipt tier: the crate mints the op id, a retry passes it
-    /// back. A floor refusal comes back as a value.
+    /// free). Receipt tier: `op_id` is minted by the app with `mint_op_id`
+    /// before the send and reused on a retry. A floor refusal comes back as
+    /// a value.
     pub async fn terminal_input(
         self: Arc<Self>,
         stream_id: u64,
         data: Vec<u8>,
         floor_gen: Option<u64>,
-        retry_op_id: Option<String>,
+        op_id: String,
     ) -> Result<TerminalInputOutcome, WireError> {
         rt().spawn(async move {
-            let op = op_id(retry_op_id)?;
+            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
             terminal::input(
                 &self.session,
                 stream_id,
@@ -750,16 +750,17 @@ impl MobileHost {
         .map_err(WireError::protocol)?
     }
 
-    /// `terminal/floor {acquire | release | take}` (dedupe tier).
+    /// `terminal/floor {acquire | release | take}` (dedupe tier); `op_id`
+    /// minted by the app with `mint_op_id`.
     pub async fn terminal_floor(
         self: Arc<Self>,
         stream_id: u64,
         action: String,
-        retry_op_id: Option<String>,
+        op_id: String,
     ) -> Result<TerminalFloorOutcome, WireError> {
         rt().spawn(async move {
             let action = terminal::floor_action(&action)?;
-            let op = op_id(retry_op_id)?;
+            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
             terminal::floor(
                 &self.session,
                 stream_id,
