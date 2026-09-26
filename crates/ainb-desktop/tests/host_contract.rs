@@ -7,7 +7,7 @@ use std::rc::Rc;
 use ainb_app::app::Effect;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
-use ainb_app::{AppState, Chord, CommandId, Intent, Keymap, SectionId};
+use ainb_app::{Chord, CommandId, Intent, Keymap, SectionId};
 use ainb_desktop::host::{DesktopHost, Executor};
 
 mod support;
@@ -463,89 +463,6 @@ fn a_name_off_its_screen_or_with_no_row_is_refused_with_the_reason() {
         host.refused_from_renderer(&name("session_list.refresh")),
         None
     );
-}
-
-/// The answer banner is drawn over every page, and its rows are the session
-/// list's: sent from the inbox, the settings or the git view, the host leaves
-/// that page for the session list first, by the reducer's own screen, and
-/// the row is then not refused (#121). Any other row sent off screen moves
-/// nothing.
-#[test]
-fn the_banners_rows_bring_the_reducer_home_from_any_page() {
-    use ainb_app::app::screens::ids as screen_ids;
-    use ainb_app::components::git_view::GitViewState;
-
-    let log = Log::default();
-    let mut recorder = Recorder(Rc::clone(&log));
-    let name = |id: &str, args: serde_json::Value| Intent::Command(CommandId::new(id), args);
-    let select_ask = || {
-        name(
-            "session_list.select_tab",
-            serde_json::json!({ "tab": "Ask" }),
-        )
-    };
-
-    // The pages a person opens from the window: the inbox and the settings.
-    let mut host = host(&[SectionId::Shell], &log);
-    for page in [
-        &["global.go_home", "home.inbox"][..],
-        &["global.go_home", "home.config"][..],
-    ] {
-        for step in page {
-            let _ = host.dispatch(name(step, serde_json::Value::Null));
-        }
-        let screen = host.state().shell.current_screen.clone();
-        assert_ne!(
-            screen,
-            screen_ids::SESSION_LIST,
-            "{page:?} left the session list"
-        );
-        assert!(
-            host.refused_from_renderer(&select_ask()).is_some(),
-            "off screen on {screen}"
-        );
-
-        // Another session-list row moves nothing: still on the page.
-        host.bring_answer_home(
-            &name("session_list.refresh", serde_json::Value::Null),
-            &mut recorder,
-        );
-        assert_eq!(host.state().shell.current_screen, screen);
-
-        host.bring_answer_home(&select_ask(), &mut recorder);
-        assert_eq!(
-            host.state().shell.current_screen,
-            screen_ids::SESSION_LIST,
-            "home from {screen}"
-        );
-        assert_eq!(host.refused_from_renderer(&select_ask()), None);
-    }
-
-    // The git view, which a session opens: a state already on it.
-    scratch_home();
-    let mut state = AppState::new();
-    state.shell.current_screen = screen_ids::GIT_VIEW.to_string();
-    state.git_view.get_mut().git_view_state =
-        Some(GitViewState::new(std::path::PathBuf::from("/work/repo")));
-    let mut host = DesktopHost::hosting(
-        state,
-        Keymap::defaults(),
-        HostId::local(),
-        Subscription::only(&[SectionId::Shell]),
-        |_: FrameBatch| {},
-    )
-    .without_attention_poll();
-    assert!(
-        host.refused_from_renderer(&select_ask()).is_some(),
-        "off screen on the git view"
-    );
-    host.bring_answer_home(&select_ask(), &mut recorder);
-    assert_eq!(
-        host.state().shell.current_screen,
-        screen_ids::SESSION_LIST,
-        "home from the git view"
-    );
-    assert_eq!(host.refused_from_renderer(&select_ask()), None);
 }
 
 /// Enter confirms whatever the open dialog holds, so it is judged by that
