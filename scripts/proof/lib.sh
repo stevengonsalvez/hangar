@@ -365,9 +365,13 @@ fixture_session() {
   fi
   local out
   out="$(cd "$repo" && "$AINB_BIN" run --repo "$repo" --worktree --format json </dev/null 2>&1)"
-  FIXTURE_ID="$(printf '%s\n' "$out" | sed -n 's/^ *Session ID: *//p' | head -1)"
-  FIXTURE_TMUX="$(printf '%s\n' "$out" | sed -n 's/^ *Tmux Session: *//p' | head -1)"
-  FIXTURE_CWD="$(printf '%s\n' "$out" | sed -n 's/^ *Working Dir: *//p' | head -1)"
+  # `--format json` prints one JSON line for the session among the CLI's own
+  # progress lines; the labelled text lines are what it prints without it.
+  local line
+  line="$(printf '%s\n' "$out" | grep -m1 '^{')"
+  FIXTURE_ID="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
+  FIXTURE_TMUX="$(jq -r '.tmux_session_name // empty' <<<"$line" 2>/dev/null)"
+  FIXTURE_CWD="$(jq -r '.worktree_path // empty' <<<"$line" 2>/dev/null)"
   if [[ -z "$FIXTURE_TMUX" ]]; then
     say "ainb run did not create a session: $out"
     return 1
