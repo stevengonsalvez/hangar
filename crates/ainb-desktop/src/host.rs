@@ -114,11 +114,20 @@ pub fn inbox_dialer() -> InboxDialer {
 const HOME_SIDEBAR_SELECT: &str = "home.sidebar.select";
 /// The row that leaves any screen for the home screen; always active.
 const GLOBAL_GO_HOME: &str = "global.go_home";
+/// The home sidebar's row that opens the session list.
+const HOME_SESSIONS: &str = "home.sessions";
 
-/// The answer banner's rows: the Ask tab and everything under `ask`.
-fn is_answer_row(id: &CommandId) -> bool {
-    id.as_str().starts_with("session_list.ask.")
-        || id.as_str() == ainb_app::app::pointer::ids::SESSION_LIST_SELECT_TAB
+/// The page's own back row, which is how its close button leaves it: the
+/// inbox's and the settings' save what the page holds (the settings tree's
+/// expansion among it) on the way out.
+fn page_back(screen: &str) -> &'static str {
+    use ainb_app::app::screens::ids;
+    match screen {
+        ids::INBOX => "inbox.back",
+        ids::CONFIG => "config.back",
+        ids::GIT_VIEW => "git_view.back",
+        _ => GLOBAL_GO_HOME,
+    }
 }
 
 /// One `AppState` hosted for the desktop renderer.
@@ -445,29 +454,32 @@ impl<S: FrameSink> DesktopHost<S> {
         );
     }
 
-    /// Leave the page the reducer is on for the answer banner's rows.
+    /// Put the reducer on the session list for the answer banner's rows.
     ///
     /// The banner is drawn over every page, but its rows (the Ask tab, the
     /// pick, the composer) are the session list's, and from the inbox, the
     /// settings or the git view the reducer refuses them as off screen: the
-    /// answer went nowhere (#121). Decided by the reducer's own screen, not by
-    /// the frame the window last drew, and the same for every page: home
-    /// first, which is always open, then the session list the way the sidebar
-    /// opens it. Nothing else moves the reducer for a name sent off screen.
-    pub fn bring_answer_home(&mut self, intent: &Intent, executor: &mut impl Executor) {
-        let Intent::Command(id, _) = intent else {
-            return;
-        };
-        if !is_answer_row(id)
-            || self.state.shell.current_screen == ainb_app::app::screens::ids::SESSION_LIST
-        {
+    /// answer went nowhere (#121). The banner asks for this before it sends,
+    /// and the decision is the reducer's own screen, not the frame the window
+    /// last drew. The page is left by its own back row, as its close button
+    /// leaves it, so what the page holds is saved on the way out; then the
+    /// session list is opened from home. Nothing moves the reducer for a
+    /// row sent off screen without this ask.
+    pub fn answer_home(&mut self, executor: &mut impl Executor) {
+        use ainb_app::app::screens::ids;
+        let command = |id: &str| Intent::Command(CommandId::new(id), serde_json::Value::Null);
+        let screen = self.state.shell.current_screen.clone();
+        if screen == ids::SESSION_LIST {
             return;
         }
-        self.run(
-            Intent::Command(CommandId::new(GLOBAL_GO_HOME), serde_json::Value::Null),
-            executor,
-        );
-        self.open_sessions(executor);
+        self.run(command(page_back(&screen)), executor);
+        if self.state.shell.current_screen == ids::SESSION_LIST {
+            return;
+        }
+        if self.state.shell.current_screen != ids::HOME {
+            self.run(command(GLOBAL_GO_HOME), executor);
+        }
+        self.run(command(HOME_SESSIONS), executor);
     }
 
     /// Every command the palette may offer, in the keymap's own order.
@@ -534,10 +546,21 @@ impl<S: FrameSink> DesktopHost<S> {
             // the screen gate. A name the reducer dropped was logged here as
             // dispatched (#121).
             Intent::Command(id, args) => {
+                use ainb_app::app::keymap::CommandRefusal;
                 return match judge_command(&self.state, &self.keymap, id, args) {
                     Ok(_) => None,
+                    // An onboarding write has a path of its own in this shell
+                    // (#1175): a row refused for what it writes points at it.
+                    // A row refused for its screen, its payload or its name
+                    // keeps that reason: the path is not why it did not run.
+                    Err(refusal @ (CommandRefusal::KeyOnly | CommandRefusal::Remote(_))) => {
+                        Some(Refusal {
+                            reason: crate::setup::desktop_path(id).unwrap_or(refusal.reason()),
+                            command: id.clone(),
+                        })
+                    }
                     Err(refusal) => Some(Refusal {
-                        reason: crate::setup::desktop_path(id).unwrap_or(refusal.reason()),
+                        reason: refusal.reason(),
                         command: id.clone(),
                     }),
                 };
