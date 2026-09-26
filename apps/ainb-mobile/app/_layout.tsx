@@ -1,6 +1,7 @@
 import { Stack } from "expo-router";
 import { StatusBar } from "expo-status-bar";
 
+import { Banner } from "../src/attention/Banner";
 import { colors } from "../src/theme";
 import { WireProvider } from "../src/wire/context";
 
@@ -21,6 +22,7 @@ export default function RootLayout() {
         <Stack.Screen name="host/[hostId]/index" options={{ title: "Sessions" }} />
         <Stack.Screen name="host/[hostId]/session/[key]" options={{ title: "Session" }} />
       </Stack>
+      <Banner />
     </WireProvider>
   );
 }

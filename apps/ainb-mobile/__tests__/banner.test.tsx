@@ -1,0 +1,57 @@
+import { fireEvent, waitFor } from "@testing-library/react-native";
+import { renderRouter } from "expo-router/testing-library";
+
+import { reset } from "../src/attention/store";
+import { FakeWire, FAKE_HOST_A } from "../src/wire/fake";
+import { setWire } from "../src/wire";
+
+let fake: FakeWire;
+beforeEach(() => {
+  reset();
+  fake = new FakeWire();
+  setWire(fake);
+});
+
+test("two taps send exactly one answer carrying the row's version as the fence", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  fireEvent.press(await screen.findByTestId("banner-att-1")); // tap 1
+  fireEvent.press(await screen.findByTestId("option-2")); // tap 2
+  expect(await screen.findByText("Delivered")).toBeTruthy();
+  expect(fake.answers).toEqual([{ opId: "op-1", attentionId: "att-1", answer: "2", version: 3 }]);
+  fireEvent.press(screen.getByTestId("answer-done"));
+  await waitFor(() => expect(screen.queryByTestId("banner-att-1")).toBeNull());
+});
+
+test("a lost reply retries with the same op id", async () => {
+  fake.dropNextAnswer = true;
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  fireEvent.press(await screen.findByTestId("banner-att-1"));
+  fireEvent.press(await screen.findByTestId("option-1"));
+  expect(await screen.findByText(/No reply/)).toBeTruthy();
+  fireEvent.press(screen.getByTestId("answer-retry"));
+  expect(await screen.findByText("Delivered")).toBeTruthy();
+  expect(fake.answers.map((a) => a.opId)).toEqual(["op-1", "op-1"]);
+  expect(fake.answers.map((a) => a.answer)).toEqual(["1", "1"]);
+});
+
+test("already_answered_by names the winner", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  fireEvent.press(await screen.findByTestId("banner-att-1"));
+  fake.answeredElsewhere(FAKE_HOST_A, "att-1", "desktop@mbp");
+  fireEvent.press(await screen.findByTestId("option-1"));
+  expect(await screen.findByText("Already answered by desktop@mbp")).toBeTruthy();
+});
+
+test("a raised ASK shows one banner and a free-text row answers with text", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await fake.connect(FAKE_HOST_A);
+  fake.raise({ id: "att-2", sessionId: "s-2", sessionKey: "codex:web", kind: "codex_request_user", version: 1, createdAt: 9, payload: { text: "Which branch?" } });
+  fake.raise({ id: "att-2", sessionId: "s-2", sessionKey: "codex:web", kind: "codex_request_user", version: 1, createdAt: 9, payload: { text: "Which branch?" } });
+  expect(await screen.findByText("2 waiting · codex:web")).toBeTruthy();
+  fireEvent.press(screen.getByTestId("banner-att-2"));
+  fireEvent.changeText(await screen.findByTestId("answer-text"), "main");
+  fireEvent.press(screen.getByTestId("answer-send"));
+  expect(await screen.findByText("Delivered")).toBeTruthy();
+  expect(fake.answers.at(-1)).toMatchObject({ attentionId: "att-2", answer: "main", version: 1 });
+});

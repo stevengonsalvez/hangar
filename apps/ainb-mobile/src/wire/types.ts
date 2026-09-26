@@ -132,16 +132,20 @@ export interface WireClient {
   subscribeAttention(hostId: HostId): Promise<AttentionRow[]>;
 
   /**
-   * `attention/answer` in the receipt tier. `opId` is minted by the crate on
-   * first call; a retry passes the same id back so the ledger dedupes it.
+   * A fresh 128-bit op id from the crate's CSPRNG (`OpId::from_bytes`). Minted
+   * BEFORE the send so a lost reply retries under the same id and the ledger
+   * dedupes it.
    */
+  mintOpId(): Promise<string>;
+
+  /** `attention/answer` in the receipt tier, fenced on the row's `version`. */
   answer(req: {
     hostId: HostId;
     attentionId: string;
     answer: string;
     version: number;
-    opId?: string;
-  }): Promise<{ opId: string; outcome: AnswerOutcome; ack?: MutationAck }>;
+    opId: string;
+  }): Promise<{ outcome: AnswerOutcome; ack?: MutationAck }>;
 
   sendPrompt(req: {
     hostId: HostId;
