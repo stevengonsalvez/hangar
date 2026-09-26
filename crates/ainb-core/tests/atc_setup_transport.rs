@@ -71,7 +71,6 @@ fn publish_endpoint(home: &Path) {
         port: 45678,
         version: 1,
         pid: std::process::id(),
-        headers_path: dir.join("hook-headers"),
     };
     std::fs::write(dir.join("hook-endpoint.env"), endpoint.render_env_file()).unwrap();
 }
