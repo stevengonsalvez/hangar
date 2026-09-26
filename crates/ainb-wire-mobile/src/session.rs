@@ -12,7 +12,7 @@
 //! what a phone needs above them: request-id correlation, a bounded
 //! notification queue that reports its own overflow, the heartbeat rule
 //! (dead after [`MISSED_PONGS_DEAD`] unanswered pings) and the close-code
-//! mapping (4401 re-hello, 4403 re-pair).
+//! table ([`classify_close`]: retryable or not, with the host's retry-after).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -20,10 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ainb_hangar_noise::{
-    FrameHeader, HEADER_LEN, MAX_NOISE_MESSAGE, MISSED_PONGS_DEAD, NOISE_PATTERN, Opcode,
-    PING_INTERVAL_SECS, prologue,
+    FrameHeader, HEADER_LEN, MAX_NOISE_MESSAGE, MAX_REASSEMBLED, MISSED_PONGS_DEAD, NOISE_PATTERN,
+    Opcode, PING_INTERVAL_SECS, prologue,
 };
 use ainb_hangar_proto::hosts::{CarrierKind, HostId};
+use ainb_hangar_proto::peer_close::PeerClose;
 use ainb_hangar_proto::{RpcId, RpcRequest, RpcResponse, jsonrpc_version, peer_close};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
@@ -156,15 +157,22 @@ pub struct Closed {
 }
 
 impl Closed {
+    /// Whether a redial makes sense, and the host's retry-after: this side's
+    /// own close never does; the peer's goes through [`classify_close`].
+    #[must_use]
+    pub fn retry(&self) -> (bool, Option<u64>) {
+        if self.local {
+            (false, None)
+        } else {
+            classify_close(self.code, &self.reason)
+        }
+    }
+
     /// The error a call on this closed session gets: [`WireError::Closed`]
     /// with the code and the crate's classification of it.
     #[must_use]
     pub fn error(&self) -> WireError {
-        let (retryable, retry_after_ms) = if self.local {
-            (false, None)
-        } else {
-            classify_close(self.code, &self.reason)
-        };
+        let (retryable, retry_after_ms) = self.retry();
         WireError::Closed {
             code: self.code,
             reason: self.reason.clone(),
@@ -189,23 +197,27 @@ impl Closed {
     }
 }
 
-/// The one close-code table: whether a close is retryable, and the host's
-/// `retry-after` in milliseconds when the reason names one. No code is a
-/// network loss (retryable); 4429, 1013 and 4503 are retryable; 4401, 4403,
-/// 4409 are not; a code this build does not know is not retryable until a
-/// person looks.
+/// The one close-code table, over the frozen `peer_close` table in the proto
+/// crate: whether a close is retryable, and the host's `retry-after` in
+/// milliseconds when the reason names one. No code, or a standard WebSocket
+/// code below 4000 (1000, 1001, 1011, 1012: a restart, a proxy, a tunnel
+/// going away), is a network loss and retryable; the daemon's own codes
+/// answer through `PeerClose::may_retry` (4429, 1013, 4503 retryable; 4401,
+/// 4403, 4409 not); a 4xxx code this build does not know is not retryable
+/// until a person looks.
 #[must_use]
 pub fn classify_close(code: Option<u16>, reason: &str) -> (bool, Option<u64>) {
-    let retry_after_ms = reason
-        .strip_prefix(peer_close::RETRY_AFTER_PREFIX)
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|secs| secs.saturating_mul(1000));
+    let retry_after_ms = peer_close::retry_after_secs(reason).map(|s| u64::from(s) * 1000);
     match code {
         None => (true, None),
-        Some(peer_close::RATE_LIMITED | peer_close::OVER_CAPACITY | peer_close::DRAINING) => {
-            (true, retry_after_ms)
-        }
-        Some(_) => (false, None),
+        Some(code) => match PeerClose::from_code(code) {
+            Some(close) => (
+                close.may_retry(),
+                retry_after_ms.filter(|_| close.may_retry()),
+            ),
+            None if code < 4000 => (true, None),
+            None => (false, None),
+        },
     }
 }
 
@@ -234,9 +246,10 @@ pub struct SessionStats {
 
 /// The heartbeat rule, clock-free so it is testable by tick.
 ///
-/// The first tick fires at connect (tokio's `interval` ticks immediately), so
-/// two consecutive unanswered pings mean dead at `2 * period`: 30 s on the
-/// frozen wire, inside the host's 35 s silence close (C7).
+/// The first tick fires when the heartbeat starts (after hello; tokio's
+/// `interval` ticks immediately), so two consecutive unanswered pings mean
+/// dead at `2 * period`: 30 s on the frozen wire, inside the host's 35 s
+/// silence close (C7).
 #[derive(Debug, Default)]
 pub struct Heartbeat {
     unanswered: u32,
@@ -300,7 +313,14 @@ pub struct Session {
     last_rtt_us: AtomicU64,
     ping_seq: AtomicU64,
     rpc_timeout: Duration,
+    heartbeat_period: Option<Duration>,
     log: Option<Arc<ConnLog>>,
+    /// Woken on close, so `next_event` returns even while the reader is
+    /// still parked on a dead socket.
+    close_notify: tokio::sync::Notify,
+    /// The reader task, aborted on a heartbeat death or at drop so a dead
+    /// socket does not pin it until the OS gives up.
+    reader_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 fn lsp_encode(body: &[u8]) -> Vec<u8> {
@@ -369,9 +389,16 @@ struct Reassembler {
 }
 
 impl Reassembler {
-    fn push(&mut self, fin: bool, payload: &[u8]) -> Option<Vec<u8>> {
+    /// Append one fragment; the whole message once `fin`. A message past
+    /// `ainb_hangar_noise::MAX_REASSEMBLED` (16 MiB) is a protocol error,
+    /// never an unbounded buffer.
+    fn push(&mut self, fin: bool, payload: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if self.buf.len().saturating_add(payload.len()) > MAX_REASSEMBLED {
+            self.buf.clear();
+            return Err(format!("rpc message larger than {MAX_REASSEMBLED} bytes"));
+        }
         self.buf.extend_from_slice(payload);
-        fin.then(|| std::mem::take(&mut self.buf))
+        Ok(fin.then(|| std::mem::take(&mut self.buf)))
     }
 }
 
@@ -412,7 +439,7 @@ impl Session {
         {
             Ok(session) => session,
             Err(_) => Err(WireError::Connect {
-                message: format!("no handshake within {} s", config.connect_timeout.as_secs()),
+                message: format!("no handshake within {:?}", config.connect_timeout),
             }),
         };
         match &session {
@@ -516,17 +543,25 @@ impl Session {
             last_rtt_us: AtomicU64::new(0),
             ping_seq: AtomicU64::new(0),
             rpc_timeout: config.rpc_timeout,
+            heartbeat_period: config.heartbeat,
             log: config.log.clone(),
+            close_notify: tokio::sync::Notify::new(),
+            reader_abort: Mutex::new(None),
         });
 
-        let writer = Arc::clone(&session);
+        // The tasks hold `Weak`: the app's handle is the only strong owner,
+        // so dropping it without `close()` still runs `Drop` (close signal,
+        // reader abort) instead of leaking the socket and the heartbeat.
+        let writer = Arc::downgrade(&session);
         tokio::spawn(async move {
             while let Some(bytes) = out_rx.recv().await {
                 if bytes.is_empty() {
                     break;
                 }
                 if let Err(e) = sink.send(Message::Binary(bytes)).await {
-                    writer.mark_closed(None, format!("write: {e}"));
+                    if let Some(s) = writer.upgrade() {
+                        s.mark_closed(None, format!("write: {e}"));
+                    }
                     break;
                 }
             }
@@ -534,13 +569,16 @@ impl Session {
             let _ = sink.close().await;
         });
 
-        let reader = Arc::clone(&session);
-        tokio::spawn(async move {
+        let reader = Arc::downgrade(&session);
+        let reader_task = tokio::spawn(async move {
             let mut reasm = Reassembler::default();
             let (code, reason) = loop {
                 match stream.next().await {
                     Some(Ok(Message::Binary(b))) => {
-                        if let Err(e) = reader.on_ciphertext(&b, &mut reasm, &events_tx) {
+                        let Some(s) = reader.upgrade() else {
+                            break (None, "dropped".to_owned());
+                        };
+                        if let Err(e) = s.on_ciphertext(&b, &mut reasm, &events_tx) {
                             break (None, format!("read: {e}"));
                         }
                     }
@@ -557,44 +595,63 @@ impl Session {
                     None => break (None, "eof".to_owned()),
                 }
             };
-            reader.mark_closed(code, reason);
+            if let Some(s) = reader.upgrade() {
+                s.mark_closed(code, reason);
+            }
             // `events_tx` drops here, which is what wakes `next_event` with
             // the close.
         });
+        *session.reader_abort.lock().unwrap() = Some(reader_task.abort_handle());
 
-        if let Some(period) = config.heartbeat {
-            let weak = Arc::downgrade(&session);
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(period);
-                // One ping after a suspend, never a burst of catch-up ticks.
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    let Some(s) = weak.upgrade() else { break };
-                    if s.is_closed() {
+        Ok(session)
+    }
+
+    /// Start the heartbeat. Called once `auth/hello` has been answered: the
+    /// daemon requires hello as the first frame of a connection, so no ping
+    /// goes out ahead of it. The first tick fires at once, so two unanswered
+    /// pings mean dead at `2 * period` from here (30 s on the frozen wire).
+    pub fn start_heartbeat(self: &Arc<Self>) {
+        let Some(period) = self.heartbeat_period else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            // One ping after a suspend, never a burst of catch-up ticks.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(s) = weak.upgrade() else { break };
+                if s.is_closed() {
+                    break;
+                }
+                let beat = s.heartbeat.lock().unwrap().tick();
+                match beat {
+                    Beat::Dead => {
+                        s.mark_closed(
+                            None,
+                            format!("heartbeat: {MISSED_PONGS_DEAD} pings unanswered"),
+                        );
+                        let _ = s.out.send(Vec::new());
+                        // The socket is dead: the reader would otherwise sit
+                        // in `next()` until the OS times the TCP stream out.
+                        s.abort_reader();
                         break;
                     }
-                    let beat = s.heartbeat.lock().unwrap().tick();
-                    match beat {
-                        Beat::Dead => {
-                            s.mark_closed(
-                                None,
-                                format!("heartbeat: {MISSED_PONGS_DEAD} pings unanswered"),
-                            );
-                            let _ = s.out.send(Vec::new());
+                    Beat::Ping => {
+                        if s.send_ping().is_err() {
                             break;
-                        }
-                        Beat::Ping => {
-                            if s.send_ping().is_err() {
-                                break;
-                            }
                         }
                     }
                 }
-            });
-        }
+            }
+        });
+    }
 
-        Ok(session)
+    fn abort_reader(&self) {
+        if let Some(handle) = self.reader_abort.lock().unwrap().take() {
+            handle.abort();
+        }
     }
 
     fn send_ping(&self) -> Result<(), WireError> {
@@ -617,9 +674,16 @@ impl Session {
         self.mark_closed_by(code, reason, false);
     }
 
+    /// Record the close. First writer wins, with one exception: the peer's
+    /// coded close frame replaces a code-less close the writer or heartbeat
+    /// recorded a moment earlier, so a 4403 that races a failed write still
+    /// reaches the app as 4403.
     fn mark_closed_by(&self, code: Option<u16>, reason: String, local: bool) {
         let mut closed = self.closed.lock().unwrap();
-        let first = closed.is_none();
+        let first = match closed.as_ref() {
+            None => true,
+            Some(prior) => !prior.local && prior.code.is_none() && code.is_some(),
+        };
         if first {
             *closed = Some(Closed {
                 code,
@@ -628,6 +692,7 @@ impl Session {
             });
         }
         drop(closed);
+        self.close_notify.notify_one();
         if first {
             if let Some(log) = &self.log {
                 log.log(Event::Close {
@@ -723,7 +788,7 @@ impl Session {
             }
             Opcode::StreamEnd => return Err("peer sent StreamEnd".to_owned()),
             Opcode::Rpc => {
-                if let Some(message) = reasm.push(header.fin, payload) {
+                if let Some(message) = reasm.push(header.fin, payload)? {
                     let body = lsp_decode(&message)?;
                     let value: serde_json::Value =
                         serde_json::from_slice(body).map_err(|e| e.to_string())?;
@@ -826,18 +891,34 @@ impl Session {
             return SessionEvent::Lagged(lagged);
         }
         let mut events = self.events.lock().await;
-        if let Some(n) = events.recv().await {
-            SessionEvent::Notification(n)
-        } else {
-            let closed = self.closed().unwrap_or(Closed {
-                code: None,
-                reason: "closed".to_owned(),
-                local: false,
-            });
-            SessionEvent::Closed {
-                code: closed.code,
-                reason: closed.reason,
+        loop {
+            if let Ok(n) = events.try_recv() {
+                return SessionEvent::Notification(n);
             }
+            if self.is_closed() {
+                return self.closed_event();
+            }
+            // `notify_one` keeps a permit, so a close that lands between the
+            // check above and this wait is not missed.
+            tokio::select! {
+                n = events.recv() => match n {
+                    Some(n) => return SessionEvent::Notification(n),
+                    None => return self.closed_event(),
+                },
+                () = self.close_notify.notified() => {}
+            }
+        }
+    }
+
+    fn closed_event(&self) -> SessionEvent {
+        let closed = self.closed().unwrap_or(Closed {
+            code: None,
+            reason: "closed".to_owned(),
+            local: false,
+        });
+        SessionEvent::Closed {
+            code: closed.code,
+            reason: closed.reason,
         }
     }
 
@@ -886,6 +967,7 @@ impl std::fmt::Debug for Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.out.send(Vec::new());
+        self.abort_reader();
     }
 }
 
@@ -958,7 +1040,7 @@ mod tests {
         for f in &frames {
             assert!(f.len() <= MAX_NOISE_MESSAGE - NOISE_TAG_LEN);
             let header = FrameHeader::decode(f).unwrap();
-            out = reasm.push(header.fin, &f[HEADER_LEN..]);
+            out = reasm.push(header.fin, &f[HEADER_LEN..]).unwrap();
         }
         assert_eq!(out.unwrap(), big);
         let body = br#"{"jsonrpc":"2.0"}"#;
