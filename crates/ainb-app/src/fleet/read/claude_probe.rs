@@ -473,6 +473,7 @@ pub fn discover_from_probes(index: &ProbeIndex) -> Vec<Session> {
     index
         .all_live()
         .map(|p| Session {
+            provider_session_id: None,
             id: if p.session_id.is_empty() {
                 format!("claude-probe-{}", p.pid)
             } else {
@@ -516,6 +517,7 @@ mod tests {
 
     fn session(tmux: Option<&str>) -> Session {
         Session {
+            provider_session_id: None,
             id: "s1".into(),
             cwd: "/w/s1".into(),
             pid: None,
