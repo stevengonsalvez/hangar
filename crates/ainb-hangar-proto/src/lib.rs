@@ -23,6 +23,7 @@ pub mod dates;
 pub mod devices;
 pub mod events;
 pub mod fleet;
+pub mod hooks;
 /// Host identity and reachability (spec D11, frozen by PR-0).
 pub mod hosts;
 pub mod lifecycle;

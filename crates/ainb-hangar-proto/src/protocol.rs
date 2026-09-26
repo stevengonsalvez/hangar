@@ -288,6 +288,10 @@ pub const CAP_TERMINAL_STREAM: &str = "terminal.stream";
 /// Capability (dark until WP15): terminal input, `terminal/input`,
 /// `terminal/floor`, `terminal/resize`.
 pub const CAP_TERMINAL_INPUT: &str = "terminal.input";
+/// Capability (dark until the hooks flip): agent hooks POST to a loopback
+/// HTTP listener in the daemon (`AINB_HANGAR_HOOK_LISTEN`), found through the
+/// endpoint and headers files in [`crate::hooks`].
+pub const CAP_HOOKS_HTTP: &str = "hangar.hooks.http";
 
 /// Every capability defined by the v2-next freeze and not yet advertised.
 ///
@@ -302,6 +306,7 @@ pub const DARK_CAPABILITIES: &[&str] = &[
     CAP_SESSION_REF,
     CAP_TERMINAL_STREAM,
     CAP_TERMINAL_INPUT,
+    CAP_HOOKS_HTTP,
 ];
 
 /// The ONE capability catalogue: every string this build advertises.
@@ -427,7 +432,7 @@ mod tests {
     /// this test in the same change that appends its strings.
     #[test]
     fn the_v2_next_capabilities_are_dark() {
-        assert_eq!(DARK_CAPABILITIES.len(), 8);
+        assert_eq!(DARK_CAPABILITIES.len(), 9);
         for id in DARK_CAPABILITIES {
             assert!(!advertises(id), "{id:?} is advertised before its flip");
         }
