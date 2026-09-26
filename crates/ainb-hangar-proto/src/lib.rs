@@ -39,6 +39,7 @@ pub mod session_ref;
 pub mod sessions;
 pub mod settings;
 pub mod snapshots;
+pub mod spawn;
 pub mod status_topic;
 pub mod status_view;
 /// Terminal streams (R2, frozen by PR-0).
