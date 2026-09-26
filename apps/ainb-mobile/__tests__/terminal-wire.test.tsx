@@ -186,3 +186,21 @@ test("early frames of another stream never count against ours", async () => {
   await waitFor(() => expect(sinkCalls().slice(-3)).toEqual(SNAPSHOT), { timeout: 5000 });
   expect(screen.queryByText(/snapshot too large/)).toBeNull();
 });
+
+test("each attach cycle gets its own overflow retry", async () => {
+  fake.snapshotBeforeReply = true;
+  fake.floodOnce = true;
+  fake.floodBytesAfterSnapshot = 2 * 1024 * 1024 + 1024; // the first snapshot overflows, the retry fits
+  const screen = await openTerminal();
+  await waitFor(() => expect(fake.attaches).toBe(2), { timeout: 5000 });
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT), { timeout: 5000 });
+  expect(screen.queryByText(/snapshot too large/)).toBeNull();
+
+  // a new cycle overflows once more: it gets a fresh retry instead of the report
+  fake.floodBytesAfterSnapshot = 2 * 1024 * 1024 + 1024;
+  await act(() => onAppState(fake, "background"));
+  await act(() => onAppState(fake, "active"));
+  await waitFor(() => expect(fake.attaches).toBe(4), { timeout: 5000 });
+  expect(screen.queryByText(/snapshot too large/)).toBeNull();
+  await waitFor(() => expect(sinkCalls().slice(-3)).toEqual(SNAPSHOT), { timeout: 5000 });
+});
