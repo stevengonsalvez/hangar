@@ -443,36 +443,56 @@ body {
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-/* Status fills the dot; attention paints a ring around it. Idle is the
-   quiet default; every other state overrides the fill, the ring, or both. */
+/* P4's status vocabulary (spec: "Status vocabulary"): one `data-status`
+   value, five colours, drawn by the sidebar's dot (`.ring`), the board's
+   card and the tab's glyph (`.tab-glyph`) alike, so the same card reads the
+   same colour on every surface it appears on. `needs-*` all read amber
+   except its own `error`, which reads coral like every other error. */
+[data-status] {
+  --status-color: var(--idle);
+}
+
+[data-status^="needs-"] {
+  --status-color: var(--gold);
+}
+
+[data-status="needs-error"] {
+  --status-color: var(--red);
+}
+
+[data-status="working"] {
+  --status-color: var(--blue);
+}
+
+[data-status="done"] {
+  --status-color: var(--green);
+}
+
+/* The dot fills with the status colour; idle and unverifiable share the
+   quiet default, and unverifiable's own dashed ring is what tells the two
+   apart (spec: "muted dashed"). */
 .ring {
   display: inline-block;
   flex-shrink: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--idle);
-  box-shadow: 0 0 0 2px transparent;
+  background: var(--status-color, var(--idle));
 }
 
-.ring.idle,
-.ring.stopped {
-  background: var(--idle);
-}
-
-.ring.error {
-  background: var(--red);
+.ring[data-status="unverifiable"] {
+  background: transparent;
+  border: 1px dashed var(--idle);
 }
 
 /* Working: the compositor spinner, a rotating ring drawn in fixed steps
    rather than eased, the way a busy indicator should read rather than a
    smooth clock (`--dur-base` already zeroes under reduced motion). */
-.ring.running {
+.ring[data-status="working"] {
   position: relative;
-  background: var(--blue);
 }
 
-.ring.running::after {
+.ring[data-status="working"]::after {
   content: "";
   position: absolute;
   inset: -3px;
@@ -489,28 +509,10 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ring.running::after {
+  .ring[data-status="working"]::after {
     animation: none;
     border-color: var(--blue);
   }
-}
-
-[data-ring="ask"] .ring,
-[data-ring="approve"] .ring,
-[data-ring="wait"] .ring {
-  box-shadow: 0 0 0 2px var(--gold);
-}
-
-[data-ring="err"] .ring {
-  background: var(--red);
-  box-shadow: 0 0 0 2px var(--red);
-}
-
-/* Done, until acked (ack lands in P4): a filled mint dot rather than the
-   working spinner or the idle default. */
-[data-ring="done"] .ring {
-  background: var(--state-done);
-  box-shadow: 0 0 0 2px var(--state-done);
 }
 
 /* The hover tint is faint on purpose; the keyboard gets a real ring. */
@@ -595,6 +597,43 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--text-sub);
+}
+
+/* The status glyph a session tab carries before its title (P4, spec: "the
+   same small glyph"): one character per `data-status`, on the colour
+   `[data-status]` already set on the tab itself. Decorative (the tab's own
+   text still names the session), so it carries no accessible name of its
+   own. */
+.tab-glyph {
+  display: inline-block;
+  width: 1em;
+  color: var(--status-color, var(--idle));
+  font-weight: 700;
+  text-align: center;
+}
+
+.tab[data-status^="needs-"] .tab-glyph::before {
+  content: "?";
+}
+
+.tab[data-status="needs-error"] .tab-glyph::before {
+  content: "!";
+}
+
+.tab[data-status="working"] .tab-glyph::before {
+  content: "\25D0"; /* ◐ */
+}
+
+.tab[data-status="done"] .tab-glyph::before {
+  content: "\2713"; /* ✓ */
+}
+
+.tab[data-status="idle"] .tab-glyph::before {
+  content: "\25CB"; /* ○ */
+}
+
+.tab[data-status="unverifiable"] .tab-glyph::before {
+  content: "\25CC"; /* ◌ */
 }
 
 .tab-close {
@@ -995,8 +1034,23 @@ body {
   color: var(--muted-foreground);
 }
 
-.board-column[data-state="waiting"] {
+.board-column[data-state="needs"] {
   border-color: var(--gold);
+}
+
+/* Idle is hidden behind a native disclosure, closed by default (spec): the
+   summary reads exactly like every other column's own heading. */
+.board-idle-toggle summary {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--gold);
+  cursor: pointer;
+}
+
+.board-idle-toggle[open] summary {
+  border-bottom: 1px solid var(--border);
 }
 
 .board-column ul,
@@ -1024,13 +1078,22 @@ body {
   width: 100%;
   margin-top: 6px;
   padding: 8px;
+  padding-inline-start: 10px;
   border: 1px solid var(--highlight);
+  /* The status colour rides the start edge (P4): the same word every other
+     surface paints this card with, without repainting the whole card over
+     `.open`'s own gold border below. */
+  border-inline-start: 3px solid var(--status-color, var(--idle));
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
   text-align: left;
   font: inherit;
   cursor: pointer;
+}
+
+.board-card[data-status="unverifiable"] {
+  border-inline-start-style: dashed;
 }
 
 .board-card:hover:not(:disabled),
@@ -1080,6 +1143,7 @@ body {
 }
 
 .card-chips .chip,
+.card-need,
 .row-kind {
   align-self: flex-start;
   padding: 0 5px;
@@ -1093,6 +1157,24 @@ body {
 .chip[data-kind="Err"],
 .attention-row[data-kind="Err"] .row-kind {
   color: var(--red);
+}
+
+/* The need kind label a needs-you card shows (spec: "show the need kind
+   label"): the same amber as the chips above, coral for its own error. */
+.card-need[data-kind="error"] {
+  color: var(--red);
+}
+
+/* Unverifiable falls in with Idle (there is no fifth column for it), so its
+   own dashed badge is what tells the two apart on the card (spec: "a muted
+   dashed badge"). */
+.badge-unverifiable {
+  align-self: flex-start;
+  padding: 0 5px;
+  border: 1px dashed var(--idle);
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
 }
 
 /* The attention banner: the selected session's question, answered here. */
