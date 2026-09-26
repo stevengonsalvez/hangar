@@ -111,7 +111,7 @@ async fn two_daemons_fold_into_one_census_and_a_killed_one_turns_unreachable() {
     assert_ne!(a.host_id, b.host_id, "two homes mint two hosts");
 
     let mut registry = HostRegistry::new();
-    registry.set_local(a.host_id.clone(), 1_000).unwrap();
+    registry.set_local(a.host_id.clone(), 1_000);
     registry.upsert_remote(b.host_id.clone(), 1_000).unwrap();
 
     // Both reachable: every row is in, under its own host.
@@ -251,7 +251,7 @@ async fn rows_from_another_host_are_never_filed_under_this_one() {
 async fn the_local_host_keyed_local_refuses_its_own_rows_until_re_keyed() {
     let a = boot_box(2, "a").await;
     let mut registry = HostRegistry::new();
-    registry.set_local(HostId::local(), 1).unwrap();
+    registry.set_local(HostId::local(), 1);
     let refused = listing_from_read(
         &mut registry,
         &HostId::local(),
@@ -264,7 +264,11 @@ async fn the_local_host_keyed_local_refuses_its_own_rows_until_re_keyed() {
         "{refused:?}"
     );
 
-    registry.set_local(a.host_id.clone(), 3).unwrap();
+    // The order the review found: this machine was paired as a remote under
+    // its own minted id before its daemon named itself. Naming the local host
+    // must still win.
+    registry.upsert_remote(a.host_id.clone(), 2).unwrap();
+    registry.set_local(a.host_id.clone(), 3);
     let listed = listing_from_read(
         &mut registry,
         &a.host_id,
@@ -277,5 +281,10 @@ async fn the_local_host_keyed_local_refuses_its_own_rows_until_re_keyed() {
         "{listed:?}"
     );
     assert_eq!(registry.local().map(|h| &h.host_id), Some(&a.host_id));
+    assert_eq!(
+        registry.len(),
+        1,
+        "the remote under the local id was dropped"
+    );
     a.serve.abort();
 }
