@@ -67,6 +67,7 @@ fn a_session_store_write_does_not_hold_the_host_tick() {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     };
     let mut store = SessionStore::default();
     store.upsert(session.clone());
