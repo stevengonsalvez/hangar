@@ -486,6 +486,7 @@ dependencies = [
  "ainb-plugin-notifyd",
  "ainb-plugin-session-reader",
  "ainb-plugin-types-sessions",
+ "ainb-term",
  "ainb-web",
  "anyhow",
  "assert_cmd",
