@@ -6,18 +6,23 @@
 #   $PROOF_WORLD/
 #     home/      HOME            (~/.agents-in-a-box lives here, never the real one; it is
 #                                 also AINB_HANGAR_HOME, the private daemon's home)
-#     tmux/      TMUX_TMPDIR     (two private tmux servers, see below)
+#     tmux/      TMUX_TMPDIR     (the fixture tmux server, see below)
+#     tmux.sock  PROOF_TMUX_SOCK (the harness tmux server, see below)
 #     bin/       first on PATH   (the `claude` fixture agent and the `headroom` stub)
 #     repo/      the git repository fixture sessions are spawned from
 #
-# Two tmux servers, both under $TMUX_TMPDIR, never the box's own:
+# Two tmux servers, both inside the world, never the box's own:
 #
-#   -L proof   hosts the TUI panes this harness types into and captures
-#   default    the one `ainb run` and the TUI itself use for agent sessions
+#   harness    `tmux -S $PROOF_TMUX_SOCK` (ptmux): an explicit socket path in
+#              the world, so no name lookup can resolve to a server outside
+#              it. Hosts the TUI panes this harness types into and captures.
+#   fixture    the default server under $TMUX_TMPDIR (ftmux), the one `ainb
+#              run` and the TUI itself use for agent sessions.
 #
-# The TUI runs with TMUX unset. Inside a `-L proof` pane it would otherwise
-# inherit that server as "its" tmux and list the harness panes instead of the
-# fixture sessions.
+# ptmux always runs with TMUX unset, so a harness call never talks to a server
+# named by an inherited TMUX. The TUI also runs with TMUX unset: inside a
+# harness pane it would otherwise inherit that server as "its" tmux and list
+# the harness panes instead of the fixture sessions.
 #
 # Nothing here is killed by pattern. Sessions are killed by exact name, and a
 # process is only signalled when its environment carries this world's
@@ -140,6 +145,8 @@ world_up() {
   # hook-raised card ever reaches the daemon.
   export AINB_HANGAR_HOME="$HOME/.agents-in-a-box"
   export TMUX_TMPDIR="$PROOF_WORLD/tmux"
+  # The harness server's socket: a path, never a name (see the header).
+  export PROOF_TMUX_SOCK="$PROOF_WORLD/tmux.sock"
   unset TMUX TMUX_PANE
   mkdir -p "$HOME/.agents-in-a-box/config" "$TMUX_TMPDIR" "$PROOF_WORLD/bin"
   PATH="$PROOF_WORLD/bin:${AINB_BIN%/*}:$PROOF_BASE_PATH"
@@ -212,7 +219,7 @@ world_down() {
 # tmux: the harness server and the fixture server
 # ---------------------------------------------------------------------------
 
-ptmux() { tmux -L proof "$@"; }
+ptmux() { env -u TMUX tmux -S "$PROOF_TMUX_SOCK" "$@"; }
 ftmux() { tmux "$@"; }
 
 # pane_text <session> [-e]: the visible screen of a harness pane.
@@ -664,27 +671,39 @@ desktop_ready() {
 }
 
 # start_desktop: the window in a harness pane, under a headless X server,
-# waited on until its renderer has applied a batch.
+# waited on until its renderer has applied a batch and the daemon its sidecar
+# starts answers with a token on disk. Every way the boot can fail is recorded
+# here as a failed check naming its own bound, and the function then returns 1,
+# so a caller only has to stop: `start_desktop || return`.
 start_desktop() {
   DESKTOP_LOG="$AINB_HANGAR_HOME/desktop.log"
   ptmux new-session -d -s desktop -x "$PROOF_COLS" -y "$PROOF_ROWS" \
     "env -u TMUX -u TMUX_PANE AINB_DESKTOP_DAEMON_BIN='$DESKTOP_DAEMON_BIN' \
        xvfb-run -a '$DESKTOP_BIN' 2>>'$PROOF_WORLD/desktop.stderr'"
-  wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null || return 1
+  if ! wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null; then
+    check "the desktop window applied a frame batch within 90 s" false
+    [[ -s "$PROOF_WORLD/desktop.stderr" ]] && observe "window stderr: $(tail -3 "$PROOF_WORLD/desktop.stderr")"
+    return 1
+  fi
   # The first batch is applied from the reducer before the window's sidecar
   # has a daemon: the socket binds and the token is written a few seconds
   # after that line on a slower box. A scenario whose first daemon read
   # follows this return would race that boot (d3p-inbox did: its issue_create
-  # found no token file), so the wait lives here, as it does in start_tui, and
-  # every desktop node's first read finds a daemon. A daemon that never comes
-  # fails the node here, against the boot, rather than against the read.
-  # Each wait is named with its own bound and the time actually waited, so a
-  # failure says which half of the boot never happened.
+  # found no token file), so both waits live here and every desktop node's
+  # first read finds a daemon. (start_tui waits for the daemon's socket only,
+  # not its token.) A daemon that never comes fails the node here, against the
+  # boot, rather than against the read. Each wait is named with its own bound
+  # and the time actually waited, so a failure says which half of the boot
+  # never happened.
   local booted=$SECONDS
   if ! wait_for 60 daemon_running; then
     check "the daemon the window starts answers on its socket within 60 s of the first batch (waited $((SECONDS - booted)) s; status: $("$AINB_BIN" hangar daemon status 2>&1 | head -1))" false
-  elif ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
-    check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - booted)) s since the first batch)" false
+    return 1
+  fi
+  local answered=$SECONDS
+  if ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
+    check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - answered)) s since it answered, $((SECONDS - booted)) s since the first batch)" false
+    return 1
   fi
 }
 

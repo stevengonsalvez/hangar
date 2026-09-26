@@ -18,6 +18,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use ainb_hangar_noise::NOISE_PATTERN;
+use zeroize::Zeroizing;
 
 use crate::records::WireError;
 
@@ -173,7 +174,7 @@ mod file {
 /// This device's Noise static keypair.
 #[derive(Clone)]
 pub struct DeviceKey {
-    private: Vec<u8>,
+    private: Zeroizing<Vec<u8>>,
     public: Vec<u8>,
 }
 
@@ -192,7 +193,7 @@ impl DeviceKey {
             .generate_keypair()
             .map_err(custody_error)?;
         Ok(Self {
-            private: keypair.private,
+            private: Zeroizing::new(keypair.private),
             public: keypair.public,
         })
     }
@@ -200,8 +201,20 @@ impl DeviceKey {
     /// The keypair for this device, minted on first use and kept as the
     /// secret [`KEY_FILE`] in this target's backend.
     pub fn load_or_create(dir: &Path) -> Result<Self, WireError> {
+        // One minter at a time: two first-use callers (the pair screen's
+        // fingerprint and the pair itself) must not each mint a key and let
+        // the second store replace the one the first already used.
+        static MINT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _mint = MINT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(bytes) = load_secret(dir, KEY_FILE)? {
-            return Self::from_bytes(&bytes);
+            match Self::from_bytes(&bytes) {
+                Ok(key) => return Ok(key),
+                // A stored item of the wrong shape (a partial write, an
+                // earlier build) is unusable and, in the Keychain, outlives
+                // the app: it is replaced, not a permanent error. The old
+                // identity was never going to connect again either way.
+                Err(_) => delete_secret(dir, KEY_FILE)?,
+            }
         }
         let key = Self::generate()?;
         store_secret(dir, KEY_FILE, &key.bytes())?;
@@ -211,19 +224,20 @@ impl DeviceKey {
     fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
         if bytes.len() != PRIVATE_LEN + PUBLIC_LEN {
             return Err(custody_error(format!(
-                "{KEY_FILE} holds {} bytes, expected {}",
+                "the stored {KEY_FILE} item holds {} bytes, expected {}",
                 bytes.len(),
                 PRIVATE_LEN + PUBLIC_LEN
             )));
         }
         Ok(Self {
-            private: bytes[..PRIVATE_LEN].to_vec(),
+            private: Zeroizing::new(bytes[..PRIVATE_LEN].to_vec()),
             public: bytes[PRIVATE_LEN..].to_vec(),
         })
     }
 
-    fn bytes(&self) -> Vec<u8> {
-        let mut bytes = self.private.clone();
+    /// Private then public, zeroed when dropped.
+    fn bytes(&self) -> Zeroizing<Vec<u8>> {
+        let mut bytes = Zeroizing::new(self.private.to_vec());
         bytes.extend_from_slice(&self.public);
         bytes
     }
@@ -259,6 +273,18 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(target_os = "ios"))]
+    fn a_malformed_stored_key_is_replaced_not_a_permanent_error() {
+        let dir = tempfile::tempdir().unwrap();
+        store_secret(dir.path(), KEY_FILE, b"not a key").unwrap();
+        let key = DeviceKey::load_or_create(dir.path()).unwrap();
+        let again = DeviceKey::load_or_create(dir.path()).unwrap();
+        assert_eq!(key.public(), again.public());
+        assert_eq!(std::fs::read(dir.path().join(KEY_FILE)).unwrap().len(), 64);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "ios"))]
     fn the_file_backend_persists_one_keypair_with_owner_only_mode() {
         let dir = tempfile::tempdir().unwrap();
         let first = DeviceKey::load_or_create(dir.path()).unwrap();

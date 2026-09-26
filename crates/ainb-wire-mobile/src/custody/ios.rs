@@ -20,7 +20,8 @@ use crate::records::WireError;
 /// account.
 pub const SERVICE: &str = "com.ainb.wire";
 
-/// errSecItemNotFound.
+/// `errSecItemNotFound` (SecBase.h), the one status that means "no item"
+/// rather than a Keychain failure.
 const NOT_FOUND: i32 = -25300;
 
 /// The secret under `name`, when one exists.
@@ -42,8 +43,10 @@ pub fn store(name: &str, bytes: &[u8]) -> Result<(), WireError> {
     .map_err(|e| custody_error(format!("keychain access control: {e}")))?;
     options.set_access_control(access);
     options.set_access_synchronized(Some(false));
-    // An existing item makes the add fail with errSecDuplicateItem; replace
-    // is the contract of `store_secret`.
+    // The library turns errSecDuplicateItem into an update in place, and an
+    // update rewrites the value but keeps the old item's attributes. Replace
+    // is the contract of `store_secret`, with THIS accessibility: delete
+    // first so the new item carries it.
     delete(name)?;
     set_generic_password_options(bytes, options)
         .map_err(|e| custody_error(format!("keychain write: {e}")))

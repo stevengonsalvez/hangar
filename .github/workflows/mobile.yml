@@ -20,8 +20,14 @@ on:
       - "crates/ainb-wire-mobile/**"
       - "crates/ainb-hangar-noise/**"
       - "crates/ainb-hangar-proto/**"
+      - "crates/ainb-hangar-core/**"
       - "apps/ainb-mobile/**"
       - ".github/workflows/mobile.yml"
+
+# A new push to a PR supersedes its running jobs, as ci.yml does.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -46,6 +52,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/ainb-wire-mobile
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format
         run: cargo fmt -- --check
       - name: Clippy (library and tests)
@@ -79,6 +86,7 @@ jobs:
         with:
           workspaces: crates/ainb-wire-mobile
           key: android
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The runner image ships an NDK; its clang wrappers are the linkers
       # cargo needs for the two ABIs the app carries (ubrn.config.yaml).
       - name: Build the release library for arm64-v8a and x86_64
@@ -88,26 +96,35 @@ jobs:
           rustup target add aarch64-linux-android x86_64-linux-android
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android24-clang"
           export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$tc/x86_64-linux-android24-clang"
-          export RUSTFLAGS="-C link-arg=-Wl,--gc-sections"
-          # Before: the untuned profile (cargo's release defaults). After:
-          # `release`, the size-tuned profile the app ships with. Both are
-          # printed by the gate step.
-          cargo build --profile untuned --lib --target aarch64-linux-android
-          cargo build --profile untuned --lib --target x86_64-linux-android
+          # No RUSTFLAGS: the gated artifact is built exactly as ubrn builds
+          # the app's (`--release`, cargo's own cdylib flags), so the number
+          # is the number the app ships.
           cargo build --release --lib --target aarch64-linux-android
           cargo build --release --lib --target x86_64-linux-android
-      # Per ABI: a warning above the 2 MiB M1-03 budget, a failure above
-      # 3 MiB, on the release profile the app ships with. Both numbers are
-      # printed before either fails, after the untuned baseline.
-      - name: Size gate, warn above 2 MiB and fail above 3 MiB per ABI
+      # The untuned baseline (cargo's release defaults) changes only when
+      # dependencies or profiles change, so it is measured on the nightly
+      # run and on dispatch, not on every push.
+      - name: Build the untuned baseline for the before number
+        if: github.event_name != 'pull_request'
         run: |
+          tc="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android24-clang"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$tc/x86_64-linux-android24-clang"
+          cargo build --profile untuned --lib --target aarch64-linux-android
+          cargo build --profile untuned --lib --target x86_64-linux-android
           echo "before (untuned profile, not gated):"
           bash scripts/size-gate.sh target/aarch64-linux-android/untuned/libainb_wire_mobile.so 9999999999 9999999999 "arm64-v8a untuned"
           bash scripts/size-gate.sh target/x86_64-linux-android/untuned/libainb_wire_mobile.so 9999999999 9999999999 "x86_64 untuned"
-          echo "after (release profile, the one the app ships, gated):"
+      # Per ABI: a warning above the 2 MiB M1-03 budget, a failure above
+      # 3 MiB, on the release profile the app ships with. Both numbers are
+      # printed before either fails. A missing artifact keeps the script's
+      # own exit code (2), so it never reads as a size regression.
+      - name: Size gate, warn above 2 MiB and fail above 3 MiB per ABI
+        run: |
+          echo "release profile, the one the app ships, gated:"
           rc=0
-          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=1
-          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 x86_64 || rc=1
+          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 arm64-v8a || rc=$?
+          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 2097152 3145728 x86_64 || { s=$?; [ "$s" -gt "$rc" ] && rc=$s; }
           exit $rc
 
   ios:
@@ -124,6 +141,7 @@ jobs:
         with:
           workspaces: crates/ainb-wire-mobile
           key: ios
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The app's size budget (a 3 MiB .app delta) is measured by the app's
       # own build; this job proves the crate links for the device and the
       # simulator with the runner's Xcode and records the library size.
@@ -147,11 +165,14 @@ jobs:
       - name: Find the app
         id: app
         run: |
-          if [ -f apps/ainb-mobile/package.json ]; then
+          # The lockfile, not package.json: setup-node's cache and `npm ci`
+          # both need it, so an app with another lockfile skips rather
+          # than fails here.
+          if [ -f apps/ainb-mobile/package-lock.json ]; then
             echo "present=true" >>"$GITHUB_OUTPUT"
           else
             echo "present=false" >>"$GITHUB_OUTPUT"
-            echo "apps/ainb-mobile is not in this tree; nothing to check" >>"$GITHUB_STEP_SUMMARY"
+            echo "apps/ainb-mobile/package-lock.json is not in this tree; nothing to check" >>"$GITHUB_STEP_SUMMARY"
           fi
       - uses: actions/setup-node@v7
         if: steps.app.outputs.present == 'true'

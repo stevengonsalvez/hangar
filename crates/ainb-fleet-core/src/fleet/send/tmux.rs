@@ -1215,8 +1215,11 @@ fn last_prompt_line_pending(pane: &str, base: Option<PasteTally>) -> bool {
 }
 
 pub async fn tmux_session_exists(name: &str) -> bool {
+    // A target may name a window and a pane (`session:0.1`): the session is
+    // what exists or not, matched exactly.
+    let session = name.split(':').next().unwrap_or(name);
     Command::new("tmux")
-        .args(["has-session", "-t", &format!("={name}")])
+        .args(["has-session", "-t", &format!("={session}")])
         .status()
         .await
         .is_ok_and(|s| s.success())

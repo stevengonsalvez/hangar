@@ -106,6 +106,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uniffi",
+ "zeroize",
 ]
 
 [[package]]
