@@ -41,7 +41,7 @@ scenario() {
   done
   check "the neighbour previews its live output" wait_screen own-tui 'neighbour tick [0-9]+' 10
   observe "clients with neighbour selected: own-tui [$(clients_on own-tui | paste -sd';' -)], neighbour [$(clients_on neighbour | paste -sd';' -)]"
-  check "the neighbour preview is a read-only client" bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' list-clients -t '=neighbour' -F '#{client_flags}' | grep -q read-only"
+  check "the neighbour preview is a read-only client" bash -c "env -u TMUX -u TMUX_PANE tmux -S '$PROOF_TMUX_SOCK' list-clients -t '=neighbour' -F '#{client_flags}' | grep -q read-only"
   capture own-tui neighbour-selected
 
   for i in 1 2 3; do
@@ -52,7 +52,7 @@ scenario() {
   check "the own session shows the placeholder" \
     wait_screen own-tui 'This is the tmux session ainb is running in' 10
   check "the placeholder names the session" \
-    bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=own-tui:' -p | cut -c $((PROOF_COLS / 2))- | grep -A3 'This is the tmux session ainb is running in' | grep -q 'own-tui'"
+    bash -c "env -u TMUX -u TMUX_PANE tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=own-tui:' -p | cut -c $((PROOF_COLS / 2))- | grep -A3 'This is the tmux session ainb is running in' | grep -q 'own-tui'"
   check "the placeholder says why there is no preview" \
     wait_screen own-tui 'A live preview would show this screen inside itself' 5
   capture own-tui own-session-selected
