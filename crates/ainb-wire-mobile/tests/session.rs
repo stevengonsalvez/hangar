@@ -16,6 +16,7 @@ use ainb_wire_mobile::custody::DeviceKey;
 use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use ainb_wire_mobile::records::{AnswerOutcome, WireError, WireEvent};
 use ainb_wire_mobile::session::{ConnectConfig, Session, SessionEvent};
+use common::DropKind;
 use common::{FakePeer, HOST_ID, PeerOpts, Reply, hello_then, method_not_found, spawn};
 use serde_json::{Value, json};
 
@@ -419,24 +420,28 @@ async fn a_host_with_another_key_or_id_is_peer_changed() {
 #[tokio::test]
 async fn a_close_before_the_handshake_reply_is_classified_by_its_code() {
     let key = DeviceKey::generate().unwrap();
-    let cases: [(u16, &str, WireError); 5] = [
+    let closed =
+        |code: u16, reason: &str, retryable: bool, retry_after_ms: Option<u64>| WireError::Closed {
+            code: Some(code),
+            reason: reason.into(),
+            retryable,
+            retry_after_ms,
+        };
+    let cases = [
         (
             4429,
             "retry-after=7",
-            WireError::RateLimited {
-                retry_after_ms: Some(7_000),
-            },
+            closed(4429, "retry-after=7", true, Some(7_000)),
         ),
         (
             1013,
             "retry-after=2",
-            WireError::OverCapacity {
-                retry_after_ms: Some(2_000),
-            },
+            closed(1013, "retry-after=2", true, Some(2_000)),
         ),
-        (4503, "draining", WireError::Draining),
-        (4409, "protocol", WireError::Incompatible),
-        (4403, "revoked", WireError::Revoked),
+        (4503, "draining", closed(4503, "draining", true, None)),
+        (4409, "protocol", closed(4409, "protocol", false, None)),
+        (4403, "revoked", closed(4403, "revoked", false, None)),
+        (4999, "novel", closed(4999, "novel", false, None)),
     ];
     for (code, reason, expected) in cases {
         let peer = spawn(
@@ -456,7 +461,7 @@ async fn a_close_before_the_handshake_reply_is_classified_by_its_code() {
         );
     }
     assert!(!WireError::PeerChanged.is_retryable());
-    assert!(!WireError::Unauthenticated.is_retryable());
+    assert!(!closed(4401, "noise", false, None).is_retryable());
 
     // A socket that vanishes with no close code is a network loss.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -477,6 +482,27 @@ async fn a_close_before_the_handshake_reply_is_classified_by_its_code() {
     let err = Session::connect(config).await.unwrap_err();
     assert!(matches!(err, WireError::Connect { .. }), "{err:?}");
     assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn a_socket_ended_or_reset_after_message_1_is_a_retryable_connect() {
+    let key = DeviceKey::generate().unwrap();
+    for kind in [DropKind::Eof, DropKind::Reset] {
+        let peer = spawn(
+            hello_then("mobile", |m, _| method_not_found(m)),
+            PeerOpts {
+                after_message_1: Some(kind),
+                ..PeerOpts::default()
+            },
+        )
+        .await;
+        let err = Session::connect(peer.config(&key)).await.unwrap_err();
+        assert!(
+            matches!(err, WireError::Connect { .. }),
+            "{kind:?} after message 1 must be a network loss, got {err:?}"
+        );
+        assert!(err.is_retryable(), "{kind:?}");
+    }
 }
 
 #[tokio::test]
@@ -504,10 +530,13 @@ async fn a_silent_host_times_out_the_connect() {
 
 #[tokio::test]
 async fn close_codes_map_4403_to_revoked_and_4401_to_unauthenticated() {
-    for (code, expected) in [
-        (4403u16, WireError::Revoked),
-        (4401, WireError::Unauthenticated),
-    ] {
+    for code in [4403u16, 4401] {
+        let expected = WireError::Closed {
+            code: Some(code),
+            reason: "go away".into(),
+            retryable: false,
+            retry_after_ms: None,
+        };
         let peer = spawn(
             Arc::new(move |_m: &str, _p: Value| Reply::Close(code, "go away".into())),
             PeerOpts::default(),
