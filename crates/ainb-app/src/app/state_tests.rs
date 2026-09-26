@@ -530,33 +530,49 @@ mod tests {
     /// would die on "already in use".
     #[test]
     fn transcript_probes_honour_claude_config_dir() {
+        use std::ffi::OsStr;
         use std::fs;
-        use std::path::PathBuf;
+        use std::path::{Path, PathBuf};
+
+        // The variable wins over the home directory, and the default stands
+        // without it.
+        assert_eq!(
+            AppState::claude_projects_dir_from(
+                Some(OsStr::new("/cfg")),
+                Some(Path::new("/home/x"))
+            ),
+            Some(PathBuf::from("/cfg/projects"))
+        );
+        assert_eq!(
+            AppState::claude_projects_dir_from(None, Some(Path::new("/home/x"))),
+            Some(PathBuf::from("/home/x/.claude/projects"))
+        );
+        assert_eq!(AppState::claude_projects_dir_from(None, None), None);
+
+        // Both probes read the projects directory they are given.
         let config_dir = tempfile::tempdir().unwrap();
-        let worktree = PathBuf::from("/Users/stevie/.agents-in-a-box/worktrees/by-name/repo--cfg");
-        let project_dir = config_dir
-            .path()
-            .join("projects")
-            .join("-Users-stevie--agents-in-a-box-worktrees-by-name-repo--cfg");
+        let projects =
+            AppState::claude_projects_dir_from(Some(config_dir.path().as_os_str()), None).unwrap();
+        let worktree = PathBuf::from("/work/repo--cfg");
+        let project_dir = projects.join("-work-repo--cfg");
         fs::create_dir_all(&project_dir).unwrap();
         let id = "11111111-2222-4333-8444-555555555555";
         fs::write(project_dir.join(format!("{id}.jsonl")), "x").unwrap();
 
-        let previous = std::env::var_os("CLAUDE_CONFIG_DIR");
-        std::env::set_var("CLAUDE_CONFIG_DIR", config_dir.path());
-        let exists = AppState::claude_transcript_exists(&worktree, id);
-        let other =
-            AppState::claude_transcript_exists(&worktree, "22222222-2222-4333-8444-555555555555");
-        let latest = AppState::find_latest_transcript(&worktree);
-        match previous {
-            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
-        }
-
-        assert!(exists, "the transcript under CLAUDE_CONFIG_DIR is found");
-        assert!(!other, "and only for its own id");
+        assert!(
+            AppState::claude_transcript_exists_under(&projects, &worktree, id),
+            "the transcript under CLAUDE_CONFIG_DIR is found"
+        );
+        assert!(
+            !AppState::claude_transcript_exists_under(
+                &projects,
+                &worktree,
+                "22222222-2222-4333-8444-555555555555"
+            ),
+            "and only for its own id"
+        );
         assert_eq!(
-            latest.as_deref(),
+            AppState::find_latest_transcript_under(&projects, &worktree).as_deref(),
             Some(project_dir.join(format!("{id}.jsonl")).as_path()),
             "the history probe reads the same directory"
         );
