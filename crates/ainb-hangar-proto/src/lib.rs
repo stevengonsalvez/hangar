@@ -107,7 +107,10 @@ pub enum RpcId {
 }
 
 /// A JSON-RPC 2.0 request envelope.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts credentials: the whole `params` of
+/// [`SECRET_PARAMS_METHODS`], and any [`SECRET_KEYS`] member elsewhere.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcRequest {
     /// The JSON-RPC protocol version; always `"2.0"`. Defaults to `"2.0"`
     /// when a lenient peer omits it on decode.
@@ -126,7 +129,10 @@ pub struct RpcRequest {
 /// Exactly one of `result` / `error` is populated, matching the JSON-RPC
 /// contract; both are `Option` and skipped when absent so the serialized form
 /// carries only the relevant half.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts any [`SECRET_KEYS`] member of the result: a response does
+/// not name its method, so the redaction goes by key.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcResponse {
     /// The JSON-RPC protocol version; always `"2.0"`. Defaults to `"2.0"`
     /// when a lenient peer omits it on decode.
@@ -143,7 +149,9 @@ pub struct RpcResponse {
 }
 
 /// A JSON-RPC 2.0 error object: `{code, message, data?}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts any [`SECRET_KEYS`] member of `data`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RpcError {
     /// The numeric error code (JSON-RPC reserves `-32768..=-32000`).
     pub code: i32,
@@ -152,4 +160,163 @@ pub struct RpcError {
     /// Optional structured detail.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub data: Option<serde_json::Value>,
+}
+
+/// Object keys whose value is a credential, at any depth of a JSON body.
+///
+/// Covers `params`, `result` and error `data`: the daemon or device token, the
+/// plaintext device token a redeem returns, the invite secret, and the pairing
+/// URI that carries it.
+pub const SECRET_KEYS: &[&str] = &["token", "device_token", "invite_secret", "offer"];
+
+/// Methods whose whole `params` object is a credential exchange, so `Debug`
+/// prints none of it.
+pub const SECRET_PARAMS_METHODS: &[&str] = &[methods::AUTH_HELLO, methods::DEVICE_REDEEM];
+
+/// A JSON value rendered for `Debug` with every [`SECRET_KEYS`] member, at any
+/// depth, replaced by [`Redacted`].
+struct RedactedValue<'a>(&'a serde_json::Value);
+
+impl std::fmt::Debug for RedactedValue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            serde_json::Value::Object(map) => {
+                let mut out = f.debug_map();
+                for (key, value) in map {
+                    if SECRET_KEYS.contains(&key.as_str()) {
+                        out.entry(key, &Redacted);
+                    } else {
+                        out.entry(key, &Self(value));
+                    }
+                }
+                out.finish()
+            }
+            serde_json::Value::Array(items) => {
+                f.debug_list().entries(items.iter().map(Self)).finish()
+            }
+            scalar => std::fmt::Debug::fmt(scalar, f),
+        }
+    }
+}
+
+impl std::fmt::Debug for RpcRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            jsonrpc,
+            id,
+            method,
+            params,
+        } = self;
+        let mut out = f.debug_struct("RpcRequest");
+        out.field("jsonrpc", jsonrpc).field("id", id).field("method", method);
+        if SECRET_PARAMS_METHODS.contains(&method.as_str()) {
+            out.field("params", &Redacted);
+        } else {
+            out.field("params", &RedactedValue(params));
+        }
+        out.finish()
+    }
+}
+
+impl std::fmt::Debug for RpcResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            jsonrpc,
+            id,
+            result,
+            error,
+        } = self;
+        f.debug_struct("RpcResponse")
+            .field("jsonrpc", jsonrpc)
+            .field("id", id)
+            .field("result", &result.as_ref().map(RedactedValue))
+            .field("error", error)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            code,
+            message,
+            data,
+        } = self;
+        f.debug_struct("RpcError")
+            .field("code", code)
+            .field("message", message)
+            .field("data", &data.as_ref().map(RedactedValue))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::*;
+
+    const TOKEN: &str = "mdt_s3cr3tDaemonTokenValue";
+
+    /// The frame every client sends first: nothing of it prints but the
+    /// envelope.
+    #[test]
+    fn hello_request_debug_hides_the_token() {
+        let request = auth::hello_request(7, TOKEN);
+        for rendered in [format!("{request:?}"), format!("{request:#?}")] {
+            assert!(!rendered.contains(TOKEN), "{rendered}");
+            assert!(!rendered.contains("mdt_"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains(methods::AUTH_HELLO), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn redeem_params_print_nothing() {
+        let request = RpcRequest {
+            jsonrpc: jsonrpc_version(),
+            id: RpcId::Number(1),
+            method: methods::DEVICE_REDEEM.to_string(),
+            params: serde_json::json!({"invite_id": "i", "invite_secret": "s3cr3tInvite"}),
+        };
+        assert!(!format!("{request:?}").contains("s3cr3tInvite"));
+    }
+
+    /// A response does not name its method, so the secret keys are redacted at
+    /// any depth, and everything else still prints.
+    #[test]
+    fn response_and_error_debug_hide_secret_keys() {
+        let response = RpcResponse {
+            jsonrpc: jsonrpc_version(),
+            id: RpcId::Number(1),
+            result: Some(serde_json::json!({
+                "device_id": "dev-visible",
+                "device_token": "mdd_s3cr3tDevice",
+                "nested": [{"offer": "ainb://pair#s3cr3tOffer", "token": TOKEN}],
+            })),
+            error: Some(RpcError {
+                code: -1,
+                message: "m".to_string(),
+                data: Some(serde_json::json!({"invite_secret": "s3cr3tInvite"})),
+            }),
+        };
+        for rendered in [format!("{response:?}"), format!("{response:#?}")] {
+            for secret in ["mdd_s3cr3tDevice", "s3cr3tOffer", TOKEN, "s3cr3tInvite"] {
+                assert!(!rendered.contains(secret), "{secret} in {rendered}");
+            }
+            assert!(rendered.contains("dev-visible"), "{rendered}");
+        }
+    }
+
+    /// Other methods keep their params visible, secret keys aside.
+    #[test]
+    fn ordinary_params_still_print() {
+        let request = RpcRequest {
+            jsonrpc: jsonrpc_version(),
+            id: RpcId::Number(2),
+            method: methods::PING.to_string(),
+            params: serde_json::json!({"workspace_id": "ws-visible", "token": TOKEN}),
+        };
+        let rendered = format!("{request:?}");
+        assert!(rendered.contains("ws-visible"), "{rendered}");
+        assert!(!rendered.contains(TOKEN), "{rendered}");
+    }
 }
