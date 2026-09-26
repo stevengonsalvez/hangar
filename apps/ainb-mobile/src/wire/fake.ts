@@ -228,10 +228,10 @@ export class FakeWire implements WireClient {
   failNextConnect = 0;
   /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
   failNextSubscribe = 0;
-  /** Deterministic backoff for tests: no jitter. */
+  /** Deterministic backoff for tests: no jitter; a host's retry-after is a floor under the backoff. */
   backoffDelayMs(attempt: number, retryAfterSecs?: number): number {
-    if (retryAfterSecs !== undefined) return Math.min(60_000, retryAfterSecs * 1000);
-    return Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
+    const backoff = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
+    return Math.max(backoff, (retryAfterSecs ?? 0) * 1000);
   }
 
   /** The daemon asks the phone to start over from a snapshot. */
