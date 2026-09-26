@@ -24,7 +24,7 @@ import type {
 import type { AckMap } from "./acks.ts";
 import { isAcked } from "./acks.ts";
 import { allSessions, ATTENTION_ORDER, label, providerId } from "./sessions.ts";
-import { deriveStatus, elicitationDetail, type UiStatus } from "./status.ts";
+import { assertNever, deriveStatus, elicitationDetail, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
 /** Orca's own board buckets, left to right. Idle also holds a card whose
@@ -116,10 +116,12 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
     .sort((a, b) => ATTENTION_ORDER.indexOf(a) - ATTENTION_ORDER.indexOf(b));
 }
 
-/** `status.kind`, onto the column it draws in. `unverifiable` has no column
- * of its own in Orca's four-bucket vocabulary, so it falls in with `idle`
- * (`BoardCard.unverifiable` carries the badge that tells the two apart). */
-function bucketOf(status: UiStatus): BoardColumnKind {
+/** `status.kind`, onto the column it draws in, or `null` for one the board
+ * leaves out. `unverifiable` has no column of its own in Orca's four-bucket
+ * vocabulary, so it falls in with `idle` (`BoardCard.unverifiable` carries
+ * the badge that tells the two apart); `exited` is not a status anyone acts
+ * on. Exhaustive: a new status fails to compile here. */
+function bucketOf(status: UiStatus): BoardColumnKind | null {
   switch (status.kind) {
     case "needs":
       return "needs";
@@ -130,6 +132,10 @@ function bucketOf(status: UiStatus): BoardColumnKind {
     case "idle":
     case "unverifiable":
       return "idle";
+    case "exited":
+      return null;
+    default:
+      return assertNever(status);
   }
 }
 
@@ -157,7 +163,7 @@ export function boardColumns(
       elicitation: elicitationDetail(session?.attention ?? []),
       acked: isAcked(acks, card.session_key, card.evidence_observed_at),
     });
-    if (status === null) continue; // exited: not a status anyone acts on.
+    if (bucketOf(status) === null) continue; // exited: not a status anyone acts on.
     cards.push({
       key: card.session_key,
       title: label(session?.name ?? card.session_key),
