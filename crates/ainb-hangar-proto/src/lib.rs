@@ -23,6 +23,7 @@ pub mod dates;
 pub mod devices;
 pub mod events;
 pub mod fleet;
+pub mod hooks;
 /// Host identity and reachability (spec D11, frozen by PR-0).
 pub mod hosts;
 pub mod lifecycle;
@@ -325,6 +326,30 @@ mod debug_redaction_tests {
                 assert!(!rendered.contains(secret), "{secret} in {rendered}");
             }
             assert!(rendered.contains("dev-visible"), "{rendered}");
+        }
+    }
+
+    /// A secret key nested inside an ordinary method's params, in an object
+    /// or inside an array of objects, is redacted too.
+    #[test]
+    fn nested_secret_keys_in_params_are_redacted() {
+        let request = RpcRequest {
+            jsonrpc: jsonrpc_version(),
+            id: RpcId::Number(3),
+            method: methods::PING.to_string(),
+            params: serde_json::json!({
+                "workspace_id": "ws-visible",
+                "auth": {"token": TOKEN, "scope": "scope-visible"},
+                "devices": [{"device_token": "mdd_s3cr3tNested"}],
+                "pairing": {"deeper": {"invite_secret": "s3cr3tInvite", "offer": "ainb://pair#s3cr3tOffer"}},
+            }),
+        };
+        for rendered in [format!("{request:?}"), format!("{request:#?}")] {
+            for secret in [TOKEN, "mdd_s3cr3tNested", "s3cr3tInvite", "s3cr3tOffer"] {
+                assert!(!rendered.contains(secret), "{secret} in {rendered}");
+            }
+            assert!(rendered.contains("ws-visible"), "{rendered}");
+            assert!(rendered.contains("scope-visible"), "{rendered}");
         }
     }
 

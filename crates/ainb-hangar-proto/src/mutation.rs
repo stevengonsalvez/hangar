@@ -111,6 +111,19 @@ pub const REASON_NOT_DELIVERED: &str = "not_delivered";
 /// calls it "rejected with `floor_denied`". The error data also carries the
 /// current `holder` and `floor_gen` ([`crate::terminal::FloorDeniedData`]).
 pub const REASON_FLOOR_DENIED: &str = "floor_denied";
+/// Reason: no live hook hold, and the answer did not originate on this
+/// machine, so the local keys fallback is refused (hooks-and-answers).
+///
+/// Typed keys into a pane are a local-only fallback. An answer from a paired
+/// device, from ainb-web, or relayed by the phone bridge gets this instead of
+/// keystrokes; the operator answers at the machine.
+pub const REASON_LOCAL_ONLY: &str = "local_only";
+/// Reason: the caller's scope does not allow this answer for this row's kind.
+///
+/// `attention/answer` is allowed in every scope column, but an approval, or an
+/// ask that resolves a live hook hold, takes the same column verdict as
+/// `fleet/action` Approve. A phone scope, interrupt-only there, gets this.
+pub const REASON_SCOPE: &str = "scope";
 
 /// The reserved key under which the daemon attaches a [`MutationAck`] to an
 /// object-shaped mutation result.
