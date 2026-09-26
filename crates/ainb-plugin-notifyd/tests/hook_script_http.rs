@@ -261,7 +261,10 @@ fn every_pre_tool_use_asks_the_daemon_which_decides_what_holds() {
         r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"note":"\"tool_name\":\"Read\""}}"#,
         &[],
     );
-    assert_eq!(out, "{}\n", "the daemon's 204 prints nothing but an empty object");
+    assert_eq!(
+        out, "{}\n",
+        "the daemon's 204 prints nothing but an empty object"
+    );
     assert_eq!(f.seen.recv().unwrap().path, "/hook/claude/hold");
 }
 
