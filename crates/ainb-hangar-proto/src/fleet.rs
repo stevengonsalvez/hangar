@@ -49,6 +49,11 @@ pub const FLEET_CAPABILITY_MESSAGE_SEND: &str = "fleet.message.send";
 pub const FLEET_CAPABILITY_MESSAGE_READ: &str = "fleet.message.read";
 /// Negotiated capability required for ACP transcript list and subscribe.
 pub const FLEET_CAPABILITY_TRANSCRIPT_READ: &str = "fleet.transcript.read";
+/// Advertised when `fleet/transcript_list` honours `before_order`. A client
+/// pages back only when the daemon advertises it: an older daemon ignores the
+/// unknown member and answers the newest page every time, which a client
+/// paging back would loop on forever.
+pub const FLEET_CAPABILITY_TRANSCRIPT_PAGE_BACK: &str = "fleet.transcript.page_back";
 /// Negotiated capability required for daemon-owned ACP session creation.
 pub const FLEET_CAPABILITY_ACP_SPAWN: &str = "fleet.acp.spawn";
 /// Negotiated capability required for the operator export-then-delete of ACP
@@ -153,6 +158,8 @@ pub const FLEET_PROTOCOL_CAPABILITY_IDS: &[&str] = &[
     FLEET_CAPABILITY_STATUS_READ,
     // Advertised with its `fleet/roster_status` dispatch arm, the same rule.
     FLEET_CAPABILITY_ROSTER_STATUS_READ,
+    // Advertised with the `before_order` arm of `fleet/transcript_list`.
+    FLEET_CAPABILITY_TRANSCRIPT_PAGE_BACK,
 ];
 
 /// Inclusive supported protocol version range.
@@ -1806,10 +1813,21 @@ pub struct FleetTranscriptListParams {
 pub struct FleetTranscriptListResult {
     /// Chunks in ascending `ingest_order`.
     pub chunks: Vec<FleetTranscriptChunk>,
-    /// Cursor for the next page, or `null` when this page is empty.
+    /// Cursor for the next FORWARD page (`after_order`): the last chunk's
+    /// order, on a forward or uncursored page. Absent on a backward
+    /// (`before_order`) page, which is not a place to walk forward from, and
+    /// on an empty page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_after_order: Option<i64>,
-    /// Whether older rows were left behind by the UNCURSORED read.
+    /// Cursor for the next BACKWARD page (`before_order`), on an uncursored or
+    /// backward page that left older rows behind (`truncated`): the lowest
+    /// order this page scanned. That is the first chunk's order, or lower when
+    /// the oldest rows it reached could not be decoded and were skipped, so a
+    /// walk back never stalls on a row it can never return. Absent when
+    /// nothing older remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_order: Option<i64>,
+    /// Whether older rows were left behind by an uncursored or backward read.
     ///
     /// Not inferable from `chunks.len()`, which is the whole reason it is on
     /// the wire. The tail read is bounded twice, by rows and by payload bytes,
@@ -1818,9 +1836,12 @@ pub struct FleetTranscriptListResult {
     /// assumed the first would render a partial run as a complete one, which is
     /// the failure `FleetProviderEventRepo::list_by_session_tail` documents.
     ///
-    /// Always `false` on a CURSORED read, which is bounded by rows alone and
-    /// answers "what came after this row" rather than "is this the whole
-    /// story": a caller walking forward already knows more may follow, because
+    /// A backward (`before_order`) page is the same tail read ending earlier,
+    /// so `truncated` there means rows older than the page remain.
+    ///
+    /// Always `false` on a FORWARD (`after_order`) read, which answers "what
+    /// came after this row" rather than "is this the whole story": a caller
+    /// walking forward already knows more may follow, because
     /// `next_after_order` tells it so.
     ///
     /// `#[serde(default)]` so a client built against this reads a daemon built
@@ -2930,6 +2951,13 @@ mod tests {
         round_trip(&FleetTranscriptListResult {
             chunks: vec![sample_chunk()],
             next_after_order: Some(41),
+            next_before_order: None,
+            truncated: true,
+        });
+        round_trip(&FleetTranscriptListResult {
+            chunks: vec![sample_chunk()],
+            next_after_order: None,
+            next_before_order: Some(40),
             truncated: true,
         });
         // And a daemon built before the flag decodes as "nothing left behind"
