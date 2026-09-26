@@ -136,10 +136,37 @@ test("the terminal tab shows the engine state and names an ignored link's host",
 });
 
 test("frames that arrive before the attach reply is recorded are replayed, not lost", async () => {
-  // The fake delivers the snapshot on a microtask queued inside terminalAttach,
-  // which can run before the hook's continuation records the stream id.
+  fake.snapshotBeforeReply = true; // the whole snapshot lands while the attach reply is still in flight
   const screen = await openTerminal();
   await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT));
   await act(async () => bridge.engineMessage!(encode({ t: "stats", bytes: 2560, cols: 57, rows: 38 })));
   expect(await screen.findByText("engine ready, 2560 B, 57x38")).toBeTruthy();
+});
+
+test("an early-frame overflow discards the buffer and re-attaches once for a fresh snapshot", async () => {
+  fake.snapshotBeforeReply = true;
+  fake.floodBytesAfterSnapshot = 300 * 1024; // past the 256 KiB early cap, all before the attach reply lands
+  const screen = await openTerminal();
+  // both attaches overflow: one retry, then the terminal says why instead of spinning
+  await waitFor(() => expect(fake.attaches).toBe(2), { timeout: 5000 });
+  expect(fake.detached).toEqual([1, 2]);
+  expect(await screen.findByText(/snapshot too large/)).toBeTruthy();
+  expect(sinkCalls()).toEqual([]); // nothing from a discarded buffer was painted
+
+  // a fresh cycle whose retry fits paints from its own snapshot
+  fake.floodBytesAfterSnapshot = 0;
+  await act(() => onAppState(fake, "background"));
+  await act(() => onAppState(fake, "active"));
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT), { timeout: 5000 });
+  expect(await screen.findByText("80x24")).toBeTruthy();
+});
+
+test("an attach that throws leaves nothing buffered and the next attach starts clean", async () => {
+  fake.failNextAttach = true;
+  const screen = await openTerminal();
+  expect(await screen.findByText("closed: attach refused")).toBeTruthy();
+  expect(sinkCalls()).toEqual([]);
+  await act(() => onAppState(fake, "background"));
+  await act(() => onAppState(fake, "active")); // afterForeground re-attaches
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT), { timeout: 5000 });
 });
