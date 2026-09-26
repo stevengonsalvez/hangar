@@ -84,6 +84,8 @@ export type AnswerOutcome =
   | { kind: "unknown"; reason: string };
 
 export interface MutationAck {
+  /** `created` on first execution, `replayed` when the ledger served a retry. */
+  outcome?: "created" | "replayed";
   status: "accepted" | "rejected" | "unknown";
   reason?: string;
   receipt?: "claimed" | "writing" | "delivered" | "failed" | "unknown";
