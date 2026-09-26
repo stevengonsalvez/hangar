@@ -637,10 +637,13 @@ impl DaemonAttention {
         }
     }
 
-    /// The daemon rows raised in `cwd`, trailing slash insensitive.
+    /// The daemon rows raised in `cwd`: the same directory through a symlink
+    /// or a trailing slash (#132).
     #[must_use]
     pub fn rows_for(&self, cwd: &str) -> &[SessionAttention] {
-        self.by_cwd.get(cwd.trim_end_matches('/')).map_or(&[], Vec::as_slice)
+        self.by_cwd
+            .get(&ainb_fleet_core::read::jsonl_tail::canonical_dir(cwd))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Daemon rows for an exact provider session id.
@@ -653,7 +656,7 @@ impl DaemonAttention {
     #[must_use]
     pub fn rows_for_unidentified_cwd(&self, cwd: &str) -> &[SessionAttention] {
         self.by_cwd_without_session_id
-            .get(cwd.trim_end_matches('/'))
+            .get(&ainb_fleet_core::read::jsonl_tail::canonical_dir(cwd))
             .map_or(&[], Vec::as_slice)
     }
 
