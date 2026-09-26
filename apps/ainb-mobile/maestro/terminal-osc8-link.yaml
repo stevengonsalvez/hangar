@@ -1,0 +1,35 @@
+# #81 lockdown, driven: the pane output carries an OSC 8 hyperlink (the fake
+# stream appends one after the snapshot, at the cursor row 10 of the alt
+# screen). Tapping it must open nothing: no browser, no navigation inside the
+# webview, the terminal still on screen with its size row.
+#   HOST_ID, SESSION_KEY: see README.md
+appId: com.stevengonsalvez.ainb.mobile
+---
+- launchApp:
+    clearState: true
+- tapOn:
+    id: "host-${HOST_ID}"
+- tapOn:
+    id: "session-${SESSION_KEY}"
+- tapOn:
+    id: "tab-terminal"
+- assertVisible:
+    id: "terminal-webview"
+- waitForAnimationToEnd:
+    timeout: 2000
+- takeScreenshot: terminal-osc8-before
+# the link text sits at the cursor row inside the webview; tap it twice
+# (xterm activates a link on a second tap when the first only hovers)
+- tapOn:
+    point: "20%,32%"
+- tapOn:
+    point: "20%,32%"
+- waitForAnimationToEnd:
+    timeout: 2000
+- takeScreenshot: terminal-osc8-after
+- assertVisible:
+    id: "terminal-webview"
+- assertVisible:
+    id: "terminal-size"
+- assertNotVisible:
+    text: "example.invalid"
