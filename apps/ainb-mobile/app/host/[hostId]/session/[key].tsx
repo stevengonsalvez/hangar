@@ -2,6 +2,7 @@ import { useLocalSearchParams } from "expo-router";
 import { useCallback, useState } from "react";
 import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
+import { FixtureTerminal } from "../../../../src/terminal/FixtureTerminal";
 import { colors } from "../../../../src/theme";
 import { useWire, useWireEvents, useWireQuery } from "../../../../src/wire/context";
 import type { TranscriptEntry } from "../../../../src/wire/types";
@@ -78,9 +79,8 @@ export default function Session() {
           </View>
         </>
       ) : (
-        <View style={styles.terminal} testID="terminal-placeholder">
-          <Text style={styles.muted}>Terminal lands with the stream (M1-11, M1-13).</Text>
-        </View>
+        // Fixture bytes until the stream arrives over the wire (M1-13).
+        <FixtureTerminal />
       )}
     </View>
   );
@@ -103,6 +103,4 @@ const styles = StyleSheet.create({
   input: { flex: 1, color: colors.text, borderWidth: 1, borderColor: colors.border, borderRadius: 8, padding: 10, backgroundColor: colors.panel },
   send: { backgroundColor: colors.gold, borderRadius: 8, paddingHorizontal: 14, justifyContent: "center" },
   sendText: { color: colors.bg, fontWeight: "700" },
-  terminal: { flex: 1, alignItems: "center", justifyContent: "center" },
-  muted: { color: colors.muted },
 });
