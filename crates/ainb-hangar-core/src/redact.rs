@@ -27,6 +27,22 @@
 //! GitHub, GitLab, AWS, Google, PEM private keys, JWTs, and a password in a URL),
 //! and [`find_secret`] exposes the same table as a tripwire for tests over a
 //! serialised frame.
+//!
+//! Named credentials (a header like `X-Api-Key`, a variable like
+//! `CLIENT_SECRET`) share one name rule, [`is_secret_name`], between the text
+//! shapes and [`scrub_json`]'s object keys. What it does NOT cover, on
+//! purpose or not yet:
+//!
+//! - lower-case and camel-case names (`api_token=...`, `password: ...`,
+//!   `{"accessToken": ...}`, `{"password": ...}`): too close to ordinary code
+//!   and prose to match by name;
+//! - YAML and other `NAME: value` forms of an environment name
+//!   (`DB_PASSWORD: hunter2`), and a spaced `NAME = value`;
+//! - bare `PASSWORD=`, `KEY=` and `PWD=` (only the suffixed forms, and bare
+//!   `SECRET=` and `TOKEN=`);
+//! - in free text, a value under 16 characters, one with no digit, or a UUID
+//!   (a JSON field named by the rule is redacted whatever its value);
+//! - a number or boolean under a secret-named JSON key.
 
 use std::sync::LazyLock;
 
@@ -167,32 +183,95 @@ static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}").expect("valid bearer token regex")
 });
-/// An API key in a header of its own rather than `Authorization`:
-/// `X-Api-Key`, `X-Auth-Token`, any `X-...-Key`, `-Token` or `-Secret`, and
-/// the bare `api-key`, `api-token`, `auth-token`, `access-token`,
-/// `private-token` (GitLab) and lower-case `apikey`. Group 1 keeps the header
-/// name. The value is 16 or more token characters, so "x-api-key: required"
-/// and a placeholder are left alone; the names carry a hyphen (or are the
-/// lower-case `apikey`), so a camel-case `apiKey: SomeType` in code is too.
+/// Header names that carry a credential by themselves: `Authorization`,
+/// `X-Api-Key`, `X-Auth-Token`, any `X-...-Key`, `-Token` or `-Secret`, and the
+/// bare `api-key`, `api-token`, `auth-token`, `access-token`, `private-token`
+/// (GitLab) and lower-case `apikey`. Case-insensitive, as HTTP header names
+/// are, except `apikey`: every other name carries a hyphen, so a camel-case
+/// identifier in code (`apiKey: SomeType`) is never one.
+///
+/// Half of the one secret-name rule, with [`SECRET_ENV_NAME`]: the text
+/// shapes embed both, and [`is_secret_name`] (which [`scrub_json`] asks of
+/// every object key) matches the same two, whole.
+const SECRET_HEADER_NAME: &str = r"(?i:(?:proxy-)?authorization|x-[a-z0-9-]*(?:key|token|secret)|api-key|api-token|auth-token|access-token|private-token)|apikey";
+/// Environment-style names that carry a credential: upper case, ending in
+/// `_TOKEN`, `_SECRET`, `_KEY`, `_PASSWORD`, `_PASSWD` or `_PWD`, or the bare
+/// `SECRET` and `TOKEN`. The other half of the secret-name rule.
+const SECRET_ENV_NAME: &str =
+    r"[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|KEY|PASSWORD|PASSWD|PWD)|SECRET|TOKEN";
+
+/// The whole-name form of the rule, for a JSON object key.
+static SECRET_NAME: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!("^(?:{SECRET_HEADER_NAME}|{SECRET_ENV_NAME})$"))
+        .expect("valid secret name regex")
+});
+/// A version 1 to 8 UUID, the canonical 8-4-4-4-12 hex form.
+static UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+        .expect("valid uuid regex")
+});
+
+/// Whether `name` (a header, a variable or a JSON key, whole) names a
+/// credential: it matches [`SECRET_HEADER_NAME`] or [`SECRET_ENV_NAME`] and
+/// does not say `PUBLIC` (`NEXT_PUBLIC_API_KEY`, `STRIPE_PUBLIC_KEY`, a
+/// `X-Public-Key`), which by its own name is meant to be seen.
+#[must_use]
+pub fn is_secret_name(name: &str) -> bool {
+    SECRET_NAME.is_match(name) && !name.to_ascii_lowercase().contains("public")
+}
+
+/// Whether free text after a secret name looks like a credential rather than
+/// prose or an identifier: it carries a digit and is not a UUID. The shapes
+/// that use it already require 16 or more token characters.
+fn is_opaque_value(value: &str) -> bool {
+    value.bytes().any(|b| b.is_ascii_digit()) && !UUID.is_match(value)
+}
+
+/// An API key in a header named by [`SECRET_HEADER_NAME`], as a curl flag, a
+/// header dump or a JSON-looking line writes it. Group 1 keeps the header
+/// name; the value is 16 or more token characters and must pass
+/// [`is_opaque_value`], so "x-api-key: required", a placeholder and a request
+/// id are left alone. `Authorization` values are the [`AUTHORIZATION_HEADER`]
+/// shape's, which runs first.
 static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"\b((?:(?i:x-[a-z0-9-]*(?:key|token|secret))|(?i:api-key|api-token|auth-token|access-token|private-token)|apikey)["']?\s*:\s*["']?)[A-Za-z0-9_.~+/=-]{16,}"#,
-    )
+    Regex::new(&format!(
+        r#"\b(?P<keep>(?P<name>{SECRET_HEADER_NAME})["']?\s*:\s*["']?)(?P<value>[A-Za-z0-9_.~+/=-]{{16,}})"#
+    ))
     .expect("valid api key header regex")
 });
-/// A credential in an environment assignment: `NAME_TOKEN=`, `NAME_SECRET=`
-/// or `NAME_KEY=` as a shell line, an `env` prefix or a `.env` file writes
-/// it, with an opaque value. Group 1 keeps the name. Upper-case names and no
-/// space around `=`, the shell's own form, so a code assignment such as
-/// `SECRET_KEY = load_secret()` is left alone. The value is 16 or more token
-/// characters and does not start with `/`, `~`, `.`, `$` or `<`, so a key
-/// file's path, a `$VAR` or `${VAR:-...}` expansion and a placeholder stay.
+/// A credential in an environment assignment named by [`SECRET_ENV_NAME`],
+/// as a shell line, an `env` prefix or a `.env` file writes it. Group 1 keeps
+/// the name. Upper-case names and no space around `=`, the shell's own form,
+/// so a code assignment such as `SECRET_KEY = load_secret()` is left alone.
+/// The value is 16 or more token characters, does not start with `/`, `~`,
+/// `.`, `$` or `<` (a key file's path, a `$VAR` or `${VAR:-...}` expansion, a
+/// placeholder), and must pass [`is_opaque_value`].
 static SECRET_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"\b((?:export\s+)?[A-Z][A-Z0-9_]*_(?:TOKEN|SECRET|KEY)=["']?)[A-Za-z0-9+_-][A-Za-z0-9_.~+/=:@-]{15,}"#,
-    )
+    Regex::new(&format!(
+        r#"\b(?P<keep>(?:export\s+)?(?P<name>{SECRET_ENV_NAME})=["']?)(?P<value>[A-Za-z0-9+_-][A-Za-z0-9_.~+/=:@-]{{15,}})"#
+    ))
     .expect("valid secret env assignment regex")
 });
+
+/// Whether one match of the shape `name` is a secret. Most shapes are
+/// decided by their regex alone; the two named-credential shapes also check
+/// the captured name against [`is_secret_name`] (the `PUBLIC` exception) and
+/// the value against [`is_opaque_value`], which a regex without look-around
+/// cannot say.
+fn accepted(name: &str, caps: &regex::Captures<'_>) -> bool {
+    match name {
+        "api key header" | "secret env assignment" => {
+            caps.name("name").is_some_and(|n| is_secret_name(n.as_str()))
+                && caps.name("value").is_some_and(|v| is_opaque_value(v.as_str()))
+        }
+        _ => true,
+    }
+}
+
+/// Whether a shape needs [`accepted`] to confirm a match.
+fn checked(name: &str) -> bool {
+    matches!(name, "api key header" | "secret env assignment")
+}
 
 /// Every credential shape [`scrub`] removes, by name, in the order it runs.
 ///
@@ -236,9 +315,15 @@ fn shapes() -> [(&'static str, &'static Regex); 24] {
 /// names, so it catches a secret that arrived through a path nobody listed.
 #[must_use]
 pub fn find_secret(input: &str) -> Option<(&'static str, String)> {
-    shapes()
-        .into_iter()
-        .find_map(|(name, re)| re.find(input).map(|m| (name, m.as_str().to_string())))
+    shapes().into_iter().find_map(|(name, re)| {
+        if checked(name) {
+            re.captures_iter(input)
+                .find(|caps| accepted(name, caps))
+                .map(|caps| (name, caps[0].to_string()))
+        } else {
+            re.find(input).map(|m| (name, m.as_str().to_string()))
+        }
+    })
 }
 
 /// Replacement marker substituted for any matched secret. Stable so callers and
@@ -325,6 +410,12 @@ pub fn scrub_lines_from<S: AsRef<str>>(lines: &[S], in_key: &mut bool) -> Vec<St
 /// Object keys are left as they are. They are the producer's structure
 /// (`content`, `rawInput`), not operator text, and rewriting one would change
 /// the shape every reader parses against.
+///
+/// Keys are also read: a field whose key [`is_secret_name`] (`X-Api-Key`,
+/// `CLIENT_SECRET`, `DB_PASSWORD`, the same rule the text shapes use) has
+/// every string under it replaced, whatever it looks like, because a bare
+/// value in a headers or env map (`{"CLIENT_SECRET": "..."}`) carries no
+/// `NAME=` or `Name:` for a text shape to find.
 pub fn scrub_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
@@ -333,7 +424,36 @@ pub fn scrub_json(value: &mut serde_json::Value) {
             }
         }
         serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
-        serde_json::Value::Object(fields) => fields.values_mut().for_each(scrub_json),
+        serde_json::Value::Object(fields) => {
+            for (key, field) in fields.iter_mut() {
+                if is_secret_name(key) {
+                    redact_every_string(field);
+                } else {
+                    scrub_json(field);
+                }
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+/// Replace every string under a field whose key [`is_secret_name`] with
+/// [`REDACTED`]. The key already says what the value is, so none of the
+/// free-text guards apply: a short password or one with no digit goes too.
+/// Only an empty string, a `$VAR` or `${VAR}` reference and a `<placeholder>`
+/// are kept, since none of them is the credential itself.
+fn redact_every_string(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => {
+            let reference = text.is_empty()
+                || text.starts_with('$')
+                || (text.starts_with('<') && text.ends_with('>'));
+            if !reference {
+                *text = REDACTED.to_string();
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_every_string),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(redact_every_string),
         serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
 }
@@ -344,20 +464,22 @@ fn scrub_shapes(input: &str) -> String {
         if !re.is_match(&out) {
             continue;
         }
-        let replaced = if name == "url userinfo" {
-            re.replace_all(&out, format!("${{1}}{REDACTED}@").as_str()).into_owned()
-        } else if matches!(
-            name,
-            "aws secret key"
-                | "authorization header"
-                | "bearer token"
-                | "api key header"
-                | "secret env assignment"
-        ) {
-            re.replace_all(&out, format!("${{1}}{REDACTED}").as_str()).into_owned()
-        } else {
-            re.replace_all(&out, REDACTED).into_owned()
-        };
+        let replaced = re
+            .replace_all(&out, |caps: &regex::Captures<'_>| {
+                if !accepted(name, caps) {
+                    return caps[0].to_string();
+                }
+                match name {
+                    "url userinfo" => format!("{}{REDACTED}@", &caps[1]),
+                    "aws secret key"
+                    | "authorization header"
+                    | "bearer token"
+                    | "api key header"
+                    | "secret env assignment" => format!("{}{REDACTED}", &caps[1]),
+                    _ => REDACTED.to_string(),
+                }
+            })
+            .into_owned();
         out = std::borrow::Cow::Owned(replaced);
     }
     out.into_owned()
@@ -544,8 +666,9 @@ mod tests {
             ),
             fake("Authorization: Bearer ", 'o', 40),
             fake("Bearer ", 'b', 32),
-            fake("X-Api-Key: ", 'k', 32),
-            fake("SERVICE_TOKEN=", 'v', 32),
+            fake("X-Api-Key: k1", 'k', 30),
+            fake("SERVICE_TOKEN=v1", 'v', 30),
+            fake("DB_PASSWORD=p4", 'p', 30),
         ];
         for shape in &shapes {
             let text = format!("before {shape} after");
@@ -655,6 +778,14 @@ mod tests {
                 "X-Api-Key: live_7Hq2_Zp9Wd4Lx1Tn".to_string(),
                 "X-Api-Key: <redacted>",
             ),
+            (format!("DB_PASSWORD={opaque}"), "DB_PASSWORD=<redacted>"),
+            (format!("SMTP_PASSWD={opaque}"), "SMTP_PASSWD=<redacted>"),
+            (format!("MYSQL_PWD={opaque}"), "MYSQL_PWD=<redacted>"),
+            (format!("SECRET={opaque}"), "SECRET=<redacted>"),
+            (
+                format!("TOKEN='{opaque}' ./run"),
+                "TOKEN='<redacted>' ./run",
+            ),
         ] {
             assert_eq!(scrub(&text), kept, "{text}");
             assert!(find_secret(&text).is_some(), "{text}");
@@ -672,9 +803,101 @@ mod tests {
             "SORT_KEY=created_at",
             "SECRET_KEY = load_secret_from_vault()",
             "set the NPM_TOKEN= variable before publishing",
+            "SORT_KEY=created_at_desc_then_name",
+            "X-Api-Key: abcdefghijklmnopqrstuvwx",
+            "TENANT_KEY=3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "X-Request-Token: 3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+            "NEXT_PUBLIC_API_KEY=Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "X-Public-Key: Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "OLDPWD=Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "db_password=Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
+            "DB_PASSWORD: Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6",
         ] {
             assert_eq!(scrub(prose), prose);
             assert_eq!(find_secret(prose), None, "{prose}");
+        }
+    }
+
+    /// Lead's case: a headers map and an env map carry bare values that no
+    /// text shape can see. The key names the credential, so every string
+    /// under it goes, a short digit-less password included; a `PUBLIC` name,
+    /// a key the rule does not name, and a reference or placeholder stay.
+    #[test]
+    fn scrub_json_redacts_values_under_secret_named_keys() {
+        let mut value = serde_json::json!({
+            "headers": { "X-Api-Key": "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6", "Accept": "application/json" },
+            "env": {
+                "CLIENT_SECRET": "s3cr3t-client-value",
+                "DB_PASSWORD": "hunter",
+                "API_TOKENS": ["tok1-aaaaaaaaaaaaaaaa", "tok2-bbbbbbbbbbbbbbbb"],
+                "ROTATING_TOKEN": ["old-1", { "next": "new-2" }, 7],
+                "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+                "ANTHROPIC_API_KEY": "<set me>",
+                "NEXT_PUBLIC_API_KEY": "pk_live_visible_by_design",
+                "HOME": "/home/dev",
+                "max_tokens": "4096",
+            },
+        });
+        scrub_json(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "headers": { "X-Api-Key": REDACTED, "Accept": "application/json" },
+                "env": {
+                    "CLIENT_SECRET": REDACTED,
+                    "DB_PASSWORD": REDACTED,
+                    "API_TOKENS": ["tok1-aaaaaaaaaaaaaaaa", "tok2-bbbbbbbbbbbbbbbb"],
+                    "ROTATING_TOKEN": [REDACTED, { "next": REDACTED }, 7],
+                    "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+                    "ANTHROPIC_API_KEY": "<set me>",
+                    "NEXT_PUBLIC_API_KEY": "pk_live_visible_by_design",
+                    "HOME": "/home/dev",
+                    "max_tokens": "4096",
+                },
+            })
+        );
+        let first = value.clone();
+        scrub_json(&mut value);
+        assert_eq!(value, first, "a second pass changes nothing");
+    }
+
+    /// One rule names a credential for both the text shapes and JSON keys.
+    #[test]
+    fn the_secret_name_rule() {
+        for name in [
+            "X-Api-Key",
+            "x-auth-token",
+            "X-Goog-Api-Key",
+            "Authorization",
+            "PRIVATE-TOKEN",
+            "apikey",
+            "CLIENT_SECRET",
+            "GITHUB_TOKEN",
+            "DEPLOY_API_KEY",
+            "DB_PASSWORD",
+            "SMTP_PASSWD",
+            "MYSQL_PWD",
+            "SECRET",
+            "TOKEN",
+        ] {
+            assert!(is_secret_name(name), "{name}");
+        }
+        for name in [
+            "NEXT_PUBLIC_API_KEY",
+            "STRIPE_PUBLIC_KEY",
+            "X-Public-Key",
+            "apiKey",
+            "password",
+            "client_secret",
+            "PASSWORD",
+            "KEY",
+            "PWD",
+            "OLDPWD",
+            "API_TOKENS",
+            "max_tokens",
+            "Accept",
+        ] {
+            assert!(!is_secret_name(name), "{name}");
         }
     }
 
