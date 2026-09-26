@@ -1646,6 +1646,7 @@ fn session_wire(
         discovered_at: row.discovered_at,
         last_observed_at: row.last_observed_at,
         lifecycle_updated_at: row.lifecycle_updated_at,
+        session_incarnation: row.session_incarnation.clone(),
         attention_updated_at: row.attention_updated_at,
         model: row.model.clone(),
         reasoning_effort: row.reasoning_effort.clone(),

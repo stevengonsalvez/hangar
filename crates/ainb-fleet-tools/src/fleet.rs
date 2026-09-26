@@ -347,6 +347,7 @@ impl FleetTools {
             .transcript_list(FleetTranscriptListParams {
                 session_key: session.to_string(),
                 after_order,
+                before_order: None,
                 limit: limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX),
             })
             .await?;

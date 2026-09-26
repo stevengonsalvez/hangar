@@ -66,8 +66,6 @@ mod pipeline_view;
 /// [`ensure_default_workspace`] / [`find_default_workspace`] / [`default_owner_id`]
 /// keep the existing CLI callers untouched.
 ///
-/// Member id used as the default issue creator (`member:stevie`).
-const DEFAULT_CREATOR_ID: &str = "stevie";
 /// Lifecycle state a freshly-created issue lands in.
 const DEFAULT_ISSUE_STATE: &str = "open";
 
@@ -6779,6 +6777,7 @@ async fn run_issue_update(store: &Store, args: IssueUpdateArgs) -> Result<()> {
     if !touched {
         anyhow::bail!("no issue with id {} in this workspace", args.id);
     }
+    record_issue_event(store.pool(), &workspace_id, &args.id, IssueEvent::Updated).await;
     println!("updated issue {}", args.id);
 
     // multica parity #13: diff the pre-edit row against the committed one and
@@ -7058,8 +7057,11 @@ async fn run_issue_create(store: &Store, args: IssueCreateArgs) -> Result<()> {
     let idgen = SystemIdGen;
     let clock = SystemClock;
     let id = idgen.new_ulid();
-    let creator = ActorRef::new(ActorKind::Member, DEFAULT_CREATOR_ID)
-        .expect("default creator id is non-empty");
+    // The local human, the same identity the daemon's create stamps and the
+    // desktop's inbox reads (`member:me`): an issue created here and left
+    // unassigned lands in the creator's own inbox, and a creator nobody is
+    // would land it in nobody's (#49).
+    let creator = ainb_hangar_core::actor::local_member();
     // A second handle for the parity-#13 `created` activity row: `creator` is
     // moved into `NewIssue` below, and the audit write happens after the insert.
     let activity_creator = creator.clone();
@@ -7244,7 +7246,7 @@ async fn run_issue_create(store: &Store, args: IssueCreateArgs) -> Result<()> {
             &mut tx,
             &ainb_hangar_store::repo::task::NewTask {
                 id: task_id.clone(),
-                workspace_id,
+                workspace_id: workspace_id.clone(),
                 runtime_id: a.runtime_id,
                 agent_id: a.agent_id,
                 issue_id: Some(id.clone()),
@@ -7277,12 +7279,49 @@ async fn run_issue_create(store: &Store, args: IssueCreateArgs) -> Result<()> {
             .context("persist task source branch")?;
         }
         tx.commit().await.context("commit enqueue tx")?;
+        record_issue_event(pool, &workspace_id, &id, IssueEvent::Created).await;
         println!("created issue {id}");
         println!("queued task {task_id}");
     } else {
+        record_issue_event(pool, &workspace_id, &id, IssueEvent::Created).await;
         println!("created issue {id}");
     }
     Ok(())
+}
+
+/// Which issue event a CLI write stands for on the daemon's event stream.
+#[derive(Clone, Copy)]
+enum IssueEvent {
+    Created,
+    Updated,
+}
+
+/// Land the inbox row the daemon's own write would have.
+///
+/// The daemon announces a committed issue write on its event stream, and its
+/// inbox aggregator turns that into the rows the desktop inbox reads. The CLI
+/// writes the store directly and announces nothing, so it records the same
+/// event by hand, from the same snapshot the daemon would push (#49).
+/// Best-effort: the write it describes has committed, and a missing row here
+/// is a missing notification, not a lost issue.
+async fn record_issue_event(
+    pool: &sqlx::SqlitePool,
+    workspace_id: &str,
+    issue_id: &str,
+    event: IssueEvent,
+) {
+    use ainb_hangar_proto::events::HangarEvent;
+    match ainb_hangar_daemon::rpc::snapshots::issue_row(pool, workspace_id, issue_id).await {
+        Ok(Some(row)) => {
+            let event = match event {
+                IssueEvent::Created => HangarEvent::IssueCreated(row),
+                IssueEvent::Updated => HangarEvent::IssueUpdated(row),
+            };
+            ainb_hangar_daemon::inbox_aggregator::record(pool, workspace_id, event).await;
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: inbox entry skipped: {e}"),
+    }
 }
 
 /// Resolve a CLI `--repo` token to the local path dispatch provisions from:
@@ -8505,7 +8544,7 @@ async fn find_default_workspace(store: &Store) -> Result<Option<String>> {
 /// user + member row when none exists.
 ///
 /// The `issue` table's `workspace_id` FK requires a `workspace` row; the
-/// `member:stevie` creator references a `member` row only at the service layer
+/// `member:me` creator references a `member` row only at the service layer
 /// (FK-less by design, per the actor module), so the member row is informational
 /// but kept consistent. Idempotent: a second call returns the existing id.
 async fn ensure_default_workspace(store: &Store) -> Result<String> {

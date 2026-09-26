@@ -352,6 +352,27 @@ pub fn spawn(
     })
 }
 
+/// Record one committed mutation in the inbox from outside the broker.
+///
+/// The CLI writes the store directly, with no daemon and no event stream, so
+/// nothing it changed ever reached [`spawn`]'s loop: an issue created or
+/// assigned from `ainb hangar issue` wrote no inbox row (#49). This is the
+/// CLI's way to the same rows the daemon's own writes land, under the same
+/// recipient policy, from the same mapping. Best-effort like the broker path:
+/// a store fault is logged and never fails a write that already committed.
+pub async fn record(pool: &SqlitePool, workspace_id: &str, event: HangarEvent) {
+    use ainb_hangar_core::clock::{HangarClock as _, SystemClock};
+    use ainb_hangar_core::idgen::SystemIdGen;
+
+    let scoped = ScopedEvent {
+        workspace_id: workspace_id.to_string(),
+        event,
+    };
+    if let Err(e) = aggregate_one(pool, &SystemIdGen, SystemClock.now_ms(), &scoped).await {
+        tracing::warn!(error = %e, "inbox aggregate write failed");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

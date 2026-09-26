@@ -17,7 +17,7 @@ scenario() {
   row="$(row_of tui 'Stats +\[i\]')"
   click tui 8 "$row"
   check "a single click moves the sidebar selection to Stats" \
-    wait_for 5 bash -c "tmux -L proof capture-pane -t '=tui:' -p | sed -n '${row}p' | grep -q '^█'"
+    wait_for 5 bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=tui:' -p | sed -n '${row}p' | grep -q '^█'"
   check "a single click does not open Stats" wait_gone tui 'Usage Analytics' 2
   capture tui sidebar-clicked
   double_click tui 8 "$row"
@@ -45,7 +45,7 @@ scenario() {
     wait_screen tui 'Live preview has no scrollback' 5
   capture tui shift-up
   check "the session cursor stays on row 2 (shift+up is not previous)" \
-    bash -c "tmux -L proof capture-pane -t '=tui:' -p | grep -q '▶ 2 ' && ! tmux -L proof capture-pane -t '=tui:' -p | grep -q '▶ 1 '"
+    bash -c "env -u TMUX tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=tui:' -p | grep -q '▶ 2 ' && ! env -u TMUX tmux -S '$PROOF_TMUX_SOCK' capture-pane -t '=tui:' -p | grep -q '▶ 1 '"
   keys tui Escape
   sleep 2
   check "esc does not quit the TUI" kill -0 "$pid"
