@@ -1824,6 +1824,15 @@ async fn handle_fleet_action(
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::fleet::FleetActionParams =
         parse_params(req, "{ session_key, expected_version, request_id, action }")?;
+    // D18 fence, checked before the `writing` receipt: a refused action never
+    // claims it began writing.
+    enforce_session_fence(
+        pool,
+        methods::FLEET_ACTION,
+        params.mutation.fence.as_ref(),
+        &params.session_key,
+    )
+    .await?;
     // The D18 `writing` boundary for this family. It is set HERE, one frame
     // above `execute_fleet_action`, rather than beside the `send-keys` itself:
     // the executor lives in `fleet.rs`, which another lane owns, and nothing
@@ -2295,6 +2304,17 @@ async fn handle_fleet_message_send(
             }
         }
     }
+    if let Some(fence) = params.mutation.fence.as_ref() {
+        // A lifecycle clock is one session's, so a fenced send names exactly
+        // one target: fanning one clock across several sessions would check
+        // all but one of them against a value nobody read.
+        let [target] = params.targets.as_slice() else {
+            return Err(invalid_params(
+                "a fenced fleet/message_send must name exactly one target",
+            ));
+        };
+        enforce_session_fence(pool, methods::FLEET_MESSAGE_SEND, Some(fence), target).await?;
+    }
     let span = tracing::info_span!(
         "fleet.message.send",
         request_id = %params.request_id,
@@ -2319,6 +2339,82 @@ async fn handle_fleet_message_send(
     let sent = message_send_inner(pool, params, events).instrument(span).await;
     mutation::mark_active_receipt(pool, message_send_receipt(sent.as_ref()), None, now_ms).await;
     sent
+}
+
+/// Enforce the D18 fence a PTY-effecting fleet call carried (F-1).
+///
+/// - `fleet/message_send` is fenced on the lifecycle clock the client read:
+///   a later `lifecycle_updated_at` means the agent moved on since the client
+///   looked, and the prompt is refused with `turn_advanced` rather than typed
+///   into a turn the client never saw.
+/// - `fleet/action` is fenced on the session incarnation: a different one
+///   means a new process owns the name, and the action is refused with
+///   `incarnation_mismatch` rather than aimed at it.
+///
+/// No fence keeps today's contract. A fence of the other kind is a malformed
+/// request. A session the store does not know is left to the handler, which
+/// already answers for it. The check runs before the `writing` receipt, so a
+/// refusal never claims an effect began; it is a check-then-send, and a turn
+/// that advances between the two is the race the next fenced call catches.
+async fn enforce_session_fence(
+    pool: &SqlitePool,
+    method: &str,
+    fence: Option<&ainb_hangar_proto::mutation::Fence>,
+    session_key: &str,
+) -> Result<(), RpcError> {
+    use ainb_hangar_proto::mutation::{Fence, REASON_INCARNATION_MISMATCH, REASON_TURN_ADVANCED};
+    use ainb_hangar_store::repo::fleet::FleetRepo;
+
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    let expected_kind = match method {
+        methods::FLEET_ACTION => "session_incarnation",
+        _ => "lifecycle_updated_at",
+    };
+    let fits = matches!(
+        (method, fence),
+        (methods::FLEET_ACTION, Fence::SessionIncarnation { .. })
+            | (
+                methods::FLEET_MESSAGE_SEND,
+                Fence::LifecycleUpdatedAt { .. }
+            )
+    );
+    if !fits {
+        return Err(invalid_params(&format!(
+            "{method} is fenced on {expected_kind}, not this fence kind"
+        )));
+    }
+    let Some(row) = FleetRepo::get_session(pool, session_key)
+        .await
+        .map_err(|error| store_err(&error))?
+    else {
+        return Ok(());
+    };
+    match fence {
+        Fence::LifecycleUpdatedAt {
+            lifecycle_updated_at,
+        } if row.lifecycle_updated_at > *lifecycle_updated_at => Err(mutation::rejected(
+            REASON_TURN_ADVANCED,
+            format!(
+                "{session_key} moved on since it was read (lifecycle {} > {lifecycle_updated_at}); \
+                 nothing was sent",
+                row.lifecycle_updated_at
+            ),
+        )),
+        Fence::SessionIncarnation {
+            session_incarnation,
+        } if row.session_incarnation.as_deref() != Some(session_incarnation.as_str()) => {
+            Err(mutation::rejected(
+                REASON_INCARNATION_MISMATCH,
+                format!(
+                    "{session_key} is a different process than the one that was read; \
+                     nothing was done"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The D18 receipt state a completed `fleet/message_send` earns.
@@ -14263,6 +14359,185 @@ mod tests {
             method: method.into(),
             params,
         }
+    }
+
+    /// A store with one fleet session at a known lifecycle clock and
+    /// incarnation, for the F-1 fence tests.
+    async fn fenced_session_store() -> (tempfile::TempDir, Store) {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        sqlx::query(
+            "UPDATE fleet_session SET lifecycle_updated_at = 10, session_incarnation = 'proc-a' \
+             WHERE session_key = 's1'",
+        )
+        .execute(store.pool())
+        .await
+        .expect("set the fenced columns");
+        (home, store)
+    }
+
+    async fn call(store: &Store, method: &str, params: serde_json::Value) -> RpcResponse {
+        dispatch_as(
+            store.pool(),
+            &req(method, params),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await
+    }
+
+    fn rejection_reason(response: &RpcResponse) -> Option<String> {
+        let error = response.error.as_ref()?;
+        (error.code == ainb_hangar_proto::mutation::MUTATION_REJECTED).then_some(())?;
+        error.data.as_ref()?[ainb_hangar_proto::mutation::ACK_KEY]["reason"]
+            .as_str()
+            .map(ToString::to_string)
+    }
+
+    /// F-1: a prompt fenced on a lifecycle clock the session has moved past
+    /// is refused `turn_advanced` and writes nothing; a retry under the same
+    /// request_id with the current clock sends.
+    #[tokio::test]
+    async fn a_stale_lifecycle_fence_refuses_the_prompt_and_a_current_one_sends() {
+        let (_home, store) = fenced_session_store().await;
+        let send = |request_id: &str, clock: i64| {
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": request_id,
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": clock},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_TURN_ADVANCED),
+            "{stale:?}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused send persists nothing");
+        // A fence refusal is NOT this op id's answer: the fingerprint strips
+        // the fence, so the phone re-reads the clock and retries under the
+        // SAME request_id, and that retry sends.
+        let retried = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 10)).await;
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the retry delivered exactly once");
+    }
+
+    /// F-1: a fenced send names one session, and the fence kind must be the
+    /// method's own.
+    #[tokio::test]
+    async fn a_fenced_prompt_names_one_target_with_its_own_fence_kind() {
+        let (_home, store) = fenced_session_store().await;
+        let two = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s2"],
+                "text": "go on",
+                "request_id": "req-two",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            two.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{two:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": "req-kind",
+                "fence": {"kind": "session_incarnation", "session_incarnation": "proc-a"},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
+    }
+
+    /// F-1: an action fenced on another process's incarnation is refused
+    /// `incarnation_mismatch` before any receipt; the matching incarnation
+    /// passes the fence (whatever the action itself then answers).
+    #[tokio::test]
+    async fn an_action_fenced_on_another_incarnation_is_refused() {
+        let (_home, store) = fenced_session_store().await;
+        let action = |request_id: &str, incarnation: &str| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": request_id,
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "session_incarnation", "session_incarnation": incarnation},
+            })
+        };
+
+        let other = call(&store, methods::FLEET_ACTION, action("req-other", "proc-b")).await;
+        assert_eq!(
+            rejection_reason(&other).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{other:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-other'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action claims no receipt");
+
+        // The same request_id with the fence re-read passes the fence: the
+        // refusal was not recorded as that op id's answer.
+        let same = call(&store, methods::FLEET_ACTION, action("req-other", "proc-a")).await;
+        assert_ne!(
+            rejection_reason(&same).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{same:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_ACTION,
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": "req-kind",
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
     }
 
     /// The request loop is transport-generic: an in-memory duplex stream, with
