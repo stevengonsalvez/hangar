@@ -31,7 +31,7 @@ interface Calls {
   answer: { version: number; opId: string }[];
   sendPrompt: { opId: string }[];
   interrupt: { version: number; fingerprint: string; opId: string }[];
-  transcriptPage: { afterOrder?: number; limit: number }[];
+  transcriptPage: { afterOrder?: number; beforeOrder?: number; limit: number }[];
   terminalInput: string[];
   terminalFloor: string[];
   attentionList: number;
@@ -47,6 +47,10 @@ interface HostOpts {
   attentionListFails?: boolean;
   /** A global transcript: `ingest_order` values this session has. */
   transcript?: number[];
+  /** The host advertises `fleet.transcript.page_back`. */
+  pagesBack?: boolean;
+  /** A backward page answers rows at or past the cursor (a daemon bug). */
+  badBackwardPage?: boolean;
 }
 
 function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobileHost; calls: Calls } {
@@ -71,7 +75,7 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
   const localClose: Tagged = { tag: "Closed", inner: { code: undefined, reason: "closed by client", retryable: false } };
   const host: NativeMobileHost = {
     hello: () => ({ selectedProtocol: 1, capabilities: ["hangar.scopes", "terminal.input"], hostId: "h1", scope: "mobile+type", admin: false }),
-    advertises: (c) => c === "terminal.input",
+    advertises: (c) => c === "terminal.input" || (c === "fleet.transcript.page_back" && opts.pagesBack === true),
     canType: () => true,
     rosterStatus: async () => ({
       rows: [
@@ -106,6 +110,7 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
       { id: "att-1", sessionId: "s-1", kind: "approval", version: 4n, payload: { question: "deploy?", options: [{ label: "yes", description: "" }], text: undefined, message: undefined }, degraded: false, createdAt: 7n },
     ],
     answer: async (_a, _b, version, opId) => {
+      if (typeof version !== "bigint") throw new Error(`version lowered as ${typeof version}`);
       calls.answer.push({ version: Number(version), opId });
       refuse();
       return { opId, outcome: { tag: "Delivered", inner: { via: "tmux (x)" } }, ack: { status: "accepted", outcome: "created", receipt: "delivered" } };
@@ -120,12 +125,19 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
       refuse();
       return { opId, receiptStatus: "DELIVERED", ack: { status: "accepted" } };
     },
-    transcriptPage: async (_s, afterOrder, limit) => {
+    transcriptPage: async (_s, afterOrder, beforeOrder, limit) => {
       const after = afterOrder === undefined ? undefined : Number(afterOrder);
-      calls.transcriptPage.push({ afterOrder: after, limit });
-      // The daemon caps a page at 100 and reads forward from the cursor.
+      const before = beforeOrder === undefined ? undefined : Number(beforeOrder);
+      calls.transcriptPage.push({ afterOrder: after, beforeOrder: before, limit });
+      // The daemon caps a page at 100; forward from the cursor, or the
+      // newest page below it when asked backward.
       const cap = Math.min(limit, 100);
       const all = opts.transcript ?? [9];
+      if (before !== undefined) {
+        if (opts.badBackwardPage) throw { tag: "Protocol", inner: { message: "a backward page carried rows at or past the cursor" } };
+        const below = all.filter((o) => o < before).slice(-cap);
+        return { chunks: below.map(chunk), nextBeforeOrder: below[0] === undefined ? undefined : BigInt(below[0]), truncated: true };
+      }
       const from = after === undefined ? all.slice(-cap) : all.filter((o) => o > after).slice(0, cap);
       return { chunks: from.map(chunk), truncated: false };
     },
@@ -134,7 +146,9 @@ function scriptedHost(events: Tagged[], opts: HostOpts = {}): { host: NativeMobi
     terminalDetach: async () => undefined,
     terminalInput: async (_s, _d, floorGen, opId) => {
       calls.terminalInput.push(opId);
-      return floorGen === 5 ? { tag: "Typed", inner: { opId, floorGen: 5n } } : { tag: "FloorDenied", inner: { holder: { principal: "local", label: "desktop", streamId: 1n }, floorGen: 3n } };
+      // The binding lowers the app's numbers as BigInt.
+      if (floorGen !== undefined && typeof floorGen !== "bigint") throw new Error(`floorGen lowered as ${typeof floorGen}`);
+      return floorGen === 5n ? { tag: "Typed", inner: { opId, floorGen: 5n } } : { tag: "FloorDenied", inner: { holder: { principal: "local", label: "desktop", streamId: 1n }, floorGen: 3n } };
     },
     terminalFloor: async (_s, action, opId) => {
       calls.terminalFloor.push(opId);
@@ -220,6 +234,20 @@ describe("native adapter", () => {
     expect(busy.retryAfterMs).toBe(7000);
   });
 
+  test("a call on a host that is not connected is not_connected, never not_paired", async () => {
+    const { host } = scriptedHost([]);
+    const wire = wireOver(host);
+    await expect(wire.rosterStatus("h1")).rejects.toMatchObject({ kind: "not_connected", retryable: true });
+    // Through a mutation's catch too: the kind survives the second mapping.
+    await expect(wire.sendPrompt({ hostId: "h1", sessionKey: "k", text: "x", lifecycleUpdatedAt: 1, opId: "o" })).rejects.toMatchObject({ kind: "not_connected", retryable: true });
+    await wire.connect("h1");
+    await wire.close("h1");
+    expect(host.isClosed()).toBe(true);
+    await expect(wire.hostInfo("h1")).rejects.toMatchObject({ kind: "not_connected" });
+    // The crate's own not_paired (no record) still maps to not_paired.
+    expect(toPeerCloseError({ tag: "NotPaired", inner: { hostId: "h9" } }).kind).toBe("not_paired");
+  });
+
   test("concurrent connects share one dial: one socket, one promise", async () => {
     const dials = { count: 0 };
     const wire = wireOver(scriptedHost([]).host, { dials, slow: true });
@@ -239,6 +267,7 @@ describe("native adapter", () => {
       { tag: "FleetRevision", inner: { event: { revision: 7n } } },
       { tag: "AttentionRaised", inner: { attentionId: "att-2", sessionId: "s-1", kind: "ask_user_question", createdAt: 4n } },
       { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 12n, eventId: "e12", sessionKey: "claude:s-1", eventType: "acp.user_message", role: "user", text: "go", observedAt: 3n } } },
+      { tag: "TranscriptChunk", inner: { chunk: { ingestOrder: 13n, eventId: "e13", sessionKey: "claude:s-1", eventType: "acp.usage", role: "system", text: undefined, observedAt: 3n } } },
       { tag: "TerminalFrame", inner: { streamId: 7n, seq: 105n, frame: { tag: "Output", inner: { data: new Uint8Array([104, 105]).buffer } } } },
       { tag: "Closed", inner: { code: 4503n, reason: "draining", retryable: true } },
     ];
@@ -248,18 +277,22 @@ describe("native adapter", () => {
     wire.onEvent((ev) => seen.push(ev));
     await wire.connect("h1");
     for (let i = 0; i < 20 && seen.length < 5; i++) await flush();
-    expect(seen.map((e) => e.kind)).toEqual(["fleet_revision", "attention_raised", "transcript_line", "terminal_frame", "closed"]);
-    const raised = must(seen[1], "attention event");
+    // The raised row is read off the loop, so it lands after the frames it
+    // would otherwise have held back; the textless usage chunk is no line.
+    const kinds = seen.map((e) => e.kind);
+    expect(kinds.filter((k) => k !== "attention_raised")).toEqual(["fleet_revision", "transcript_line", "terminal_frame", "closed"]);
+    expect(kinds).toContain("attention_raised");
+    const raised = must(seen.find((e) => e.kind === "attention_raised"), "attention event");
     if (raised.kind !== "attention_raised") throw new Error("not a raise");
     expect(raised.row).toMatchObject({ id: "att-2", version: 9, payload: { question: "which?" } });
     expect(calls.attentionList).toBe(1);
-    const line = must(seen[2], "transcript event");
+    const line = must(seen.find((e) => e.kind === "transcript_line"), "transcript event");
     if (line.kind !== "transcript_line") throw new Error("not a line");
     expect(line.entry).toEqual({ seq: 12, role: "user", text: "go", atMs: 3 });
-    const frame = must(seen[3], "frame event");
+    const frame = must(seen.find((e) => e.kind === "terminal_frame"), "frame event");
     if (frame.kind !== "terminal_frame" || frame.frame.kind !== "output") throw new Error(`not an output frame: ${JSON.stringify(frame)}`);
     expect(Array.from(frame.frame.data)).toEqual([104, 105]);
-    const closed = must(seen[4], "close event");
+    const closed = must(seen.find((e) => e.kind === "closed"), "close event");
     if (closed.kind !== "closed") throw new Error(`not a close: ${JSON.stringify(closed)}`);
     expect(closed.code).toBe(4503);
     expect(closed.retryable).toBe(true);
@@ -276,6 +309,20 @@ describe("native adapter", () => {
     expect(seen).toEqual([{ kind: "fleet_resync_required", hostId: "h1" }]);
   });
 
+  test("a binding error on any host call arrives as a PeerCloseError", async () => {
+    const { host } = scriptedHost([]);
+    host.rosterStatus = async () => {
+      throw { tag: "Closed", inner: { code: undefined, reason: "eof", retryable: true } };
+    };
+    host.terminalAttach = async () => {
+      throw { tag: "Rpc", inner: { code: -32602, message: "invalid params", reason: "cols" } };
+    };
+    const wire = wireOver(host);
+    await wire.connect("h1");
+    await expect(wire.rosterStatus("h1")).rejects.toMatchObject({ kind: "closed", retryable: true });
+    await expect(wire.terminalAttach({ hostId: "h1", sessionKey: "k" })).rejects.toMatchObject({ kind: "rpc", reason: "invalid params: cols" });
+  });
+
   test("an RPC refusal carries the daemon's reason beside its message", () => {
     const e = toPeerCloseError({ tag: "Rpc", inner: { code: -32602, message: "invalid params", reason: "session_key: unknown" } });
     expect(e.kind).toBe("rpc");
@@ -283,13 +330,15 @@ describe("native adapter", () => {
     expect(toPeerCloseError({ tag: "Rpc", inner: { code: -32601, message: "no such method" } }).reason).toBe("no such method");
   });
 
-  test("a failed event pull closes the host with retryable false", async () => {
-    const wire = wireOver(scriptedHost([], { pumpFails: true }).host);
+  test("a failed event pull closes the host with retryable false, and closes the socket", async () => {
+    const { host } = scriptedHost([], { pumpFails: true });
+    const wire = wireOver(host);
     const seen: WireEvent[] = [];
     wire.onEvent((ev) => seen.push(ev));
     await wire.connect("h1");
     for (let i = 0; i < 10 && seen.length < 1; i++) await flush();
     expect(seen[0]).toMatchObject({ kind: "closed", hostId: "h1", retryable: false });
+    expect(host.isClosed()).toBe(true);
     expect(must((await wire.hosts())[0], "host row").reachability).toBe("unreachable");
   });
 
@@ -300,6 +349,11 @@ describe("native adapter", () => {
     expect(await wire.subscribeFleet("h1")).toEqual({ revision: 6, replayState: "complete" });
     expect(await wire.subscribeFleet("h1", 4)).toEqual({ revision: 6, replayState: "complete" });
     expect(calls.subscribeFleet).toEqual([11, 4]);
+    // After the app read a roster, the first subscribe starts at that read,
+    // not at a second read the app never rendered.
+    await wire.rosterStatus("h1");
+    await wire.subscribeFleet("h1");
+    expect(calls.subscribeFleet).toEqual([11, 4, 11]);
   });
 
   test("a -32008 answers as the rejected outcome the app renders, -32009 as unknown, never a throw", async () => {
@@ -344,11 +398,27 @@ describe("native adapter", () => {
     expect(newest).toHaveLength(100);
     expect(newest[0]).toEqual({ seq: 1200, role: "agent", text: "line 1200", atMs: 2 });
     expect(newest.at(-1)?.seq).toBe(1299);
-    expect(calls.transcriptPage).toEqual([{ afterOrder: undefined, limit: 100 }]);
-    // An older page would come back as the session's oldest window (1000 to 1099),
-    // not the rows below 1200: the adapter answers empty instead and makes no call.
+    expect(calls.transcriptPage).toEqual([{ afterOrder: undefined, beforeOrder: undefined, limit: 100 }]);
+    // Without the capability an older page is empty and no call is made: an
+    // older daemon would answer the session's oldest window as if it were history.
     expect(await wire.transcriptPage("h1", "claude:s-1", 1200)).toEqual([]);
     expect(calls.transcriptPage).toHaveLength(1);
+  });
+
+  test("a host that pages back answers the rows below the cursor, and a wrong page is refused", async () => {
+    const transcript = Array.from({ length: 300 }, (_, i) => 1000 + i);
+    const { host, calls } = scriptedHost([], { transcript, pagesBack: true });
+    const wire = wireOver(host);
+    await wire.connect("h1");
+    const older = await wire.transcriptPage("h1", "claude:s-1", 1200);
+    expect(older).toHaveLength(100);
+    expect(older[0]?.seq).toBe(1100);
+    expect(older.at(-1)?.seq).toBe(1199);
+    expect(must(calls.transcriptPage[0], "backward call")).toEqual({ afterOrder: undefined, beforeOrder: 1200, limit: 100 });
+    expect(await wire.transcriptPage("h1", "claude:s-1", 1000)).toEqual([]);
+    const bad = wireOver(scriptedHost([], { transcript, pagesBack: true, badBackwardPage: true }).host);
+    await bad.connect("h1");
+    await expect(bad.transcriptPage("h1", "claude:s-1", 1200)).rejects.toMatchObject({ kind: "protocol" });
   });
 
   test("a close during a dial waits for the dial, then closes the socket it produced", async () => {

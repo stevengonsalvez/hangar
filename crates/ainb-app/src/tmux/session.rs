@@ -154,8 +154,12 @@ impl TmuxSession {
         if !self.remain_on_exit {
             args.push(self.program.clone());
         }
+        // Every tmux call while starting has its stdout dropped (errors still
+        // reach stderr): none prints anything a person needs, and `ainb
+        // --format json run` promises its stdout to one JSON line.
         let status = Command::new("tmux")
             .args(&args)
+            .stdout(std::process::Stdio::null())
             .status()
             .await
             .context("Failed to start tmux session")?;
@@ -176,6 +180,7 @@ impl TmuxSession {
             let target = format!("={}:", self.sanitized_name);
             let status = Command::new("tmux")
                 .args(["set-option", "-w", "-t", &target, "remain-on-exit", "on"])
+                .stdout(std::process::Stdio::null())
                 .status()
                 .await
                 .context("Failed to set remain-on-exit")?;
@@ -189,6 +194,7 @@ impl TmuxSession {
             // with, so `-c` is not needed here.
             let status = Command::new("tmux")
                 .args(["respawn-pane", "-k", "-t", &target, &self.program])
+                .stdout(std::process::Stdio::null())
                 .status()
                 .await
                 .context("Failed to respawn tmux pane with the program")?;
@@ -218,6 +224,7 @@ impl TmuxSession {
                 "history-limit",
                 "10000",
             ])
+            .stdout(std::process::Stdio::null())
             .status()
             .await?;
 
@@ -232,12 +239,14 @@ impl TmuxSession {
                 "window-size",
                 "latest",
             ])
+            .stdout(std::process::Stdio::null())
             .status()
             .await?;
 
         // Enable mouse scrolling
         Command::new("tmux")
             .args(["set-option", "-t", &self.sanitized_name, "mouse", "on"])
+            .stdout(std::process::Stdio::null())
             .status()
             .await?;
 

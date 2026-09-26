@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use ainb_hangar_noise::PairingOffer;
 use ainb_hangar_proto::agent_status::RosterStatusResult;
 use ainb_hangar_proto::auth::{DeviceInfo, HelloParams, HelloResult};
+use ainb_hangar_proto::devices::BaseScope;
 use ainb_hangar_proto::fleet::{
     ControlAction, FleetActionParams, FleetActionResult, FleetMessageSendParams,
     FleetMessageSendResult, FleetSubscribeParams, FleetSubscribeResult, FleetTranscriptListParams,
@@ -24,9 +25,9 @@ use ainb_hangar_proto::fleet::{
 use ainb_hangar_proto::hosts::HostId;
 use ainb_hangar_proto::methods;
 use ainb_hangar_proto::mutation::{ACK_KEY, Fence, MutationAck, MutationEnvelope, OpId};
-use ainb_hangar_proto::protocol::{ProtocolRange, catalogue_strings};
+use ainb_hangar_proto::protocol::{CAP_TERMINAL_INPUT, ProtocolRange, catalogue_strings};
 use ainb_hangar_proto::snapshots::{
-    AnswerParams, AnswerResult, AttentionListResult, AttentionSubscribeParams,
+    AnswerParams, AnswerResult, AttentionListParams, AttentionListResult, AttentionSubscribeParams,
     AttentionSubscribeResult,
 };
 use tokio::runtime::Runtime;
@@ -69,8 +70,11 @@ fn split_ack<R: serde::de::DeserializeOwned>(
     Ok((typed, ack))
 }
 
-fn open_log(log_dir: &str) -> Result<Arc<ConnLog>, WireError> {
-    ConnLog::open(Path::new(log_dir))
+/// The connection log, or none when its directory cannot be used: the log
+/// is diagnostic, and an unwritable log dir must never keep a phone from
+/// connecting.
+fn open_log(log_dir: &str) -> Option<Arc<ConnLog>> {
+    ConnLog::open(Path::new(log_dir)).ok()
 }
 
 /// A fresh 128-bit op id from the crate's CSPRNG, for an app that mints
@@ -138,8 +142,13 @@ pub fn read_connection_log(log_dir: String, limit: u32) -> Result<Vec<ConnLogEnt
     Ok(log.tail(limit as usize).into_iter().map(ConnLogEntry::from).collect())
 }
 
-/// The fingerprint of the device key kept under `custody_dir`, minting the
-/// key on first use. All the app ever sees of the key.
+/// The daemon capability that makes `before_order` on `fleet/transcript_list`
+/// mean the backward page (the catalogue's `fleet.transcript.page_back`).
+pub const CAP_TRANSCRIPT_PAGE_BACK: &str = "fleet.transcript.page_back";
+
+/// The fingerprint of the device key, minting the key on first use. All the
+/// app ever sees of the key. `custody_dir` is where the file backend keeps
+/// it; on iOS the key is a Keychain item and the directory is unused.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub fn device_key_fingerprint(custody_dir: String) -> Result<String, WireError> {
@@ -198,9 +207,12 @@ pub fn parse_offer(uri: String) -> Result<OfferSummary, WireError> {
     })
 }
 
-/// Redeem an offer as `display_name`: dial, `device/redeem`, `auth/hello`,
-/// then save the pairing (token in custody). The session is closed; the app
-/// calls `connect_host` with the returned host id.
+/// Redeem an offer as `display_name`: dial, `device/redeem`, save the
+/// pairing (token in custody), then `auth/hello`. The pairing is saved the
+/// moment redeem succeeds, because the invite is burned then: a hello that
+/// fails (a dropped socket, a 4401 from a clock skew) still leaves a pairing
+/// the app lists and connects later, never a lost token. The session is
+/// closed; the app calls `connect_host` with the returned host id.
 #[uniffi::export]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn pair(
@@ -210,9 +222,9 @@ pub async fn pair(
     log_dir: String,
 ) -> Result<PairingRecord, WireError> {
     rt().spawn(async move {
-        let log = open_log(&log_dir)?;
+        let log = open_log(&log_dir);
         let (record, _hello) =
-            pairing::pair(&uri, &display_name, Path::new(&custody_dir), Some(log)).await?;
+            pairing::pair(&uri, &display_name, Path::new(&custody_dir), log).await?;
         Ok(record)
     })
     .await
@@ -242,7 +254,10 @@ pub fn forget_pairing(custody_dir: String, host_id: String) -> Result<(), WireEr
 pub struct ConnectParams {
     /// The paired host.
     pub host_id: String,
-    /// The directory the device secrets are kept under.
+    /// The directory the pairing index and, on the file backend, the device
+    /// secrets are kept under. On iOS the secrets are Keychain items and the
+    /// directory holds the index only: clearing it does not reset the
+    /// device identity there.
     pub custody_dir: String,
     /// The directory the connection log is kept under.
     pub log_dir: String,
@@ -291,6 +306,11 @@ pub struct MobileHost {
     streams: Arc<Streams>,
     custody_dir: std::path::PathBuf,
     host_id: String,
+    /// The pinned host id, parsed once at connect (hello may not echo it).
+    pinned_host_id: HostId,
+    /// Whether the close has been put on the pairing record already: the
+    /// pump can ask for the close many times, the index is written once.
+    latched: std::sync::atomic::AtomicBool,
 }
 
 /// A refusal from the host goes on the pairing record: `repair` for an
@@ -299,8 +319,37 @@ pub struct MobileHost {
 /// including a network loss, set nothing: `Closed { retryable, retry_after_ms }`
 /// stays the app's only source of truth for a redial.
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
-    let _ = pairing::mark_refusal(custody_dir, host_id, err);
+    pairing::latch(custody_dir, host_id, err);
 }
+
+/// A required op id from the app, or the protocol error naming what is wrong.
+fn parse_op_id(op_id: &str) -> Result<OpId, WireError> {
+    OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })
+}
+
+/// The refusal behind a failed hello. The daemon answers a refused hello
+/// with the JSON-RPC error first and the close frame (4401, 4403, 4409) a
+/// moment later, so the reply the app needs to latch on is the close, not
+/// the `Rpc` error that raced it: wait briefly for the close and prefer it.
+pub(crate) async fn hello_refusal(session: &Session, err: WireError) -> WireError {
+    if !matches!(err, WireError::Rpc { .. }) {
+        return err;
+    }
+    let deadline = std::time::Instant::now() + HELLO_CLOSE_GRACE;
+    while std::time::Instant::now() < deadline {
+        if let Some(closed) = session.closed() {
+            if closed.code.is_some() {
+                return closed.error();
+            }
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    err
+}
+
+/// How long a refused hello waits for the close frame that names the refusal.
+const HELLO_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl std::fmt::Debug for MobileHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -312,9 +361,10 @@ impl std::fmt::Debug for MobileHost {
 }
 
 /// Dial the paired host, handshake with its pinned key, and `auth/hello` as
-/// the paired device. A 4401 or 4403 comes back as `Unauthenticated` or
-/// `Revoked` and sets the re-pair latch on the pairing record; the app shows
-/// "re-pair" and keeps the pairing until the user forgets it or pairs again.
+/// the paired device. A 4401 or 4403 comes back as `Closed { code }` (not
+/// retryable) and sets the re-pair latch on the pairing record; the app
+/// shows "re-pair" and keeps the pairing until the user forgets it or pairs
+/// again. A successful hello starts the heartbeat and clears a parked notice.
 #[uniffi::export]
 pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, WireError> {
     rt().spawn(async move {
@@ -335,33 +385,32 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
                 ),
             })?;
         let key = DeviceKey::load_or_create(custody_dir)?;
-        let log = open_log(&params.log_dir)?;
-        let session = match pairing::dial(
-            &record.endpoints,
-            &host_id,
-            host_static_pubkey,
-            &key,
-            Some(log),
-        )
-        .await
-        {
-            Ok(session) => session,
-            Err(e) => {
-                // A wrong pinned host key, or 4401 before message 2, is the
-                // host refusing this device's identity: latch re-pair.
-                latch_repair(custody_dir, &params.host_id, &e);
-                return Err(e);
-            }
-        };
+        let log = open_log(&params.log_dir);
+        let session =
+            match pairing::dial(&record.endpoints, &host_id, host_static_pubkey, &key, log).await {
+                Ok(session) => session,
+                Err(e) => {
+                    // A wrong pinned host key, or 4401 before message 2, is the
+                    // host refusing this device's identity: latch re-pair.
+                    latch_repair(custody_dir, &params.host_id, &e);
+                    return Err(e);
+                }
+            };
         let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
             Ok(hello) => {
+                session.start_heartbeat();
                 // The host and this build agree again: a parked notice
                 // (incompatible, unknown code) is over. The re-pair latch is
-                // not: only a successful pair clears that.
-                pairing::clear_notice(custody_dir, &params.host_id)?;
+                // not: only a successful pair clears that. Bookkeeping never
+                // vetoes a live session: a failed index write is swallowed,
+                // as the latch's own is.
+                let _ = pairing::clear_notice(custody_dir, &params.host_id);
+                let _ =
+                    pairing::note_expiry(custody_dir, &params.host_id, hello.device_expires_at_ms);
                 hello
             }
             Err(e) => {
+                let e = hello_refusal(&session, e).await;
                 session.close();
                 latch_repair(custody_dir, &params.host_id, &e);
                 return Err(e);
@@ -373,6 +422,8 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             streams: Arc::new(Streams::default()),
             custody_dir: custody_dir.to_path_buf(),
             host_id: params.host_id.clone(),
+            pinned_host_id: host_id,
+            latched: std::sync::atomic::AtomicBool::new(false),
         }))
     })
     .await
@@ -430,8 +481,18 @@ impl MobileHost {
     /// The open attention rows, oldest first.
     pub async fn attention_list(self: Arc<Self>) -> Result<Vec<AttentionRecord>, WireError> {
         rt().spawn(async move {
-            let result: AttentionListResult =
-                self.session.call(methods::ATTENTION_LIST, &serde_json::json!({})).await?;
+            // Host-wide: every workspace and the host rows. The empty
+            // params would mean the no-workspace rows only.
+            let result: AttentionListResult = self
+                .session
+                .call(
+                    methods::ATTENTION_LIST,
+                    &AttentionListParams {
+                        workspace_id: None,
+                        fleet: true,
+                    },
+                )
+                .await?;
             Ok(result.attention.into_iter().map(Into::into).collect())
         })
         .await
@@ -468,7 +529,7 @@ impl MobileHost {
         op_id: String,
     ) -> Result<AnswerReply, WireError> {
         rt().spawn(async move {
-            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
+            let op = parse_op_id(&op_id)?;
             let params = AnswerParams {
                 attention_id,
                 answer,
@@ -508,7 +569,7 @@ impl MobileHost {
         op_id: String,
     ) -> Result<SendPromptReply, WireError> {
         rt().spawn(async move {
-            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
+            let op = parse_op_id(&op_id)?;
             let params = FleetMessageSendParams {
                 scope_key: None,
                 // The daemon pins the actor to `device:<id>` (T12).
@@ -554,7 +615,7 @@ impl MobileHost {
         op_id: String,
     ) -> Result<InterruptReply, WireError> {
         rt().spawn(async move {
-            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
+            let op = parse_op_id(&op_id)?;
             let params = FleetActionParams {
                 session_key,
                 expected_version: version,
@@ -593,9 +654,24 @@ impl MobileHost {
         self: Arc<Self>,
         session_key: String,
         after_order: Option<i64>,
+        before_order: Option<i64>,
         limit: u32,
     ) -> Result<TranscriptPage, WireError> {
         rt().spawn(async move {
+            if after_order.is_some() && before_order.is_some() {
+                return Err(WireError::Protocol {
+                    message: "a transcript page has one cursor, after_order or before_order"
+                        .to_owned(),
+                });
+            }
+            // A backward page is only asked of a daemon that advertises it:
+            // an older one ignores the unknown field and answers the
+            // forward page, which the app would show as history.
+            if before_order.is_some() && !self.advertises(CAP_TRANSCRIPT_PAGE_BACK.to_owned()) {
+                return Err(WireError::Protocol {
+                    message: format!("the host does not advertise {CAP_TRANSCRIPT_PAGE_BACK}"),
+                });
+            }
             let result: FleetTranscriptListResult = self
                 .session
                 .call(
@@ -603,16 +679,24 @@ impl MobileHost {
                     &FleetTranscriptListParams {
                         session_key,
                         after_order,
-                        // The forward page only here; the backward page
-                        // (`before_order`, behind the daemon's
-                        // `fleet.transcript.page_back` capability) is the
-                        // facade's own call.
-                        before_order: None,
+                        before_order,
                         limit,
                     },
                 )
                 .await?;
-            Ok(result.into())
+            let page = TranscriptPage::from(result);
+            // A backward page whose rows are not all below the cursor is
+            // not the page asked for: refused, never shown as history.
+            if let Some(before) = before_order {
+                if page.chunks.iter().any(|c| c.ingest_order >= before) {
+                    return Err(WireError::Protocol {
+                        message: format!(
+                            "a backward page from {before} carried rows at or past it"
+                        ),
+                    });
+                }
+            }
+            Ok(page)
         })
         .await
         .map_err(WireError::protocol)?
@@ -667,22 +751,25 @@ impl MobileHost {
                     }
                 }
                 SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
-                SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
+                SessionEvent::Lagged(dropped) => {
+                    // Dropped notifications may have been terminal frames
+                    // whose bytes were never counted: the cumulative ack
+                    // would under-report forever. The accounts are reset
+                    // and the app re-attaches its terminals.
+                    self.streams.reset();
+                    WireEvent::Lagged { dropped }
+                }
                 SessionEvent::Closed { code, reason } => {
                     // The session's own record says whether this side closed
-                    // on purpose (never retryable) or the host did.
+                    // on purpose (never retryable) or the host did; the
+                    // pairing record takes the refusal once.
+                    self.streams.reset();
                     let (retryable, retry_after_ms) = match self.session.closed() {
                         Some(closed) => {
-                            let err = closed.error();
-                            latch_repair(&self.custody_dir, &self.host_id, &err);
-                            match err {
-                                WireError::Closed {
-                                    retryable,
-                                    retry_after_ms,
-                                    ..
-                                } => (retryable, retry_after_ms),
-                                _ => classify_close(code, &reason),
+                            if !self.latched.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                latch_repair(&self.custody_dir, &self.host_id, &closed.error());
                             }
+                            closed.retry()
                         }
                         None => classify_close(code, &reason),
                     };
@@ -723,8 +810,9 @@ impl MobileHost {
     /// Whether this device may type: scope `mobile+type` or above AND the
     /// daemon advertises `terminal.input` (C-R2-8). Gates the type toggle.
     pub fn can_type(&self) -> bool {
-        matches!(self.hello.scope.as_deref(), Some("mobile+type" | "desktop"))
-            && self.hello.capabilities.iter().any(|c| c == "terminal.input")
+        let typing = [BaseScope::MobileType.as_str(), BaseScope::Desktop.as_str()];
+        self.hello.scope.as_deref().is_some_and(|s| typing.contains(&s))
+            && self.advertises(CAP_TERMINAL_INPUT.to_owned())
     }
 
     /// `terminal/attach` for `session_key` on this host. With `want_input`
@@ -739,18 +827,8 @@ impl MobileHost {
         scrollback_rows: Option<u32>,
     ) -> Result<TerminalAttachRecord, WireError> {
         rt().spawn(async move {
-            let host_id = self
-                .hello
-                .host_id
-                .as_deref()
-                .ok_or_else(|| WireError::Protocol {
-                    message: "the daemon did not name its host id at hello".to_owned(),
-                })
-                .and_then(|h| {
-                    HostId::parse_minted(h).map_err(|e| WireError::Protocol {
-                        message: e.to_string(),
-                    })
-                })?;
+            // The host id pinned at connect: hello may not echo one.
+            let host_id = self.pinned_host_id.clone();
             terminal::attach(
                 &self.session,
                 &self.streams,
@@ -786,7 +864,7 @@ impl MobileHost {
         op_id: String,
     ) -> Result<TerminalInputOutcome, WireError> {
         rt().spawn(async move {
-            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
+            let op = parse_op_id(&op_id)?;
             terminal::input(
                 &self.session,
                 stream_id,
@@ -811,7 +889,7 @@ impl MobileHost {
     ) -> Result<TerminalFloorOutcome, WireError> {
         rt().spawn(async move {
             let action = terminal::floor_action(&action)?;
-            let op = OpId::parse(op_id).map_err(|e| WireError::Protocol { message: e })?;
+            let op = parse_op_id(&op_id)?;
             terminal::floor(
                 &self.session,
                 stream_id,
@@ -866,5 +944,13 @@ impl MobileHost {
             .into_iter()
             .map(ConnLogEntry::from)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_page_back_capability_is_in_the_catalogue() {
+        assert!(super::catalogue_strings().iter().any(|c| c == super::CAP_TRANSCRIPT_PAGE_BACK));
     }
 }
