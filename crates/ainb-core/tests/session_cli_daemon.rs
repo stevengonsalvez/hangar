@@ -335,6 +335,7 @@ fn a_daemon_session_and_a_run_session_both_appear_once() {
         model_source: "LegacyTyped".to_string(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     };
     hangar.block_on(async {
         SessionsRepo::upsert(hangar.pool(), &daemon_row)
@@ -631,6 +632,7 @@ fn a_non_uuid_row_is_skipped_not_reinvented() {
         model_source: "LegacyTyped".to_string(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     };
     hangar.block_on(async {
         SessionsRepo::upsert(hangar.pool(), &legacy).await.expect("seed legacy row");
