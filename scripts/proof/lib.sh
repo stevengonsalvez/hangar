@@ -16,8 +16,14 @@
 #   harness    `tmux -S $PROOF_TMUX_SOCK` (ptmux): an explicit socket path in
 #              the world, so no name lookup can resolve to a server outside
 #              it. Hosts the TUI panes this harness types into and captures.
-#   fixture    the default server under $TMUX_TMPDIR (ftmux), the one `ainb
-#              run` and the TUI itself use for agent sessions.
+#   fixture    the default server under $TMUX_TMPDIR, the one `ainb run` and
+#              the TUI itself start for agent sessions. The product picks it
+#              by name; the harness (ftmux) reaches the same server by its
+#              socket path, $PROOF_FIXTURE_SOCK.
+#
+# Both socket paths must fit a unix socket address (103 bytes), which a long
+# macOS TMPDIR does not leave room for, so worlds live under /tmp and world_up
+# fails the node when either path is still too long.
 #
 # ptmux always runs with TMUX unset, so a harness call never talks to a server
 # named by an inherited TMUX. The TUI also runs with TMUX unset: inside a
@@ -137,7 +143,7 @@ world_up() {
   # Without a world every path below would land under / (HOME=/home), so a
   # failed mktemp ends the node before anything is exported. run.sh sets
   # PROOF_TMP_ROOT to a directory of its own so concurrent runs stay apart.
-  PROOF_WORLD="$(mktemp -d "${PROOF_TMP_ROOT:-${TMPDIR:-/tmp}}/ainb-proof-$NODE.XXXXXX")" || exit 1
+  PROOF_WORLD="$(mktemp -d "${PROOF_TMP_ROOT:-/tmp}/ainb-proof-$NODE.XXXXXX")" || exit 1
   : "${PROOF_WORLD:?mktemp gave no world directory}"
   export HOME="$PROOF_WORLD/home"
   # The daemon tails $AINB_HANGAR_HOME/events.jsonl while the hook appends to
@@ -147,6 +153,19 @@ world_up() {
   export TMUX_TMPDIR="$PROOF_WORLD/tmux"
   # The harness server's socket: a path, never a name (see the header).
   export PROOF_TMUX_SOCK="$PROOF_WORLD/tmux.sock"
+  # The fixture server's socket: where tmux puts the default server for this
+  # TMUX_TMPDIR, so ftmux names the server `ainb run` started by its path.
+  PROOF_FIXTURE_SOCK="$TMUX_TMPDIR/tmux-$(id -u)/default"
+  export PROOF_FIXTURE_SOCK
+  local sock
+  for sock in "$PROOF_TMUX_SOCK" "$PROOF_FIXTURE_SOCK"; do
+    if ((${#sock} > 103)); then
+      check "the world's tmux socket path fits a unix socket address (${#sock} bytes, 103 at most: $sock)" false
+      write_result
+      rm -rf "$PROOF_WORLD"
+      exit 1
+    fi
+  done
   unset TMUX TMUX_PANE
   mkdir -p "$HOME/.agents-in-a-box/config" "$TMUX_TMPDIR" "$PROOF_WORLD/bin"
   PATH="$PROOF_WORLD/bin:${AINB_BIN%/*}:$PROOF_BASE_PATH"
@@ -195,12 +214,10 @@ world_down() {
     ptmux send-keys -t "=$name:" C-c 2>/dev/null || true
   done
   sleep 2
-  for name in $(ptmux list-sessions -F '#{session_name}' 2>/dev/null); do
-    ptmux kill-session -t "=$name" 2>/dev/null || true
-  done
-  for name in $(ftmux list-sessions -F '#{session_name}' 2>/dev/null); do
-    ftmux kill-session -t "=$name" 2>/dev/null || true
-  done
+  # Both servers are this world's own, reached only by their socket paths, so
+  # each is ended whole rather than listed and killed session by session.
+  ptmux kill-server 2>/dev/null || true
+  ftmux kill-server 2>/dev/null || true
   "$AINB_BIN" hangar daemon stop >/dev/null 2>&1 || true
   for pid in $(world_pids); do kill "$pid" 2>/dev/null || true; done
   sleep 1
@@ -220,7 +237,7 @@ world_down() {
 # ---------------------------------------------------------------------------
 
 ptmux() { env -u TMUX -u TMUX_PANE tmux -S "${PROOF_TMUX_SOCK:?world_up not run}" "$@"; }
-ftmux() { tmux "$@"; }
+ftmux() { env -u TMUX -u TMUX_PANE tmux -S "${PROOF_FIXTURE_SOCK:?world_up not run}" "$@"; }
 
 # pane_text <session> [-e]: the visible screen of a harness pane.
 pane_text() { ptmux capture-pane -t "=$1:" -p "${@:2}" 2>/dev/null; }
