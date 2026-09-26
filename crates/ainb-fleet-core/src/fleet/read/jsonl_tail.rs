@@ -47,6 +47,51 @@ pub fn canonical_cwd(cwd: &str) -> String {
         .unwrap_or_else(|| cwd.to_string())
 }
 
+/// `cwd` as one directory is spelled once: canonical through every symlink
+/// ([`canonical_cwd`]), trailing slash trimmed. The path an agent reports for
+/// its cwd is canonical (`/private/tmp/…`) while the path ainb was given for
+/// the same worktree is what a person typed (`/tmp/…`), so anything that
+/// compares the two compares these instead (#132).
+///
+/// Memoised per thread: the reducer compares on every tick, over every row,
+/// and a directory's real path does not move under a running session.
+#[must_use]
+pub fn canonical_dir(cwd: &str) -> String {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static SEEN: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    }
+    let key = cwd.trim_end_matches('/');
+    if key.is_empty() {
+        return String::new();
+    }
+    SEEN.with(|seen| {
+        if let Some(found) = seen.borrow().get(key) {
+            return found.clone();
+        }
+        let real = canonical_cwd(key).trim_end_matches('/').to_string();
+        let mut seen = seen.borrow_mut();
+        // ponytail: a flat cap, not an LRU; paths are worktrees, a few dozen.
+        if seen.len() >= 4096 {
+            seen.clear();
+        }
+        seen.insert(key.to_string(), real.clone());
+        real
+    })
+}
+
+/// Whether `a` and `b` name the same directory, through symlinks and a
+/// trailing slash. Two empty paths name nothing, so they are not the same.
+#[must_use]
+pub fn same_dir(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || canonical_dir(a) == canonical_dir(b)
+}
+
 /// Locate the most recently modified `.jsonl` file under
 /// `~/.claude/projects/<cwd-slug>/`. Returns `None` if no transcripts exist.
 ///
