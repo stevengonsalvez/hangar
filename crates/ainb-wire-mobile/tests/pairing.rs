@@ -120,7 +120,10 @@ async fn pair_redeems_once_stores_the_token_in_custody_and_connects_by_host_id()
     assert_eq!(record.device_id, DEVICE_ID);
     assert_eq!(record.scope, "mobile+type");
     assert_eq!(record.endpoints.len(), 2);
-    assert!(!record.repair);
+    assert_eq!(
+        (record.repair.as_deref(), record.notice.as_deref()),
+        (None, None)
+    );
     assert_eq!(peer.received_methods(), ["device/redeem", "auth/hello"]);
 
     // The token is in custody, not in the index the app reads.
@@ -204,7 +207,11 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     let saved = list_pairings(dir_s.clone()).unwrap();
     assert_eq!(saved.len(), 1, "the pairing is saved before hello");
     assert_eq!(saved[0].device_id, DEVICE_ID);
-    assert!(!saved[0].repair, "a draining host is not a refusal");
+    assert_eq!(
+        (saved[0].repair.as_deref(), saved[0].notice.as_deref()),
+        (None, None),
+        "a draining host is not a refusal"
+    );
 
     // The same failure at hello with a 4403 keeps the pairing AND latches.
     let revoking = spawn(
@@ -235,8 +242,9 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     );
     let latched = list_pairings(other_s).unwrap();
     assert_eq!(latched.len(), 1);
-    assert!(
-        latched[0].repair,
+    assert_eq!(
+        latched[0].repair.as_deref(),
+        Some("revoked"),
         "4403 on the first hello sets the re-pair latch"
     );
 
@@ -281,7 +289,7 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     )
     .await
     .unwrap();
-    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+    assert_eq!(list_pairings(dir_s.clone()).unwrap()[0].repair, None);
 
     // The host's key changed under the pairing: connect_host is PeerChanged
     // and the latch is set.
@@ -296,14 +304,20 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     .await
     .unwrap_err();
     assert_eq!(err, WireError::PeerChanged);
-    assert!(
-        list_pairings(dir_s.clone()).unwrap()[0].repair,
+    assert_eq!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair.as_deref(),
+        Some("peer_changed"),
         "PeerChanged at connect latches"
     );
 
-    // Re-pairing with an offer the host refuses at message 1 keeps the
-    // latch set (it stays a re-pair until a pair succeeds).
-    ainb_wire_mobile::pairing::mark_repair(dir.path(), HOST_ID, false).unwrap();
+    // The reviewer's repro: an offer is unauthenticated input. A second
+    // offer for this host with a DIFFERENT key (a stale or hostile QR code)
+    // is refused before any dial and leaves the record untouched.
+    ainb_wire_mobile::pairing::clear_flags(dir.path(), HOST_ID).unwrap();
+    let mut good = list_pairings(dir_s.clone()).unwrap().remove(0);
+    good.host_static_pubkey = peer.host_pubkey.to_vec();
+    ainb_wire_mobile::pairing::save(dir.path(), good.clone(), TOKEN).unwrap();
+    let handshakes_before = peer.handshakes.load(Ordering::SeqCst);
     let err = pair(
         offer_for(&peer, [9u8; 32], vec![live(&peer)]),
         "my phone".into(),
@@ -312,13 +326,48 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     )
     .await
     .unwrap_err();
-    assert_eq!(err, WireError::PeerChanged);
-    assert!(
-        list_pairings(dir_s.clone()).unwrap()[0].repair,
-        "PeerChanged at pair latches"
+    assert!(matches!(err, WireError::Offer { .. }), "{err:?}");
+    let after = list_pairings(dir_s.clone()).unwrap().remove(0);
+    assert_eq!(
+        after.host_static_pubkey, good.host_static_pubkey,
+        "the pinned key is untouched"
+    );
+    assert_eq!(
+        (after.repair, after.notice),
+        (None, None),
+        "no flag from a hostile offer"
+    );
+    assert_eq!(
+        peer.handshakes.load(Ordering::SeqCst),
+        handshakes_before,
+        "no dial happened"
     );
 
-    // A good pair clears it.
+    // A re-pair offer carrying the key we already pin, refused by a host
+    // whose key has changed, is the legitimate PeerChanged and latches.
+    let moved = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let err = pair(
+        offer_for(&moved, peer.host_pubkey, vec![live(&moved)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, WireError::PeerChanged);
+    assert_eq!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair.as_deref(),
+        Some("peer_changed"),
+        "PeerChanged on the pinned key latches"
+    );
+
+    // A good pair clears it. The host really moved to a new key, so the
+    // user forgets the host (the explicit action) and pairs it afresh.
+    forget_pairing(dir_s.clone(), HOST_ID.into()).unwrap();
     let fresh = spawn(
         issuing_host(Arc::new(AtomicBool::new(false)), None),
         PeerOpts::default(),
@@ -332,8 +381,11 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     )
     .await
     .unwrap();
-    assert!(!record.repair);
-    assert!(!list_pairings(dir_s).unwrap()[0].repair);
+    assert_eq!(
+        (record.repair.as_deref(), record.notice.as_deref()),
+        (None, None)
+    );
+    assert_eq!(list_pairings(dir_s).unwrap()[0].repair, None);
 }
 
 #[tokio::test]
@@ -430,14 +482,15 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
         ),
         "{err:?}"
     );
-    assert!(
-        list_pairings(dir_s.clone()).unwrap()[0].repair,
+    assert_eq!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair.as_deref(),
+        Some("revoked"),
         "4403 at hello sets the re-pair latch"
     );
 
     // A 4403 in the middle of a live session latches too, through the
     // event pump: the app keeps no copy.
-    ainb_wire_mobile::pairing::mark_repair(dir.path(), HOST_ID, false).unwrap();
+    ainb_wire_mobile::pairing::clear_flags(dir.path(), HOST_ID).unwrap();
     let mid = spawn(
         Arc::new(|method: &str, _p: Value| match method {
             "auth/hello" => Reply::Result(json!({"selected": 1, "host_id": HOST_ID})),
@@ -457,7 +510,7 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
     })
     .await
     .unwrap();
-    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+    assert_eq!(list_pairings(dir_s.clone()).unwrap()[0].repair, None);
     assert!(Arc::clone(&host).roster_status().await.is_err());
     assert!(matches!(
         Arc::clone(&host).next_event().await,
@@ -466,12 +519,15 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
             ..
         }
     ));
-    assert!(
-        list_pairings(dir_s.clone()).unwrap()[0].repair,
+    assert_eq!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair.as_deref(),
+        Some("revoked"),
         "a mid-session 4403 sets the re-pair latch"
     );
 
-    // A successful pair with the host clears it.
+    // A successful pair with the host clears it; the pinned key belongs to
+    // the earlier host, so forget it first (the explicit user action).
+    forget_pairing(dir_s.clone(), HOST_ID.into()).unwrap();
     let fresh = spawn(
         issuing_host(Arc::new(AtomicBool::new(false)), None),
         PeerOpts::default(),
@@ -485,8 +541,11 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
     )
     .await
     .unwrap();
-    assert!(!record.repair);
-    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+    assert_eq!(
+        (record.repair.as_deref(), record.notice.as_deref()),
+        (None, None)
+    );
+    assert_eq!(list_pairings(dir_s.clone()).unwrap()[0].repair, None);
 
     forget_pairing(dir_s.clone(), HOST_ID.into()).unwrap();
     assert!(list_pairings(dir_s).unwrap().is_empty());
