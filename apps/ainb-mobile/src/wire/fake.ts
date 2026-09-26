@@ -3,7 +3,7 @@
 
 import { fromBase64 } from "../terminal/engine/protocol";
 import { FIXTURES } from "../terminal/fixtures";
-import { PEER_CHANGED, PeerCloseError, type PeerCloseKind } from "./types";
+import { PEER_CHANGED, PeerCloseError, type WireErrorKind } from "./types";
 import type {
   AnswerOutcome,
   AttentionRow,
@@ -225,7 +225,7 @@ export class FakeWire implements WireClient {
     if (code !== undefined) return this.closedBy(hostId, code, reason);
     this.host(hostId).connected = false;
     this.record(hostId, "close", "network");
-    this.emit({ kind: "closed", hostId, code, reason });
+    this.emit({ kind: "closed", hostId, code, reason: reason ?? "network", retryable: true });
   }
 
   /** Extra bytes of output the fake sends right after each snapshot (before the attach reply is processed). */
@@ -240,14 +240,22 @@ export class FakeWire implements WireClient {
   attaches = 0;
   /** When set, the next N `connect` calls fail as a network error (the redials that must be rescheduled). */
   failNextConnect = 0;
-  /** When set, the next `connect` fails this way (no close event, like lane E): a close code, or a non-close kind. */
-  refuseNextConnectWith?: { code?: number; kind?: PeerCloseKind; reason?: string };
+  /** When set, the next `connect` fails this way (no close event, like lane E): a close code, or another WireError kind. */
+  refuseNextConnectWith?: { code?: number; kind?: WireErrorKind; reason?: string };
   /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
   failNextSubscribe = 0;
-  /** Deterministic backoff for tests: no jitter; a host's retry-after is a floor under the backoff. */
-  backoffDelayMs(attempt: number, retryAfterSecs?: number): number {
+  /** Deterministic backoff for tests: no jitter; the host's retry_after_ms is a floor under the backoff. */
+  backoffDelayMs(attempt: number, retryAfterMs?: number): number {
     const backoff = Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
-    return Math.max(backoff, (retryAfterSecs ?? 0) * 1000);
+    return Math.max(backoff, retryAfterMs ?? 0);
+  }
+
+  /** What the crate decides for a coded close (peer_close.rs T9) and the `retry-after=<s>` reason. */
+  private static verdict(code: number | undefined, reason?: string): { retryable: boolean; retryAfterMs?: number } {
+    const m = reason ? /retry-after=(\d+)/.exec(reason) : null;
+    const retryAfterMs = m ? Number(m[1]) * 1000 : undefined;
+    if (code === undefined) return { retryable: true, retryAfterMs };
+    return { retryable: [1013, 4429, 4503].includes(code), retryAfterMs };
   }
 
   /** The daemon asks the phone to start over from a snapshot. */
@@ -297,12 +305,13 @@ export class FakeWire implements WireClient {
   closedBy(hostId: HostId, code: number, reason?: string) {
     const host = this.host(hostId);
     host.connected = false;
+    const v = FakeWire.verdict(code, reason);
     if (code === 4403) host.row.repair = "revoked";
     else if (code === 4401) host.row.repair = "identity";
     else if (code === 4409) host.row.notice = "update_required";
     else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_close";
     this.record(hostId, "close", String(code));
-    this.emit({ kind: "closed", hostId, code, reason });
+    this.emit({ kind: "closed", hostId, code, reason: reason ?? "", ...v });
   }
 
   async forget(hostId: HostId) {
@@ -315,21 +324,22 @@ export class FakeWire implements WireClient {
     if (this.failNextConnect > 0) {
       this.failNextConnect -= 1;
       this.record(hostId, "dial-failed");
-      throw PeerCloseError.network("dial failed");
+      throw new PeerCloseError("connect", { reason: "dial failed", retryable: true });
     }
     const refuse = this.refuseNextConnectWith;
     if (refuse) {
       this.refuseNextConnectWith = undefined;
-      const kind: PeerCloseKind = refuse.kind ?? "close";
-      if (kind === "close" && refuse.code !== undefined) {
+      const kind: WireErrorKind = refuse.kind ?? "closed";
+      if (kind === "closed" && refuse.code !== undefined) {
         if (refuse.code === 4403) host.row.repair = "revoked";
         else if (refuse.code === 4401) host.row.repair = "identity";
         else if (refuse.code === 4409) host.row.notice = "update_required";
         else if (![1013, 4429, 4503].includes(refuse.code)) host.row.notice = "unknown_close";
       } else if (kind === "peer_changed") host.row.repair = "peer_changed";
-      this.record(hostId, "refused", kind === "close" ? String(refuse.code) : kind);
+      this.record(hostId, "refused", kind === "closed" ? String(refuse.code) : kind);
       this.emit({ kind: "reachability", hostId, reachability: host.row.reachability, sinceMs: host.row.sinceMs });
-      throw new PeerCloseError(kind, refuse.code, refuse.reason);
+      const v = kind === "closed" ? FakeWire.verdict(refuse.code, refuse.reason) : { retryable: kind === "connect" || kind === "timeout" };
+      throw new PeerCloseError(kind, { code: refuse.code, reason: refuse.reason, ...v });
     }
     host.connected = true;
     this.record(hostId, "hello", "scope=mobile");
@@ -339,6 +349,8 @@ export class FakeWire implements WireClient {
     const host = this.host(hostId);
     host.connected = false;
     this.record(hostId, "close", "1000");
+    // The crate reports a close the phone asked for as never retryable.
+    this.emit({ kind: "closed", hostId, code: 1000, reason: "closed by app", retryable: false });
   }
 
   async hostInfo(hostId: HostId): Promise<HostInfo> {
