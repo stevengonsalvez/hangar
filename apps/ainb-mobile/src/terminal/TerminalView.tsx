@@ -35,8 +35,12 @@ export interface TerminalSink {
 }
 
 export interface TerminalViewProps {
-  /** Called once the engine is up; returns the sink to feed bytes into. */
-  onReady(sink: TerminalSink): void;
+  /**
+   * Called on mount with the sink to feed bytes into. Writes made before the
+   * engine is up queue and inject once it reports `ready`, so a snapshot that
+   * arrives while the webview is still loading is never lost.
+   */
+  onSink(sink: TerminalSink): void;
   /** Keystrokes from the soft keyboard or the accessory bar; absent = read only. */
   onInput?(data: string): void;
   onFit?(cols: number, rows: number): void;
@@ -47,7 +51,7 @@ export interface TerminalViewProps {
  * xterm.js inside a webview. Bytes queue until the engine says `ready`, then
  * cross the bridge as base64; the engine coalesces them per frame.
  */
-export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewProps) {
+export function TerminalView({ onSink, onInput, onFit, testID }: TerminalViewProps) {
   const web = useRef<WebView>(null);
   const ready = useRef(false);
   const queue = useRef<ToEngine[]>([]);
@@ -71,6 +75,10 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
   );
 
   useEffect(() => {
+    onSink(sink);
+  }, [onSink, sink]);
+
+  useEffect(() => {
     if (ready.current) send({ t: "readonly", on: readOnly });
   }, [readOnly, send]);
 
@@ -85,7 +93,6 @@ export function TerminalView({ onReady, onInput, onFit, testID }: TerminalViewPr
       send({ t: "readonly", on: readOnly });
       for (const m of queue.current) send(m);
       queue.current = [];
-      onReady(sink);
     } else if (msg.t === "fit") onFit?.(msg.cols, msg.rows);
     else if (msg.t === "input") type(msg.data);
   };
