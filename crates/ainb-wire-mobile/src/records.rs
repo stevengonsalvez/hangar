@@ -73,6 +73,26 @@ pub enum WireError {
     /// The device was revoked: 4403. The app latches to "re-pair".
     #[error("revoked (4403)")]
     Revoked,
+    /// The protocol ranges do not overlap: 4409. Not retryable until one
+    /// side is updated.
+    #[error("protocol incompatible (4409)")]
+    Incompatible,
+    /// Rate limited: 4429. Retry after the delay the host named.
+    #[error("rate limited (4429)")]
+    RateLimited {
+        /// The host's `retry-after`, in milliseconds, when it named one.
+        retry_after_ms: Option<u64>,
+    },
+    /// The host is over capacity: 1013. Retry after the delay it named.
+    #[error("host over capacity (1013)")]
+    OverCapacity {
+        /// The host's `retry-after`, in milliseconds, when it named one.
+        retry_after_ms: Option<u64>,
+    },
+    /// The host is draining, or this device was rescoped and must hello
+    /// again: 4503. Reconnect.
+    #[error("host draining (4503)")]
+    Draining,
     /// A pairing offer did not parse.
     #[error("bad offer: {message}")]
     Offer {
@@ -94,6 +114,22 @@ pub enum WireError {
 }
 
 impl WireError {
+    /// Whether a reconnect can succeed without a person acting: a network
+    /// loss, a timeout, a busy or draining host. An identity refusal, a
+    /// revocation or an incompatible protocol is not.
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect { .. }
+                | Self::Timeout { .. }
+                | Self::Closed { .. }
+                | Self::RateLimited { .. }
+                | Self::OverCapacity { .. }
+                | Self::Draining
+        )
+    }
+
     pub(crate) fn protocol(e: impl std::fmt::Display) -> Self {
         Self::Protocol {
             message: e.to_string(),
