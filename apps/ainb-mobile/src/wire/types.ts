@@ -19,9 +19,14 @@ export interface HostRow {
   /** Set when unreachable: when the host was last seen, epoch ms. */
   sinceMs?: number;
   scope?: DeviceScope;
-  /** A close only a new pairing clears (T9: 4403 revoked or expired, 4401 identity). */
+  /**
+   * A close that only a new pairing clears, per `peer_close.rs` (T9):
+   * 4403 `revoked` (revoked OR token expired, "latch re-pair") and 4401
+   * `identity` (unauthenticated: "identity changed, re-pair"). Kept with
+   * the pairing record so it survives a restart; a 4503 rescope never sets it.
+   */
   repair?: "revoked" | "identity";
-  /** A close nobody should redial through: 4409, or a code this build does not know. */
+  /** A close nobody should redial through: 4409 (update one side) or a code this build does not know. */
   notice?: "update_required" | "unknown_close";
 }
 
@@ -37,6 +42,9 @@ export interface PairingOffer {
   endpoints: { carrier: "tailnet" | "lan" | "ssh-l" | "unknown"; url: string }[];
   expiresAtMs: number;
 }
+
+/** `pair` refuses with this when the host's static key differs from the pinned one. */
+export const PEER_CHANGED = "peer_changed";
 
 export interface PairedHost {
   hostId: HostId;
@@ -183,8 +191,10 @@ export type Unsubscribe = () => void;
 
 export interface WireClient {
   hosts(): Promise<HostRow[]>;
+  /** Display-only decode of an offer (no secret crosses into JS). */
   parseOffer(uri: string): Promise<PairingOffer>;
-  pair(offer: PairingOffer, displayName: string): Promise<PairedHost>;
+  /** Redeem the offer URI itself: the crate reads the invite secret from it (lane E `pair(uri, ..)`). */
+  pair(uri: string, displayName: string): Promise<PairedHost>;
   forget(hostId: HostId): Promise<void>;
 
   connect(hostId: HostId): Promise<void>;

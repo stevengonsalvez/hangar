@@ -3,6 +3,7 @@
 
 import { fromBase64 } from "../terminal/engine/protocol";
 import { FIXTURES } from "../terminal/fixtures";
+import { PEER_CHANGED } from "./types";
 import type {
   AnswerOutcome,
   AttentionRow,
@@ -80,6 +81,8 @@ export class FakeWire implements WireClient {
   private nextStream = 1;
   /** The floor per session key: who holds it and its generation. */
   private floors = new Map<SessionKey, FloorState>();
+  /** host id to the static key pinned at pairing (the fake offer's `.key` suffix). */
+  private pinned = new Map<HostId, string>();
   /** The op-id ledger: a retry under a known id replays the stored reply. */
   private ledger = new Map<string, { outcome: AnswerOutcome; ack: MutationAck }>();
   /** Dedupe ledger for prompts and interrupts. */
@@ -236,17 +239,41 @@ export class FakeWire implements WireClient {
     return [...this.hosts_.values()].map((h) => h.row);
   }
 
+  // Fake offer: `ainb://pair#<26-char host id>[.<key>]`; the real one is a
+  // base64url JSON the crate decodes (T7).
   async parseOffer(uri: string): Promise<PairingOffer> {
     if (!uri.startsWith("ainb://pair#")) throw new Error("not an ainb pairing offer");
-    const hostId = uri.slice("ainb://pair#".length, "ainb://pair#".length + 26);
+    const rest = uri.slice("ainb://pair#".length);
+    const hostId = rest.slice(0, 26);
     if (hostId.length !== 26) throw new Error("offer host id is not 26 characters");
-    return { hostId, endpoints: [{ carrier: "lan", url: "ws://fake" }], expiresAtMs: Date.now() + 300_000 };
+    return { hostId, endpoints: [{ carrier: "lan", url: `ws://fake/${rest}` }], expiresAtMs: Date.now() + 300_000 };
   }
 
-  async pair(offer: PairingOffer, displayName: string): Promise<PairedHost> {
+  async pair(uri: string, displayName: string): Promise<PairedHost> {
+    const offer = await this.parseOffer(uri);
+    const key = uri.split(".")[1] ?? "k0";
+    const pinned = this.pinned.get(offer.hostId);
+    if (pinned !== undefined && pinned !== key) throw new Error(PEER_CHANGED);
+    this.pinned.set(offer.hostId, key);
     if (!this.hosts_.has(offer.hostId)) this.addHost(offer.hostId, displayName, "reachable");
+    const row = this.host(offer.hostId).row;
+    delete row.repair;
+    delete row.notice;
     this.record(offer.hostId, "paired", displayName);
+    this.emit({ kind: "reachability", hostId: offer.hostId, reachability: row.reachability, sinceMs: row.sinceMs });
     return { hostId: offer.hostId, deviceId: `dev-${offer.hostId.slice(-5)}`, scope: { base: "mobile", admin: false } };
+  }
+
+  /** The host closed us with a peer close code (T9); 4403 and 4401 latch re-pair, 4409 and unknown codes park the row. */
+  closedBy(hostId: HostId, code: number) {
+    const host = this.host(hostId);
+    host.connected = false;
+    if (code === 4403) host.row.repair = "revoked";
+    else if (code === 4401) host.row.repair = "identity";
+    else if (code === 4409) host.row.notice = "update_required";
+    else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_close";
+    this.record(hostId, "close", String(code));
+    this.emit({ kind: "closed", hostId, code });
   }
 
   async forget(hostId: HostId) {

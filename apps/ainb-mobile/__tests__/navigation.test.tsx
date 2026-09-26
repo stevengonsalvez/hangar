@@ -31,6 +31,7 @@ test("pairing a pasted offer adds the host", async () => {
   const screen = renderRouter("./app", { initialUrl: "/pair" });
   fireEvent.changeText(screen.getByTestId("offer"), "ainb://pair#01K5C0000000000000000CCCCC");
   fireEvent.changeText(screen.getByTestId("device-name"), "pixel");
+  await screen.findByTestId("offer-preview");
   fireEvent.press(screen.getByTestId("pair-submit"));
   await waitFor(() => expect(screen).toHavePathname("/"));
   expect(await screen.findByText("pixel")).toBeTruthy();
