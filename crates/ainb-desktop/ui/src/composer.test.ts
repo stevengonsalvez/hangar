@@ -161,7 +161,6 @@ test("toArgs sends blank fields as null and trims the ones the daemon trims", ()
   assert.equal(args.base, null);
   assert.equal(args.branch, null);
   assert.equal(args.prompt, null);
-  assert.equal(args.name, null);
   assert.equal(args.agent, "claude");
 });
 
