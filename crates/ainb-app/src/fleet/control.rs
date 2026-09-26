@@ -480,14 +480,7 @@ async fn resolve_and_send_typed(
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
     let merged = merge_sessions(vec![ainb, peers]);
     let Some(session) = exact_target(&merged, session_id) else {
-        let label = if is_answer {
-            "cannot safely answer"
-        } else {
-            "refusing to send"
-        };
-        return Err(format!(
-            "no live session runs under this id — {label} (target may have exited)"
-        ));
+        return Err(crate::fleet::types::NO_LIVE_TARGET.to_string());
     };
     outcome_result(send(session, text).await)
 }
