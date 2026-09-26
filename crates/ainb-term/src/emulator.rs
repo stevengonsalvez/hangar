@@ -36,6 +36,17 @@
 //! movement, DECSTBM and RIS clear it; DECSC/DECRC save and restore it.
 //! [`Modes::wrap_pending`] is what the snapshot re-enters.
 //!
+//! Cost of the wrapper over the raw fork, measured in release on spike 2's
+//! 50 MB attributed flood at 120x40 with a 1,000-row window, on a Mac
+//! shared with other builds (the raw fork alone varies 10 to 15 s between
+//! runs there): with 4 KiB feeds the wrapper took 13.2 to 25.1 s over five
+//! runs against the fork's 10.1 to 14.9 s, a same-run overhead of 2 to 69
+//! percent and 32 percent best against best; with 64 KiB feeds 13.5 to
+//! 18.2 s against 11.4 to 12.7 s. Before the parser was streamed (one
+//! `Action` per byte, one emulator entry per escape sequence) the same
+//! flood measured 146 percent over the fork. Reproduce with the ignored
+//! test `flood_throughput_wrapper_against_raw_fork`.
+//!
 //! A panic inside the emulator is contained: the fork lacks upstream's fix for
 //! a divide by zero in inline image placement, and crafted agent output must
 //! not take the daemon down. After a panic the pane is [`Poisoned`] and every
