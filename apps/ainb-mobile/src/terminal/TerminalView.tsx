@@ -122,6 +122,7 @@ export function TerminalView({ onSink, onInput, onFit, onLink, onEngine, testID 
     } else if (msg.t === "fit") onFit?.(msg.cols, msg.rows);
     else if (msg.t === "input") type(msg.data);
     else if (msg.t === "link") onLink?.(msg.uri);
+    else if (msg.t === "stats") onEngine?.(`engine ready, ${msg.bytes} B, ${msg.cols}x${msg.rows}`);
   };
 
   const type = (data: string) => {
