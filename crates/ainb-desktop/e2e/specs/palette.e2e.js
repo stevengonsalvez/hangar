@@ -27,9 +27,21 @@ const focused = () => browser.execute(() => document.activeElement?.className ??
 async function focusState() {
   return browser.execute(() => ({
     active: `${document.activeElement?.tagName}.${document.activeElement?.className}`,
+    activeTab: document.activeElement?.closest(".terminal[data-tab]")?.getAttribute("data-tab") ?? null,
     visibility: document.visibilityState,
-    tabs: document.querySelectorAll(".tab[data-state]").length,
+    tabs: [...document.querySelectorAll(".tab[data-state]")].map(
+      (tab) => `${tab.getAttribute("data-state")}:${tab.textContent?.trim().slice(0, 40)}`,
+    ),
+    terminals: [...document.querySelectorAll(".terminal[data-tab]")].map((el) => el.getAttribute("data-tab")),
+    banner: document.querySelector(".answer-banner")?.textContent?.slice(0, 80) ?? null,
   }));
+}
+
+/** The last lines of every seeded pane, for a failure to say where a keystroke went. */
+function paneTails() {
+  return Object.fromEntries(
+    seeded().map((session) => [session.tmux, paneText(session.tmux).split("\n").filter(Boolean).slice(-5)]),
+  );
 }
 
 /** How many lines the agent in `session`'s pane has read so far. */
@@ -224,7 +236,14 @@ describe("the palette over a terminal", () => {
     await browser.keys(["Enter"]);
     await browser.waitUntil(() => linesRead(session) > before, {
       timeout: 30_000,
-      timeoutMsg: `the terminal never took the keyboard from the composer: ${JSON.stringify(await focusState())}`,
+      timeoutMsg: `the terminal never took the keyboard from the composer: ${JSON.stringify({
+        before,
+        now: linesRead(session),
+        session: session.tmux,
+        index,
+        ...(await focusState()),
+        panes: paneTails(),
+      })}`,
     });
     await shot("composer-draft-after-tab-chord");
     assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the draft stayed in the composer");
