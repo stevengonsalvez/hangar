@@ -28,10 +28,28 @@
 //! resets everything it depends on, so a client that did not is still
 //! repainted correctly except for stale scrollback.
 //!
-//! Known ceiling: only the ACTIVE screen is painted. When the app is on the
-//! alternate screen the primary screen is not carried, so a client sees a
-//! blank primary screen when the app exits alt mode until the app repaints.
-//! The emulator does not expose its inactive screen.
+//! Every row ends with a reset pen and a closed link BEFORE its CRLF: when
+//! painting history scrolls the screen, BCE fills the new row with the
+//! current background, so a row ending in a coloured run would otherwise
+//! bleed to the right margin. A row the emulator marks as wrapped is painted
+//! to the full width with no CRLF, so the replay wraps the same way and the
+//! row keeps its wrapped flag. The charset in use (G0/G1 designation and
+//! SO/SI) is replayed after the modes, so a pane mid-way through DEC line
+//! drawing keeps drawing lines.
+//!
+//! Known ceilings:
+//!
+//! * Only the ACTIVE screen is painted. When the app is on the alternate
+//!   screen the primary screen is not carried, so a client sees a blank
+//!   primary screen when the app exits alt mode until the app repaints. The
+//!   emulator does not expose its inactive screen.
+//! * A pending autowrap is lost. After a row is filled exactly, the next
+//!   glyph wraps in the original but overwrites the last column in the
+//!   replay, until the app repositions the cursor. The emulator does not
+//!   expose `wrap_next`, and its public state after a full row is the same
+//!   as after `CUP` to the last column. Pinned by
+//!   `a_pending_autowrap_is_the_documented_loss`; the accessor belongs
+//!   upstream.
 
 use std::fmt::Write as _;
 
@@ -39,14 +57,25 @@ use wezterm_term::color::ColorAttribute;
 use wezterm_term::{CellAttributes, Intensity, Line, Underline};
 
 use crate::canon::{lines, link_key};
-use crate::emulator::{Modes, PaneEmulator};
+use crate::emulator::{Modes, PaneEmulator, Poisoned};
 
 const ESC: &str = "\x1b";
 
+/// A title with every C0 and C1 control removed, safe to embed in OSC 0: a
+/// C1 ST inside it would end the OSC early on xterm.js.
+pub fn sanitize_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control() && !('\u{80}'..='\u{9f}').contains(c))
+        .collect()
+}
+
 /// The repaint bytes for `pane`, with up to `scrollback_rows` rows of
-/// history above the viewport.
-pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Vec<u8> {
-    let _ = pane.flush();
+/// history above the viewport. Held text is flushed first, so the snapshot
+/// stands at [`PaneEmulator::bytes_fed`] and `seq` can be taken from it. A
+/// poisoned pane is refused: its grid is not to be served.
+pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Result<Vec<u8>, Poisoned> {
+    pane.flush()?;
     let (cols, _rows) = pane.size();
     let cols = usize::from(cols);
     let modes = pane.modes();
@@ -58,23 +87,26 @@ pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Vec<u8> {
     } else {
         "\x1b[?1049l"
     });
-    let _ = write!(out, "{ESC}]0;{}\x07", pane.title());
+    let _ = write!(out, "{ESC}]0;{}\x07", sanitize_title(pane.title()));
     out.push_str("\x1b[r\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
 
-    // 4. the rows.
+    // 4. the rows. Each ends with a reset pen and no open link before its
+    // CRLF, so BCE never bleeds a background into the next row; a wrapped
+    // row is painted full width without CRLF so the replay wraps too.
     let (history, viewport) = lines(pane, scrollback_rows);
     let mut pen = Pen::default();
-    let mut first = true;
+    let mut newline_pending = false;
     for line in history.iter().chain(viewport.iter()) {
-        if !first {
+        if newline_pending {
             out.push_str("\r\n");
         }
-        first = false;
-        emit_row(&mut out, &mut pen, line, cols);
-    }
-    out.push_str("\x1b[0m");
-    if !pen.link.is_empty() {
-        out.push_str("\x1b]8;;\x1b\\");
+        let wrapped = emit_row(&mut out, &mut pen, line, cols);
+        out.push_str("\x1b[0m");
+        if !pen.link.is_empty() {
+            out.push_str("\x1b]8;;\x1b\\");
+        }
+        pen = Pen::default();
+        newline_pending = !wrapped;
     }
 
     // 5. region and modes.
@@ -102,7 +134,7 @@ pub fn snapshot(pane: &mut PaneEmulator, scrollback_rows: usize) -> Vec<u8> {
     } else {
         "\x1b[?25l"
     });
-    out.into_bytes()
+    Ok(out.into_bytes())
 }
 
 fn emit_modes(out: &mut String, m: &Modes) {
@@ -135,6 +167,14 @@ fn emit_modes(out: &mut String, m: &Modes) {
     });
     out.push_str(if m.insert { "\x1b[4h" } else { "\x1b[4l" });
     dec(out, 6, m.origin);
+    // The charset in use: designations, then which one is shifted in.
+    let _ = write!(
+        out,
+        "{ESC}({}{ESC}){}{}",
+        m.g0.designator(),
+        m.g1.designator(),
+        if m.shift_out { "\x0e" } else { "\x0f" }
+    );
 }
 
 /// The style in effect on the output side.
@@ -215,13 +255,21 @@ fn is_blank_default(text: &str, a: &CellAttributes) -> bool {
         && a.hyperlink().is_none()
 }
 
-/// Paint one row from the cursor, up to its last non-default cell.
-fn emit_row(out: &mut String, pen: &mut Pen, line: &Line, cols: usize) {
+/// Paint one row from the cursor, up to its last non-default cell, or to
+/// the full width when the row wrapped into the next. Returns whether it
+/// wrapped, in which case the caller sends no CRLF.
+fn emit_row(out: &mut String, pen: &mut Pen, line: &Line, cols: usize) -> bool {
     let cells: Vec<_> = line.visible_cells().take_while(|c| c.cell_index() < cols).collect();
-    let last = cells
-        .iter()
-        .rposition(|c| !is_blank_default(c.str(), c.attrs()))
-        .map_or(0, |i| i + 1);
+    let wrapped = line.last_cell_was_wrapped();
+    let painted: usize = cells.iter().map(|c| c.width().max(1)).sum();
+    let last = if wrapped {
+        cells.len()
+    } else {
+        cells
+            .iter()
+            .rposition(|c| !is_blank_default(c.str(), c.attrs()))
+            .map_or(0, |i| i + 1)
+    };
     for c in &cells[..last] {
         let a = c.attrs();
         let sgr = sgr_params(a);
@@ -245,6 +293,15 @@ fn emit_row(out: &mut String, pen: &mut Pen, line: &Line, cols: usize) {
         }
         out.push_str(c.str());
     }
+    if wrapped && painted < cols {
+        // Pad to the margin so the next glyph wraps exactly as it did.
+        if !pen.sgr.is_empty() || !pen.link.is_empty() {
+            out.push_str("\x1b[0m\x1b]8;;\x1b\\");
+            *pen = Pen::default();
+        }
+        out.extend(std::iter::repeat_n(' ', cols - painted));
+    }
+    wrapped
 }
 
 #[cfg(test)]
@@ -298,7 +355,7 @@ mod tests {
     /// The round trip the plan names: `canon(emu) == canon(fresh.feed(snapshot(emu)))`.
     fn round_trip(name: &str, p: &mut PaneEmulator, scrollback_rows: usize) {
         let (cols, rows) = p.size();
-        let snap = snapshot(p, scrollback_rows);
+        let snap = snapshot(p, scrollback_rows).unwrap();
         let mut fresh = PaneEmulator::new(cols, rows, 1000);
         for c in snap.chunks(11) {
             fresh.feed(c).unwrap();
@@ -341,12 +398,12 @@ mod tests {
     #[test]
     fn the_snapshot_head_is_ordered_as_the_spike_proved() {
         let mut p = fed(FIXTURES[0].1, 40, 20);
-        let snap = String::from_utf8(snapshot(&mut p, 0)).unwrap();
+        let snap = String::from_utf8(snapshot(&mut p, 0).unwrap()).unwrap();
         assert!(snap.starts_with("\x1b[?1049h\x1b]0;spike2 agent panel\x07\x1b[r\x1b[?6l\x1b[?7h\x1b[4l\x1b(B\x0f\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J"));
         // f1 ends with `ESC[r`, so no region; the cursor at 10;12 shown.
-        assert!(snap.ends_with("\x1b[?1000l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[?7h\x1b>\x1b[4l\x1b[?6l\x1b[10;12H\x1b[?25h"), "{}", snap.replace('\x1b', "^["));
+        assert!(snap.ends_with("\x1b[?1000l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[?7h\x1b>\x1b[4l\x1b[?6l\x1b(B\x1b)B\x0f\x1b[10;12H\x1b[?25h"), "{}", snap.replace('\x1b', "^["));
         let mut p = fed(FIXTURES[1].1, 40, 20);
-        let snap = String::from_utf8(snapshot(&mut p, 0)).unwrap();
+        let snap = String::from_utf8(snapshot(&mut p, 0).unwrap()).unwrap();
         assert!(
             snap.starts_with("\x1b[?1049l\x1b]0;wezterm\x07"),
             "primary screen, crate default title"
@@ -360,8 +417,8 @@ mod tests {
         p.feed(b"\x1b[6;18r\x1b[?6h\x1b[3;9Hx").unwrap();
         p.flush().unwrap();
         assert_eq!((p.cursor().row, p.cursor().col), (7, 9), "absolute row 7");
-        let snap = String::from_utf8(snapshot(&mut p, 0)).unwrap();
-        assert!(snap.ends_with("\x1b[6;18r\x1b[?1000l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[?7h\x1b>\x1b[4l\x1b[?6h\x1b[3;10H\x1b[?25h"), "{}", snap.replace('\x1b', "^["));
+        let snap = String::from_utf8(snapshot(&mut p, 0).unwrap()).unwrap();
+        assert!(snap.ends_with("\x1b[6;18r\x1b[?1000l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b[?7h\x1b>\x1b[4l\x1b[?6h\x1b(B\x1b)B\x0f\x1b[3;10H\x1b[?25h"), "{}", snap.replace('\x1b', "^["));
         round_trip("origin", &mut p, 0);
         // Turning origin off afterwards must not move the replayed cursor
         // somewhere else than the original.
@@ -385,7 +442,7 @@ mod tests {
             p.feed(format!("\x1b[0m\x1b[{sgr}mX").as_bytes()).unwrap();
         }
         round_trip("sgr", &mut p, 0);
-        let snap = String::from_utf8(snapshot(&mut p, 0)).unwrap();
+        let snap = String::from_utf8(snapshot(&mut p, 0).unwrap()).unwrap();
         let shown = snap.replace('\x1b', "^[");
         for want in [
             "\x1b[1;3;4;5;7;9;53;38;5;200mX",
@@ -413,5 +470,105 @@ mod tests {
         p.feed("0123456789\r\n01234567\u{4E2D}\r\n012345678\u{4E2D}ZZ\r\n".as_bytes())
             .unwrap();
         round_trip("margins", &mut p, 0);
+    }
+
+    /// The lead's reproduction: a row ending in a coloured background run,
+    /// followed by history that scrolls the screen. Without a pen reset
+    /// before the CRLF, BCE painted every new row blue to the margin.
+    #[test]
+    fn a_background_run_at_a_row_end_does_not_bleed_into_the_next_row() {
+        let mut p = PaneEmulator::new(20, 5, 100);
+        for i in 0..13 {
+            p.feed(format!("r{i:02} \x1b[44mBLUE\x1b[0m\r\n").as_bytes()).unwrap();
+        }
+        round_trip("bce", &mut p, 8);
+        let snap = String::from_utf8(snapshot(&mut p, 8).unwrap()).unwrap();
+        assert!(
+            snap.contains("BLUE\x1b[0m\r\n"),
+            "{}",
+            snap.replace('\x1b', "^[")
+        );
+    }
+
+    #[test]
+    fn a_pane_mid_line_drawing_keeps_drawing_lines_after_a_snapshot() {
+        let mut p = PaneEmulator::new(20, 4, 10);
+        p.feed(b"\x1b(0lqk\x1b)0").unwrap();
+        p.flush().unwrap();
+        let (cols, rows) = p.size();
+        let snap = snapshot(&mut p, 0).unwrap();
+        let mut fresh = PaneEmulator::new(cols, rows, 10);
+        fresh.feed(&snap).unwrap();
+        assert_eq!(canon(&mut fresh, 0).render(), canon(&mut p, 0).render());
+        // The next glyph is drawn from the same set on both.
+        p.feed(b"q\x0ex").unwrap();
+        fresh.feed(b"q\x0ex").unwrap();
+        assert_eq!(
+            canon(&mut fresh, 0).row_text(0),
+            canon(&mut p, 0).row_text(0)
+        );
+        assert_eq!(
+            canon(&mut p, 0).row_text(0),
+            "\u{250c}\u{2500}\u{2510}\u{2500}\u{2502}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_row_replays_as_wrapped() {
+        let mut p = PaneEmulator::new(10, 4, 50);
+        p.feed(b"0123456789abc\r\n\x1b[41m0123456789\x1b[0mxyz\r\nshort\r\n").unwrap();
+        p.flush().unwrap();
+        let c = canon(&mut p, 0);
+        let text = c.render();
+        assert!(text.contains("r000 t |0123456789|\n"), "{text}");
+        assert!(text.contains("r000 a 0..9 fg=- bg=i1"), "{text}");
+        assert!(text.contains("r000 wrap\nr001 t |xyz|\n"), "{text}");
+        round_trip("wrap", &mut p, 0);
+        // A wrapped row that later lost its trailing cells is padded so
+        // the replay still wraps.
+        p.feed(b"\x1b[1;8H\x1b[K").unwrap();
+        round_trip("wrap-padded", &mut p, 0);
+    }
+
+    /// The documented ceiling: the emulator does not expose a pending
+    /// autowrap, so after an exactly full row the replay overwrites the last
+    /// column where the original wraps.
+    #[test]
+    fn a_pending_autowrap_is_the_documented_loss() {
+        let mut p = PaneEmulator::new(10, 3, 10);
+        p.feed(b"0123456789").unwrap();
+        p.flush().unwrap();
+        let snap = snapshot(&mut p, 0).unwrap();
+        let mut fresh = PaneEmulator::new(10, 3, 10);
+        fresh.feed(&snap).unwrap();
+        assert_eq!(
+            canon(&mut fresh, 0).render(),
+            canon(&mut p, 0).render(),
+            "equal until the next glyph"
+        );
+        p.feed(b"X").unwrap();
+        fresh.feed(b"X").unwrap();
+        p.flush().unwrap();
+        fresh.flush().unwrap();
+        assert_eq!(canon(&mut p, 0).row_text(1), "X", "the original wraps");
+        assert_eq!(
+            canon(&mut fresh, 0).row_text(0),
+            "012345678X",
+            "the replay overwrites"
+        );
+    }
+
+    #[test]
+    fn the_title_is_stripped_of_c0_and_c1_controls() {
+        assert_eq!(sanitize_title("a\x07b\u{9c}c\x1bd\x7fe"), "abcde");
+        assert_eq!(sanitize_title("plain \u{4E2D}"), "plain \u{4E2D}");
+        let mut p = PaneEmulator::new(20, 3, 10);
+        p.feed("\x1b]0;bad\u{9c}title\x07".as_bytes()).unwrap();
+        let snap = String::from_utf8(snapshot(&mut p, 0).unwrap()).unwrap();
+        assert!(
+            snap.contains("\x1b]0;badtitle\x07") || snap.contains("\x1b]0;bad\x07"),
+            "{}",
+            snap.replace('\x1b', "^[")
+        );
     }
 }
