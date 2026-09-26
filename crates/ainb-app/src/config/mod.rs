@@ -27,6 +27,7 @@ pub mod session_defaults;
 pub mod session_store_worker;
 pub mod settings_model;
 pub mod ssh_display_names;
+pub mod toml_error;
 pub mod tunables;
 
 pub use container::{ContainerTemplate, ContainerTemplateConfig};
