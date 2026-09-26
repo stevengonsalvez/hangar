@@ -47,3 +47,18 @@ test("send prompt with a stale fence shows turn_advanced", async () => {
   fireEvent.press(screen.getByTestId("send"));
   expect(await screen.findByText("Not sent: turn_advanced")).toBeTruthy();
 });
+
+test("interrupt sends the row version the user saw and an op id; a stale version is refused", async () => {
+  const fake = new FakeWire();
+  setWire(fake);
+  const screen = renderRouter("./app", { initialUrl: `/host/${FAKE_HOST_A}/session/claude:hangar` });
+  await screen.findAllByText(/Which runner/);
+  fireEvent.press(screen.getByTestId("interrupt"));
+  expect(await screen.findByText("Interrupted")).toBeTruthy();
+  expect(fake.interrupts).toEqual([{ sessionKey: "claude:hangar", version: 1, opId: expect.stringMatching(/^op-\d+$/) }]);
+
+  // the agent moved on under the user: the row they saw is stale
+  fake.advanceTurn(FAKE_HOST_A, "claude:hangar");
+  fireEvent.press(screen.getByTestId("interrupt"));
+  expect(await screen.findByText("Not interrupted: turn_advanced")).toBeTruthy();
+});
