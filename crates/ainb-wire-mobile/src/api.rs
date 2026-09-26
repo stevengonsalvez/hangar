@@ -142,6 +142,10 @@ pub fn read_connection_log(log_dir: String, limit: u32) -> Result<Vec<ConnLogEnt
     Ok(log.tail(limit as usize).into_iter().map(ConnLogEntry::from).collect())
 }
 
+/// The daemon capability that makes `before_order` on `fleet/transcript_list`
+/// mean the backward page (the catalogue's `fleet.transcript.page_back`).
+pub const CAP_TRANSCRIPT_PAGE_BACK: &str = "fleet.transcript.page_back";
+
 /// The fingerprint of the device key, minting the key on first use. All the
 /// app ever sees of the key. `custody_dir` is where the file backend keeps
 /// it; on iOS the key is a Keychain item and the directory is unused.
@@ -650,9 +654,24 @@ impl MobileHost {
         self: Arc<Self>,
         session_key: String,
         after_order: Option<i64>,
+        before_order: Option<i64>,
         limit: u32,
     ) -> Result<TranscriptPage, WireError> {
         rt().spawn(async move {
+            if after_order.is_some() && before_order.is_some() {
+                return Err(WireError::Protocol {
+                    message: "a transcript page has one cursor, after_order or before_order"
+                        .to_owned(),
+                });
+            }
+            // A backward page is only asked of a daemon that advertises it:
+            // an older one ignores the unknown field and answers the
+            // forward page, which the app would show as history.
+            if before_order.is_some() && !self.advertises(CAP_TRANSCRIPT_PAGE_BACK.to_owned()) {
+                return Err(WireError::Protocol {
+                    message: format!("the host does not advertise {CAP_TRANSCRIPT_PAGE_BACK}"),
+                });
+            }
             let result: FleetTranscriptListResult = self
                 .session
                 .call(
@@ -660,16 +679,24 @@ impl MobileHost {
                     &FleetTranscriptListParams {
                         session_key,
                         after_order,
-                        // The forward page only here; the backward page
-                        // (`before_order`, behind the daemon's
-                        // `fleet.transcript.page_back` capability) is the
-                        // facade's own call.
-                        before_order: None,
+                        before_order,
                         limit,
                     },
                 )
                 .await?;
-            Ok(result.into())
+            let page = TranscriptPage::from(result);
+            // A backward page whose rows are not all below the cursor is
+            // not the page asked for: refused, never shown as history.
+            if let Some(before) = before_order {
+                if page.chunks.iter().any(|c| c.ingest_order >= before) {
+                    return Err(WireError::Protocol {
+                        message: format!(
+                            "a backward page from {before} carried rows at or past it"
+                        ),
+                    });
+                }
+            }
+            Ok(page)
         })
         .await
         .map_err(WireError::protocol)?
@@ -917,5 +944,13 @@ impl MobileHost {
             .into_iter()
             .map(ConnLogEntry::from)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_page_back_capability_is_in_the_catalogue() {
+        assert!(super::catalogue_strings().iter().any(|c| c == super::CAP_TRANSCRIPT_PAGE_BACK));
     }
 }
