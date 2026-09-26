@@ -785,7 +785,7 @@ async fn start_peer_leg(
     pool: &sqlx::SqlitePool,
     loaded: &crate::host_key::Loaded,
     shutdown: crate::shutdown::Handle,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<peer_listener::PeerLeg> {
     let host_id =
         match ainb_hangar_store::repo::daemon_identity::DaemonIdentityRepo::read(pool).await {
             Ok(Some(identity)) => identity.host_id,
@@ -918,7 +918,7 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
     // drained on every exit, including a shutdown mid-boot that drops that
     // future: draining is what lets every open peer socket close 4503 before
     // the process exits.
-    let peer_leg: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+    let peer_leg: std::sync::Arc<std::sync::Mutex<Option<peer_listener::PeerLeg>>> =
         std::sync::Arc::default();
     let peer_leg_slot = std::sync::Arc::clone(&peer_leg);
 
@@ -1572,13 +1572,12 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
             Ok(())
         }
     };
-    // The shutdown handle already told the peer leg to drain; wait for it,
-    // bounded, so its 4503 closes are sent before the process exits.
+    // Drained on every exit: a signal already cancelled it, and a one-shot
+    // boot or a boot error cancels it here, so its 4503 closes are sent before
+    // the process exits either way.
     let leg = peer_leg.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     if let Some(leg) = leg {
-        if tokio::time::timeout(peer_listener::DRAIN_BOUND, leg).await.is_err() {
-            tracing::warn!("peer leg did not drain in time");
-        }
+        leg.drain().await;
     }
     result
 }
