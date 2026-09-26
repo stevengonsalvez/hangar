@@ -101,3 +101,32 @@ fn a_broken_bridge_token_line_leaks_into_neither_the_error_nor_the_log() {
     assert!(chain.contains("config does not parse"), "{chain}");
     assert!(chain.contains("line 2"), "{chain}");
 }
+
+/// A secret pasted into a typed field tokenizes fine and fails serde, whose
+/// message quotes the rejected value. `load` must not print it either.
+#[test]
+#[allow(clippy::significant_drop_tightening)]
+fn a_secret_in_a_typed_field_does_not_reach_the_error() {
+    const TYPED: &str = "sk-ant-api03-s3cr3tTypedFieldValue";
+    let mut home = ScopedHome::new();
+    home.unset("AINB_CONFIG_PATH");
+    let canonical = home.path().join(".agents-in-a-box").join("config").join("config.toml");
+    std::fs::create_dir_all(canonical.parent().unwrap()).expect("mkdir");
+    std::fs::write(&canonical, format!("[docker]\ntimeout = \"{TYPED}\"\n"))
+        .expect("write canonical");
+
+    let error = AppConfig::load().expect_err("a string is not a u64");
+    for rendered in [
+        format!("{error}"),
+        format!("{error:#}"),
+        format!("{error:?}"),
+    ] {
+        assert!(!rendered.contains(TYPED), "value in the error: {rendered}");
+        assert!(
+            !rendered.contains("s3cr3t"),
+            "value in the error: {rendered}"
+        );
+    }
+    let chain = format!("{error:#}");
+    assert!(chain.contains("invalid type: string"), "{chain}");
+}

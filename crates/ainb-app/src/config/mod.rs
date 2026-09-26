@@ -2025,7 +2025,11 @@ impl AppConfig {
     /// the honest attribution: a value is only wrong in combination with the
     /// layers above it.
     fn from_merged_layers(merged: toml::Table) -> Result<Self> {
-        Ok(toml::Value::Table(merged).try_into()?)
+        // Never `?` the raw error: a type error quotes the rejected value, and
+        // a key pasted into the wrong field is exactly that value.
+        toml::Value::Table(merged).try_into().map_err(|error| {
+            toml_error::toml_value_error("config does not load into ainb's schema", &error)
+        })
     }
 
     /// Build a config from file contents in [`load`](Self::load) order, lowest
@@ -2075,10 +2079,13 @@ impl AppConfig {
             // save — so without this, a DEFAULT config gets overlaid and every
             // modelled section on disk is replaced with defaults. Same wipe the
             // syntax gate above exists to stop, one layer down.
-            let _: AppConfig = toml::Value::Table(table.clone()).try_into().context(
-                "refusing to save over a config.toml that parses but does not load into ainb's \
-                 schema — saving would replace every section it models with defaults",
-            )?;
+            let _: AppConfig = toml::Value::Table(table.clone()).try_into().map_err(|error| {
+                toml_error::toml_value_error(
+                    "refusing to save over a config.toml that parses but does not load into \
+                     ainb's schema; saving would replace every section it models with defaults",
+                    &error,
+                )
+            })?;
             table
         };
         let toml::Value::Table(ours) = toml::Value::try_from(self)? else {
@@ -2585,7 +2592,13 @@ impl ProjectConfig {
 
         let content = fs::read_to_string(&config_path)?;
         let config: Self = toml::from_str(&content).map_err(|error| {
-            toml_error::toml_parse_error("project.toml does not parse", &content, &error)
+            // Syntax and type errors both land here, so "does not load", and
+            // the path, because several worktrees can each have one.
+            toml_error::toml_parse_error(
+                &format!("{} does not load", config_path.display()),
+                &content,
+                &error,
+            )
         })?;
         Ok(Some(config))
     }
