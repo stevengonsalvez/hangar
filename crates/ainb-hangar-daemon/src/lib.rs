@@ -837,6 +837,12 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    // hooks-and-answers: this process now owns the home, so any hook endpoint
+    // or headers file here is a previous daemon's leftover (a crash, SIGKILL
+    // or forced exit skips its clean removal). Remove it whatever the switch
+    // says: with the switch off it would otherwise stay forever, with it on it
+    // would name a dead pid until the new files replace it.
+    crate::hook_ingress::remove_stale(&dir);
 
     // Crash breadcrumbs start HERE, once this process owns the home — never
     // before. They live in the SHARED home: `start_breadcrumbs` deletes the
