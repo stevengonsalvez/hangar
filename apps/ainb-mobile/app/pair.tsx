@@ -4,6 +4,7 @@ import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { useIncomingOffer } from "../src/pairing/deeplink";
 import { Scanner } from "../src/pairing/Scanner";
+import { connectHost } from "../src/lifecycle";
 import { colors } from "../src/theme";
 import { useWire } from "../src/wire/context";
 import { PEER_CHANGED, type PairingOffer } from "../src/wire/types";
@@ -46,6 +47,7 @@ export default function Pair() {
     try {
       const paired = await wire.pair(offer.trim(), name.trim() || "phone");
       setStatus(`paired as ${paired.deviceId} (${paired.scope.base})`);
+      void connectHost(wire, paired.hostId).catch(() => undefined);
       if (router.canGoBack()) router.back();
       else router.replace("/");
     } catch (e) {

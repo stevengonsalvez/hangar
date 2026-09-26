@@ -19,7 +19,12 @@ export default function Hosts() {
             href={item.repair ? { pathname: "/pair", params: { repair: item.repair } } : { pathname: "/host/[hostId]", params: { hostId: item.hostId } }}
             asChild
           >
-            <Pressable style={styles.row} testID={`host-${item.hostId}`}>
+            <Pressable
+              style={styles.row}
+              testID={`host-${item.hostId}`}
+              accessibilityRole="button"
+              accessibilityLabel={`${item.displayName}, ${item.repair ?? item.notice ?? item.reachability}`}
+            >
               <Text style={styles.name}>{item.displayName}</Text>
               {item.repair ? (
                 <Text style={styles.repair} testID={`repair-${item.hostId}`}>
@@ -33,7 +38,11 @@ export default function Hosts() {
                 <Text style={item.reachability === "reachable" ? styles.up : styles.down}>
                   {item.reachability === "reachable"
                     ? "reachable"
-                    : `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`}
+                    : item.reachability === "stale"
+                      ? `stale since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                      : item.reachability === "unreachable"
+                        ? `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                        : "unknown"}
                 </Text>
               )}
             </Pressable>
