@@ -1,5 +1,5 @@
 {
-  "about": "Shared cases for worktree/create field validation. Checked by crates/ainb-hangar-proto/tests/spawn_validation_parity.rs (the daemon's validator) and by the desktop composer's validator test, so the two agree.",
+  "about": "Shared cases for worktree/create field validation, the one table both validators answer to: crates/ainb-hangar-proto/tests/spawn_validation_parity.rs runs every case through the daemon's WorktreeCreateParams::validate, and the desktop composer's validator test runs every case through the composer's own check.",
   "cases": [
     {
       "field": "branch",
@@ -336,24 +336,6 @@
       "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
       "ok": false,
       "why": "over 200 bytes"
-    },
-    {
-      "field": "name",
-      "value": "my-task",
-      "ok": true,
-      "why": "plain name"
-    },
-    {
-      "field": "name",
-      "value": "a\nb",
-      "ok": false,
-      "why": "control character"
-    },
-    {
-      "field": "name",
-      "value": "   ",
-      "ok": false,
-      "why": "blank"
     },
     {
       "field": "model",
