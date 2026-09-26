@@ -6,18 +6,12 @@
 
 import { hostCalls, hostReplies, settle } from "./window.ts";
 
-import { invoke } from "@tauri-apps/api/core";
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { createComponent, createEffect, createSignal, on, Show } from "solid-js";
+import { createComponent, Show } from "solid-js";
 import { render } from "solid-js/web";
 import type { Session_Serialize, SessionsView_Serialize, Workspace_Serialize } from "../../../../ainb-app/bindings/AppState";
-import {
-  type ComposerFields,
-  type CreatedWorktree,
-  type CreateState,
-  toArgs,
-} from "../../src/composer.ts";
+import { createComposerFlow } from "../../src/composer.ts";
 import { Composer } from "../../src/composer.tsx";
 
 function session(id: string, workspacePath: string): Session_Serialize {
@@ -35,45 +29,31 @@ function frame(): SessionsView_Serialize {
   } as unknown as SessionsView_Serialize;
 }
 
+/** What the flow did outside the view: toasts raised, focus restores. */
+const effects = { toasts: [] as string[], restored: 0 };
+
 /**
- * A stand-in for `main.tsx`'s own composer wiring: the request's progress is
- * held here, outside the overlay, so Cancel closing the view never drops a
- * create already running on the host (`composer.ts`'s own `CreateState`
- * comment), and a `done` state closes the view the same way `main.tsx`'s
- * effect does.
+ * The window's own flow (`createComposerFlow`, the code `main.tsx` runs),
+ * mounted with its real `worktree_create` call going through the invoke stub.
+ * The button stands in for Mod+N and "+ New", which only call `openComposer`.
  */
 function Harness(props: { sessions: SessionsView_Serialize }) {
-  const [open, setOpen] = createSignal(false);
-  const [state, setState] = createSignal<CreateState>({ kind: "idle" });
-
-  const openComposer = () => {
-    if (state().kind !== "creating") setState({ kind: "idle" });
-    setOpen(true);
-  };
-  const closeComposer = () => setOpen(false);
-  const submit = (fields: ComposerFields) => {
-    setState({ kind: "creating" });
-    void invoke<CreatedWorktree>("worktree_create", { args: toArgs(fields) })
-      .then((result) => setState({ kind: "done", result }))
-      .catch((error: unknown) => setState({ kind: "failed", message: String(error) }));
-  };
-  createEffect(
-    on(state, (current) => {
-      if (current.kind === "done") closeComposer();
-    }),
-  );
-
+  const flow = createComposerFlow({
+    toast: (message) => effects.toasts.push(message),
+    restoreFocus: () => {
+      effects.restored += 1;
+    },
+  });
   const button = document.createElement("button");
   button.type = "button";
   button.className = "open-composer";
   button.textContent = "New worktree";
-  button.addEventListener("click", openComposer);
-
+  button.addEventListener("click", flow.openComposer);
   return [
     button,
     createComponent(Show, {
       get when() {
-        return open();
+        return flow.open();
       },
       get children() {
         return createComponent(Composer, {
@@ -81,10 +61,10 @@ function Harness(props: { sessions: SessionsView_Serialize }) {
             return props.sessions;
           },
           get state() {
-            return state();
+            return flow.state();
           },
-          onSubmit: submit,
-          onClose: closeComposer,
+          onSubmit: flow.submit,
+          onClose: flow.closeComposer,
         });
       },
     }),
@@ -98,6 +78,8 @@ afterEach(() => {
   document.body.innerHTML = "";
   hostReplies.clear();
   hostCalls.clear();
+  effects.toasts = [];
+  effects.restored = 0;
 });
 
 async function open() {
@@ -180,12 +162,61 @@ test("a refused create shows the host's sentence and keeps the typed fields", as
   assert.ok(container.querySelector(".composer"), "the overlay stayed open");
 });
 
-test("Esc closes the composer", async () => {
+test("Esc closes the composer even after focus left every field, and focus is restored", async () => {
   const container = await open();
-  const backdrop = container.querySelector<HTMLElement>(".composer-backdrop")!;
-  backdrop.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  (document.activeElement as HTMLElement | null)?.blur();
+  document.body.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await settle();
   assert.equal(container.querySelector(".composer"), null);
+  assert.equal(effects.restored, 1, "the keyboard went back where it was");
+});
+
+test("Esc while an input method is composing does not close", async () => {
+  const container = await open();
+  document.body.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, isComposing: true }));
+  await settle();
+  assert.ok(container.querySelector(".composer"), "the candidate is cancelled, not the form");
+});
+
+test("a drag that starts in a field and ends on the scrim does not close", async () => {
+  const container = await open();
+  const backdrop = container.querySelector<HTMLElement>(".composer-backdrop")!;
+  container.querySelector(".composer-name")!.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true }));
+  backdrop.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await settle();
+  assert.ok(container.querySelector(".composer"), "released outside, nothing thrown away");
+
+  backdrop.dispatchEvent(new window.MouseEvent("mousedown", { bubbles: true }));
+  backdrop.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await settle();
+  assert.equal(container.querySelector(".composer"), null, "a real click on the scrim closes");
+});
+
+test("Tab from the last control wraps to the first, Shift+Tab the other way", async () => {
+  const container = await open();
+  const form = container.querySelector<HTMLFormElement>("form.composer")!;
+  const controls = [
+    ...form.querySelectorAll<HTMLElement>(
+      "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary",
+    ),
+  ];
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  last.focus();
+  last.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true }));
+  assert.equal(document.activeElement, first);
+  first.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true }));
+  assert.equal(document.activeElement, last);
+});
+
+test("a create that fails after Cancel is raised as a toast, not lost", async () => {
+  hostReplies.set("worktree_create", new Error("branch exists"));
+  const container = await open();
+  fill(container, ".composer-name", "Fix login");
+  submitButton(container).click();
+  container.querySelector<HTMLButtonElement>(".composer-cancel")?.click();
+  await settle();
+  assert.deepEqual(effects.toasts, ["branch exists"]);
 });
 
 test("Cancel closes the view without waiting for the host to answer", async () => {
