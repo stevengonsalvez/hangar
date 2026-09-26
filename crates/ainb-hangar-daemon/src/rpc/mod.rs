@@ -14297,11 +14297,38 @@ mod tests {
             "session": {"host_id": "local", "session_key": "s1"},
             "want_input": true,
         });
+        let attach_with = |want_input: serde_json::Value| {
+            serde_json::json!({
+                "session": {"host_id": "local", "session_key": "s1"},
+                "want_input": want_input,
+            })
+        };
+        let omitted = serde_json::json!({
+            "session": {"host_id": "local", "session_key": "s1"},
+        });
+        // Non-bool `want_input` does not parse as `TerminalAttachParams`, so
+        // it earns no params rule: the watch-only grant is refused whatever
+        // the value looks like, and a scope that allows attach outright still
+        // passes the gate (the handler's own parse answers it, once it lands).
+        let number = attach_with(serde_json::json!(1));
+        let string_false = attach_with(serde_json::json!("false"));
+        let null = attach_with(serde_json::Value::Null);
+        let object = attach_with(serde_json::json!({"want_input": false}));
         // (method, params, which scopes the table lets through)
-        let cases: [(&str, &serde_json::Value, [bool; 4]); 8] = [
+        let cases: [(&str, &serde_json::Value, [bool; 4]); 13] = [
             // [mobile, mobile+type, desktop, desktop+admin]
             (methods::TERMINAL_ATTACH, &watch, [true, true, true, true]),
             (methods::TERMINAL_ATTACH, &typing, [false, true, true, true]),
+            // Omitted is the serde default, `false`: watch-only is earned.
+            (methods::TERMINAL_ATTACH, &omitted, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &number, [false, true, true, true]),
+            (
+                methods::TERMINAL_ATTACH,
+                &string_false,
+                [false, true, true, true],
+            ),
+            (methods::TERMINAL_ATTACH, &null, [false, true, true, true]),
+            (methods::TERMINAL_ATTACH, &object, [false, true, true, true]),
             (methods::TERMINAL_DETACH, &watch, [true, true, true, true]),
             (methods::TERMINAL_ACK, &watch, [true, true, true, true]),
             (
