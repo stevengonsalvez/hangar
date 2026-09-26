@@ -41,6 +41,7 @@ fn fixture_session() -> FleetSession {
         discovered_at: 1,
         last_observed_at: 9,
         lifecycle_updated_at: 5,
+        session_incarnation: None,
         attention_updated_at: 7,
         model: None,
         reasoning_effort: None,

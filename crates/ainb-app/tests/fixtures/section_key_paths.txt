@@ -320,6 +320,7 @@ fleet.fleet_snapshot[].provenance
 fleet.fleet_snapshot[].provider
 fleet.fleet_snapshot[].provider_session_id
 fleet.fleet_snapshot[].reasoning_effort
+fleet.fleet_snapshot[].session_incarnation
 fleet.fleet_snapshot[].session_key
 fleet.fleet_snapshot[].tmux_target
 fleet.fleet_snapshot[].transport_health
