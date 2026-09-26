@@ -51,7 +51,11 @@ import {
   type TabsView,
 } from "./tabs.ts";
 import { TerminalView } from "./terminal.tsx";
+import "@fontsource-variable/geist";
+import "@fontsource-variable/geist-mono";
+import "./theme/tokens.css";
 import "./shell.css";
+import { startTheme } from "./theme/theme.ts";
 
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
@@ -714,4 +718,5 @@ function Shell() {
   );
 }
 
+startTheme();
 render(() => <Shell />, document.getElementById("root")!);
