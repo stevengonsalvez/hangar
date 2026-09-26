@@ -67,6 +67,7 @@ pub fn session_at(worktree: &Path, tmux: &str) -> SessionMetadata {
         model_source: ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
@@ -86,6 +87,7 @@ pub fn row_of(meta: &SessionMetadata) -> ainb_hangar_store::repo::sessions::Sess
         model_source: e.model_source,
         codex_model: e.codex_model,
         codex_thread_id: e.codex_thread_id,
+        claude_session_id: None,
     }
 }
 
