@@ -334,3 +334,43 @@ async fn connections_past_the_cap_are_turned_away() {
     assert_eq!(status(&resp), 503, "{resp}");
     drop(idle);
 }
+
+#[tokio::test]
+async fn hostile_framing_is_refused_and_never_reaches_the_sink() {
+    let w = World::start().await;
+    let tok = format!("X-Ainb-Hook-Token: {}\r\n", w.token());
+    let host = w.host();
+    let cases = [
+        format!(
+            "POST /hook/claude HTTP/1.1\r\nHost: {host}\r\n{tok}Content-Type: application/json\r\nTransfer-Encoding: chunked\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+        format!(
+            "POST /hook/claude HTTP/1.1\r\nHost: {host}\r\n{tok}Content-Type: application/json\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+        format!(
+            "POST /hook/claude HTTP/1.1\r\nHost: {host}\r\n{tok}Content-Type: application/json\r\nContent-Length: -1\r\n\r\n{{}}"
+        ),
+        format!(
+            "POST /hook/claude HTTP/1.1\r\nHost: {host}\r\n{tok}Host: {host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
+        ),
+    ];
+    for raw in cases {
+        let resp = exchange(w.running.port(), raw.as_bytes()).await;
+        assert_eq!(status(&resp), 400, "{raw:?}");
+    }
+    // A short body: the head declares 10 bytes, the peer sends 2 and closes.
+    let mut s = TcpStream::connect(("127.0.0.1", w.running.port())).await.unwrap();
+    s.write_all(
+        format!(
+            "POST /hook/claude HTTP/1.1\r\nHost: {host}\r\n{tok}Content-Type: application/json\r\nContent-Length: 10\r\n\r\n{{}}"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    s.shutdown().await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    assert_eq!(status(&String::from_utf8_lossy(&out)), 400);
+    assert!(w.events().is_empty());
+}
