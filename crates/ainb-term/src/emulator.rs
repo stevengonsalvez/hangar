@@ -24,6 +24,14 @@
 //! a divide by zero in inline image placement, and crafted agent output must
 //! not take the daemon down. After a panic the pane is [`Poisoned`] and every
 //! further feed is refused, so the daemon replaces it and re-seeds.
+//!
+//! Printable text at the end of a feed is held back until the next feed or a
+//! [`PaneEmulator::flush`]. Measured on the fork: `a` in one batch and
+//! U+030A in the next leaves a bare `a`, and so does a split inside the
+//! mark's UTF-8 bytes. tmux ends notifications mid-grapheme under load
+//! (spike 2 section 1), so without the hold a phone would show accents,
+//! ZWJ emoji and flags dropping at random. The cost is that the last
+//! printed run of a feed shows a few milliseconds late.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -215,6 +223,25 @@ impl Modes {
     }
 }
 
+/// Pop the trailing run of printable text off `actions`, joined into one
+/// string, so it can be replayed at the head of the next batch.
+fn take_trailing_text(actions: &mut Vec<Action>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    while let Some(last) = actions.last() {
+        match last {
+            Action::Print(c) => parts.push(c.to_string()),
+            Action::PrintString(s) => parts.push(s.clone()),
+            _ => break,
+        }
+        actions.pop();
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.concat())
+}
+
 /// The emulator panicked on some input and its grid can no longer be
 /// trusted. Replace the pane and re-seed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +276,10 @@ pub struct PaneEmulator {
     rows: u16,
     bytes_fed: u64,
     poisoned: bool,
+    /// Printable text at the end of the last feed, not yet performed: a
+    /// combining mark, ZWJ or variation selector in the next feed must land
+    /// in the same batch as its base, or the emulator drops it.
+    held: Option<String>,
     /// Test-only: make the next feed panic inside the guarded region, so
     /// the containment path is exercised without a crafted image.
     #[cfg(test)]
@@ -284,6 +315,7 @@ impl PaneEmulator {
             rows,
             bytes_fed: 0,
             poisoned: false,
+            held: None,
             #[cfg(test)]
             panic_on_next_feed: false,
         }
@@ -292,6 +324,12 @@ impl PaneEmulator {
     /// Feed pane output. The slice may end anywhere, including inside an
     /// escape sequence or a multi-byte grapheme; the parser carries state
     /// across calls.
+    ///
+    /// Printable text at the very end of the slice is HELD until the next
+    /// feed or [`flush`](Self::flush): the emulator only joins a combining
+    /// mark, ZWJ or variation selector to its base when both arrive in one
+    /// batch, and a tmux feed splits graphemes wherever it likes. The daemon
+    /// flushes after a few idle milliseconds; a snapshot flushes itself.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<(), Poisoned> {
         if self.poisoned {
             return Err(Poisoned);
@@ -300,7 +338,11 @@ impl PaneEmulator {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
             assert!(!self.panic_on_next_feed, "injected emulator panic");
-            let actions = self.parser.parse_as_vec(bytes);
+            let mut actions = self.parser.parse_as_vec(bytes);
+            if let Some(held) = self.held.take() {
+                actions.insert(0, Action::PrintString(held));
+            }
+            self.held = take_trailing_text(&mut actions);
             for action in &actions {
                 self.modes.observe(action, rows);
             }
@@ -318,8 +360,34 @@ impl PaneEmulator {
         }
     }
 
+    /// Perform the text held back by the last [`feed`](Self::feed). Call it
+    /// when the feed goes idle and before reading the grid.
+    pub fn flush(&mut self) -> Result<(), Poisoned> {
+        if self.poisoned {
+            return Err(Poisoned);
+        }
+        let Some(held) = self.held.take() else {
+            return Ok(());
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.term.perform_actions(vec![Action::PrintString(held)]);
+        }));
+        if outcome.is_err() {
+            self.poisoned = true;
+            return Err(Poisoned);
+        }
+        Ok(())
+    }
+
+    /// Whether text is held back, waiting for a flush or the next feed.
+    pub const fn has_held_text(&self) -> bool {
+        self.held.is_some()
+    }
+
     /// Resize the pane. Like the emulator, this drops the scroll region.
+    /// Held text is flushed first so it lands at the old width, in order.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        let _ = self.flush();
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.term.resize(TerminalSize {
@@ -506,9 +574,56 @@ mod tests {
         // A grapheme split mid-sequence lands as one cell.
         p.feed(b"\x1b[H\xe4\xb8").unwrap();
         p.feed(b"\xadX").unwrap();
+        assert!(p.has_held_text(), "the trailing text waits for a flush");
+        assert_eq!(row_text(&p, 0), "");
+        p.flush().unwrap();
+        assert!(!p.has_held_text());
         assert_eq!(row_text(&p, 0), "\u{4E2D}X");
         assert_eq!(p.cursor().col, 3);
         assert_eq!(p.bytes_fed(), 23);
+    }
+
+    /// Measured on the fork: a combining mark, a ZWJ sequence or a variation
+    /// selector that arrives in a later batch than its base is dropped. The
+    /// hold-back joins them.
+    #[test]
+    fn a_grapheme_split_across_feeds_joins_its_base() {
+        let cases: [(&str, &[&[u8]], &str); 5] = [
+            ("base|mark", &[b"xa", b"\xcc\x8a tail"], "xa\u{30a} tail"),
+            ("mid-mark", &[b"xa\xcc", b"\x8a tail"], "xa\u{30a} tail"),
+            (
+                "base|mark|more",
+                &[b"xa", b"\xcc\x8a", b" tail"],
+                "xa\u{30a} tail",
+            ),
+            (
+                "zwj",
+                &[b"\xf0\x9f\x91\xa9", b"\xe2\x80\x8d\xf0\x9f\x92\xbb!"],
+                "\u{1F469}\u{200D}\u{1F4BB}!",
+            ),
+            (
+                "vs16",
+                &[b"\xe2\x9d\xa4", b"\xef\xb8\x8f."],
+                "\u{2764}\u{FE0F}.",
+            ),
+        ];
+        for (label, parts, want) in cases {
+            let mut p = pane(20, 3);
+            for part in parts {
+                p.feed(part).unwrap();
+            }
+            p.flush().unwrap();
+            assert_eq!(row_text(&p, 0), want, "{label}");
+        }
+        // Held text is released by the next feed too, in order.
+        let mut p = pane(20, 3);
+        p.feed(b"xa").unwrap();
+        p.feed(b"\xcc\x8a").unwrap();
+        p.feed(b"\x1b[2;1Hy").unwrap();
+        p.flush().unwrap();
+        assert_eq!(row_text(&p, 0), "xa\u{30a}");
+        assert_eq!(row_text(&p, 1), "y");
+        assert_eq!(p.cursor().col, 1);
     }
 
     #[test]
@@ -544,7 +659,13 @@ mod tests {
         let size = p.terminal().get_size();
         assert_eq!((size.cols, size.rows), (40, 20));
         p.feed(b"\x1b[H\x1b[2J0123456789012345678901234567890123456789X").unwrap();
+        p.flush().unwrap();
         assert_eq!(row_text(&p, 1), "X", "wraps at the new width");
+        p.feed(b"held").unwrap();
+        p.resize(80, 24);
+        assert!(!p.has_held_text(), "resize flushes first");
+        // The widened pane reflows the wrapped row back onto row 0.
+        assert!(row_text(&p, 0).ends_with("9Xheld"), "{}", row_text(&p, 0));
     }
 
     #[test]
