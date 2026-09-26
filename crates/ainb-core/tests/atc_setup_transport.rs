@@ -9,37 +9,52 @@ use std::process::Command;
 
 use ainb_hangar_proto::hooks::{CLAUDE_HOOK_EVENTS, HookEndpoint, render_headers_file};
 
+/// An instance name no real ATC uses, so teardown can only ever touch its own.
+const INSTANCE: &str = "hooks-transport-test";
+
 fn ainb_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ainb"))
 }
 
 fn setup(home: &Path, transport: &str) -> serde_json::Value {
     let ainb_home = home.join("ainb");
-    let out = Command::new(ainb_bin())
-        .env("HOME", home)
-        .env("AINB_HOME", &ainb_home)
-        .env("AINB_HANGAR_HOME", &ainb_home)
-        .env("AINB_BIN", ainb_bin())
-        .args([
-            "--format",
-            "json",
-            "fleet",
-            "atc",
+    run(
+        home,
+        &[("AINB_HOME", &ainb_home), ("AINB_HANGAR_HOME", &ainb_home)],
+        &[
             "setup",
-            "tower",
+            INSTANCE,
             "--no-spawn",
             "--no-heartbeat",
             "--hooks",
             transport,
-        ])
-        .output()
-        .expect("invoke ainb");
+        ],
+    )
+}
+
+/// Run `ainb --format json fleet atc <args>` with `HOME=home` and `envs`.
+fn run(home: &Path, envs: &[(&str, &Path)], args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(ainb_bin());
+    // A private tmux server under the temp home, never the user's: teardown
+    // kills the instance's session by name.
+    cmd.env("HOME", home)
+        .env("TMUX_TMPDIR", home)
+        .env_remove("TMUX")
+        .env_remove("AINB_HOME")
+        .env_remove("AINB_HANGAR_HOME")
+        .env("AINB_BIN", ainb_bin())
+        .args(["--format", "json", "fleet", "atc"])
+        .args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("invoke ainb");
     assert!(
         out.status.success(),
-        "setup failed: {}",
+        "{args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    serde_json::from_slice(&out.stdout).expect("setup prints JSON")
+    serde_json::from_slice(&out.stdout).expect("atc prints JSON")
 }
 
 fn settings(home: &Path) -> serde_json::Value {
@@ -63,7 +78,11 @@ fn managed_commands(settings: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 fn publish_endpoint(home: &Path) {
-    let dir = home.join("ainb").join("hangar");
+    publish_endpoint_in(&home.join("ainb"));
+}
+
+fn publish_endpoint_in(hangar_home: &Path) {
+    let dir = hangar_home.join("hangar");
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
     std::fs::write(dir.join("hook-headers"), render_headers_file("t")).unwrap();
@@ -145,8 +164,65 @@ fn legacy_to_http_to_legacy_rewrites_the_managed_entries_in_place() {
     setup(home.path(), "legacy");
     let back = managed_commands(&settings(home.path()));
     assert_eq!(back, legacy, "legacy is restored exactly");
+    assert!(
+        !home.path().join("ainb/hooks/transport").exists(),
+        "legacy is the absence of the marker"
+    );
+}
+
+#[test]
+fn teardown_of_the_last_instance_clears_the_http_marker() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    publish_endpoint(home.path());
+    setup(home.path(), "http");
+    let marker = home.path().join("ainb/hooks/transport");
+    assert!(marker.exists());
+    let ainb_home = home.path().join("ainb");
+    let report = run(
+        home.path(),
+        &[("AINB_HOME", &ainb_home), ("AINB_HANGAR_HOME", &ainb_home)],
+        &["teardown", INSTANCE],
+    );
+    assert_eq!(report["lifecycle_hooks_uninstalled"], true);
+    assert!(
+        !marker.exists(),
+        "an orphan http marker keeps notify.sh down forever"
+    );
+    assert!(managed_commands(&settings(home.path())).is_empty());
+}
+
+#[test]
+fn the_marker_goes_where_notify_sh_reads_it_when_the_homes_differ() {
+    // AINB_HANGAR_HOME unset: the daemon and ainb-hook.sh use
+    // ~/.agents-in-a-box, while notify.sh reads AINB_HOME first.
+    let home = tempfile::tempdir().unwrap();
+    let default_hangar = home.path().join(".agents-in-a-box");
+    let ainb_home = home.path().join("elsewhere");
+    publish_endpoint_in(&default_hangar);
+    let report = run(
+        home.path(),
+        &[("AINB_HOME", &ainb_home)],
+        &[
+            "setup",
+            INSTANCE,
+            "--no-spawn",
+            "--no-heartbeat",
+            "--hooks",
+            "http",
+        ],
+    );
+    assert_eq!(report["lifecycle_hooks_installed"], true);
     assert_eq!(
-        std::fs::read_to_string(home.path().join("ainb/hooks/transport")).unwrap(),
-        "legacy\n"
+        std::fs::read_to_string(ainb_home.join("hooks/transport")).unwrap(),
+        "http\n",
+        "notify.sh reads AINB_HOME"
+    );
+    let pinned = format!("AINB_HANGAR_HOME='{}'", default_hangar.display());
+    assert!(
+        managed_commands(&settings(home.path()))
+            .iter()
+            .all(|(_, c)| c.starts_with(&pinned)),
+        "the hooks are pinned to the daemon's home"
     );
 }
