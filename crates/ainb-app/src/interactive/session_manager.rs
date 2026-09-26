@@ -148,6 +148,15 @@ pub fn new_claude_session_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Whether `id` is a canonical UUID, the one form a minted Claude session id
+/// takes: lower-case, hyphenated, nothing else. A stored id goes into a shell
+/// command, so anything that is not exactly that is refused before it gets
+/// near argv, whatever wrote it.
+#[must_use]
+pub fn is_canonical_claude_session_id(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok_and(|uuid| uuid.hyphenated().to_string() == id)
+}
+
 /// Whether shared Codex remote control can work in this process's hangar home.
 ///
 /// `ensure_hangar_daemon` never spawns a daemon into an ephemeral home, and
@@ -3048,6 +3057,15 @@ impl InteractiveSessionManager {
         // picker instead of resuming - `--continue` is the correct "resume
         // latest" for a cwd-scoped session.
         if agent_type == SessionAgentType::Claude {
+            // A stored id that is not a canonical UUID never reaches argv:
+            // the launch goes on as one with no minted id.
+            let claude_session = claude_session.filter(|session| {
+                let canonical = is_canonical_claude_session_id(session.id);
+                if !canonical {
+                    warn!("refusing a Claude session id that is not a canonical UUID");
+                }
+                canonical
+            });
             match claude_session {
                 Some(session) if resume_requested && session.resumable => {
                     cmd_parts.push("--resume".to_string());
@@ -5266,6 +5284,42 @@ trust_level = "trusted"
             session.to_session_model().provider_session_id.as_deref(),
             Some("11111111-2222-4333-8444-555555555555")
         );
+    }
+
+    #[test]
+    fn a_claude_session_id_that_is_not_a_canonical_uuid_never_reaches_argv() {
+        for bad in [
+            "x; rm -rf /",
+            "11111111-2222-4333-8444-55555555555",
+            "11111111222243338444555555555555",
+            "11111111-2222-4333-8444-555555555555 --resume",
+            "11111111-2222-4333-8444-55555555555A",
+            "",
+        ] {
+            let p = claude_parts(
+                false,
+                false,
+                ClaudeSession {
+                    id: bad,
+                    resumable: false,
+                },
+            );
+            assert_eq!(p, vec!["claude"], "{bad:?} must be refused");
+            let p = claude_parts(
+                true,
+                true,
+                ClaudeSession {
+                    id: bad,
+                    resumable: true,
+                },
+            );
+            assert_eq!(
+                p,
+                vec!["claude", "--continue"],
+                "{bad:?} must be refused on resume too"
+            );
+        }
+        assert!(is_canonical_claude_session_id(&new_claude_session_id()));
     }
 
     #[test]
