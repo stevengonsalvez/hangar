@@ -12,7 +12,7 @@ run.sh ──▶ for each node: ( source lib.sh + scenarios/<node>.sh )
              ├─ world_up     private HOME, TMUX_TMPDIR, PATH stubs, ainb init
              ├─ scenario     keys in, captures out, check / observe
              ├─ write_result proof-out/<node>/result.json
-             └─ world_down   quit TUIs, kill by exact name, stop daemon, rm world
+             └─ world_down   quit TUIs, kill-server on each world socket, stop daemon, rm world
            ──▶ summarize.py  proof-out/summary.json + summary.md, exit status
 ```
 
