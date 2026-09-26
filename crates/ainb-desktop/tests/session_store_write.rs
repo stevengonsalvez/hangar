@@ -53,6 +53,7 @@ fn a_session_store_write_is_queued_while_it_cannot_proceed_and_lands_after() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -120,6 +121,7 @@ fn a_worker_that_is_gone_is_replaced_rather_than_failing_every_write() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -182,6 +184,7 @@ fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
@@ -257,6 +260,7 @@ fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
         model_source: ainb_app::interactive::session_manager::ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 
