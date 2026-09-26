@@ -212,7 +212,7 @@ body {
 }
 
 .ring.running {
-  background: var(--green);
+  background: var(--state-working);
 }
 
 .ring.error {
@@ -230,13 +230,19 @@ body {
 }
 
 [data-ring="done"] .ring {
-  box-shadow: 0 0 0 2px var(--border);
+  box-shadow: 0 0 0 2px var(--state-done);
 }
 
 .session-row:hover,
 .session-row:focus-visible {
   background: var(--highlight);
   outline: none;
+}
+
+/* The hover tint is faint on purpose; the keyboard gets a real ring. */
+.session-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
 }
 
 .workarea {
@@ -310,6 +316,7 @@ body {
   position: relative;
   flex: 1;
   min-height: 0;
+  background: var(--terminal-bg);
 }
 
 .xterm-host {
@@ -324,7 +331,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  background: rgba(25, 25, 35, 0.8);
+  background: color-mix(in srgb, var(--terminal-bg) 80%, transparent);
   color: var(--gold);
 }
 
@@ -360,7 +367,7 @@ body {
   display: flex;
   justify-content: center;
   padding-top: 12vh;
-  background: rgba(25, 25, 35, 0.6);
+  background: color-mix(in srgb, var(--background) 60%, transparent);
 }
 
 .palette {
@@ -545,6 +552,12 @@ body {
   outline: none;
 }
 
+.board-card:focus-visible,
+.attention-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 .board-card:disabled,
 .attention-row:disabled {
   cursor: default;
@@ -646,8 +659,8 @@ body {
 .answer-option:focus-visible,
 .answer-composer input:focus-visible,
 .answer-composer button:focus-visible {
-  border-color: var(--green);
-  outline: 2px solid var(--green);
+  border-color: var(--ring);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -1146,15 +1159,15 @@ body {
 }
 
 .review-row[data-kind="added"] {
-  background: rgb(30, 50, 35);
+  background: color-mix(in srgb, var(--state-done) 14%, var(--background));
 }
 
 .review-row[data-kind="removed"] {
-  background: rgb(55, 32, 35);
+  background: color-mix(in srgb, var(--state-error) 14%, var(--background));
 }
 
 .review-emph {
-  background: rgb(60, 70, 45);
+  background: color-mix(in srgb, var(--state-needs) 22%, var(--background));
   border-radius: 2px;
 }
 
@@ -1242,7 +1255,7 @@ body {
 .stats-bar {
   width: 100%;
   min-height: 1px;
-  background: var(--border);
+  background: var(--state-working);
   border-radius: 2px 2px 0 0;
 }
 
@@ -1437,6 +1450,11 @@ body {
 .commit-row:focus-visible {
   background: var(--highlight);
   outline: none;
+}
+
+.commit-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
 }
 
 .commit-sha {
