@@ -46,6 +46,19 @@ security-framework = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 
+# The size-tuned profile the phone libraries are built with (`--profile
+# mobile`): smallest code, whole-program LTO, one codegen unit, symbols
+# stripped (uniffi's exported symbols are dynamic and survive). Panics stay
+# `unwind`: uniffi catches a panic at the boundary and turns it into an error,
+# which `abort` would make a crash.
+[profile.mobile]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
 [profile.release]
 opt-level = "z"
 lto = true

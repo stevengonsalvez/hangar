@@ -82,13 +82,34 @@ pub fn list(custody_dir: &Path) -> Result<Vec<PairingRecord>, WireError> {
     }
 }
 
-fn write_index(custody_dir: &Path, records: &[PairingRecord]) -> Result<(), WireError> {
+/// The lock file beside the index; every writer holds it exclusively.
+pub const LOCK_FILE: &str = "pairings.lock";
+
+/// The one writer path: an exclusive file lock, read the index, apply
+/// `change`, write to a temp file and rename it over the index. Two
+/// callers in one process or two processes cannot erase each other's
+/// records, and a kill mid-write leaves the old index, never a torn one.
+fn with_index<T>(
+    custody_dir: &Path,
+    change: impl FnOnce(&mut Vec<PairingRecord>) -> T,
+) -> Result<T, WireError> {
     std::fs::create_dir_all(custody_dir).map_err(index_error)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(custody_dir.join(LOCK_FILE))
+        .map_err(index_error)?;
+    lock.lock().map_err(index_error)?;
+    let mut records = list(custody_dir)?;
+    let out = change(&mut records);
     let tmp = custody_dir.join(format!("{INDEX_FILE}.tmp"));
-    let body = serde_json::to_vec_pretty(records).map_err(index_error)?;
+    let body = serde_json::to_vec_pretty(&records).map_err(index_error)?;
     std::fs::write(&tmp, body)
         .and_then(|()| std::fs::rename(&tmp, custody_dir.join(INDEX_FILE)))
-        .map_err(index_error)
+        .map_err(index_error)?;
+    let _ = lock.unlock();
+    Ok(out)
 }
 
 /// The pairing for `host_id`, when one exists.
@@ -104,18 +125,18 @@ pub fn save(custody_dir: &Path, record: PairingRecord, token: &str) -> Result<()
         &token_secret(&record.host_id),
         token.as_bytes(),
     )?;
-    let mut records = list(custody_dir)?;
-    records.retain(|r| r.host_id != record.host_id);
-    records.push(record);
-    write_index(custody_dir, &records)
+    with_index(custody_dir, |records| {
+        records.retain(|r| r.host_id != record.host_id);
+        records.push(record);
+    })
 }
 
 /// Forget a pairing: the token and the record. Absent is not an error.
 pub fn forget(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {
     delete_secret(custody_dir, &token_secret(host_id))?;
-    let mut records = list(custody_dir)?;
-    records.retain(|r| r.host_id != host_id);
-    write_index(custody_dir, &records)
+    with_index(custody_dir, |records| {
+        records.retain(|r| r.host_id != host_id);
+    })
 }
 
 /// The device token for `host_id`, for the crate's own hello.
@@ -190,14 +211,21 @@ pub(crate) async fn pair(
         log,
     )
     .await?;
-    let outcome = redeem_and_hello(&session, &offer, display_name).await;
-    session.close();
-    let (redeemed, hello) = outcome?;
+    let redeemed = match redeem(&session, &offer, display_name).await {
+        Ok(redeemed) => redeemed,
+        Err(e) => {
+            session.close();
+            return Err(e);
+        }
+    };
+    // The invite is single-use and burned now: persist the token and the
+    // record BEFORE hello, so a hello that fails (a dropped socket, a 4401
+    // from a clock skew) leaves a pairing to retry, never a lost token.
     let record = PairingRecord {
         host_id: offer.host_id.as_str().to_owned(),
         host_static_pubkey: offer.host_static_pubkey.to_vec(),
         endpoints,
-        device_id: redeemed.device_id,
+        device_id: redeemed.device_id.clone(),
         display_name: display_name.to_owned(),
         scope: redeemed.scope.base().as_str().to_owned(),
         admin: redeemed.scope.admin(),
@@ -205,14 +233,22 @@ pub(crate) async fn pair(
         paired_at_ms: now_ms(),
     };
     save(custody_dir, record.clone(), &redeemed.device_token)?;
-    Ok((record, hello))
+    let hello = crate::api::hello(
+        &session,
+        &redeemed.device_token,
+        &redeemed.device_id,
+        display_name,
+    )
+    .await;
+    session.close();
+    Ok((record, hello?))
 }
 
-async fn redeem_and_hello(
+async fn redeem(
     session: &Session,
     offer: &PairingOffer,
     display_name: &str,
-) -> Result<(DeviceRedeemResult, HelloSummary), WireError> {
+) -> Result<DeviceRedeemResult, WireError> {
     let params = DeviceRedeemParams {
         invite_id: offer.invite_id.clone(),
         invite_secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(offer.invite_secret),
@@ -229,14 +265,7 @@ async fn redeem_and_hello(
             ),
         });
     }
-    let hello = crate::api::hello(
-        session,
-        &redeemed.device_token,
-        &redeemed.device_id,
-        display_name,
-    )
-    .await?;
-    Ok((redeemed, hello))
+    Ok(redeemed)
 }
 
 #[cfg(test)]
@@ -286,6 +315,30 @@ mod tests {
         assert!(find(dir.path(), "h1").unwrap().is_none());
         assert_eq!(token(dir.path(), "h1").unwrap(), None);
         assert_eq!(token(dir.path(), "h2").unwrap().as_deref(), Some("mdd_two"));
+    }
+
+    #[test]
+    fn two_concurrent_writers_lose_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let writers: Vec<_> = (0..2)
+            .map(|w| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        save(&path, record(&format!("w{w}-{i}")), "mdd_x").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let listed = list(dir.path()).unwrap();
+        assert_eq!(listed.len(), 100, "every save survived the other writer");
+        let text = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        assert!(serde_json::from_str::<Vec<PairingRecord>>(&text).is_ok());
+        assert!(!dir.path().join(format!("{INDEX_FILE}.tmp")).exists());
     }
 
     #[test]
