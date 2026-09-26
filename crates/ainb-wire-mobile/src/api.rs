@@ -39,6 +39,9 @@ use crate::records::{
     MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptPage, WireError, WireEvent,
 };
 use crate::session::{Session, SessionEvent, SessionStats, backoff_delay};
+use crate::terminal::{
+    self, ResizeOutcome, Streams, TerminalAttachRecord, TerminalFloorOutcome, TerminalInputOutcome,
+};
 
 fn rt() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
@@ -77,6 +80,13 @@ fn split_ack<R: serde::de::DeserializeOwned>(
 
 fn open_log(log_dir: &str) -> Result<Arc<ConnLog>, WireError> {
     ConnLog::open(Path::new(log_dir)).map(Arc::new)
+}
+
+/// A fresh 128-bit op id from the crate's CSPRNG, for an app that mints
+/// before it sends so a lost reply retries under the same id.
+#[uniffi::export]
+pub fn mint_op_id() -> String {
+    OpId::from_bytes(rand::random::<[u8; 16]>()).as_str().to_owned()
 }
 
 /// The version string, for the log.
@@ -276,6 +286,7 @@ pub(crate) async fn hello(
 pub struct MobileHost {
     session: Arc<Session>,
     hello: HelloSummary,
+    streams: Streams,
 }
 
 impl std::fmt::Debug for MobileHost {
@@ -322,7 +333,11 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
         let hello = hello(&session, &token, &record.device_id, &record.display_name)
             .await
             .inspect_err(|_| session.close())?;
-        Ok(Arc::new(MobileHost { session, hello }))
+        Ok(Arc::new(MobileHost {
+            session,
+            hello,
+            streams: Streams::default(),
+        }))
     })
     .await
     .map_err(WireError::protocol)?
@@ -582,9 +597,22 @@ impl MobileHost {
     }
 
     /// The next pushed event. After `Closed`, every call returns `Closed`.
+    /// Terminal frames arrive decoded, and the crate acks them itself.
     pub async fn next_event(self: Arc<Self>) -> WireEvent {
         rt().spawn(async move {
             match self.session.next_event().await {
+                SessionEvent::Notification(n) if n.method == methods::TERMINAL_FRAME => {
+                    match terminal::on_frame(&self.session, &self.streams, n.params).await {
+                        Ok((stream_id, seq, frame)) => WireEvent::TerminalFrame {
+                            stream_id,
+                            seq,
+                            frame,
+                        },
+                        Err(e) => WireEvent::Other {
+                            method: format!("{}: {e}", methods::TERMINAL_FRAME),
+                        },
+                    }
+                }
                 SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
                 SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
                 SessionEvent::Closed { code, reason } => WireEvent::Closed { code, reason },
@@ -611,6 +639,135 @@ impl MobileHost {
     /// The counters, for the connection log.
     pub fn stats(&self) -> SessionStats {
         self.session.stats()
+    }
+
+    /// Whether this device may type: scope `mobile+type` or above AND the
+    /// daemon advertises `terminal.input` (C-R2-8). Gates the type toggle.
+    pub fn can_type(&self) -> bool {
+        matches!(self.hello.scope.as_deref(), Some("mobile+type" | "desktop"))
+            && self.hello.capabilities.iter().any(|c| c == "terminal.input")
+    }
+
+    /// `terminal/attach` for `session_key` on this host. With `want_input`
+    /// and a free floor the attach takes the floor and becomes the resize
+    /// owner (needs `mobile+type`).
+    pub async fn terminal_attach(
+        self: Arc<Self>,
+        session_key: String,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        want_input: bool,
+        scrollback_rows: Option<u32>,
+    ) -> Result<TerminalAttachRecord, WireError> {
+        rt().spawn(async move {
+            let host_id = self
+                .hello
+                .host_id
+                .as_deref()
+                .ok_or_else(|| WireError::Protocol {
+                    message: "the daemon did not name its host id at hello".to_owned(),
+                })
+                .and_then(|h| {
+                    HostId::parse_minted(h).map_err(|e| WireError::Protocol {
+                        message: e.to_string(),
+                    })
+                })?;
+            terminal::attach(
+                &self.session,
+                &self.streams,
+                host_id,
+                session_key,
+                cols,
+                rows,
+                want_input,
+                scrollback_rows,
+            )
+            .await
+        })
+        .await
+        .map_err(WireError::protocol)?
+    }
+
+    /// `terminal/detach`: releases the floor at once.
+    pub async fn terminal_detach(self: Arc<Self>, stream_id: u64) -> Result<(), WireError> {
+        rt().spawn(async move { terminal::detach(&self.session, &self.streams, stream_id).await })
+            .await
+            .map_err(WireError::protocol)?
+    }
+
+    /// Type `data` on `stream_id` under `floor_gen` (absent: acquire if
+    /// free). Receipt tier: the crate mints the op id, a retry passes it
+    /// back. A floor refusal comes back as a value.
+    pub async fn terminal_input(
+        self: Arc<Self>,
+        stream_id: u64,
+        data: Vec<u8>,
+        floor_gen: Option<u64>,
+        retry_op_id: Option<String>,
+    ) -> Result<TerminalInputOutcome, WireError> {
+        rt().spawn(async move {
+            let op = op_id(retry_op_id)?;
+            terminal::input(
+                &self.session,
+                stream_id,
+                floor_gen,
+                &data,
+                MutationEnvelope::with_op_id(op),
+                split_ack,
+            )
+            .await
+        })
+        .await
+        .map_err(WireError::protocol)?
+    }
+
+    /// `terminal/floor {acquire | release | take}` (dedupe tier).
+    pub async fn terminal_floor(
+        self: Arc<Self>,
+        stream_id: u64,
+        action: String,
+        retry_op_id: Option<String>,
+    ) -> Result<TerminalFloorOutcome, WireError> {
+        rt().spawn(async move {
+            let action = terminal::floor_action(&action)?;
+            let op = op_id(retry_op_id)?;
+            terminal::floor(
+                &self.session,
+                stream_id,
+                action,
+                MutationEnvelope::with_op_id(op),
+                split_ack,
+            )
+            .await
+        })
+        .await
+        .map_err(WireError::protocol)?
+    }
+
+    /// `terminal/resize`: floor holder only, debounced by the daemon.
+    pub async fn terminal_resize(
+        self: Arc<Self>,
+        stream_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ResizeOutcome, WireError> {
+        rt().spawn(async move { terminal::resize(&self.session, stream_id, cols, rows).await })
+            .await
+            .map_err(WireError::protocol)?
+    }
+
+    /// `terminal/scrollback`: `rows` rows above `before_row`, decoded.
+    pub async fn terminal_scrollback(
+        self: Arc<Self>,
+        stream_id: u64,
+        before_row: u64,
+        rows: u32,
+    ) -> Result<Vec<u8>, WireError> {
+        rt().spawn(
+            async move { terminal::scrollback(&self.session, stream_id, before_row, rows).await },
+        )
+        .await
+        .map_err(WireError::protocol)?
     }
 
     /// The last `limit` lines of this host's connection log, oldest first.
