@@ -120,6 +120,7 @@ async fn pair_redeems_once_stores_the_token_in_custody_and_connects_by_host_id()
     assert_eq!(record.device_id, DEVICE_ID);
     assert_eq!(record.scope, "mobile+type");
     assert_eq!(record.endpoints.len(), 2);
+    assert!(!record.repair);
     assert_eq!(peer.received_methods(), ["device/redeem", "auth/hello"]);
 
     // The token is in custody, not in the index the app reads.
@@ -252,6 +253,64 @@ async fn a_revoked_device_gets_4403_and_the_app_can_forget_the_pairing() {
     .await
     .unwrap_err();
     assert_eq!(err, WireError::Revoked);
+    assert!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair,
+        "4403 at hello sets the re-pair latch"
+    );
+
+    // A 4403 in the middle of a live session latches too, through the
+    // event pump: the app keeps no copy.
+    ainb_wire_mobile::pairing::mark_repair(dir.path(), HOST_ID, false).unwrap();
+    let mid = spawn(
+        Arc::new(|method: &str, _p: Value| match method {
+            "auth/hello" => Reply::Result(json!({"selected": 1, "host_id": HOST_ID})),
+            _ => Reply::Close(4403, "revoked".into()),
+        }),
+        PeerOpts::default(),
+    )
+    .await;
+    let mut record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    record.endpoints[0].url = mid.url.clone();
+    record.host_static_pubkey = mid.host_pubkey.to_vec();
+    ainb_wire_mobile::pairing::save(dir.path(), record, TOKEN).unwrap();
+    let host = connect_host(ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    })
+    .await
+    .unwrap();
+    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+    assert!(Arc::clone(&host).roster_status().await.is_err());
+    assert!(matches!(
+        Arc::clone(&host).next_event().await,
+        ainb_wire_mobile::records::WireEvent::Closed {
+            code: Some(4403),
+            ..
+        }
+    ));
+    assert!(
+        list_pairings(dir_s.clone()).unwrap()[0].repair,
+        "a mid-session 4403 sets the re-pair latch"
+    );
+
+    // A successful pair with the host clears it.
+    let fresh = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let record = pair(
+        offer_for(&fresh, fresh.host_pubkey, vec![live(&fresh)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(!record.repair);
+    assert!(!list_pairings(dir_s.clone()).unwrap()[0].repair);
+
     forget_pairing(dir_s.clone(), HOST_ID.into()).unwrap();
     assert!(list_pairings(dir_s).unwrap().is_empty());
 }
