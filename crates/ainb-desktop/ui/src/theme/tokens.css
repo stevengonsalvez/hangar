@@ -24,11 +24,12 @@
   --foreground: rgb(226, 232, 240);
   --muted-foreground: rgb(148, 163, 184);
 
-  /* Actions and focus */
+  /* Actions and focus. The ring is opaque: it is the only mark of where the
+     keyboard is on a row whose hover tint is deliberately faint. */
   --primary: rgb(96, 165, 250);
   --primary-foreground: #0b0e14;
   --destructive: rgb(251, 113, 133);
-  --ring: rgb(96 165 250 / 0.55);
+  --ring: rgb(96, 165, 250);
 
   /* Hairlines */
   --border: rgb(255 255 255 / 0.07);
@@ -40,6 +41,9 @@
   --state-done: rgb(94, 234, 212);
   --state-error: rgb(251, 113, 133);
   --state-idle: rgb(148 163 184 / 0.55);
+
+  /* Terminals keep the dark palette in both themes (see theme.ts). */
+  --terminal-bg: #0b0e14;
 
   /* Type */
   --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
@@ -82,12 +86,12 @@
   --accent: #e2e8f0;
 
   --foreground: #0f172a;
-  --muted-foreground: #64748b;
+  --muted-foreground: #475569;
 
   --primary: #2563eb;
   --primary-foreground: #ffffff;
-  --destructive: #e11d48;
-  --ring: rgb(37 99 235 / 0.45);
+  --destructive: #be123c;
+  --ring: #2563eb;
 
   --border: rgb(15 23 42 / 0.08);
   --input: rgb(15 23 42 / 0.14);
@@ -95,8 +99,8 @@
   --state-needs: #b45309;
   --state-working: #2563eb;
   --state-done: #0f766e;
-  --state-error: #e11d48;
-  --state-idle: rgb(100 116 139 / 0.6);
+  --state-error: #be123c;
+  --state-idle: #64748b;
 
   --float-bg: rgb(255 255 255 / 0.88);
   --float-border: rgb(15 23 42 / 0.14);
