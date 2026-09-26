@@ -484,6 +484,14 @@ fn a_forged_low_order_static_is_refused_at_message_one() {
         host.read_message(&msg1[..len]),
         Err(NoiseError::LowOrderKey)
     );
-    assert!(host.write_message().is_err(), "the host answers nothing");
-    assert!(host.into_session().is_err());
+    // Each later call fails with the refusal itself, not with a turn or
+    // unfinished-handshake error that would pass without the guard's flag.
+    let refused = NoiseError::State("handshake was refused");
+    assert_eq!(host.read_message(&msg1[..len]), Err(refused.clone()));
+    assert_eq!(
+        host.write_message(),
+        Err(refused.clone()),
+        "the host answers nothing"
+    );
+    assert_eq!(host.into_session().unwrap_err(), refused);
 }
