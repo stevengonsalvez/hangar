@@ -1607,44 +1607,21 @@ impl EventHandler {
         match intent {
             Intent::Key(chord) => Self::handle_key_event_with_keymap(chord, state, keymap, host),
             Intent::Command(id, args) => {
-                let Some(binding) = keymap.command(&id) else {
-                    tracing::warn!("command `{id}` is unknown");
-                    return None;
+                // One judgement for every surface that names a row
+                // (`judge_command`): a host asks it before dispatching, so a
+                // name that will not run is refused where it was sent from,
+                // not dropped here in silence (#121).
+                let action = match crate::app::keymap::judge_command(state, keymap, &id, &args) {
+                    Ok(action) => action,
+                    Err(crate::app::keymap::CommandRefusal::Payload(fields)) => {
+                        tracing::warn!("command `{id}` rejected arguments with fields {fields:?}");
+                        return None;
+                    }
+                    Err(refusal) => {
+                        tracing::warn!("command `{id}` not run: {}", refusal.reason());
+                        return None;
+                    }
                 };
-                // Host-authored rows (a host's reports, a plugin action naming
-                // its plugin) run from any screen. A row that writes outside
-                // ainb runs only from its key, so no other surface can fire it
-                // by name. Every other row passes the gate a key passes: it
-                // runs only while its context is active and no overlay covers
-                // it, so a click resolved on one screen cannot act after the
-                // user has left it or opened a dialog over it.
-                if binding.key_only() {
-                    tracing::warn!("command `{id}` runs only from its key");
-                    return None;
-                }
-                let Some(action) = binding.action.with_args(&args) else {
-                    // Field names only: a payload can carry a pairing code, a
-                    // path or typed text, none of which belongs in a log.
-                    let fields: Vec<&String> =
-                        args.as_object().map(|object| object.keys().collect()).unwrap_or_default();
-                    tracing::warn!("command `{id}` rejected arguments with fields {fields:?}");
-                    return None;
-                };
-                // Judged with its payload: a pointer row's action is what the
-                // arguments name (the settings row a `config.set_row` edits,
-                // #1224), not the placeholder the table wrote.
-                if let Some(why) = state.remote_command_refusal(&action) {
-                    tracing::warn!("command `{id}` refused: {why}");
-                    return None;
-                }
-                let host_authored = crate::app::reports::ids::ALL.contains(&id.as_str())
-                    || crate::app::plugin_action::ids::ALL.contains(&id.as_str());
-                if !host_authored
-                    && !crate::app::keymap::command_contexts(state).contains(&binding.ctx)
-                {
-                    tracing::warn!("command `{id}` is not active on this screen");
-                    return None;
-                }
                 Self::apply_key_action(action, state, host)
             }
             // A press resolves to what was under it; a host answering a press
