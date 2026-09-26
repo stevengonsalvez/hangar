@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use ainb_app::app::RendererHost;
 use ainb_app::app::intent::{Btn, Pos};
-use ainb_app::app::keymap::{HostAction, active_contexts};
+use ainb_app::app::keymap::{HostAction, active_contexts, command_on_screen};
 use ainb_app::app::state::WorkspaceRescan;
 use ainb_app::config::AppConfig;
 use ainb_app::fleet::agent_status_reader::{AgentStatusReader, Dialer};
@@ -507,6 +507,16 @@ impl<S: FrameSink> DesktopHost<S> {
                         reason: "its payload does not fit the row",
                     });
                 };
+                // The reducer's own screen gate, asked here so the window
+                // hears the refusal: a name it sends off the row's screen
+                // (the answer banner's pick over the inbox page, #121) was
+                // dropped by the reducer and logged as dispatched.
+                if !command_on_screen(&self.state, id, &row.ctx) {
+                    return Some(Refusal {
+                        command: id.clone(),
+                        reason: "it is not active on this screen",
+                    });
+                }
                 (id.clone(), action)
             }
             _ => return None,
