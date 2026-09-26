@@ -219,7 +219,7 @@ world_down() {
 # tmux: the harness server and the fixture server
 # ---------------------------------------------------------------------------
 
-ptmux() { env -u TMUX tmux -S "$PROOF_TMUX_SOCK" "$@"; }
+ptmux() { env -u TMUX -u TMUX_PANE tmux -S "${PROOF_TMUX_SOCK:?world_up not run}" "$@"; }
 ftmux() { tmux "$@"; }
 
 # pane_text <session> [-e]: the visible screen of a harness pane.
