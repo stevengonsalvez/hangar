@@ -2532,24 +2532,6 @@ fn resolve_matcher(
         .map(str::to_string)
 }
 
-/// The variable ainb sets on every agent it launches: the tmux pane id
-/// (`%N`) the agent runs in, the same for the pane's whole life.
-pub const PANE_KEY_ENV: &str = "AINB_PANE_KEY";
-
-/// The pane key the hook runs under, when ainb launched the agent.
-fn pane_key_from_env() -> Option<String> {
-    pane_key_value(std::env::var(PANE_KEY_ENV).ok().as_deref())
-}
-
-/// `value` as a pane key: a tmux pane id (`%` and digits), trimmed, else
-/// `None`. Nothing else is carried on the line, so a variable set to junk
-/// cannot aim a delivery.
-fn pane_key_value(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    let digits = value.strip_prefix('%')?;
-    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| value.to_string())
-}
-
 fn current_tmux_identity() -> Option<(String, String)> {
     let pane = std::env::var_os("TMUX_PANE").filter(|value| !value.is_empty())?;
     let tmux = std::ffi::OsString::from("tmux");
@@ -2667,7 +2649,6 @@ fn build_event_line_for_agent(
         "parent": parent,
         "tmux_target": tmux_target,
         "process_start_fingerprint": process_start_fingerprint,
-        "pane_key": pane_key_from_env(),
         "payload": payload_val,
         "raw_payload_ref": raw_payload_stored.then_some(event_id),
     })
@@ -2756,19 +2737,6 @@ This is ATC's durable, human-readable memory. Append one dated line per action\n
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    /// Only a tmux pane id rides on the line as the pane key: anything else
-    /// in the variable is dropped rather than aimed at.
-    #[test]
-    fn the_pane_key_is_a_pane_id_or_nothing() {
-        assert_eq!(pane_key_value(Some("%12")), Some("%12".to_string()));
-        assert_eq!(pane_key_value(Some(" %3 ")), Some("%3".to_string()));
-        assert_eq!(pane_key_value(Some("")), None);
-        assert_eq!(pane_key_value(Some("12")), None);
-        assert_eq!(pane_key_value(Some("%")), None);
-        assert_eq!(pane_key_value(Some("%1a")), None);
-        assert_eq!(pane_key_value(None), None);
-    }
 
     /// A minimal idle needs row for the given session id.
     fn needs_row(session_id: &str) -> NeedsRow {
