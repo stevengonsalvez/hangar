@@ -25,3 +25,6 @@ wezterm-escape-parser = { package = "tattoy-wezterm-escape-parser", version = "=
 # Grapheme boundaries for the held trailing cluster. Already in the lock file
 # through the fork's dependencies: no new lock entry.
 unicode-segmentation = "1"
+
+[dev-dependencies]
+proptest = { workspace = true }
