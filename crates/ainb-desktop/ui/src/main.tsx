@@ -171,14 +171,18 @@ function Shell() {
     }
   };
   /**
-   * How many tab-strip answers the host has given so far, on the strip as
-   * `data-host-answers`: the host answers a tab open on its own schedule, and
+   * How many tab-strip answers the host has given so far, and which tab the
+   * last one focused, on the strip as `data-host-answers` and
+   * `data-host-focus`: the host answers a tab open on its own schedule, and
    * a driven run that must act after that answer (not before, not a guessed
-   * second later) has nothing else to read it from.
+   * second later, not on a strip tidy-up that focused nothing) has nothing
+   * else to read it from.
    */
   const [hostAnswers, setHostAnswers] = createSignal(0);
+  const [hostFocus, setHostFocus] = createSignal("");
   const showTabs = (view: TabsView) => {
     setHostAnswers((n) => n + 1);
+    setHostFocus(view.focus ?? "");
     setTabs(view.tabs);
     for (const key of focusers.keys()) {
       if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
@@ -530,7 +534,7 @@ function Shell() {
           ref={(element) => (sidebar = element)}
         />
         <section class="workarea">
-          <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()}>
+          <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
             <span class="tab board-tab" classList={{ active: showing("board") }}>
               <button
                 type="button"
