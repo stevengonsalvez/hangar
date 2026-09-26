@@ -210,7 +210,12 @@ pub enum LspError {
     NoTerminator,
     /// A header line without `name: value`, or not UTF-8.
     MalformedHeader,
-    /// A header other than `Content-Length`.
+    /// A header line holding a bare CR or LF: every header line ends with
+    /// exactly one `\r\n` and holds no other line break.
+    StrayLineBreak,
+    /// A header other than `Content-Length`. The text is the peer's header
+    /// name, truncated to [`PEER_TEXT_MAX`] characters and escaped, so it is
+    /// safe to log.
     UnsupportedHeader(String),
     /// `Content-Length` given twice.
     DuplicateContentLength,
@@ -232,6 +237,7 @@ impl std::fmt::Display for LspError {
         match self {
             Self::NoTerminator => f.write_str("no LSP header terminator"),
             Self::MalformedHeader => f.write_str("malformed frame header"),
+            Self::StrayLineBreak => f.write_str("frame header line holds a bare CR or LF"),
             Self::UnsupportedHeader(name) => write!(f, "unsupported frame header: {name}"),
             Self::DuplicateContentLength => f.write_str("duplicate Content-Length header"),
             Self::ContentLength => {
@@ -252,6 +258,19 @@ impl std::fmt::Display for LspError {
 
 impl std::error::Error for LspError {}
 
+/// The most characters of peer-supplied text an error keeps.
+pub const PEER_TEXT_MAX: usize = 32;
+
+/// Peer text made safe to log: at most [`PEER_TEXT_MAX`] characters, each
+/// escaped (`\n`, `\u{1b}`, quotes), with `...` when it was cut.
+fn peer_text(text: &str) -> String {
+    let mut out: String = text.chars().take(PEER_TEXT_MAX).flat_map(char::escape_default).collect();
+    if text.chars().nth(PEER_TEXT_MAX).is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Frame `body` the way the unix leg does: `Content-Length: N\r\n\r\n` + body.
 #[must_use]
 pub fn lsp_encode(body: &[u8]) -> Vec<u8> {
@@ -261,7 +280,8 @@ pub fn lsp_encode(body: &[u8]) -> Vec<u8> {
 }
 
 /// The body of one whole LSP-framed message, as strict as the unix leg's
-/// `read_frame`: `\r\n` line ends, `Content-Length` as the only header and
+/// `read_frame`, and stricter where that one trims: `\r\n` line ends with no
+/// bare CR or LF inside a header line, `Content-Length` as the only header and
 /// given once, an unsigned decimal value no larger than [`MAX_REASSEMBLED`],
 /// and exactly that many body bytes (the message is whole, so a trailing byte
 /// is refused too).
@@ -273,9 +293,14 @@ pub fn lsp_body(message: &[u8]) -> Result<&[u8], LspError> {
     let headers = std::str::from_utf8(&message[..split]).map_err(|_| LspError::MalformedHeader)?;
     let mut declared = None;
     for line in headers.split("\r\n") {
+        // A CR or LF left inside a line is a second line ending the split did
+        // not see; `trim` below would otherwise swallow it.
+        if line.bytes().any(|b| b == b'\r' || b == b'\n') {
+            return Err(LspError::StrayLineBreak);
+        }
         let (name, value) = line.split_once(':').ok_or(LspError::MalformedHeader)?;
         if !name.trim().eq_ignore_ascii_case("content-length") {
-            return Err(LspError::UnsupportedHeader(name.trim().to_string()));
+            return Err(LspError::UnsupportedHeader(peer_text(name.trim())));
         }
         if declared.is_some() {
             return Err(LspError::DuplicateContentLength);
@@ -464,5 +489,40 @@ mod tests {
         let mut small = Reassembler::with_cap(MAX_REASSEMBLED * 2);
         small.authenticated();
         assert_eq!(small.cap(), MAX_REASSEMBLED * 2, "never lowers a cap");
+    }
+
+    /// F1: a bare CR or LF inside a header line is refused, not trimmed
+    /// away. Each of these was accepted before.
+    #[test]
+    fn a_header_line_with_a_bare_cr_or_lf_is_refused() {
+        let probes: [&[u8]; 4] = [
+            b"Content-Length: 2\n\r\n\r\nab",
+            b"Content-Length: 2\r\r\n\r\nab",
+            b"Content-Length:\n2\r\n\r\nab",
+            b"Content-Length\r: 2\r\n\r\nab",
+        ];
+        for probe in probes {
+            assert_eq!(
+                lsp_body(probe),
+                Err(LspError::StrayLineBreak),
+                "{}",
+                String::from_utf8_lossy(probe).escape_default()
+            );
+        }
+    }
+
+    /// F4: the peer's header name reaches an error truncated and escaped.
+    #[test]
+    fn an_unsupported_header_is_truncated_and_escaped() {
+        let long = format!("X-{}: 1\r\n\r\n", "a".repeat(200));
+        let Err(LspError::UnsupportedHeader(text)) = lsp_body(long.as_bytes()) else {
+            panic!("refused as unsupported");
+        };
+        assert_eq!(text, format!("X-{}...", "a".repeat(PEER_TEXT_MAX - 2)));
+        let Err(LspError::UnsupportedHeader(text)) = lsp_body(b"X\x1b[31m\t\"y: 1\r\n\r\n") else {
+            panic!("refused as unsupported");
+        };
+        assert_eq!(text, "X\\u{1b}[31m\\t\\\"y");
+        assert!(!text.contains('\u{1b}'), "no raw escape reaches a log line");
     }
 }
