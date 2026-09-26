@@ -68,7 +68,8 @@ export default function Session() {
     guarded(async () => {
       if (!hostId || !key || !row) return;
       interruptOp.current ??= await wire.mintOpId();
-      const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation, opId: interruptOp.current });
+      // the version of the row the user saw: a stale view is refused, never a null on the wire
+      const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation, version: row.version, opId: interruptOp.current });
       interruptOp.current = undefined;
       setNotice(ack.status === "accepted" ? "Interrupted" : `Not interrupted: ${ack.reason ?? ack.status}`);
     });
