@@ -37,6 +37,11 @@ base64 = "0.22"
 sha2 = "0.10"
 uniffi = "0.31"
 
+# iOS only: the Keychain backend. `cargo check` for the iOS targets covers it
+# from any host; a run needs a simulator or a phone.
+[target.'cfg(target_os = "ios")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
