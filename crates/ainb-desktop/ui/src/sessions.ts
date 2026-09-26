@@ -68,6 +68,14 @@ export function allSessions(view: SessionsView_Serialize | undefined): Session_S
   return view?.workspaces.flatMap((workspace) => workspace.sessions) ?? [];
 }
 
+/** The provider session id inside a `provider:session-id` key: `board.ts`'s
+ * join, `status.ts`'s join, and nowhere else, so a third copy never drifts
+ * from the other two. */
+export function providerId(sessionKey: string): string {
+  const at = sessionKey.indexOf(":");
+  return at < 0 ? sessionKey : sessionKey.slice(at + 1);
+}
+
 /**
  * Whether `sessionId` is the session list's selected row.
  *
