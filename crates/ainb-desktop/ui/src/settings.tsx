@@ -48,6 +48,14 @@ interface Props {
  * itself. The page keeps no selection: a click names a node or a row and the
  * reducer moves. The DOM half of parity renders this component.
  */
+/**
+ * The OpenTelemetry setup's draft, kept outside the page: the page is drawn
+ * while the reducer is on its Config screen and unmounted the moment it
+ * leaves, which the answer banner's pick does on its own (#121), and three
+ * pasted values are not typed twice.
+ */
+const [otel, setOtel] = createSignal({ otlp_endpoint: "", instance_id: "", api_token: "" });
+
 export function SettingsPage(props: Props) {
   const tree = createMemo(() => settingsTree(props.config));
   const rows = createMemo(() => settingsRows(props.config));
@@ -65,8 +73,6 @@ export function SettingsPage(props: Props) {
   const daemonKeys = createMemo(() => daemonList().keys, [], { equals: sameKeys });
   const hooks = createMemo(() => hookHealthLines(props.hangar));
   const collected = createMemo(() => daemonsCollectedAt(props.hangar));
-  const [otel, setOtel] = createSignal({ otlp_endpoint: "", instance_id: "", api_token: "" });
-
   const edit = (row: SettingsRow, input: string | number | boolean) => {
     const intent = rowEdit(row, input, props.revision);
     if (intent) props.run([intent]);
