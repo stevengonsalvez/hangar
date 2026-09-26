@@ -278,6 +278,104 @@ impl From<FleetSubscribeResult> for FleetSubscribeSummary {
     }
 }
 
+/// The most characters any hook-written text keeps; the payload is whatever
+/// a hook wrote, so it is bounded here, where it is parsed.
+const MAX_PAYLOAD_TEXT_CHARS: usize = 512;
+/// The most options a sheet offers, for the same reason.
+const MAX_PAYLOAD_OPTIONS: usize = 16;
+
+fn bounded(text: &str) -> String {
+    text.chars().take(MAX_PAYLOAD_TEXT_CHARS).collect()
+}
+
+/// One option an ASK offers.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AttentionOptionRecord {
+    /// The label the user picks; delivered as the answer text.
+    pub label: String,
+    /// The option's own explanation, or empty.
+    pub description: String,
+}
+
+/// The attention payload, decoded: every producer nests it differently, so
+/// this walks the shapes the TUI walks (`NeedsContext`, Claude
+/// `AskUserQuestion`, the web card, approval prose, an ATC escalation) and
+/// gives up rather than inventing a line. A row with no question renders as
+/// its kind alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
+pub struct AttentionPayload {
+    /// The one-line question, when the payload says one.
+    pub question: Option<String>,
+    /// The structured options, empty for free text.
+    pub options: Vec<AttentionOptionRecord>,
+    /// Free text beside the question (`text`), when any.
+    pub text: Option<String>,
+    /// Approval or notification prose (`message`), when any.
+    pub message: Option<String>,
+}
+
+impl AttentionPayload {
+    /// Decode the stored payload JSON. A payload that is not JSON, or JSON
+    /// that names none of the known fields, is the empty payload.
+    #[must_use]
+    pub fn parse(raw: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return Self::default();
+        };
+        let first = |paths: &[&str]| {
+            paths
+                .iter()
+                .find_map(|p| value.pointer(p).and_then(serde_json::Value::as_str))
+                .map(|s| bounded(s.trim()))
+                .filter(|s| !s.is_empty())
+        };
+        let options = [
+            "/context/options",
+            "/tool_input/questions/0/options",
+            "/payload/tool_input/questions/0/options",
+            "/options",
+        ]
+        .iter()
+        .find_map(|p| value.pointer(p).and_then(serde_json::Value::as_array))
+        .map(|options| {
+            options
+                .iter()
+                .take(MAX_PAYLOAD_OPTIONS)
+                .filter_map(|o| {
+                    if let Some(label) = o.as_str() {
+                        return Some(AttentionOptionRecord {
+                            label: bounded(label),
+                            description: String::new(),
+                        });
+                    }
+                    let label = o.get("label").and_then(serde_json::Value::as_str)?;
+                    Some(AttentionOptionRecord {
+                        label: bounded(label),
+                        description: bounded(
+                            o.get("description")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                        ),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+        Self {
+            question: first(&[
+                "/context/question",
+                "/tool_input/questions/0/question",
+                "/payload/tool_input/questions/0/question",
+                "/question",
+                "/reason",
+            ]),
+            options,
+            text: first(&["/context/text", "/text"]),
+            message: first(&["/message", "/payload/message"]),
+        }
+    }
+}
+
 /// One open attention row.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AttentionRecord {
@@ -291,8 +389,8 @@ pub struct AttentionRecord {
     pub kind: String,
     /// The `AttentionVersion` fence for the answer.
     pub version: i64,
-    /// The request-context JSON the sheet renders.
-    pub payload: String,
+    /// The request context, decoded.
+    pub payload: AttentionPayload,
     /// Whether the row came from the degraded pane classifier.
     pub degraded: bool,
     /// Ingest time, epoch ms.
@@ -307,7 +405,7 @@ impl From<AttentionRow> for AttentionRecord {
             workspace_id: r.workspace_id,
             kind: r.kind,
             version: r.version,
-            payload: r.payload,
+            payload: AttentionPayload::parse(&r.payload),
             degraded: r.degraded,
             created_at: r.created_at,
         }
@@ -580,6 +678,48 @@ impl WireEvent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn payloads_decode_every_known_shape_and_give_up_honestly() {
+        let needs = AttentionPayload::parse(
+            &json!({"kind": "ASK", "context": {"question": " deploy? ", "options": [
+                {"label": "yes", "description": "ship it"}, {"label": "no"}]}})
+            .to_string(),
+        );
+        assert_eq!(needs.question.as_deref(), Some("deploy?"));
+        assert_eq!(needs.options.len(), 2);
+        assert_eq!(needs.options[0].description, "ship it");
+        assert_eq!(needs.options[1].description, "");
+        let claude = AttentionPayload::parse(
+            &json!({"tool_input": {"questions": [{"question": "which?", "options": [{"label": "a"}]}]}})
+                .to_string(),
+        );
+        assert_eq!(claude.question.as_deref(), Some("which?"));
+        assert_eq!(claude.options[0].label, "a");
+        let web = AttentionPayload::parse(
+            &json!({"question": "pick", "options": ["one", "two"], "text": "free"}).to_string(),
+        );
+        assert_eq!(
+            web.options.iter().map(|o| o.label.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(web.text.as_deref(), Some("free"));
+        let approval = AttentionPayload::parse(&json!({"message": "allow rm -rf?"}).to_string());
+        assert_eq!(approval.message.as_deref(), Some("allow rm -rf?"));
+        assert_eq!(approval.question, None);
+        assert_eq!(
+            AttentionPayload::parse("not json"),
+            AttentionPayload::default()
+        );
+        let long = "x".repeat(2_000);
+        let bounded = AttentionPayload::parse(&json!({"question": long}).to_string());
+        assert_eq!(bounded.question.unwrap().len(), MAX_PAYLOAD_TEXT_CHARS);
+        let many: Vec<String> = (0..40).map(|i| i.to_string()).collect();
+        assert_eq!(
+            AttentionPayload::parse(&json!({"options": many}).to_string()).options.len(),
+            MAX_PAYLOAD_OPTIONS
+        );
+    }
 
     #[test]
     fn hello_maps_scope_and_legacy_protocol() {
