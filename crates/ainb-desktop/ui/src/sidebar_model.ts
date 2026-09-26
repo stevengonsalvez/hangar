@@ -54,23 +54,27 @@ export interface ProjectGroup {
   cards: WorktreeCard[];
 }
 
-/** `session.last_accessed` as epoch millis, or `-Infinity` when it is missing
- * or unparsable: sorts to the bottom of "recent first" rather than throwing,
- * which is what "unknown fields tolerated" means for a timestamp. */
-function accessedAt(session: Session_Serialize): number {
-  const parsed = Date.parse(session.last_accessed ?? "");
+/** `session.created_at` as epoch millis, or `-Infinity` when it is missing
+ * or unparsable: sorts to the bottom of "newest first" rather than throwing,
+ * which is what "unknown fields tolerated" means for a timestamp.
+ *
+ * Creation, not `last_accessed`: opening a session touches its access time,
+ * so sorting by it would move the card under the pointer that just clicked
+ * it. A card's place changes only when a newer worktree appears. */
+function createdAt(session: Session_Serialize): number {
+  const parsed = Date.parse(session.created_at ?? "");
   return Number.isNaN(parsed) ? -Infinity : parsed;
 }
 
 /** The session a card's title, branch, git counts and model come from: the
- * most recently accessed of the sessions sharing the worktree. A tie, or
- * every session missing the field, keeps the first (`Array.prototype.sort`
- * is stable, so ties never reorder the frame's own order either). */
+ * newest of the sessions sharing the worktree. A tie, or every session
+ * missing the field, keeps the first, so ties never reorder the frame's own
+ * order either. */
 function primaryOf(sessions: readonly Session_Serialize[]): Session_Serialize {
   let primary = sessions[0];
-  let primaryAt = accessedAt(primary);
+  let primaryAt = createdAt(primary);
   for (const session of sessions.slice(1)) {
-    const at = accessedAt(session);
+    const at = createdAt(session);
     if (at > primaryAt) {
       primary = session;
       primaryAt = at;
@@ -79,10 +83,10 @@ function primaryOf(sessions: readonly Session_Serialize[]): Session_Serialize {
   return primary;
 }
 
-/** The newest `accessedAt` among `sessions`, for the group's own sort: a card
- * moves up the moment any of its sessions does. */
-function newestAccessed(sessions: readonly Session_Serialize[]): number {
-  return sessions.reduce((newest, session) => Math.max(newest, accessedAt(session)), -Infinity);
+/** The newest `createdAt` among `sessions`, for the group's own sort: a card
+ * moves up when a session is added to its worktree. */
+function newestCreated(sessions: readonly Session_Serialize[]): number {
+  return sessions.reduce((newest, session) => Math.max(newest, createdAt(session)), -Infinity);
 }
 
 function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
@@ -100,8 +104,7 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
 }
 
 /**
- * `sessions` folded into one card per worktree path, most recently accessed
- * card first. `fallbackPath` is the project's own path, for a session that
+ * `sessions` folded into one card per worktree path, newest card first. `fallbackPath` is the project's own path, for a session that
  * carries no `workspace_path` of its own (an older host, a test fixture):
  * every such session in one project folds into the SAME card rather than
  * one each, which is the closest a missing field can get to the real shape.
@@ -116,7 +119,7 @@ export function worktreeCards(sessions: readonly Session_Serialize[], fallbackPa
   }
   return [...byPath.entries()]
     .map(([key, group]) => cardFor(key, group))
-    .sort((a, b) => newestAccessed(b.sessions) - newestAccessed(a.sessions));
+    .sort((a, b) => newestCreated(b.sessions) - newestCreated(a.sessions));
 }
 
 /**
@@ -172,11 +175,12 @@ export interface SidebarStorage {
   setItem(key: string, value: string): void;
 }
 
-/** The localStorage key holding which project names are collapsed. */
+/** The localStorage key holding which project paths are collapsed. */
 export const COLLAPSED_KEY = "ainb.sidebar.collapsed";
 
 /**
- * Which project names are collapsed, from storage; empty when storage is
+ * Which project paths are collapsed, from storage (a path, not a name: two
+ * repositories can share a directory name); empty when storage is
  * absent, throws (a private window, blocked site data), or holds something
  * that is not the array this module wrote.
  */
@@ -191,7 +195,7 @@ export function readCollapsed(storage: SidebarStorage | undefined): ReadonlySet<
   }
 }
 
-/** Store which project names are collapsed; a storage that throws only loses
+/** Store which project paths are collapsed; a storage that throws only loses
  * the memory of it for this window's life. */
 export function writeCollapsed(storage: SidebarStorage | undefined, collapsed: ReadonlySet<string>): void {
   try {
