@@ -26,8 +26,8 @@ interface Live {
   /** We asked for this close ourselves (background, or the race guard): its `closed` event never redials. */
   closing: boolean;
   attempts: number;
-  /** The host's `retry-after`, kept for every redial of this outage. */
-  retryAfter?: number;
+  /** The host's `retry_after_ms`, kept for every redial of this outage. */
+  retryAfterMs?: number;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -39,21 +39,17 @@ let chain: Promise<void> = Promise.resolve();
 let generation = 0;
 let foreground = true;
 
-/** Close codes worth redialing through (T9). Undefined is a plain network drop. */
-const RETRYABLE = new Set([1013, 4429, 4503]);
 
 /**
- * Fail-closed: only an explicit network failure, or a peer close with one of
- * the three retryable codes, is redialled. A plain error, an unknown object,
- * a key mismatch, a custody or protocol failure all stop the loop.
+ * Fail-closed, and the verdict is the crate's: only a failure the crate marks
+ * `retryable` is redialled (a network loss, a `Closed` with no code, or a
+ * coded close it judged retryable). Anything else, including a plain error or
+ * a non-error, stops the loop.
  */
 export function mayRedial(e: unknown): boolean {
-  if (!isPeerCloseError(e)) return false;
-  if (e.kind === "network") return true;
-  return e.kind === "close" && e.code !== undefined && RETRYABLE.has(e.code);
+  return isPeerCloseError(e) && e.retryable === true;
 }
 const HOOK_BUDGET_MS = 500;
-const RETRY_AFTER_PREFIX = "retry-after=";
 
 /** Something that must let go before the socket does (the terminal stream). */
 export function beforeBackground(cb: () => Promise<void> | void) {
@@ -65,15 +61,6 @@ export function beforeBackground(cb: () => Promise<void> | void) {
 export function afterForeground(cb: () => Promise<void> | void) {
   onForeground.add(cb);
   return () => onForeground.delete(cb);
-}
-
-/** The `<s>` of a `retry-after=<s>` close reason (peer_close.rs), if present. */
-export function retryAfterSecs(reason: string | undefined): number | undefined {
-  if (!reason) return undefined;
-  const at = reason.indexOf(RETRY_AFTER_PREFIX);
-  if (at < 0) return undefined;
-  const n = Number.parseInt(reason.slice(at + RETRY_AFTER_PREFIX.length), 10);
-  return Number.isFinite(n) && n >= 0 ? n : undefined;
 }
 
 function entry(hostId: HostId): Live {
@@ -105,7 +92,7 @@ export function connectHost(wire: WireClient, hostId: HostId): Promise<FleetCurs
       l.cursor = cursor.revision;
       l.replay = cursor.replayState;
       l.attempts = 0;
-      l.retryAfter = undefined;
+      l.retryAfterMs = undefined;
       await reconcile(wire, hostId);
       if (!foreground || myGeneration !== generation) {
         // A background began while we were dialling: DV3 says no socket stays open.
@@ -139,11 +126,11 @@ function scheduleRedial(wire: WireClient, hostId: HostId) {
     if (!foreground) return;
     connectHost(wire, hostId).catch((e: unknown) => {
       if (!mayRedial(e)) return; // 4401, 4403, 4409 or an unknown code: the row shows the latch, no more dials
-      if (isPeerCloseError(e)) l.retryAfter = retryAfterSecs(e.reason) ?? l.retryAfter;
+      if (isPeerCloseError(e)) l.retryAfterMs = e.retryAfterMs ?? l.retryAfterMs;
       l.attempts += 1;
       scheduleRedial(wire, hostId); // the host's retry-after still applies
     });
-  }, wire.backoffDelayMs(l.attempts, l.retryAfter));
+  }, wire.backoffDelayMs(l.attempts, l.retryAfterMs));
 }
 
 /** Connect every paired host that is not latched (revoked, identity, parked); a failed dial enters the redial loop. */
@@ -208,8 +195,8 @@ export function noteRevision(hostId: HostId, revision: number) {
   if (l && revision > (l.cursor ?? -1)) l.cursor = revision;
 }
 
-/** The socket went away while foregrounded: redial when the code allows it. */
-function onClosed(wire: WireClient, hostId: HostId, code: number | undefined, reason: string | undefined) {
+/** The socket went away while foregrounded: redial when the crate says the close was retryable. */
+function onClosed(wire: WireClient, hostId: HostId, retryable: boolean, retryAfterMs: number | undefined) {
   const l = entry(hostId);
   l.connected = false;
   if (l.timer) clearTimeout(l.timer);
@@ -220,9 +207,9 @@ function onClosed(wire: WireClient, hostId: HostId, code: number | undefined, re
     return;
   }
   if (!foreground) return;
-  if (code !== undefined && !RETRYABLE.has(code)) return;
-  l.retryAfter = retryAfterSecs(reason) ?? l.retryAfter;
-  scheduleRedial(wire, hostId); // attempt 0 waits 1 s (or retry-after); each failure doubles it
+  if (!retryable) return;
+  l.retryAfterMs = retryAfterMs ?? l.retryAfterMs;
+  scheduleRedial(wire, hostId); // attempt 0 waits 1 s (or retry_after_ms); each failure doubles it
 }
 
 /** A lag or a resync: subscribe again, from the cursor or from a snapshot. */
@@ -257,7 +244,7 @@ export function useLifecycle(wire: WireClient) {
     const sub = AppState.addEventListener("change", (next) => void onAppState(wire, next));
     const off = wire.onEvent((ev) => {
       if (ev.kind === "fleet_revision") noteRevision(ev.hostId, ev.revision);
-      else if (ev.kind === "closed") onClosed(wire, ev.hostId, ev.code, ev.reason);
+      else if (ev.kind === "closed") onClosed(wire, ev.hostId, ev.retryable, ev.retryAfterMs);
       else if (ev.kind === "lagged") void resubscribe(wire, ev.hostId, false);
       else if (ev.kind === "fleet_resync_required") void resubscribe(wire, ev.hostId, true);
     });
