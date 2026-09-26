@@ -7,8 +7,9 @@
 //! The listener drains its connection tasks, and boot awaits that drain before
 //! returning, which is what lets the 4503 win the race with exit.
 //!
-//! Real binary, isolated home: `HOME` is a temporary directory and the home
-//! overrides are removed, so nothing touches the operator's fleet. Turning the
+//! Real binary, isolated home: `HOME` is a temporary directory and the
+//! Hangar home is set explicitly inside it (`AINB_HANGAR_HOME`), so nothing
+//! touches the operator's fleet. Turning the
 //! leg on makes the daemon load its host key, and `load_or_mint` asks the
 //! platform keychain (the operator's real one on macOS) only when the 0600 key
 //! file is absent. The test seeds that file first, so the keychain is never
@@ -46,10 +47,12 @@ fn free_loopback_port() -> SocketAddr {
     probe.local_addr().expect("probe addr")
 }
 
-/// Write the host key the daemon will find before it asks any keychain:
-/// `{hangar_home}/hangar/host_static.key`, 32 raw bytes, mode 0600.
+/// Write the host key the daemon will find before it asks any keychain, at
+/// the path the daemon itself resolves (`host_key_file_in`), 32 raw
+/// bytes, mode 0600. Resolved, not spelled out here, so a change to that path
+/// moves the seed with it instead of leaving the daemon to reach a keychain.
 fn seed_host_key(hangar_home: &Path, secret: &[u8; 32]) -> std::path::PathBuf {
-    let file = hangar_home.join("hangar").join("host_static.key");
+    let file = ainb_hangar_daemon::host_key_file_in(hangar_home);
     std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
     std::fs::OpenOptions::new()
         .write(true)
@@ -64,7 +67,8 @@ fn seed_host_key(hangar_home: &Path, secret: &[u8; 32]) -> std::path::PathBuf {
 #[tokio::test]
 async fn sigterm_closes_open_peer_sockets_4503_before_exit() {
     let home = tempfile::tempdir().expect("home");
-    let hangar_home = home.path().join(".agents-in-a-box");
+    // Named explicitly for the child below, never derived from `HOME`.
+    let hangar_home = home.path().join("hangar-home");
 
     // The host id the device routes to, minted ahead so the test knows it
     // (the daemon reads the same row back), and the host key, seeded.
@@ -86,7 +90,7 @@ async fn sigterm_closes_open_peer_sockets_4503_before_exit() {
     let mut daemon = Daemon(
         Command::new(env!("CARGO_BIN_EXE_ainb-hangar-daemon"))
             .env("HOME", home.path())
-            .env_remove("AINB_HANGAR_HOME")
+            .env(ainb_hangar_core::paths::HANGAR_HOME_ENV, &hangar_home)
             .env_remove("AINB_HOME")
             .env("HANGAR_TEST_PARENT_PID", std::process::id().to_string())
             .env("HANGAR_DAEMON_DISABLE_CLAIM", "1")

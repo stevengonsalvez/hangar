@@ -139,6 +139,11 @@ pub mod host_identity;
 /// The host's Noise static key for the peer leg (R1-02): minted once, kept in
 /// the keychain or a `0600` file, made only when the peer leg is switched on.
 mod host_key;
+/// Where the peer leg's `0600` host key file lives inside a Hangar home.
+/// Re-exported alone, for tests that seed the key before the daemon boots;
+/// the rest of the key custody stays private.
+#[doc(hidden)]
+pub use host_key::key_file_in as host_key_file_in;
 /// The inbox aggregator: the writer that turns the live event stream into the
 /// durable notification inbox (e38.14).
 ///
