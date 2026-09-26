@@ -98,6 +98,7 @@ export class FakeWire implements WireClient {
     const hostId = row.hostId ?? HOST_A;
     const host = this.host(hostId);
     const full: AttentionRow = { ...row, hostId };
+    if (host.attention.has(full.id)) return full; // the same row twice is one event
     host.attention.set(full.id, full);
     host.revision += 1;
     if (host.connected) this.emit({ kind: "attention_raised", row: full });
