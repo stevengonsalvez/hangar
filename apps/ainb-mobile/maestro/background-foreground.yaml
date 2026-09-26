@@ -1,28 +1,40 @@
-# M1-09 / M1-14 step 4: background, events land, foreground shows the new
-# banner once and the cursor is at head.
-#
-# FakeWire build: the fake cannot be driven from outside the process, so this
-# flow proves the app side only: a background then foreground leaves the seen
-# banner unshown and the session list intact. The real run (M1-14) commits 20
-# fleet events plus 1 ASK through the scenario script while the app is in the
-# background, then asserts the new banner appears exactly once.
+# M1-09 / M1-14 step 4: a real background (Home), then foreground, on the
+# same process: the banner already shown is not shown again and the host's
+# sessions are still there. The real run (M1-14) commits 20 fleet events plus
+# 1 ASK through the scenario script during the WAIT below and then asserts the
+# new banner once; pass NEW_ATTENTION_ID to enable that assertion.
+#   HOST_ID, SESSION_NAME, ATTENTION_ID, QUESTION: see banner-answer.yaml
 appId: com.stevengonsalvez.ainb.mobile
+env:
+  NEW_ATTENTION_ID: ""
+  WAIT_MS: "3000"
 ---
 - launchApp:
     clearState: true
 - assertVisible:
-    text: "Which runner do you mean?"
+    text: ${QUESTION}
 - tapOn:
-    id: "banner-att-1"
+    id: "banner-${ATTENTION_ID}"
 - tapOn:
     id: "answer-cancel"
 - tapOn:
-    id: "host-01K5A0000000000000000AAAAA"
+    id: "host-${HOST_ID}"
 - assertVisible:
-    text: "hangar"
-- stopApp
-- launchApp
+    text: ${SESSION_NAME}
+# background: Home, not a kill
+- pressKey: Home
+- waitForAnimationToEnd:
+    timeout: ${WAIT_MS}
+# foreground: same process, no clearState
+- launchApp:
+    stopApp: false
 - assertVisible:
-    text: "hangar"
+    text: ${SESSION_NAME}
 - assertVisible:
-    id: "banner-att-1"
+    id: "banner-${ATTENTION_ID}"
+- runFlow:
+    when:
+      true: ${NEW_ATTENTION_ID != ""}
+    commands:
+      - assertVisible:
+          id: "banner-${NEW_ATTENTION_ID}"
