@@ -120,6 +120,8 @@ pub struct SessionRow {
     pub codex_model: Option<String>,
     /// Shared Codex app-server remote thread ID.
     pub codex_thread_id: Option<String>,
+    /// The session id ainb minted for a Claude launch (`claude --session-id`).
+    pub claude_session_id: Option<String>,
 }
 
 impl SessionRow {
@@ -142,6 +144,7 @@ impl SessionRow {
             model_source: row.get("model_source"),
             codex_model: row.get("codex_model"),
             codex_thread_id: row.get("codex_thread_id"),
+            claude_session_id: row.get("claude_session_id"),
         }
     }
 }
@@ -164,7 +167,7 @@ impl SessionsRepo {
             sqlx::query(
                 "SELECT session_id, tmux_session_name, worktree_path, workspace_name, \
                  created_at, agent_type, headroom_enabled, rtk_enabled, skip_permissions, \
-                 model, model_source, codex_model, codex_thread_id \
+                 model, model_source, codex_model, codex_thread_id, claude_session_id \
                  FROM sessions WHERE workspace_name = ? \
                  ORDER BY created_at DESC, session_id LIMIT ?",
             )
@@ -176,7 +179,7 @@ impl SessionsRepo {
             sqlx::query(
                 "SELECT session_id, tmux_session_name, worktree_path, workspace_name, \
                  created_at, agent_type, headroom_enabled, rtk_enabled, skip_permissions, \
-                 model, model_source, codex_model, codex_thread_id \
+                 model, model_source, codex_model, codex_thread_id, claude_session_id \
                  FROM sessions ORDER BY created_at DESC, session_id LIMIT ?",
             )
             .bind(i64::from(limit))
@@ -195,7 +198,7 @@ impl SessionsRepo {
         let row = sqlx::query(
             "SELECT session_id, tmux_session_name, worktree_path, workspace_name, \
              created_at, agent_type, headroom_enabled, rtk_enabled, skip_permissions, \
-             model, model_source, codex_model, codex_thread_id \
+             model, model_source, codex_model, codex_thread_id, claude_session_id \
              FROM sessions WHERE session_id = ?",
         )
         .bind(session_id)
@@ -213,7 +216,7 @@ impl SessionsRepo {
         let row = sqlx::query(
             "SELECT session_id, tmux_session_name, worktree_path, workspace_name, \
              created_at, agent_type, headroom_enabled, rtk_enabled, skip_permissions, \
-             model, model_source, codex_model, codex_thread_id \
+             model, model_source, codex_model, codex_thread_id, claude_session_id \
              FROM sessions WHERE tmux_session_name = ?",
         )
         .bind(tmux_name)
@@ -264,8 +267,9 @@ impl SessionsRepo {
             "INSERT INTO sessions ( \
              session_id, tmux_session_name, worktree_path, workspace_name, \
              created_at, agent_type, headroom_enabled, rtk_enabled, \
-             skip_permissions, model, model_source, codex_model, codex_thread_id \
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             skip_permissions, model, model_source, codex_model, codex_thread_id, \
+             claude_session_id \
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(session_id) DO UPDATE SET \
              tmux_session_name = excluded.tmux_session_name, \
              worktree_path = excluded.worktree_path, \
@@ -278,7 +282,8 @@ impl SessionsRepo {
              model = excluded.model, \
              model_source = excluded.model_source, \
              codex_model = excluded.codex_model, \
-             codex_thread_id = excluded.codex_thread_id",
+             codex_thread_id = excluded.codex_thread_id, \
+             claude_session_id = COALESCE(excluded.claude_session_id, sessions.claude_session_id)",
         )
         .bind(&session.session_id)
         .bind(&session.tmux_session_name)
@@ -293,6 +298,7 @@ impl SessionsRepo {
         .bind(&session.model_source)
         .bind(&session.codex_model)
         .bind(&session.codex_thread_id)
+        .bind(&session.claude_session_id)
         .execute(&mut *conn)
         .await?;
 

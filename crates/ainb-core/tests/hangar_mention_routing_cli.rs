@@ -133,6 +133,40 @@ fn mentioning_a_human_notifies_them_and_never_spawns_a_run() {
     );
 }
 
+/// An issue created or assigned from the CLI reaches the local human's inbox
+/// (#49): the daemon's own create announces itself on its event stream and its
+/// aggregator writes the row, and the CLI, which writes the store directly,
+/// has to land the same row itself.
+#[test]
+fn creating_and_assigning_an_issue_from_the_cli_lands_in_the_inbox() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let h = home.path();
+
+    let issue = created_id(&ainb(
+        h,
+        &["hangar", "issue", "create", "--title", "inbox demo"],
+    ));
+    // The default recipient is the local human, `member:me`, which is what
+    // the desktop's inbox reads.
+    let inbox = ainb(h, &["hangar", "inbox", "list", "--format", "json"]);
+    let entries = rows(&inbox);
+    assert_eq!(entries.len(), 1, "the create landed one entry: {inbox}");
+    assert_eq!(field(&entries[0], "event"), "issue_created", "{inbox}");
+    assert_eq!(field(&entries[0], "subject_id"), issue, "{inbox}");
+
+    ainb(
+        h,
+        &["hangar", "issue", "update", &issue, "--assign", "member:me"],
+    );
+    let inbox = ainb(h, &["hangar", "inbox", "list", "--format", "json"]);
+    let events: Vec<String> =
+        rows(&inbox).iter().map(|row| field(row, "event").to_string()).collect();
+    assert!(
+        events.iter().any(|event| event == "issue_updated"),
+        "the assignment landed an entry: {inbox}"
+    );
+}
+
 /// **ACCEPTANCE 2** — a repeat mention SURFACES as `coalesced` instead of
 /// disappearing into a swallowed unique-constraint violation.
 #[test]
