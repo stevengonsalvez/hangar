@@ -113,7 +113,7 @@ static OPENAI_KEY: LazyLock<Regex> = LazyLock::new(|| {
 /// name so a scrubbed `.env` line still says what was there.
 static AWS_SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-    r#"((?i:aws_secret_access_key|aws_secret_key|secret_access_key|secretaccesskey)["']?\s*[:=]\s*["']?)[A-Za-z0-9/+=]{40}"#
+    r#"((?i:aws_secret_access_key|aws_secret_key|secret_access_key|secretaccesskey)["']?[ \t]*[:=][ \t]*["']?)[A-Za-z0-9/+=]{40}"#
     )
     .expect("valid aws secret key regex")
 });
@@ -183,7 +183,7 @@ static URL_USERINFO: LazyLock<Regex> = LazyLock::new(|| {
 /// more, so prose such as "authorization: required" is left alone.
 static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b((?:proxy-)?authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token|digest|negotiate)\s+[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{20,})"#,
+        r#"(?i)\b((?:proxy-)?authorization["']?[ \t]*[:=][ \t]*["']?)(?:(?:bearer|basic|token|digest|negotiate)[ \t]+[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{20,})"#,
     )
     .expect("valid authorization header regex")
 });
@@ -191,7 +191,7 @@ static AUTHORIZATION_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 /// variable). Group 1 keeps the scheme word; 16 or more token characters, so
 /// "bearer of bad news" is left alone.
 static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{16,}").expect("valid bearer token regex")
+    Regex::new(r"(?i)\b(bearer[ \t]+)[A-Za-z0-9._~+/=-]{16,}").expect("valid bearer token regex")
 });
 /// Header names that carry a credential by themselves: `Authorization`,
 /// `X-Api-Key`, `X-Auth-Token`, any `X-...-Key`, `-Token` or `-Secret`, and the
@@ -266,14 +266,24 @@ fn json_key_normal_form(key: &str) -> String {
 }
 
 /// A camel-case or hyphenated name in the upper snake case the environment
-/// rule reads: `dbPassword` is `DB_PASSWORD`, `X-Idempotency-Key` is
-/// `X_IDEMPOTENCY_KEY`, and `SORT_KEY` is itself.
+/// rule reads: `dbPassword` is `DB_PASSWORD`, `azureOpenAIApiKey` is
+/// `AZURE_OPEN_AI_API_KEY`, `X-Idempotency-Key` is `X_IDEMPOTENCY_KEY`, and
+/// `SORT_KEY` is itself.
 fn upper_snake(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len() + 4);
     let mut previous: Option<char> = None;
-    for c in name.chars() {
+    for (i, &c) in chars.iter().enumerate() {
+        // A word starts at an upper-case letter after a lower-case letter or
+        // digit (`dbPassword`), or at the last capital of an acronym run
+        // that a lower-case letter follows (`OpenAIApiKey` is OPEN_AI_API_KEY).
+        let next_lower = chars.get(i + 1).is_some_and(char::is_ascii_lowercase);
         if c.is_ascii_uppercase()
-            && previous.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+            && previous.is_some_and(|p| {
+                p.is_ascii_lowercase()
+                    || p.is_ascii_digit()
+                    || (p.is_ascii_uppercase() && next_lower)
+            })
         {
             out.push('_');
         }
@@ -333,12 +343,17 @@ const NOT_A_CURSOR_WORDS: [&str; 13] = [
     "ACCESS", "REFRESH", "APIKEY",
 ];
 
-/// Whether `name` names a paging cursor: it has a [`CURSOR_WORDS`] word and
-/// `TOKEN` is its only credential word, none of [`NOT_A_CURSOR_WORDS`]
-/// beside it.
+/// Whether `name` names a paging cursor: made only of [`CURSOR_WORDS`] and
+/// `TOKEN`, with both present (`NEXT_TOKEN`, `nextPageToken`,
+/// `continuationToken`). Any other word makes it a credential's name, so a
+/// rotated vendor token (`PREVIOUS_GITHUB_TOKEN`, `NEXT_BOT_TOKEN`) or a
+/// page's own token (`FB_PAGE_TOKEN`) is still redacted.
 fn is_cursor_name(name: &str) -> bool {
-    has_word(name, &CURSOR_WORDS)
-        && has_word(name, &["TOKEN"])
+    let snake = upper_snake(name);
+    let words: Vec<&str> = snake.split('_').filter(|w| !w.is_empty()).collect();
+    words.contains(&"TOKEN")
+        && words.iter().any(|w| CURSOR_WORDS.contains(w))
+        && words.iter().all(|w| *w == "TOKEN" || CURSOR_WORDS.contains(w))
         && !has_word(name, &NOT_A_CURSOR_WORDS)
 }
 
@@ -404,7 +419,7 @@ pub fn is_secret_name(name: &str) -> bool {
 /// [`AUTHORIZATION_HEADER`] shape's, which runs first.
 static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\b(?P<keep>(?P<name>{SECRET_HEADER_NAME})["']?\s*:\s*["']?)(?P<value>[A-Za-z0-9_.~+/=-]{{16,}})(?P<call>\()?"#
+        r#"\b(?P<keep>(?P<name>{SECRET_HEADER_NAME})["']?[ \t]*:[ \t]*["']?)(?P<value>[A-Za-z0-9_.~+/=-]{{16,}})(?P<call>\()?"#
     ))
     .expect("valid api key header regex")
 });
@@ -420,10 +435,49 @@ static API_KEY_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 /// [`is_secret_value`].
 static SECRET_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
-        r#"\b(?P<keep>(?:export\s+)?(?P<name>{SECRET_ENV_NAME})=["']?)(?P<value>[A-Za-z0-9+_-][A-Za-z0-9_.~+/=:@-]{{15,}})(?P<call>\()?"#
+        r#"\b(?P<keep>(?:export[ \t]+)?(?P<name>{SECRET_ENV_NAME})=["']?)(?P<value>[A-Za-z0-9+_-][A-Za-z0-9_.~+/=:@-]{{15,}})(?P<call>\()?"#
     ))
     .expect("valid secret env assignment regex")
 });
+
+/// A credential-named JSON field written in text, `"NAME": "value"`, as a
+/// `cat .mcp.json` or a logged request body shows it. The key is judged by
+/// [`is_secret_json_key`], the rule [`scrub_json`] uses on parsed objects,
+/// and the value by [`is_secret_value`]; group 1 keeps the key and the
+/// opening quote. One line only, and not a value holding an escaped quote.
+static SECRET_JSON_FIELD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?P<keep>"(?P<name>[A-Za-z][A-Za-z0-9_-]{0,63})"[ \t]*:[ \t]*")(?P<value>[^"\\\r\n]+)"#,
+    )
+    .expect("valid secret json field regex")
+});
+/// A credential in a query string or a long flag: `?apikey=...`,
+/// `&access_token=...`, `--api-key=...`. Names judged as for
+/// [`SECRET_JSON_FIELD`]; group 1 keeps the separator and the name.
+static SECRET_QUERY_OR_FLAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?P<keep>(?:[?&]|--)(?P<name>[A-Za-z][A-Za-z0-9_-]{0,63})=)(?P<value>[^&\s"'#]+)"#,
+    )
+    .expect("valid secret query regex")
+});
+/// A Digest `Authorization` response hash, which the header shape stops
+/// short of (the value is quoted after `username=`). Group 1 keeps the key.
+static DIGEST_RESPONSE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(response=")[0-9a-f]{32,}"#).expect("valid digest response regex")
+});
+/// An AWS SigV4 request signature (`Signature=<64 hex>`). Group 1 keeps the
+/// key.
+static SIGV4_SIGNATURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(Signature=)[0-9a-f]{64}\b").expect("valid sigv4 signature regex")
+});
+
+/// Whether a value is a reference or a placeholder, not the credential: an
+/// empty string, a whole upper-case `$VAR` / `${VAR}`, or a `<placeholder>`.
+fn is_reference(value: &str) -> bool {
+    value.is_empty()
+        || ENV_REFERENCE.is_match(value)
+        || (value.starts_with('<') && value.ends_with('>'))
+}
 
 /// Whether one match of the shape `name` is a secret. Most shapes are
 /// decided by their regex alone; the two named-credential shapes also check
@@ -432,6 +486,16 @@ static SECRET_ENV_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 /// [`is_secret_value`], which a regex without look-around cannot say.
 fn accepted(name: &str, caps: &regex::Captures<'_>) -> bool {
     match name {
+        "secret json field" | "query or flag credential" => {
+            match (caps.name("name"), caps.name("value")) {
+                (Some(n), Some(v)) => {
+                    is_secret_json_key(n.as_str())
+                        && !is_reference(v.as_str())
+                        && is_secret_value(&upper_snake(n.as_str()), v.as_str())
+                }
+                _ => false,
+            }
+        }
         "api key header" | "secret env assignment" => {
             // `name(` is a call only when the value is a function name; an
             // opaque value with `(` after it is still the secret.
@@ -453,7 +517,13 @@ fn accepted(name: &str, caps: &regex::Captures<'_>) -> bool {
 
 /// Whether a shape needs [`accepted`] to confirm a match.
 fn checked(name: &str) -> bool {
-    matches!(name, "api key header" | "secret env assignment")
+    matches!(
+        name,
+        "api key header"
+            | "secret env assignment"
+            | "secret json field"
+            | "query or flag credential"
+    )
 }
 
 /// Every credential shape [`scrub`] removes, by name, in the order it runs.
@@ -463,7 +533,7 @@ fn checked(name: &str) -> bool {
 /// so an `sk-ant-` key is named for what it is. The header, bearer and
 /// environment shapes run last, after every named token shape, so a known
 /// token inside a header or an assignment is still named for what it is.
-fn shapes() -> [(&'static str, &'static Regex); 24] {
+fn shapes() -> [(&'static str, &'static Regex); 28] {
     [
         ("pem private key", &PEM_PRIVATE_KEY),
         ("telegram bot token", &TELEGRAM_TOKEN),
@@ -489,6 +559,10 @@ fn shapes() -> [(&'static str, &'static Regex); 24] {
         ("bearer token", &BEARER_TOKEN),
         ("api key header", &API_KEY_HEADER),
         ("secret env assignment", &SECRET_ENV_ASSIGNMENT),
+        ("secret json field", &SECRET_JSON_FIELD),
+        ("query or flag credential", &SECRET_QUERY_OR_FLAG),
+        ("digest response", &DIGEST_RESPONSE),
+        ("sigv4 signature", &SIGV4_SIGNATURE),
     ]
 }
 
@@ -603,7 +677,9 @@ pub fn scrub_lines_from<S: AsRef<str>>(lines: &[S], in_key: &mut bool) -> Vec<St
 pub fn scrub_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(text) => {
-            if find_secret(text).is_some() {
+            // `scrub` also catches a token split by colour codes, which the
+            // raw `find_secret` does not see, so an escape is reason enough.
+            if text.contains('\x1b') || find_secret(text).is_some() {
                 *text = scrub(text);
             }
         }
@@ -667,7 +743,11 @@ fn scrub_shapes(input: &str) -> String {
                     | "authorization header"
                     | "bearer token"
                     | "api key header"
-                    | "secret env assignment" => format!(
+                    | "secret env assignment"
+                    | "secret json field"
+                    | "query or flag credential"
+                    | "digest response"
+                    | "sigv4 signature" => format!(
                         "{}{REDACTED}{}",
                         &caps[1],
                         caps.name("call").map_or("", |call| call.as_str())
@@ -1356,6 +1436,94 @@ mod tests {
         ] {
             assert!(!is_secret_name(name), "{name}");
         }
+    }
+
+    /// #149 and #151 review fixes, one case each.
+    #[test]
+    fn closes_the_review_gaps_in_text_and_json() {
+        let opaque = "Hq4Zp9Wd2Lx7Tn5Rb8Mc3Vf6";
+        // A token split by colour codes, inside a JSON string.
+        let mut coloured = serde_json::json!({
+            "text": format!("\x1b[32mexport GH=ghp_{}\x1b[1m{}\x1b[0m", "C".repeat(20), "C".repeat(20)),
+        });
+        scrub_json(&mut coloured);
+        assert!(
+            !coloured["text"].as_str().unwrap().contains("CCCC"),
+            "{coloured}"
+        );
+
+        // Credential-named JSON fields written in text (a `cat .mcp.json`).
+        let text = format!(
+            r#"{{"env": {{"GITHUB_TOKEN": "a1b2c3d4e5f6a7b8c9d0", "DB_PASSWORD": "hunter2", "access_token":"{opaque}", "password": "${{DB_PASSWORD}}", "session_key": "claude:4f2a9c1e", "NEXT_TOKEN": "c2VjcmV0", "HOME": "/home/dev"}}}}"#
+        );
+        let scrubbed = scrub(&text);
+        for gone in ["a1b2c3d4e5f6a7b8c9d0", "hunter2", opaque] {
+            assert!(!scrubbed.contains(gone), "{gone}: {scrubbed}");
+        }
+        for kept in ["${DB_PASSWORD}", "claude:4f2a9c1e", "c2VjcmV0", "/home/dev"] {
+            assert!(scrubbed.contains(kept), "{kept}: {scrubbed}");
+        }
+        assert!(
+            scrubbed.contains(r#""GITHUB_TOKEN": "<redacted>""#),
+            "{scrubbed}"
+        );
+
+        // Query strings and long flags.
+        let query = format!("curl 'https://api.example.com/v1/data?apikey={opaque}&page=2'");
+        assert_eq!(
+            scrub(&query),
+            "curl 'https://api.example.com/v1/data?apikey=<redacted>&page=2'"
+        );
+        assert_eq!(
+            scrub("tool --access-token=abc123xyz"),
+            "tool --access-token=<redacted>"
+        );
+        assert_eq!(
+            scrub("tool --page-token=c2VjcmV0 ?page_token=abc"),
+            "tool --page-token=c2VjcmV0 ?page_token=abc"
+        );
+
+        // A match never runs onto the next line.
+        let two_lines = "required header x-api-key:\n  ExpectedCredentialProviderName1";
+        assert_eq!(scrub(two_lines), two_lines);
+
+        // A rotated vendor token is not a paging cursor.
+        for name in [
+            "PREVIOUS_GITHUB_TOKEN",
+            "NEXT_BOT_TOKEN",
+            "FB_PAGE_TOKEN",
+            "previousSlackToken",
+        ] {
+            assert!(is_secret_json_key(name), "{name}");
+        }
+        for name in [
+            "NEXT_TOKEN",
+            "nextPageToken",
+            "continuationToken",
+            "PAGE_TOKEN",
+        ] {
+            assert!(!is_secret_json_key(name), "{name}");
+        }
+
+        // Acronyms split into words.
+        assert_eq!(upper_snake("azureOpenAIApiKey"), "AZURE_OPEN_AI_API_KEY");
+        assert_eq!(upper_snake("DBPassword"), "DB_PASSWORD");
+        for name in ["azureOpenAIApiKey", "serviceAPIKey", "DBPassword"] {
+            assert!(is_secret_json_key(name), "{name}");
+        }
+
+        // Digest and SigV4 signatures.
+        let digest = r#"Authorization: Digest username="bob", realm="x", response="6629fae49393a05397450978507c4ef1""#;
+        assert!(!scrub(digest).contains("6629fae4"), "{}", scrub(digest));
+        let sigv4 = format!(
+            "Credential=x/20240101/us-east-1/s3/aws4_request, Signature={}",
+            "a".repeat(64)
+        );
+        assert!(
+            !scrub(&sigv4).contains(&"a".repeat(64)),
+            "{}",
+            scrub(&sigv4)
+        );
     }
 
     #[test]
