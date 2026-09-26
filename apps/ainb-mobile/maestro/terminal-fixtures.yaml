@@ -16,6 +16,8 @@ appId: com.stevengonsalvez.ainb.mobile
     id: "terminal"
 - assertVisible:
     id: "terminal-size"
+- assertVisible:
+    text: "engine ready"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-f1-altscreen
