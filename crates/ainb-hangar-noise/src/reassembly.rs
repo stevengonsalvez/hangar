@@ -20,7 +20,7 @@
 
 use crate::frame::{FrameHeader, HEADER_LEN, HeaderError};
 use crate::opcode::Opcode;
-use crate::{MAX_NOISE_MESSAGE, MAX_REASSEMBLED};
+use crate::{MAX_NOISE_MESSAGE, MAX_PREAUTH_REASSEMBLED, MAX_REASSEMBLED};
 
 /// The authentication tag Noise appends to every transport message.
 pub const TAG_LEN: usize = 16;
@@ -145,6 +145,16 @@ impl Reassembler {
         Self::with_cap(MAX_REASSEMBLED)
     }
 
+    /// A reassembler for a session that has not authenticated yet, capped at
+    /// [`MAX_PREAUTH_REASSEMBLED`] (64 KiB). The peer leg starts every
+    /// session here and calls [`Self::authenticated`] once `auth/hello` or
+    /// `device/redeem` is accepted, so an unauthenticated socket can make the
+    /// host hold at most 64 KiB, not 16 MiB.
+    #[must_use]
+    pub const fn pre_auth() -> Self {
+        Self::with_cap(MAX_PREAUTH_REASSEMBLED)
+    }
+
     /// A reassembler with its own cap on one logical message.
     #[must_use]
     pub const fn with_cap(cap: usize) -> Self {
@@ -152,6 +162,18 @@ impl Reassembler {
             buf: Vec::new(),
             cap,
         }
+    }
+
+    /// The session authenticated: raise the cap to [`MAX_REASSEMBLED`], the
+    /// unix leg's body cap. Never lowers a cap.
+    pub fn authenticated(&mut self) {
+        self.cap = self.cap.max(MAX_REASSEMBLED);
+    }
+
+    /// The cap on one logical message.
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
     }
 
     /// Add a fragment. Returns the whole logical message on `FIN`.
@@ -180,13 +202,22 @@ impl Reassembler {
     }
 }
 
-/// Why bytes are not one LSP-framed body.
+/// Why bytes are not one LSP-framed body. The rules are the daemon's own
+/// unix-leg `read_frame`, so both legs refuse the same inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspError {
     /// No `\r\n\r\n` after the headers.
     NoTerminator,
-    /// No `Content-Length` header, or one that is not a number.
+    /// A header line without `name: value`, or not UTF-8.
+    MalformedHeader,
+    /// A header other than `Content-Length`.
+    UnsupportedHeader(String),
+    /// `Content-Length` given twice.
+    DuplicateContentLength,
+    /// No `Content-Length` header, or one that is not an unsigned decimal.
     ContentLength,
+    /// `Content-Length` above [`MAX_REASSEMBLED`], the unix leg's body cap.
+    TooLarge(usize),
     /// The body is not the declared length.
     Length {
         /// The declared length.
@@ -200,7 +231,15 @@ impl std::fmt::Display for LspError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoTerminator => f.write_str("no LSP header terminator"),
-            Self::ContentLength => f.write_str("no valid Content-Length header"),
+            Self::MalformedHeader => f.write_str("malformed frame header"),
+            Self::UnsupportedHeader(name) => write!(f, "unsupported frame header: {name}"),
+            Self::DuplicateContentLength => f.write_str("duplicate Content-Length header"),
+            Self::ContentLength => {
+                f.write_str("Content-Length must be an unsigned decimal byte length")
+            }
+            Self::TooLarge(len) => {
+                write!(f, "Content-Length {len} exceeds cap {MAX_REASSEMBLED}")
+            }
             Self::Length { declared, actual } => {
                 write!(
                     f,
@@ -221,23 +260,37 @@ pub fn lsp_encode(body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The body of one whole LSP-framed message.
+/// The body of one whole LSP-framed message, as strict as the unix leg's
+/// `read_frame`: `\r\n` line ends, `Content-Length` as the only header and
+/// given once, an unsigned decimal value no larger than [`MAX_REASSEMBLED`],
+/// and exactly that many body bytes (the message is whole, so a trailing byte
+/// is refused too).
 pub fn lsp_body(message: &[u8]) -> Result<&[u8], LspError> {
     let split = message
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or(LspError::NoTerminator)?;
-    let headers = std::str::from_utf8(&message[..split]).map_err(|_| LspError::ContentLength)?;
-    let declared: usize = headers
-        .split("\r\n")
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().ok())
-                .flatten()
-        })
-        .ok_or(LspError::ContentLength)?;
+    let headers = std::str::from_utf8(&message[..split]).map_err(|_| LspError::MalformedHeader)?;
+    let mut declared = None;
+    for line in headers.split("\r\n") {
+        let (name, value) = line.split_once(':').ok_or(LspError::MalformedHeader)?;
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            return Err(LspError::UnsupportedHeader(name.trim().to_string()));
+        }
+        if declared.is_some() {
+            return Err(LspError::DuplicateContentLength);
+        }
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(LspError::ContentLength);
+        }
+        let len: usize = value.parse().map_err(|_| LspError::ContentLength)?;
+        if len > MAX_REASSEMBLED {
+            return Err(LspError::TooLarge(len));
+        }
+        declared = Some(len);
+    }
+    let declared = declared.ok_or(LspError::ContentLength)?;
     let body = &message[split + 4..];
     if body.len() != declared {
         return Err(LspError::Length {
@@ -318,14 +371,11 @@ mod tests {
     fn lsp_framing_round_trips_and_checks_the_length() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
         assert_eq!(lsp_body(&lsp_encode(body)), Ok(&body[..]));
-        assert_eq!(
-            lsp_body(b"content-length: 2\r\nX: y\r\n\r\nab"),
-            Ok(&b"ab"[..])
-        );
+        assert_eq!(lsp_body(b"content-length: 2\r\n\r\nab"), Ok(&b"ab"[..]));
         assert_eq!(lsp_body(b"Content-Length: 2"), Err(LspError::NoTerminator));
         assert_eq!(
             lsp_body(b"Length: 2\r\n\r\nab"),
-            Err(LspError::ContentLength)
+            Err(LspError::UnsupportedHeader("Length".to_string()))
         );
         assert_eq!(
             lsp_body(b"Content-Length: 3\r\n\r\nab"),
@@ -334,5 +384,85 @@ mod tests {
                 actual: 2
             })
         );
+    }
+
+    /// Every input the daemon's unix-leg `read_frame` refuses, this refuses.
+    #[test]
+    fn lsp_body_is_as_strict_as_the_unix_leg() {
+        let refused: [(&[u8], LspError); 9] = [
+            (
+                b"Content-Length: 2\r\nContent-Length: 2\r\n\r\nab",
+                LspError::DuplicateContentLength,
+            ),
+            (
+                b"Content-Length: 2\r\nX-Other: y\r\n\r\nab",
+                LspError::UnsupportedHeader("X-Other".to_string()),
+            ),
+            (b"Content-Length: +2\r\n\r\nab", LspError::ContentLength),
+            (b"Content-Length: -2\r\n\r\nab", LspError::ContentLength),
+            (b"Content-Length: 0x2\r\n\r\nab", LspError::ContentLength),
+            (b"Content-Length:\r\n\r\nab", LspError::ContentLength),
+            (b"Content-Length 2\r\n\r\nab", LspError::MalformedHeader),
+            (
+                b"Content-Length: 99999999999999999999\r\n\r\n",
+                LspError::ContentLength,
+            ),
+            (
+                b"Content-Length: 2\r\n\r\nabc",
+                LspError::Length {
+                    declared: 2,
+                    actual: 3,
+                },
+            ),
+        ];
+        for (input, want) in refused {
+            assert_eq!(
+                lsp_body(input),
+                Err(want),
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
+        let over = format!("Content-Length: {}\r\n\r\n", MAX_REASSEMBLED + 1);
+        assert_eq!(
+            lsp_body(over.as_bytes()),
+            Err(LspError::TooLarge(MAX_REASSEMBLED + 1))
+        );
+        assert_eq!(
+            lsp_body(b"Content-Length: 2\n\nab"),
+            Err(LspError::NoTerminator),
+            "bare LF line ends are refused, as on the unix leg"
+        );
+        assert_eq!(lsp_body(b"Content-Length:  2 \r\n\r\nab"), Ok(&b"ab"[..]));
+    }
+
+    #[test]
+    fn an_unauthenticated_session_reassembles_at_most_64_kib() {
+        let mut r = Reassembler::pre_auth();
+        assert_eq!(r.cap(), MAX_PREAUTH_REASSEMBLED);
+        let fits = vec![1u8; MAX_PREAUTH_REASSEMBLED];
+        let mut whole = None;
+        for frame in rpc_frames(&fits) {
+            whole = r.push(&frame).unwrap();
+        }
+        assert_eq!(whole.as_deref(), Some(&fits[..]));
+        let over = vec![1u8; MAX_PREAUTH_REASSEMBLED + 1];
+        let result: Result<Vec<_>, _> = rpc_frames(&over).iter().map(|f| r.push(f)).collect();
+        assert_eq!(
+            result.unwrap_err(),
+            ReassemblyError::TooLarge {
+                cap: MAX_PREAUTH_REASSEMBLED
+            }
+        );
+        r.authenticated();
+        assert_eq!(r.cap(), MAX_REASSEMBLED);
+        let mut whole = None;
+        for frame in rpc_frames(&over) {
+            whole = r.push(&frame).unwrap();
+        }
+        assert_eq!(whole.map(|w| w.len()), Some(MAX_PREAUTH_REASSEMBLED + 1));
+        let mut small = Reassembler::with_cap(MAX_REASSEMBLED * 2);
+        small.authenticated();
+        assert_eq!(small.cap(), MAX_REASSEMBLED * 2, "never lowers a cap");
     }
 }
