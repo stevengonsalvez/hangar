@@ -45,8 +45,9 @@ use ainb_hangar_store::repo::autopilot_webhook::{
     AutopilotWebhookRepo, DeliveryOutcome, NewDelivery, WebhookSecretStore,
 };
 use sqlx::SqlitePool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::local_http;
 
 /// The outcome of processing one webhook request: the HTTP status to return plus
 /// the structured delivery record that was logged.
@@ -306,7 +307,7 @@ async fn handle_connection(
     clock: &dyn HangarClock,
 ) -> std::io::Result<()> {
     let Some(req) = read_request(&mut stream).await? else {
-        // Malformed request line / headers — answer 400 and close.
+        // Malformed request line / headers, or over the cap: answer 400 and close.
         write_response(&mut stream, 400, "bad request").await?;
         return Ok(());
     };
@@ -353,74 +354,27 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
+/// Upper bound on a webhook request (head + body). Webhook payloads are tiny;
+/// 64 KiB is generous and caps a memory-exhaustion attempt.
+const MAX_REQUEST: usize = 64 * 1024;
+
 /// Read and parse one HTTP/1.1 request from `stream`. Returns `Ok(None)` on a
-/// malformed head (the caller answers 400). Reads exactly `Content-Length` body
-/// bytes after the header terminator. A hard cap bounds the body so a hostile
-/// client cannot exhaust memory.
+/// malformed head or a request over [`MAX_REQUEST`] (the caller answers 400).
+/// Reads exactly `Content-Length` body bytes after the header terminator.
 async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<ParsedRequest>> {
-    /// Upper bound on a webhook request (head + body). Webhook payloads are tiny;
-    /// 64 KiB is generous and caps a memory-exhaustion attempt.
-    const MAX_REQUEST: usize = 64 * 1024;
-
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 4096];
-
-    // Read until we have the full header block (CRLFCRLF).
-    let header_end = loop {
-        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > MAX_REQUEST {
-            return Ok(None);
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            // Connection closed before a full header — malformed.
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.split("\r\n");
-    let Some(request_line) = lines.next() else {
+    let Some(head) = local_http::read_head(stream, MAX_REQUEST).await? else {
         return Ok(None);
     };
-    let mut parts = request_line.split_whitespace();
-    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+    let remaining = MAX_REQUEST.saturating_sub(head.head_len);
+    let method = head.method.clone();
+    let path = head.path.clone();
+    let headers = head.headers.clone();
+    let Some(body) = local_http::read_body(stream, head, remaining).await? else {
         return Ok(None);
     };
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    let content_length: usize =
-        headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if header_end + content_length > MAX_REQUEST {
-        return Ok(None);
-    }
-
-    // Body bytes already buffered, plus any remaining to read.
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-
     Ok(Some(ParsedRequest {
-        method: method.to_string(),
-        path: path.to_string(),
+        method,
+        path,
         headers,
         body,
     }))
@@ -435,35 +389,5 @@ fn event_from_body(body: &[u8]) -> Option<String> {
 
 /// Write a minimal HTTP/1.1 response with a plain-text body and close.
 async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    let reason = reason_phrase(status);
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        len = body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
-}
-
-/// A minimal reason-phrase table for the statuses the ingress returns.
-const fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Internal Server Error",
-    }
-}
-
-/// Find the first index of `needle` in `haystack` (a tiny substring search; the
-/// header block is small so a naive scan is fine).
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    local_http::write_response(stream, status, "text/plain", body.as_bytes()).await
 }
