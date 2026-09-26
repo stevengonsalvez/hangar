@@ -63,7 +63,9 @@ pub struct Redacted;
 
 impl std::fmt::Debug for Redacted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
+        // The one shared marker, so a test or a log grep for it matches every
+        // redaction in the workspace.
+        f.write_str(ainb_hangar_core::redact::REDACTED)
     }
 }
 

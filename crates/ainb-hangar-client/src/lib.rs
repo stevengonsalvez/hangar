@@ -313,11 +313,30 @@ pub fn socket_path_in(home: &std::path::Path) -> PathBuf {
 }
 
 /// Client for stateless daemon RPCs and persistent Fleet subscription.
-#[derive(Debug, Clone)]
+///
+/// `Debug` redacts the daemon token: the client holds it for the process's
+/// whole life, so any `{:?}` of a client (or of a struct that embeds one)
+/// would otherwise print it.
+#[derive(Clone)]
 pub struct DaemonClient {
     socket: PathBuf,
     token: String,
     surface: SurfaceInfo,
+}
+
+impl std::fmt::Debug for DaemonClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            socket,
+            token: _,
+            surface,
+        } = self;
+        f.debug_struct("DaemonClient")
+            .field("socket", socket)
+            .field("token", &ainb_hangar_proto::Redacted)
+            .field("surface", surface)
+            .finish()
+    }
 }
 
 /// Live stream of daemon connection-registry changes.
@@ -1317,6 +1336,21 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> Result<Value, Daem
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The client holds the daemon token for its whole life; `{:?}` of it
+    /// must not print the token.
+    #[test]
+    fn debug_redacts_the_daemon_token() {
+        let client = DaemonClient::with_parts(
+            PathBuf::from("/run/hangar-visible.sock"),
+            "mdt_s3cr3tClientToken".to_string(),
+        );
+        for rendered in [format!("{client:?}"), format!("{client:#?}")] {
+            assert!(!rendered.contains("s3cr3tClientToken"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("hangar-visible.sock"), "{rendered}");
+        }
+    }
     use ainb_hangar_proto::fleet::{FleetEvent, FleetProvenance};
     use tokio::net::UnixListener;
 
