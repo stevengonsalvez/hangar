@@ -1,8 +1,9 @@
 import { useLocalSearchParams } from "expo-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
-import { FixtureTerminal } from "../../../../src/terminal/FixtureTerminal";
+import { connectHost } from "../../../../src/lifecycle";
+import { WireTerminal } from "../../../../src/terminal/WireTerminal";
 import { colors } from "../../../../src/theme";
 import { useWire, useWireEvents, useWireQuery } from "../../../../src/wire/context";
 import type { TranscriptEntry } from "../../../../src/wire/types";
@@ -16,6 +17,9 @@ export default function Session() {
   const [tail, setTail] = useState<TranscriptEntry[]>([]);
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string>();
+  useEffect(() => {
+    if (hostId) connectHost(wire, hostId).catch(() => undefined);
+  }, [wire, hostId]);
 
   const page = useWireQuery((w) => (hostId && key ? w.transcriptPage(hostId, key) : Promise.resolve([])));
   const roster = useWireQuery((w) => (hostId ? w.rosterStatus(hostId) : Promise.resolve([])), ["fleet_revision"]);
@@ -79,8 +83,7 @@ export default function Session() {
           </View>
         </>
       ) : (
-        // Fixture bytes until the stream arrives over the wire (M1-13).
-        <FixtureTerminal />
+        <WireTerminal hostId={hostId} sessionKey={key} />
       )}
     </View>
   );
