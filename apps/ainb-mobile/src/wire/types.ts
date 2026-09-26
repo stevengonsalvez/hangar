@@ -189,6 +189,23 @@ export type WireEvent =
 
 export type Unsubscribe = () => void;
 
+/**
+ * A `connect` refused by the peer with a close code (T9): lane E's
+ * `connect_host` answers `Err(Revoked)` and friends with no close event, so
+ * the code travels on the rejection instead. `code` undefined is a plain
+ * network failure, the only kind worth redialling on its own.
+ */
+export class PeerCloseError extends Error {
+  readonly code?: number;
+  readonly reason?: string;
+  constructor(code: number | undefined, reason?: string) {
+    super(code === undefined ? (reason ?? "connect failed") : `peer closed ${code}${reason ? `: ${reason}` : ""}`);
+    this.name = "PeerCloseError";
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
 export interface WireClient {
   hosts(): Promise<HostRow[]>;
   /** Display-only decode of an offer (no secret crosses into JS). */
@@ -197,6 +214,7 @@ export interface WireClient {
   pair(uri: string, displayName: string): Promise<PairedHost>;
   forget(hostId: HostId): Promise<void>;
 
+  /** Rejects with a `PeerCloseError` carrying the close code when the peer refuses; a plain error is a network failure. */
   connect(hostId: HostId): Promise<void>;
   close(hostId: HostId): Promise<void>;
   hostInfo(hostId: HostId): Promise<HostInfo>;
