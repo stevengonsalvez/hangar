@@ -17,6 +17,7 @@ use std::time::Duration;
 use ainb_desktop::create::{CreateWorktreeArgs, request};
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, daemon_pid};
 use ainb_hangar_client::DaemonClient;
+use ainb_hangar_proto::spawn::SpawnAgent;
 
 /// A cold runner needs time to migrate a fresh store and mint the token.
 const BOOT_BUDGET: Duration = Duration::from_secs(90);
@@ -75,8 +76,48 @@ impl Drop for Home {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_window_creates_a_worktree_session_through_the_daemon() {
     let tools = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    // The daemon only creates from a repository top inside a registered
+    // folder: a home whose config registers `<home>/code`, holding a repo.
+    let user_home = tempfile::tempdir().unwrap();
+    let repo = user_home.path().join("code/app");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    }
+    let config = user_home.path().join(".agents-in-a-box/config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!(
+            "[workspace_defaults]\nworkspace_scan_paths = [\"{}\"]\n",
+            user_home.path().join("code").display()
+        ),
+    )
+    .unwrap();
+    let repo = std::fs::canonicalize(repo).unwrap();
     // Inherited by the daemon the sidecar spawns. Edition 2021: safe.
+    std::env::set_var("HOME", user_home.path());
     std::env::set_var("AINB_CODEX_MANAGED", "0");
     std::env::set_var("AINB_HANGAR_SPAWN", "1");
     std::env::set_var("AINB_BIN", fake_ainb(tools.path()));
@@ -106,13 +147,12 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
     let created = request(
         &client,
         CreateWorktreeArgs {
-            repo_path: repo.path().display().to_string(),
+            repo_path: repo.display().to_string(),
             branch: Some("feat/window".into()),
             base: Some("main".into()),
-            agent: "claude".into(),
+            agent: SpawnAgent::Claude,
             model: None,
             prompt: Some("hello from the window".into()),
-            name: None,
         },
     )
     .await
