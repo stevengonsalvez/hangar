@@ -75,7 +75,7 @@ async function settle(condition, timeout, explain) {
   try {
     await browser.waitUntil(condition, { timeout, interval: 100 });
   } catch {
-    throw new Error(explain());
+    throw new Error(await explain());
   }
 }
 
@@ -259,7 +259,10 @@ describe("answering from the window", () => {
         return phase === "delivered";
       },
       60_000,
-      () => `the pick over the inbox never read delivered (last phase: ${phase || "none"})\n${desktopLog()}`,
+      async () =>
+        `the pick over the inbox never read delivered (last phase: ${phase || "none"}; toasts: ${JSON.stringify(
+          await browser.execute(() => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent)),
+        )}; screen: ${await browser.execute(() => document.querySelector(".inbox") ? "inbox" : "not inbox")})\n${desktopLog()}`,
     );
     const sent = intentsSent().slice(sentBefore);
     const shown = sent.map(({ command, outcome }) => `${command}:${outcome}`).join(", ");
