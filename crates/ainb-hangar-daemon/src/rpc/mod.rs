@@ -1364,9 +1364,12 @@ async fn dispatch_as_connection(
         // than of ~96 hand-written transactions. A read, or a mutation whose
         // caller sent no op id, passes straight through.
         Ok(()) => {
-            mutation::guard(pool, req, caller, SystemClock.now_ms(), || {
-                handle(pool, req, health, events, caller, connection, registry)
-            })
+            auth::serving(
+                caller.clone(),
+                mutation::guard(pool, req, caller, SystemClock.now_ms(), || {
+                    handle(pool, req, health, events, caller, connection, registry)
+                }),
+            )
             .await
         }
         Err(refusal) => Err(refusal),
@@ -1493,14 +1496,16 @@ async fn handle(
         | methods::HANGAR_AUTOPILOT_COLLABORATORS
         | methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD
         | methods::HANGAR_AUTOPILOT_SUBSCRIBER_REMOVE
-        | methods::HANGAR_AUTOPILOT_SUBSCRIBERS => handle_autopilot(pool, req, events).await,
+        | methods::HANGAR_AUTOPILOT_SUBSCRIBERS => {
+            handle_autopilot(pool, req, events, caller).await
+        }
         methods::HANGAR_TASKS_LIST => handle_tasks_list(pool, req).await,
         methods::HANGAR_TASK_TRANSITION => handle_task_transition(pool, req, events).await,
         methods::HANGAR_TASK_RETRY => handle_task_retry(pool, req, events).await,
-        methods::HANGAR_ISSUE_CREATE => handle_issue_create(pool, req, events).await,
+        methods::HANGAR_ISSUE_CREATE => handle_issue_create(pool, req, events, caller).await,
         methods::HANGAR_ISSUE_DELETE => handle_issue_delete(pool, req, events).await,
         methods::HANGAR_ISSUE_CANCEL_ACTIVE => handle_issue_cancel_active(pool, req, events).await,
-        methods::HANGAR_ISSUE_UPDATE => handle_issue_update(pool, req, events).await,
+        methods::HANGAR_ISSUE_UPDATE => handle_issue_update(pool, req, events, caller).await,
         methods::HANGAR_ISSUES_BATCH_UPDATE => handle_issues_batch_update(pool, req, events).await,
         methods::HANGAR_ISSUE_LABEL_ATTACH => handle_issue_label(pool, req, events, true).await,
         methods::HANGAR_ISSUE_LABEL_DETACH => handle_issue_label(pool, req, events, false).await,
@@ -1522,7 +1527,7 @@ async fn handle(
         methods::HANGAR_ISSUE_METADATA_DELETE => {
             handle_issue_metadata(pool, req, events, MetaOp::Delete).await
         }
-        methods::HANGAR_COMMENT_ADD => handle_comment_add(pool, req, events).await,
+        methods::HANGAR_COMMENT_ADD => handle_comment_add(pool, req, events, caller).await,
         methods::HANGAR_COMMENT_MENTION_PREVIEW => handle_comment_mention_preview(pool, req).await,
         methods::HANGAR_AGENT_CREATE => handle_agent_create(pool, req).await,
         methods::HANGAR_AGENT_DELETE => handle_agent_delete(pool, req).await,
@@ -1574,11 +1579,13 @@ async fn handle(
         methods::HANGAR_ISSUE_LINK_ADD => handle_issue_link(pool, req, true).await,
         methods::HANGAR_ISSUE_LINK_REMOVE => handle_issue_link(pool, req, false).await,
         methods::HANGAR_ISSUE_LINKS => handle_issue_links(pool, req).await,
-        methods::HANGAR_ISSUE_SUBSCRIBE => handle_issue_subscribe(pool, req, true).await,
-        methods::HANGAR_ISSUE_UNSUBSCRIBE => handle_issue_subscribe(pool, req, false).await,
+        methods::HANGAR_ISSUE_SUBSCRIBE => handle_issue_subscribe(pool, req, caller, true).await,
+        methods::HANGAR_ISSUE_UNSUBSCRIBE => handle_issue_subscribe(pool, req, caller, false).await,
         methods::HANGAR_ISSUE_SUBSCRIBERS => handle_issue_subscribers(pool, req).await,
-        methods::HANGAR_ISSUE_REACTION_ADD => handle_issue_reaction(pool, req, true).await,
-        methods::HANGAR_ISSUE_REACTION_REMOVE => handle_issue_reaction(pool, req, false).await,
+        methods::HANGAR_ISSUE_REACTION_ADD => handle_issue_reaction(pool, req, caller, true).await,
+        methods::HANGAR_ISSUE_REACTION_REMOVE => {
+            handle_issue_reaction(pool, req, caller, false).await
+        }
         methods::HANGAR_DISPATCH_ATTEMPTS_LIST => handle_dispatch_attempts_list(pool, req).await,
         methods::HANGAR_ISSUE_TIMELINE => handle_issue_timeline(pool, req).await,
         methods::HANGAR_BOARD_CARD_SET_AUTO_RUN => handle_board_card_set_auto_run(pool, req).await,
@@ -6773,7 +6780,10 @@ async fn execute_acp_action(
             // An operator prompt joins the SAME bus a chat message does, so it
             // gets a message row, a delivery leg, and a threaded reply rather
             // than a turn nothing can correlate afterwards.
-            match crate::acp_session::enqueue(pool, &session.session_key, "operator", text).await {
+            // The prompt's sender is whoever asked for it: the request's own
+            // caller, or `operator` for a daemon-internal action.
+            let sender = auth::current_sender().unwrap_or_else(|| "operator".to_string());
+            match crate::acp_session::enqueue(pool, &session.session_key, &sender, text).await {
                 Ok(message_id) => {
                     let outcome = acp.submit_prompt(&session.session_key, &message_id, text).await;
                     match outcome {
@@ -7626,6 +7636,7 @@ async fn handle_issue_create(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::SystemIdGen;
@@ -7642,11 +7653,11 @@ async fn handle_issue_create(
     if params.title.trim().is_empty() {
         return Err(invalid_params("issue title must not be empty"));
     }
-    let creator = ActorRef::from_str(&params.creator).map_err(|e| {
+    let creator = caller.stamp(Some(ActorRef::from_str(&params.creator).map_err(|e| {
         invalid_params(&format!(
             "creator must be `agent:<id>` or `member:<id>`: {e}"
         ))
-    })?;
+    })?));
     // 0043: an upstream link is optional; a blank one links nothing (stored NULL).
     let external_ref = params.external_ref.as_deref().map(str::trim).filter(|s| !s.is_empty());
     // 0046: an optional parent makes the new issue a sub-issue. Validate the parent
@@ -8127,6 +8138,7 @@ async fn handle_issue_update(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_proto::events::HangarEvent;
 
@@ -8240,7 +8252,7 @@ async fn handle_issue_update(
                 .await
                 .map_err(|e| store_err(&e))?
         {
-            let actor = acting_actor(pool).await;
+            let actor = acting_actor(pool, caller).await;
             ActivityService::record_issue_diff(
                 pool,
                 &SystemIdGen,
@@ -8542,6 +8554,7 @@ async fn handle_comment_add(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_core::actor::ActorRef;
     use ainb_hangar_core::idgen::SystemIdGen;
@@ -8556,11 +8569,11 @@ async fn handle_comment_add(
     if params.body.trim().is_empty() {
         return Err(invalid_params("comment body must not be empty"));
     }
-    let author = ActorRef::from_str(&params.author).map_err(|e| {
+    let author = caller.stamp(Some(ActorRef::from_str(&params.author).map_err(|e| {
         invalid_params(&format!(
             "author must be `agent:<id>` or `member:<id>`: {e}"
         ))
-    })?;
+    })?));
     let row = snapshots::comment_add(
         pool,
         &SystemIdGen,
@@ -11303,6 +11316,13 @@ fn resolve_actor_param(raw: Option<&str>) -> Result<ActorRef, RpcError> {
     }
 }
 
+/// [`resolve_actor_param`] through the caller's stamp: the operator's named
+/// (or defaulted) actor stands; a device always acts as itself.
+fn stamped_actor_param(caller: &auth::Caller, raw: Option<&str>) -> Result<ActorRef, RpcError> {
+    let claimed = resolve_actor_param(raw)?;
+    Ok(caller.stamp(Some(claimed)))
+}
+
 /// The reference's `isWorkspaceEntity` gate (its `403`): the target must belong
 /// to this workspace.
 ///
@@ -11355,6 +11375,7 @@ async fn reject_actor_outside_workspace(
 async fn handle_issue_subscribe(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: bool,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::issue_subscriber::{IssueSubscriberRepo, SubscribeReason};
@@ -11362,8 +11383,10 @@ async fn handle_issue_subscribe(
     let params: ainb_hangar_proto::snapshots::IssueSubscribeParams =
         parse_params(req, "{ workspace_id, issue_id, actor? }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let actor = resolve_actor_param(params.actor.as_deref())?;
-    reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    let actor = stamped_actor_param(caller, params.actor.as_deref())?;
+    if !caller.is_own_device_stamp(&actor) {
+        reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    }
 
     let already = IssueSubscriberRepo::is_subscribed(pool, &params.issue_id, &actor)
         .await
@@ -11421,6 +11444,7 @@ async fn handle_issue_subscribers(
 async fn handle_issue_reaction(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: bool,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::issue_reaction::{IssueReactionError, IssueReactionRepo};
@@ -11428,8 +11452,10 @@ async fn handle_issue_reaction(
     let params: ainb_hangar_proto::snapshots::IssueReactionParams =
         parse_params(req, "{ workspace_id, issue_id, emoji, actor? }")?;
     let ws = resolve_wire_or_reject(pool, &params.workspace_id).await?;
-    let actor = resolve_actor_param(params.actor.as_deref())?;
-    reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    let actor = stamped_actor_param(caller, params.actor.as_deref())?;
+    if !caller.is_own_device_stamp(&actor) {
+        reject_actor_outside_workspace(pool, &ws, &actor).await?;
+    }
     if !issue_in_workspace(pool, ws.as_str(), &params.issue_id).await? {
         return Err(invalid_params(&format!(
             "no issue `{}` in this workspace",
@@ -11563,9 +11589,16 @@ async fn handle_dispatch_attempts_list(
 /// faults) the row is a `system` fact rather than a fabricated member. When
 /// per-request actor identity lands (parity #1's member work), swap this body —
 /// no call site changes.
-async fn acting_actor(pool: &SqlitePool) -> ainb_hangar_core::activity::ActivityActor {
-    let owner = ainb_hangar_store::bootstrap::default_owner_id(pool).await.ok().flatten();
-    ainb_hangar_core::activity::ActivityActor::member_or_system(owner.as_deref())
+async fn acting_actor(
+    pool: &SqlitePool,
+    caller: &auth::Caller,
+) -> ainb_hangar_core::activity::ActivityActor {
+    if matches!(caller, auth::Caller::Operator) {
+        let owner = ainb_hangar_store::bootstrap::default_owner_id(pool).await.ok().flatten();
+        return ainb_hangar_core::activity::ActivityActor::member_or_system(owner.as_deref());
+    }
+    // Anyone else is recorded as themselves, never as the workspace owner.
+    ainb_hangar_core::activity::ActivityActor::Actor(caller.stamp(None))
 }
 
 /// `hangar/issue_timeline` (multica parity #13): one card's merged activity +
@@ -12308,6 +12341,7 @@ async fn handle_autopilot(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
 ) -> Result<serde_json::Value, RpcError> {
     match req.method.as_str() {
         methods::HANGAR_AUTOPILOTS_LIST => {
@@ -12645,21 +12679,23 @@ async fn handle_autopilot(
             to_value(&result)
         }
         methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD => {
-            handle_autopilot_collaborator(pool, req, Some(true)).await
+            handle_autopilot_collaborator(pool, req, caller, Some(true)).await
         }
         methods::HANGAR_AUTOPILOT_COLLABORATOR_REMOVE => {
-            handle_autopilot_collaborator(pool, req, Some(false)).await
+            handle_autopilot_collaborator(pool, req, caller, Some(false)).await
         }
         methods::HANGAR_AUTOPILOT_COLLABORATORS => {
-            handle_autopilot_collaborator(pool, req, None).await
+            handle_autopilot_collaborator(pool, req, caller, None).await
         }
         methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD => {
-            handle_autopilot_subscriber(pool, req, Some(true)).await
+            handle_autopilot_subscriber(pool, req, caller, Some(true)).await
         }
         methods::HANGAR_AUTOPILOT_SUBSCRIBER_REMOVE => {
-            handle_autopilot_subscriber(pool, req, Some(false)).await
+            handle_autopilot_subscriber(pool, req, caller, Some(false)).await
         }
-        methods::HANGAR_AUTOPILOT_SUBSCRIBERS => handle_autopilot_subscriber(pool, req, None).await,
+        methods::HANGAR_AUTOPILOT_SUBSCRIBERS => {
+            handle_autopilot_subscriber(pool, req, caller, None).await
+        }
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown autopilot method: {other}"),
@@ -12719,6 +12755,7 @@ async fn autopilot_write_gate(
 async fn autopilot_actor_target(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
 ) -> Result<(WorkspaceId, AutopilotId, ActorRef, Option<ActorRef>), RpcError> {
     let params: ainb_hangar_proto::snapshots::AutopilotActorParams = parse_params(
         req,
@@ -12737,7 +12774,13 @@ async fn autopilot_actor_target(
         )));
     }
     let target = resolve_actor_param(params.actor.as_deref())?;
-    let acting = member_actor(params.actor_user_id.as_deref());
+    // The acting actor is who the write gate checks. The operator's claimed
+    // `actor_user_id` stands (unchanged); a device is always itself, so it can
+    // never pass the gate as a collaborator it is not.
+    let acting = match caller {
+        auth::Caller::Operator => member_actor(params.actor_user_id.as_deref()),
+        _ => Some(caller.stamp(None)),
+    };
     Ok((ws, id, target, acting))
 }
 
@@ -12750,11 +12793,12 @@ async fn autopilot_actor_target(
 async fn handle_autopilot_collaborator(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: Option<bool>,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::autopilot_access::{AutopilotCollaboratorRepo, CollaboratorRole};
 
-    let (ws, id, target, acting) = autopilot_actor_target(pool, req).await?;
+    let (ws, id, target, acting) = autopilot_actor_target(pool, req, caller).await?;
     if let Some(add) = add {
         autopilot_write_gate(pool, &ws, &id, acting.as_ref()).await?;
         let params: ainb_hangar_proto::snapshots::AutopilotActorParams =
@@ -12799,11 +12843,12 @@ async fn handle_autopilot_collaborator(
 async fn handle_autopilot_subscriber(
     pool: &SqlitePool,
     req: &RpcRequest,
+    caller: &auth::Caller,
     add: Option<bool>,
 ) -> Result<serde_json::Value, RpcError> {
     use ainb_hangar_store::repo::autopilot_access::AutopilotSubscriberRepo;
 
-    let (ws, id, target, acting) = autopilot_actor_target(pool, req).await?;
+    let (ws, id, target, acting) = autopilot_actor_target(pool, req, caller).await?;
     if let Some(add) = add {
         autopilot_write_gate(pool, &ws, &id, acting.as_ref()).await?;
         if add {
@@ -14269,6 +14314,256 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sender, "device:01J0PHONE");
+    }
+
+    /// Review follow-up A: every write that records an author, creator or
+    /// acting actor takes it from `Caller::stamp`, never from the request, for
+    /// a paired device. Walks each such method as a desktop device that claims
+    /// to be the operator (or an agent) and reads back what was stored.
+    ///
+    /// `fleet/action` SendPrompt on ACP takes the same identity through
+    /// `auth::current_sender` (proved in `rpc::auth::tests`); it needs a live
+    /// ACP pool, so it is not driven here.
+    #[tokio::test]
+    async fn every_authored_write_from_a_device_is_stamped_from_its_credential() {
+        use ainb_hangar_proto::devices::DeviceScope;
+
+        const STAMPED: &[&str] = &[
+            methods::HANGAR_ISSUE_CREATE,
+            methods::HANGAR_COMMENT_ADD,
+            methods::HANGAR_ISSUE_UPDATE,
+            methods::HANGAR_ISSUE_SUBSCRIBE,
+            methods::HANGAR_ISSUE_REACTION_ADD,
+            methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD,
+            methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD,
+        ];
+        const DEVICE: (&str, &str) = ("member", "device:01J0LAPTOP");
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        crate::seed::seed_p4_fixture(store.pool()).await.expect("seed workspace");
+        let pool = store.pool();
+        let autopilot = ainb_hangar_store::repo::autopilot::AutopilotRepo::create_as(
+            pool,
+            &SystemClock,
+            &ainb_hangar_store::repo::autopilot::NewAutopilot {
+                workspace_id: WorkspaceId::from_str(crate::seed::WS_ID).unwrap(),
+                agent_id: AgentId::from_str("agent-1").unwrap(),
+                name: "daily".to_string(),
+                instructions: None,
+                cron_expr: "0 9 * * *".to_string(),
+                max_concurrent_runs: 1,
+                execution_mode: ainb_hangar_store::repo::autopilot::ExecutionMode::RunOnly,
+                concurrency_policy: ainb_hangar_store::repo::autopilot::ConcurrencyPolicy::Queue,
+                api_trigger_enabled: false,
+            },
+            Some(&ActorRef::new(ActorKind::Member, "user-1").unwrap()),
+        )
+        .await
+        .expect("create autopilot")
+        .to_string();
+        let laptop = auth::Caller::Device {
+            device_id: "01J0LAPTOP".to_string(),
+            scope: DeviceScope::DESKTOP,
+        };
+        let call = |method: &str, params: serde_json::Value| {
+            let request = req(method, params);
+            let laptop = laptop.clone();
+            async move { dispatch_as(pool, &request, &health(), &sink(), &laptop).await }
+        };
+        let stored = |sql: &'static str, bind: String| async move {
+            sqlx::query_as::<_, (String, String)>(sql)
+                .bind(bind)
+                .fetch_one(pool)
+                .await
+                .expect(sql)
+        };
+
+        for method in STAMPED {
+            let (row, what) = match *method {
+                methods::HANGAR_ISSUE_CREATE => {
+                    let created = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_SLUG,
+                            "title": "from the laptop",
+                            "creator": "member:me",
+                        }),
+                    )
+                    .await;
+                    assert!(created.error.is_none(), "{method}: {:?}", created.error);
+                    let row = stored(
+                        "SELECT creator_type, creator_id FROM issue WHERE title = ?",
+                        "from the laptop".to_string(),
+                    )
+                    .await;
+                    (row, "creator")
+                }
+                methods::HANGAR_COMMENT_ADD => {
+                    let added = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_SLUG,
+                            "issue_id": "issue-1",
+                            "author": "agent:agent-1",
+                            "body": "claimed to be an agent",
+                        }),
+                    )
+                    .await;
+                    assert!(added.error.is_none(), "{method}: {:?}", added.error);
+                    let row = stored(
+                        "SELECT author_type, author_id FROM comment WHERE body = ?",
+                        "claimed to be an agent".to_string(),
+                    )
+                    .await;
+                    (row, "author")
+                }
+                methods::HANGAR_ISSUE_UPDATE => {
+                    let updated = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_SLUG,
+                            "issue_id": "issue-2",
+                            "title": "renamed from the laptop",
+                        }),
+                    )
+                    .await;
+                    assert!(updated.error.is_none(), "{method}: {:?}", updated.error);
+                    let row = stored(
+                        "SELECT actor_type, actor_id FROM activity_log \
+                         WHERE issue_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                        "issue-2".to_string(),
+                    )
+                    .await;
+                    (row, "activity actor")
+                }
+                methods::HANGAR_ISSUE_SUBSCRIBE => {
+                    let subscribed = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_SLUG,
+                            "issue_id": "issue-3",
+                            "actor": "member:me",
+                        }),
+                    )
+                    .await;
+                    assert!(
+                        subscribed.error.is_none(),
+                        "{method}: {:?}",
+                        subscribed.error
+                    );
+                    let row = stored(
+                        "SELECT actor_type, actor_id FROM issue_subscriber \
+                         WHERE issue_id = ? AND actor_id LIKE 'device:%'",
+                        "issue-3".to_string(),
+                    )
+                    .await;
+                    (row, "subscriber")
+                }
+                methods::HANGAR_ISSUE_REACTION_ADD => {
+                    let reacted = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_SLUG,
+                            "issue_id": "issue-3",
+                            "emoji": "+1",
+                            "actor": "member:me",
+                        }),
+                    )
+                    .await;
+                    assert!(reacted.error.is_none(), "{method}: {:?}", reacted.error);
+                    let row = stored(
+                        "SELECT actor_type, actor_id FROM issue_reaction WHERE issue_id = ?",
+                        "issue-3".to_string(),
+                    )
+                    .await;
+                    (row, "reactor")
+                }
+                methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD
+                | methods::HANGAR_AUTOPILOT_SUBSCRIBER_ADD => {
+                    let table = if *method == methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD {
+                        "autopilot_collaborator"
+                    } else {
+                        "autopilot_subscriber"
+                    };
+                    let added = call(
+                        method,
+                        serde_json::json!({
+                            "workspace_id": crate::seed::WS_ID,
+                            "autopilot_id": autopilot,
+                            "actor": "member:user-1",
+                            "actor_user_id": "user-1",
+                        }),
+                    )
+                    .await;
+                    assert!(added.error.is_none(), "{method}: {:?}", added.error);
+                    let created_by: Option<String> = sqlx::query_scalar(&format!(
+                        "SELECT created_by FROM {table} WHERE autopilot_id = ?"
+                    ))
+                    .bind(&autopilot)
+                    .fetch_one(pool)
+                    .await
+                    .expect("created_by");
+                    let created_by = created_by.expect("attributed");
+                    let (kind, id) = created_by.split_once(':').expect("an actor ref");
+                    ((kind.to_string(), id.to_string()), "created_by")
+                }
+                other => panic!("{other} is listed but not walked"),
+            };
+            assert_eq!(
+                (row.0.as_str(), row.1.as_str()),
+                DEVICE,
+                "{method}: the {what} must be the device, not what it claimed"
+            );
+        }
+
+        // A restricted rule: the laptop claims to be the owner (`actor_user_id`
+        // user-1) and is still refused, because the gate checks the stamp.
+        sqlx::query("UPDATE autopilot SET access_mode = 'restricted' WHERE id = ?")
+            .bind(&autopilot)
+            .execute(pool)
+            .await
+            .expect("restrict");
+        let refused = call(
+            methods::HANGAR_AUTOPILOT_COLLABORATOR_ADD,
+            serde_json::json!({
+                "workspace_id": crate::seed::WS_ID,
+                "autopilot_id": autopilot,
+                "actor": "member:user-1",
+                "actor_user_id": "user-1",
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused.error.as_ref().map(|e| e.code),
+            Some(PERMISSION_DENIED),
+            "{refused:?}"
+        );
+
+        // The operator is unchanged: a local agent authoring as itself stands.
+        let operator = dispatch_as(
+            pool,
+            &req(
+                methods::HANGAR_COMMENT_ADD,
+                serde_json::json!({
+                    "workspace_id": crate::seed::WS_SLUG,
+                    "issue_id": "issue-1",
+                    "author": "agent:agent-1",
+                    "body": "an agent on the operator token",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await;
+        assert!(operator.error.is_none(), "{:?}", operator.error);
+        let (kind, id) = stored(
+            "SELECT author_type, author_id FROM comment WHERE body = ?",
+            "an agent on the operator token".to_string(),
+        )
+        .await;
+        assert_eq!((kind.as_str(), id.as_str()), ("agent", "agent-1"));
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
