@@ -2,13 +2,15 @@
 //
 // These records mirror the frozen proto shapes (docs/contracts/v2-next.md)
 // one to one so the app never reads wire JSON itself (C-M1-3): every method
-// here returns a decoded record, and every event arrives decoded. When the
-// ubrn bindings for `ainb-wire-mobile` land, this file becomes a re-export of
-// the generated types; nothing outside src/wire/ may declare a wire shape.
+// here returns a decoded record, and every event arrives decoded. The native
+// side (lane E's `MobileHost`, one object per host with a pull event loop)
+// is wrapped by an adapter in src/wire/ that presents this hostId-keyed,
+// push-event interface; nothing outside src/wire/ may declare a wire shape.
 
 export type HostId = string;
 export type SessionKey = string;
-export type Reachability = "reachable" | "unreachable";
+/** T4: `stale` is a host whose last heartbeat is late; `unknown` is one this build cannot classify. */
+export type Reachability = "reachable" | "unreachable" | "stale" | "unknown";
 
 export interface HostRow {
   hostId: HostId;
@@ -17,6 +19,10 @@ export interface HostRow {
   /** Set when unreachable: when the host was last seen, epoch ms. */
   sinceMs?: number;
   scope?: DeviceScope;
+  /** A close only a new pairing clears (T9: 4403 revoked or expired, 4401 identity). */
+  repair?: "revoked" | "identity";
+  /** A close nobody should redial through: 4409, or a code this build does not know. */
+  notice?: "update_required" | "unknown_close";
 }
 
 export type BaseScope = "desktop" | "mobile" | "mobile+type" | "unknown";
@@ -84,6 +90,8 @@ export type AnswerOutcome =
   | { kind: "unknown"; reason: string };
 
 export interface MutationAck {
+  /** `created` on first execution, `replayed` when the ledger served a retry. */
+  outcome?: "created" | "replayed";
   status: "accepted" | "rejected" | "unknown";
   reason?: string;
   receipt?: "claimed" | "writing" | "delivered" | "failed" | "unknown";
@@ -114,7 +122,12 @@ export type WireEvent =
   | { kind: "fleet_revision"; hostId: HostId; revision: number }
   | { kind: "reachability"; hostId: HostId; reachability: Reachability; sinceMs?: number }
   | { kind: "transcript_line"; hostId: HostId; sessionKey: SessionKey; entry: TranscriptEntry }
-  | { kind: "closed"; hostId: HostId; code: number };
+  /** The socket closed; `code` is the peer close code when there was one (T9). */
+  | { kind: "closed"; hostId: HostId; code?: number; reason?: string }
+  /** The event stream fell behind: resubscribe from the cursor. */
+  | { kind: "lagged"; hostId: HostId }
+  /** The daemon asks for a fresh snapshot: resubscribe without a cursor. */
+  | { kind: "fleet_resync_required"; hostId: HostId };
 
 export type Unsubscribe = () => void;
 
@@ -128,7 +141,8 @@ export interface WireClient {
   close(hostId: HostId): Promise<void>;
 
   rosterStatus(hostId: HostId): Promise<SessionRow[]>;
-  subscribeFleet(hostId: HostId, afterRevision: number): Promise<FleetCursor>;
+  /** No `afterRevision` asks for a snapshot; with one, the daemon replays from it. */
+  subscribeFleet(hostId: HostId, afterRevision?: number): Promise<FleetCursor>;
   subscribeAttention(hostId: HostId): Promise<AttentionRow[]>;
 
   /**
@@ -147,19 +161,25 @@ export interface WireClient {
     opId: string;
   }): Promise<{ outcome: AnswerOutcome; ack?: MutationAck }>;
 
+  /** `fleet/message_send`, op id minted by `mintOpId` before the first send and reused on retry. */
   sendPrompt(req: {
     hostId: HostId;
     sessionKey: SessionKey;
     text: string;
     lifecycleUpdatedAt: number;
+    opId: string;
   }): Promise<MutationAck>;
+  /** `fleet/action { interrupt }`, same op id rule. */
   interrupt(req: {
     hostId: HostId;
     sessionKey: SessionKey;
     sessionIncarnation: string;
+    opId: string;
   }): Promise<MutationAck>;
 
   transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]>;
+  /** `fleet/transcript_subscribe`: live lines for one session until unsubscribed. */
+  subscribeTranscript(hostId: HostId, sessionKey: SessionKey, cb: (entry: TranscriptEntry) => void): Unsubscribe;
 
   connectionLog(): Promise<LogLine[]>;
   deviceKeyFingerprint(): Promise<string>;

@@ -1,9 +1,10 @@
 import { useLocalSearchParams } from "expo-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
+import { connectHost } from "../../../../src/lifecycle";
 import { colors } from "../../../../src/theme";
-import { useWire, useWireEvents, useWireQuery } from "../../../../src/wire/context";
+import { useWire, useWireQuery } from "../../../../src/wire/context";
 import type { TranscriptEntry } from "../../../../src/wire/types";
 
 type Tab = "transcript" | "terminal";
@@ -15,35 +16,61 @@ export default function Session() {
   const [tail, setTail] = useState<TranscriptEntry[]>([]);
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string>();
+  // One op id per draft: a retry of the same text reuses it, new text mints anew.
+  const draftOp = useRef<{ text: string; opId: string } | undefined>(undefined);
+  const inFlight = useRef(false);
+  useEffect(() => {
+    if (hostId) connectHost(wire, hostId).catch(() => undefined);
+  }, [wire, hostId]);
 
   const page = useWireQuery((w) => (hostId && key ? w.transcriptPage(hostId, key) : Promise.resolve([])));
   const roster = useWireQuery((w) => (hostId ? w.rosterStatus(hostId) : Promise.resolve([])), ["fleet_revision"]);
   const row = roster.data?.find((s) => s.sessionKey === key);
 
-  useWireEvents(
-    useCallback(
-      (ev) => {
-        if (ev.kind === "transcript_line" && ev.hostId === hostId && ev.sessionKey === key)
-          setTail((t) => [...t, ev.entry]);
-      },
-      [hostId, key],
-    ),
-  );
+  useEffect(() => {
+    if (!hostId || !key) return;
+    return wire.subscribeTranscript(hostId, key, (entry) => setTail((t) => [...t, entry]));
+  }, [wire, hostId, key]);
 
-  const entries = [...(page.data ?? []), ...tail];
+  // Page and tail can overlap when a live line lands before the page: merge by seq.
+  const bySeq = new Map<number, TranscriptEntry>();
+  for (const e of [...(page.data ?? []), ...tail]) bySeq.set(e.seq, e);
+  const entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
 
-  const send = async () => {
-    if (!hostId || !key || !row || !draft.trim()) return;
-    const ack = await wire.sendPrompt({ hostId, sessionKey: key, text: draft.trim(), lifecycleUpdatedAt: row.lifecycleUpdatedAt });
-    setNotice(ack.status === "accepted" ? undefined : `Not sent: ${ack.reason ?? ack.status}`);
-    if (ack.status === "accepted") setDraft("");
+  const guarded = async (run: () => Promise<void>) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    try {
+      await run();
+    } catch (e) {
+      setNotice(`No reply, tap again to retry (${e instanceof Error ? e.message : String(e)})`);
+    } finally {
+      inFlight.current = false;
+    }
   };
 
-  const interrupt = async () => {
-    if (!hostId || !key || !row) return;
-    const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation });
-    setNotice(ack.status === "accepted" ? "Interrupted" : `Not interrupted: ${ack.reason ?? ack.status}`);
-  };
+  const send = () =>
+    guarded(async () => {
+      const text = draft.trim();
+      if (!hostId || !key || !row || !text) return;
+      if (draftOp.current?.text !== text) draftOp.current = { text, opId: await wire.mintOpId() };
+      const ack = await wire.sendPrompt({ hostId, sessionKey: key, text, lifecycleUpdatedAt: row.lifecycleUpdatedAt, opId: draftOp.current.opId });
+      setNotice(ack.status === "accepted" ? undefined : `Not sent: ${ack.reason ?? ack.status}`);
+      if (ack.status === "accepted") {
+        setDraft("");
+        draftOp.current = undefined;
+      }
+    });
+
+  const interruptOp = useRef<string | undefined>(undefined);
+  const interrupt = () =>
+    guarded(async () => {
+      if (!hostId || !key || !row) return;
+      interruptOp.current ??= await wire.mintOpId();
+      const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation, opId: interruptOp.current });
+      interruptOp.current = undefined;
+      setNotice(ack.status === "accepted" ? "Interrupted" : `Not interrupted: ${ack.reason ?? ack.status}`);
+    });
 
   return (
     <View style={styles.screen}>
