@@ -258,6 +258,25 @@ impl Modes {
     /// end reaches the margin leaves the cursor and sets the flag when
     /// autowrap is on; a zero-width cluster joins the previous cell.
     fn observe_print(&mut self, text: &str, mut x: usize, cols: usize) {
+        if text.is_ascii() {
+            // Every printable ASCII byte is one cell: no width lookup.
+            let n = text.len();
+            if self.wrap_pending {
+                x = 0;
+                self.wrap_pending = false;
+            }
+            if cols == 0 {
+                return;
+            }
+            // `room` chars fit before the margin; the next one lands on it
+            // and parks the cursor. After that every `cols` chars park it
+            // again, so the run ends pending exactly when the remainder is
+            // a multiple of the width. With autowrap off the cursor stays
+            // on the margin and the fork overwrites it: never pending.
+            let room = cols - 1 - x.min(cols - 1);
+            self.wrap_pending = n > room && self.auto_wrap && (n - room - 1).is_multiple_of(cols);
+            return;
+        }
         let uv = UnicodeVersion {
             version: UNICODE_VERSION,
             ambiguous_are_wide: false,
@@ -424,41 +443,28 @@ impl Modes {
     }
 }
 
-/// Split the last grapheme cluster off the trailing printable text of
-/// `actions`, so it can be replayed at the head of the next batch. The rest
-/// of that text stays in `actions` and is performed now, so the cost is
-/// linear in the bytes fed. A cluster longer than [`MAX_HELD_BYTES`] is not
-/// held at all.
-fn take_trailing_cluster(actions: &mut Vec<Action>) -> Option<String> {
-    // The parser emits one `Print` per character, so gather the whole
-    // trailing run first.
-    let mut parts: Vec<String> = Vec::new();
-    while let Some(last) = actions.last() {
-        match last {
-            Action::Print(c) => parts.push(c.to_string()),
-            Action::PrintString(s) => parts.push(s.clone()),
-            _ => break,
-        }
-        actions.pop();
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    parts.reverse();
-    let text = parts.concat();
-    let last = text.graphemes(true).next_back()?;
+/// Split the last grapheme cluster off `text`: the head is performed now,
+/// the cluster is held for the next feed. A cluster longer than
+/// [`MAX_HELD_BYTES`] is not held at all.
+fn split_trailing_cluster(mut text: String) -> (String, Option<String>) {
+    let Some(last) = text.graphemes(true).next_back() else {
+        return (text, None);
+    };
     if last.len() > MAX_HELD_BYTES {
-        actions.push(Action::PrintString(text));
-        return None;
+        return (text, None);
     }
     let head_len = text.len() - last.len();
     let held = text[head_len..].to_string();
-    if head_len > 0 {
-        let mut head = text;
-        head.truncate(head_len);
-        actions.push(Action::PrintString(head));
-    }
-    Some(held)
+    text.truncate(head_len);
+    (text, Some(held))
+}
+
+/// Shadow the wrap rule over `text` from the emulator's real cursor column,
+/// then print it as one run.
+fn perform_print(term: &mut Terminal, modes: &mut Modes, cols: u16, text: String) {
+    let x = term.cursor_pos().x;
+    modes.observe_print(&text, x, usize::from(cols));
+    term.perform_actions(vec![Action::PrintString(text)]);
 }
 
 /// The emulator panicked on some input and its grid can no longer be
@@ -554,35 +560,57 @@ impl PaneEmulator {
         if self.poisoned {
             return Err(Poisoned);
         }
-        let rows = self.rows;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             #[cfg(test)]
             assert!(!self.panic_on_next_feed, "injected emulator panic");
-            let mut actions = self.parser.parse_as_vec(bytes);
-            if let Some(held) = self.held.take() {
-                actions.insert(0, Action::PrintString(held));
-            }
-            self.held = take_trailing_cluster(&mut actions);
-            // Print runs are performed as one string each, with the cursor
-            // read just before, so the wrap shadow starts from the real
-            // column; every other action is observed and performed in
-            // order.
-            let mut run = String::new();
-            for action in actions {
-                match action {
-                    Action::Print(c) => run.push(c),
-                    Action::PrintString(s) => run.push_str(&s),
-                    other => {
-                        if !run.is_empty() {
-                            self.perform_print(std::mem::take(&mut run));
-                        }
-                        self.modes.observe(&other, rows);
-                        self.term.perform_actions(vec![other]);
+            // The parser streams actions; print characters gather into one
+            // run and every other action into one batch, so the emulator
+            // is entered a few times per feed rather than once per byte or
+            // per escape sequence. A batch is performed just before the
+            // next run so the run starts from the real cursor column. The
+            // run's last grapheme cluster is held for the next feed.
+            let Self {
+                parser,
+                term,
+                modes,
+                held,
+                cols,
+                rows,
+                ..
+            } = self;
+            let (cols, rows) = (*cols, *rows);
+            let mut run = held.take().unwrap_or_default();
+            let mut batch: Vec<Action> = Vec::new();
+            parser.parse(bytes, |action| match action {
+                Action::Print(c) => {
+                    if !batch.is_empty() {
+                        term.perform_actions(std::mem::take(&mut batch));
                     }
+                    run.push(c);
                 }
+                Action::PrintString(s) => {
+                    if !batch.is_empty() {
+                        term.perform_actions(std::mem::take(&mut batch));
+                    }
+                    run.push_str(&s);
+                }
+                other => {
+                    if !run.is_empty() {
+                        perform_print(term, modes, cols, std::mem::take(&mut run));
+                    }
+                    modes.observe(&other, rows);
+                    batch.push(other);
+                }
+            });
+            if !batch.is_empty() {
+                term.perform_actions(batch);
             }
             if !run.is_empty() {
-                self.perform_print(run);
+                let (head, tail) = split_trailing_cluster(run);
+                if !head.is_empty() {
+                    perform_print(term, modes, cols, head);
+                }
+                *held = tail;
             }
         }));
         match outcome {
@@ -607,21 +635,13 @@ impl PaneEmulator {
             return Ok(());
         };
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            self.perform_print(held);
+            perform_print(&mut self.term, &mut self.modes, self.cols, held);
         }));
         if outcome.is_err() {
             self.poisoned = true;
             return Err(Poisoned);
         }
         Ok(())
-    }
-
-    /// Shadow the wrap rule over `text` from the real cursor column, then
-    /// print it.
-    fn perform_print(&mut self, text: String) {
-        let x = self.term.cursor_pos().x;
-        self.modes.observe_print(&text, x, usize::from(self.cols));
-        self.term.perform_actions(vec![Action::PrintString(text)]);
     }
 
     /// Whether text is held back, waiting for a flush or the next feed.
@@ -1130,5 +1150,44 @@ mod tests {
         p.feed(b"56789").unwrap();
         p.flush().unwrap();
         assert!(p.modes().wrap_pending);
+    }
+
+    /// Feed throughput on spike 2's 50 MB attributed flood, wrapper against
+    /// the raw fork, in release. Ignored by default: point `AINB_TERM_FLOOD`
+    /// at the flood file (spike 2's `make-workload.py --flood`) and run
+    /// `cargo test --release -p ainb-term --lib flood -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs AINB_TERM_FLOOD and a release build"]
+    fn flood_throughput_wrapper_against_raw_fork() {
+        let Ok(path) = std::env::var("AINB_TERM_FLOOD") else {
+            eprintln!("AINB_TERM_FLOOD unset");
+            return;
+        };
+        let flood = std::fs::read(&path).expect("flood file");
+        let mb = flood.len() as f64 / 1e6;
+        for chunk in [4096usize, 65536] {
+            let mut p = PaneEmulator::new(120, 40, crate::DEFAULT_LIVE_ROWS);
+            let t = std::time::Instant::now();
+            for c in flood.chunks(chunk) {
+                p.feed(c).unwrap();
+            }
+            p.flush().unwrap();
+            let wrapper = t.elapsed();
+            let mut raw = crate::new_terminal(120, 40, crate::TermConfig::default());
+            let t = std::time::Instant::now();
+            for c in flood.chunks(chunk) {
+                raw.advance_bytes(c);
+            }
+            let fork = t.elapsed();
+            eprintln!(
+                "FLOOD chunk={chunk}: wrapper {:.2} s ({:.1} MB/s), raw fork {:.2} s ({:.1} MB/s), wrapper/raw {:.2}x",
+                wrapper.as_secs_f64(),
+                mb / wrapper.as_secs_f64(),
+                fork.as_secs_f64(),
+                mb / fork.as_secs_f64(),
+                wrapper.as_secs_f64() / fork.as_secs_f64()
+            );
+            assert_eq!(p.bytes_fed(), flood.len() as u64);
+        }
     }
 }
