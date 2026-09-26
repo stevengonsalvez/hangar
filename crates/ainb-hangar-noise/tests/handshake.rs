@@ -4,8 +4,8 @@
 //! phone crate build on:
 //!
 //! 1. a handshake between a pinned host key and a device key yields two
-//!    sessions that carry frames both ways, and the host learns the device key
-//!    at message 1;
+//!    sessions that carry frames both ways, and the host is handed the device
+//!    key only once a frame from the device opens (message 1 can be replayed);
 //! 2. the three G5 cases (wrong carrier, unpinned key, wrong host id) fail at
 //!    message 1, before the host writes anything;
 //! 3. a tampered, replayed or cross-session message does not decrypt;
@@ -66,24 +66,26 @@ fn ik_yields_two_sessions_that_carry_frames_both_ways() {
     let mut client =
         initiator(&k.device.private, &k.host.public, CarrierKind::Tailnet, &id).unwrap();
     let mut host = responder(&k.host.private, CarrierKind::Tailnet, &id).unwrap();
-    assert_eq!(host.remote_static(), None);
 
     let msg1 = client.write_message().unwrap();
     assert!(client.write_message().is_err(), "msg2 is the host's turn");
     host.read_message(&msg1).unwrap();
-    assert_eq!(
-        host.remote_static(),
-        Some(k.device.public),
-        "the host knows the device key after message 1, before it answers"
-    );
     let msg2 = host.write_message().unwrap();
     client.read_message(&msg2).unwrap();
     assert!(client.is_finished() && host.is_finished());
 
     let mut client = client.into_session().unwrap();
     let mut host = host.into_session().unwrap();
-    assert_eq!(client.remote_static(), k.host.public);
-    assert_eq!(host.remote_static(), k.device.public);
+    assert_eq!(
+        client.remote_static(),
+        Some(k.host.public),
+        "the pinned key"
+    );
+    assert_eq!(
+        host.remote_static(),
+        None,
+        "no device key before a frame from the device opens"
+    );
     assert_eq!(client.handshake_hash(), host.handshake_hash());
     assert!(!client.handshake_hash().is_empty());
 
@@ -94,6 +96,7 @@ fn ik_yields_two_sessions_that_carry_frames_both_ways() {
     let sealed = client.encrypt_frame(&hello[0]).unwrap();
     assert_eq!(sealed.len(), hello[0].encode().len() + TAG_LEN);
     assert_eq!(host.decrypt_frame(&sealed).unwrap(), hello[0]);
+    assert_eq!(host.remote_static(), Some(k.device.public));
 
     for seq in 0..3 {
         let ping = Frame::control(Opcode::Ping, seq, Vec::new());
@@ -209,6 +212,89 @@ fn a_frame_larger_than_one_noise_message_is_refused() {
         host.decrypt_frame(&vec![0; MAX_NOISE_MESSAGE + 1]),
         Err(NoiseError::TooLarge(MAX_NOISE_MESSAGE + 1))
     );
+}
+
+/// A recorded message 1 replayed to the host completes the host's half of
+/// the handshake, but the replayer holds no key to send a frame with, so the
+/// host is never handed the device key and never has a frame to act on.
+#[test]
+fn a_replayed_message_one_proves_nothing() {
+    let k = keys();
+    let id = host_id(HOST);
+    let mut genuine =
+        initiator(&k.device.private, &k.host.public, CarrierKind::Tailnet, &id).unwrap();
+    let recorded = genuine.write_message().unwrap();
+
+    let mut host = responder(&k.host.private, CarrierKind::Tailnet, &id).unwrap();
+    host.read_message(&recorded).unwrap();
+    let _answer = host.write_message().unwrap();
+    let mut host = host.into_session().unwrap();
+    assert_eq!(host.remote_static(), None);
+    // The replayer guesses at frames; none opens, and the key stays unproven.
+    for guess in [vec![0u8; 64], vec![0xff; 32], recorded.clone()] {
+        assert_eq!(host.decrypt_frame(&guess), Err(NoiseError::Decrypt));
+    }
+    assert_eq!(host.remote_static(), None);
+}
+
+/// A reserved opcode (R2's binary lane) decrypts but is dropped as unknown
+/// while no capability names it; the session goes on.
+#[test]
+fn a_reserved_opcode_is_dropped_and_the_session_goes_on() {
+    let k = keys();
+    let (mut client, mut host) = connected(&k);
+    for reserved in Opcode::ALL.into_iter().filter(|op| !op.in_use()) {
+        let frame = Frame::control(reserved, 0, b"x".to_vec());
+        let err = host.decrypt_frame(&client.encrypt_frame(&frame).unwrap()).unwrap_err();
+        assert_eq!(
+            err,
+            NoiseError::Frame(ainb_hangar_noise::frame::HeaderError::UnknownOpcode(
+                reserved.as_u8()
+            )),
+            "{reserved:?}"
+        );
+        assert!(!err.is_fatal());
+    }
+    let ping = Frame::control(Opcode::Ping, 1, Vec::new());
+    assert_eq!(
+        host.decrypt_frame(&client.encrypt_frame(&ping).unwrap()),
+        Ok(ping)
+    );
+}
+
+/// For R1-07's redeem check: the known low-order X25519 points (including
+/// the non-canonical encodings of 0 and 1) are flagged, real keys are not.
+#[test]
+fn low_order_device_keys_are_recognised() {
+    fn hex(s: &str) -> [u8; KEY_LEN] {
+        std::array::from_fn(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap())
+    }
+    let mut p_minus_1 = [0xff; KEY_LEN];
+    p_minus_1[0] = 0xec;
+    p_minus_1[31] = 0x7f;
+    let mut p = p_minus_1;
+    p[0] = 0xed;
+    let mut p_plus_1 = p_minus_1;
+    p_plus_1[0] = 0xee;
+    let mut one = [0u8; KEY_LEN];
+    one[0] = 1;
+    let low = [
+        [0u8; KEY_LEN],
+        one,
+        hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"),
+        hex("5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"),
+        p_minus_1,
+        p,
+        p_plus_1,
+    ];
+    for point in low {
+        assert!(ainb_hangar_noise::is_low_order(&point), "{point:02x?}");
+    }
+    for _ in 0..16 {
+        assert!(!ainb_hangar_noise::is_low_order(
+            &generate_keypair().unwrap().public
+        ));
+    }
 }
 
 /// The unix leg's 16 MiB cap holds end to end on the peer leg.
