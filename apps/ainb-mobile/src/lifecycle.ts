@@ -133,7 +133,7 @@ function scheduleRedial(wire: WireClient, hostId: HostId) {
   }, wire.backoffDelayMs(l.attempts, l.retryAfterMs));
 }
 
-/** Connect every paired host that is not latched (revoked, identity, parked); a failed dial enters the redial loop. */
+/** Connect every paired host that is not latched (revoked, unauthenticated, peer_changed) or parked; a failed dial enters the redial loop. */
 export async function connectAll(wire: WireClient) {
   const hosts = await wire.hosts().catch(() => []);
   await Promise.allSettled(
