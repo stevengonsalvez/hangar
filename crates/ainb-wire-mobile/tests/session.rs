@@ -344,7 +344,18 @@ async fn subscribe_replays_after_revision_and_events_arrive_in_order() {
 
     host.close();
     let closed = Arc::clone(&host).next_event().await;
-    assert!(matches!(closed, WireEvent::Closed { .. }), "{closed:?}");
+    assert!(
+        matches!(
+            closed,
+            WireEvent::Closed {
+                code: None,
+                retryable: false,
+                retry_after_ms: None,
+                ..
+            }
+        ),
+        "the app's own close is never retryable: {closed:?}"
+    );
 }
 
 #[tokio::test]
