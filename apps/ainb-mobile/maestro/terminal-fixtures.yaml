@@ -16,8 +16,10 @@ appId: com.stevengonsalvez.ainb.mobile
     id: "terminal"
 - assertVisible:
     id: "terminal-size"
+# painted, not merely up: the engine row counts the bytes xterm has written,
+# and a blank terminal reads "engine ready, 0 B" or shows no count at all
 - assertVisible:
-    text: "engine ready.*"
+    text: "engine ready, [1-9][0-9]* B.*"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-f1-altscreen
