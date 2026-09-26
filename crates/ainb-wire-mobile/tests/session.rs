@@ -227,7 +227,8 @@ async fn send_prompt_and_interrupt_carry_their_fences_and_surface_reasons() {
         WireError::Rpc {
             code: -32008,
             message: "turn advanced".into(),
-            reason: Some("turn_advanced".into())
+            reason: Some("turn_advanced".into()),
+            data: Some(json!({"reason": "turn_advanced"}).to_string()),
         }
     );
 
