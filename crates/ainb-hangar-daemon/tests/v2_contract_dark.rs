@@ -177,7 +177,10 @@ fn every_dispatched_method_is_classified() {
 #[test]
 fn the_arm_parser_sees_every_arm_shape() {
     // Two hashes are needed: the source holds `""#` inside a raw string.
-    #[allow(clippy::needless_raw_string_hashes)]
+    #[expect(
+        clippy::needless_raw_string_hashes,
+        reason = "a false positive: the literal holds a quote followed by a hash"
+    )]
     let source = r##"
         match req.method.as_str() {
             methods::SINGLE => a(),
