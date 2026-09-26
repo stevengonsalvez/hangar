@@ -564,28 +564,34 @@ where
     // before any `writing` receipt, so the retry runs for real.
     if let Err(error) = &result {
         if let Some(reason) = fence_refusal(error) {
+            // Only a row that is actually gone frees the op id. If nothing was
+            // abandoned (the receipt already reached `writing`) or the delete
+            // failed, fall through and record the refusal as the answer:
+            // returning here would leave the row in flight, and the boot
+            // sweep would later call a refused action `unknown`.
             match MutationLedgerRepo::abandon(pool, &key).await {
-                Ok(0) => tracing::warn!(
+                Ok(n) if n > 0 => {
+                    return Err(with_error_ack(
+                        error.clone(),
+                        &MutationAck::refused(
+                            ainb_hangar_proto::mutation::MutationOutcome::Created,
+                            reason,
+                        ),
+                    ));
+                }
+                Ok(_) => tracing::warn!(
                     op_id = %key.op_id,
                     method = %req.method,
                     reason,
-                    "a refusal to retry abandoned no ledger row; the op id may replay it"
+                    "a refusal to retry abandoned no ledger row; recording it as the op id's answer"
                 ),
-                Ok(_) => {}
                 Err(error) => tracing::warn!(
                     op_id = %key.op_id,
                     method = %req.method,
                     %error,
-                    "a refusal to retry could not abandon its ledger row"
+                    "a refusal to retry could not abandon its ledger row; recording it as the op id's answer"
                 ),
             }
-            return Err(with_error_ack(
-                error.clone(),
-                &MutationAck::refused(
-                    ainb_hangar_proto::mutation::MutationOutcome::Created,
-                    reason,
-                ),
-            ));
         }
     }
 
@@ -666,9 +672,11 @@ where
 
 /// A handler refusal the client cures by re-reading and resending under the
 /// SAME op id: a stale fence (`turn_advanced`, `incarnation_mismatch`) or a
-/// stale fleet session version (`conflict`). It must not be recorded as the
-/// op id's answer, because the body fingerprint ignores both the fence and
-/// the retry's fresh read; see the abandon path in [`guard`].
+/// stale fleet session version (`conflict`). It is abandoned rather than
+/// recorded: the body fingerprint strips the fence, so a recorded fence
+/// refusal would replay to the retry that carries a fresh fence; see the
+/// abandon path in [`guard`]. (`expected_version` is in the fingerprint, so a
+/// recorded version refusal would instead meet the retry as a body mismatch.)
 fn fence_refusal(error: &RpcError) -> Option<&'static str> {
     match handler_reason(error)?.as_str() {
         REASON_TURN_ADVANCED => Some(REASON_TURN_ADVANCED),
