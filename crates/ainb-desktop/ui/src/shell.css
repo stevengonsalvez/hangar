@@ -368,10 +368,6 @@ body {
   padding: 3px 8px;
 }
 
-/* The selected session, on the token the spec names for it. */
-.session-row.selected {
-  background: var(--accent);
-}
 
 .session-row .agent-type {
   color: var(--muted-foreground);
@@ -390,6 +386,15 @@ body {
 .session-row:focus-visible {
   background: var(--highlight);
   outline: none;
+}
+
+/* The selected session: a primary bar on the start side and a tint strong
+   enough to tell apart from hover, which is the faint accent above. Declared
+   after hover so a hovered selected row stays selected-looking. */
+.session-row.selected,
+.session-row.selected:hover {
+  background: color-mix(in srgb, var(--primary) 18%, var(--sidebar));
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
 /* Status fills the dot; attention paints a ring around it. Idle is the
@@ -1723,4 +1728,29 @@ body {
 .commits .empty {
   margin: 8px 10px;
   color: var(--muted-foreground);
+}
+
+/* One keyboard ring for every chrome control, the same opaque token rows use:
+   a focus mark must never depend on a hover tint. */
+.titlebar button:focus-visible,
+.statusbar button:focus-visible,
+.workspace-name:focus-visible,
+.tab button:focus-visible,
+.sidebar-head button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+/* Text for assistive technology only: present in the accessibility tree,
+   drawn nowhere. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
