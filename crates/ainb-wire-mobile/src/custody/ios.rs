@@ -1,39 +1,40 @@
-//! iOS Keychain custody: the keypair is a generic-password item with
+//! iOS Keychain custody: every secret is a generic-password item with
 //! `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, ungated.
 //!
 //! After-first-unlock, because the app reconnects from the background grace
 //! window without the user present; this-device-only, because a Noise static
-//! key that migrated to a new phone through a backup would let that phone
-//! impersonate this one. No biometry gate: the key is a device identity, not
-//! a user secret, and a Face ID prompt on every reconnect is what the spike
-//! measured as unusable.
+//! key or a device token that migrated to a new phone through a backup would
+//! let that phone impersonate this one. No biometry gate: these are device
+//! identities, not user secrets, and a Face ID prompt on every reconnect is
+//! what the spike measured as unusable.
 
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::passwords::{
     PasswordOptions, delete_generic_password, get_generic_password, set_generic_password_options,
 };
 
-use super::{KeyBytes, custody_error};
+use super::custody_error;
 use crate::records::WireError;
 
-/// The keychain service.
+/// The keychain service every secret is filed under; the secret name is the
+/// account.
 pub const SERVICE: &str = "com.ainb.wire";
-/// The keychain account: the one device keypair.
-pub const ACCOUNT: &str = "device-noise-static";
 
-/// The stored keypair, when one exists.
-pub fn load() -> Result<Option<KeyBytes>, WireError> {
-    match get_generic_password(SERVICE, ACCOUNT) {
+/// errSecItemNotFound.
+const NOT_FOUND: i32 = -25300;
+
+/// The secret under `name`, when one exists.
+pub fn load(name: &str) -> Result<Option<Vec<u8>>, WireError> {
+    match get_generic_password(SERVICE, name) {
         Ok(bytes) => Ok(Some(bytes)),
-        // errSecItemNotFound
-        Err(e) if e.code() == -25300 => Ok(None),
+        Err(e) if e.code() == NOT_FOUND => Ok(None),
         Err(e) => Err(custody_error(format!("keychain read: {e}"))),
     }
 }
 
-/// Store a freshly minted keypair.
-pub fn store(bytes: &KeyBytes) -> Result<(), WireError> {
-    let mut options = PasswordOptions::new_generic_password(SERVICE, ACCOUNT);
+/// Store `bytes` under `name`, replacing any previous item.
+pub fn store(name: &str, bytes: &[u8]) -> Result<(), WireError> {
+    let mut options = PasswordOptions::new_generic_password(SERVICE, name);
     let access = SecAccessControl::create_with_protection(
         Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
         0,
@@ -41,10 +42,18 @@ pub fn store(bytes: &KeyBytes) -> Result<(), WireError> {
     .map_err(|e| custody_error(format!("keychain access control: {e}")))?;
     options.set_access_control(access);
     options.set_access_synchronized(Some(false));
-    // A stale item from an earlier install with other attributes would make
-    // the add fail with errSecDuplicateItem; the file backend has the same
-    // create-once rule, so replace rather than fail.
-    let _ = delete_generic_password(SERVICE, ACCOUNT);
+    // An existing item makes the add fail with errSecDuplicateItem; replace
+    // is the contract of `store_secret`.
+    delete(name)?;
     set_generic_password_options(bytes, options)
         .map_err(|e| custody_error(format!("keychain write: {e}")))
+}
+
+/// Forget the secret under `name`; absent is not an error.
+pub fn delete(name: &str) -> Result<(), WireError> {
+    match delete_generic_password(SERVICE, name) {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == NOT_FOUND => Ok(()),
+        Err(e) => Err(custody_error(format!("keychain delete: {e}"))),
+    }
 }
