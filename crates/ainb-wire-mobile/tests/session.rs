@@ -373,6 +373,7 @@ async fn heartbeat_declares_dead_after_two_unanswered_pings_and_lives_on_pongs()
     let mut config = silent.config(&key);
     config.heartbeat = Some(Duration::from_millis(50));
     let session = Session::connect(config).await.unwrap();
+    session.start_heartbeat();
     tokio::time::sleep(Duration::from_millis(400)).await;
     let stats = session.stats();
     assert!(stats.closed, "{stats:?}");
@@ -395,6 +396,7 @@ async fn heartbeat_declares_dead_after_two_unanswered_pings_and_lives_on_pongs()
     let mut config = answering.config(&key);
     config.heartbeat = Some(Duration::from_millis(50));
     let session = Session::connect(config).await.unwrap();
+    session.start_heartbeat();
     tokio::time::sleep(Duration::from_millis(400)).await;
     let stats = session.stats();
     assert!(!stats.closed, "{stats:?}");
