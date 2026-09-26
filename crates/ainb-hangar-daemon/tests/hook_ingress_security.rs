@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ainb_hangar_daemon::hook_ingress::{self, HookEvent, HookReply, HookSink};
-use ainb_hangar_proto::hooks::{HookEndpoint, HookSource, ENDPOINT_FILE_NAME};
+use ainb_hangar_proto::hooks::{ENDPOINT_FILE_NAME, HookEndpoint, HookSource};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -60,10 +60,7 @@ impl World {
 
     fn token(&self) -> String {
         let line = std::fs::read_to_string(self.endpoint().headers_path).unwrap();
-        line.trim_end()
-            .strip_prefix("X-Ainb-Hook-Token: ")
-            .unwrap()
-            .to_string()
+        line.trim_end().strip_prefix("X-Ainb-Hook-Token: ").unwrap().to_string()
     }
 
     fn host(&self) -> String {
@@ -108,7 +105,12 @@ async fn a_good_event_is_ingested_with_its_pane_headers() {
     );
     let resp = exchange(
         w.running.port(),
-        &post("/hook/claude", &w.host(), &extra, r#"{"hook_event_name":"Stop"}"#),
+        &post(
+            "/hook/claude",
+            &w.host(),
+            &extra,
+            r#"{"hook_event_name":"Stop"}"#,
+        ),
     )
     .await;
     assert_eq!(status(&resp), 204, "{resp}");
@@ -146,9 +148,7 @@ async fn a_wrong_token_is_refused_before_the_body_is_read() {
         "POST /hook/claude HTTP/1.1\r\nHost: {}\r\nX-Ainb-Hook-Token: not-the-token\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n",
         w.host()
     );
-    let mut s = TcpStream::connect(("127.0.0.1", w.running.port()))
-        .await
-        .unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", w.running.port())).await.unwrap();
     s.write_all(head.as_bytes()).await.unwrap();
     let mut out = Vec::new();
     tokio::time::timeout(Duration::from_millis(1500), s.read_to_end(&mut out))
@@ -164,7 +164,10 @@ async fn missing_token_foreign_host_and_origin_are_forbidden() {
     let w = World::start().await;
     let port = w.running.port();
     let tok = format!("X-Ainb-Hook-Token: {}\r\n", w.token());
-    assert_eq!(status(&exchange(port, &post("/hook/claude", &w.host(), "", "{}")).await), 403);
+    assert_eq!(
+        status(&exchange(port, &post("/hook/claude", &w.host(), "", "{}")).await),
+        403
+    );
     assert_eq!(
         status(&exchange(port, &post("/hook/claude", "localhost", &tok, "{}")).await),
         403
@@ -182,8 +185,14 @@ async fn routes_methods_types_sizes_and_bodies() {
     let w = World::start().await;
     let port = w.running.port();
     let tok = format!("X-Ainb-Hook-Token: {}\r\n", w.token());
-    assert_eq!(status(&exchange(port, &post("/hook/gemini", &w.host(), &tok, "{}")).await), 404);
-    let get = format!("GET /hook/claude HTTP/1.1\r\nHost: {}\r\n{tok}\r\n", w.host());
+    assert_eq!(
+        status(&exchange(port, &post("/hook/gemini", &w.host(), &tok, "{}")).await),
+        404
+    );
+    let get = format!(
+        "GET /hook/claude HTTP/1.1\r\nHost: {}\r\n{tok}\r\n",
+        w.host()
+    );
     assert_eq!(status(&exchange(port, get.as_bytes()).await), 405);
     let text = format!(
         "POST /hook/claude HTTP/1.1\r\nHost: {}\r\n{tok}Content-Type: text/plain\r\nContent-Length: 2\r\n\r\n{{}}",
@@ -196,21 +205,30 @@ async fn routes_methods_types_sizes_and_bodies() {
         hook_ingress::MAX_BODY + 1
     );
     assert_eq!(status(&exchange(port, too_big.as_bytes()).await), 413);
-    assert_eq!(status(&exchange(port, &post("/hook/claude", &w.host(), &tok, "[1]")).await), 400);
-    assert_eq!(status(&exchange(port, &post("/hook/claude", &w.host(), &tok, "nope")).await), 400);
+    assert_eq!(
+        status(&exchange(port, &post("/hook/claude", &w.host(), &tok, "[1]")).await),
+        400
+    );
+    assert_eq!(
+        status(&exchange(port, &post("/hook/claude", &w.host(), &tok, "nope")).await),
+        400
+    );
     assert!(w.events().is_empty());
 }
 
 #[tokio::test]
 async fn expect_continue_is_answered_so_curl_does_not_stall() {
     let w = World::start().await;
-    let extra = format!("X-Ainb-Hook-Token: {}\r\nExpect: 100-continue\r\n", w.token());
+    let extra = format!(
+        "X-Ainb-Hook-Token: {}\r\nExpect: 100-continue\r\n",
+        w.token()
+    );
     let head = post("/hook/claude", &w.host(), &extra, "");
-    let mut s = TcpStream::connect(("127.0.0.1", w.running.port()))
-        .await
-        .unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", w.running.port())).await.unwrap();
     // Send the head declaring 2 bytes, wait for 100 Continue, then the body.
-    let head = String::from_utf8(head).unwrap().replace("Content-Length: 0", "Content-Length: 2");
+    let head = String::from_utf8(head)
+        .unwrap()
+        .replace("Content-Length: 0", "Content-Length: 2");
     s.write_all(head.as_bytes()).await.unwrap();
     let mut first = [0_u8; 25];
     tokio::time::timeout(Duration::from_millis(500), s.read_exact(&mut first))
@@ -231,7 +249,11 @@ async fn bad_pane_headers_are_dropped_not_trusted() {
         "X-Ainb-Hook-Token: {}\r\nX-Ainb-Pane-Key: v1:../../etc\r\nX-Ainb-Tmux-Pane: $(id)\r\n",
         w.token()
     );
-    let resp = exchange(w.running.port(), &post("/hook/codex", &w.host(), &extra, "{}")).await;
+    let resp = exchange(
+        w.running.port(),
+        &post("/hook/codex", &w.host(), &extra, "{}"),
+    )
+    .await;
     assert_eq!(status(&resp), 204);
     let e = &w.events()[0];
     assert_eq!(e.source, HookSource::Codex);
@@ -269,7 +291,12 @@ async fn a_restart_mints_a_new_token_and_the_old_one_is_refused() {
     let host = w2.host();
     let resp = exchange(
         w2.running.port(),
-        &post("/hook/claude", &host, &format!("X-Ainb-Hook-Token: {old}\r\n"), "{}"),
+        &post(
+            "/hook/claude",
+            &host,
+            &format!("X-Ainb-Hook-Token: {old}\r\n"),
+            "{}",
+        ),
     )
     .await;
     assert_eq!(status(&resp), 403);
