@@ -212,7 +212,7 @@ async fn send_prompt_and_interrupt_carry_their_fences_and_surface_reasons() {
     let host = connect_host(params_for(&peer, dir.path())).await.unwrap();
 
     let sent = Arc::clone(&host)
-        .send_prompt("claude:s-1".into(), "hi".into(), 5, None)
+        .send_prompt("claude:s-1".into(), "hi".into(), 5, mint_op_id())
         .await
         .unwrap();
     assert_eq!(sent.message_id, "m1");
@@ -226,7 +226,7 @@ async fn send_prompt_and_interrupt_carry_their_fences_and_surface_reasons() {
     );
 
     let stale = Arc::clone(&host)
-        .send_prompt("claude:s-1".into(), "hi".into(), 4, None)
+        .send_prompt("claude:s-1".into(), "hi".into(), 4, mint_op_id())
         .await
         .unwrap_err();
     assert_eq!(
@@ -240,7 +240,7 @@ async fn send_prompt_and_interrupt_carry_their_fences_and_surface_reasons() {
     );
 
     let interrupted = Arc::clone(&host)
-        .interrupt("claude:s-1".into(), 3, "fp-1".into(), None)
+        .interrupt("claude:s-1".into(), 3, "fp-1".into(), mint_op_id())
         .await
         .unwrap();
     assert_eq!(interrupted.receipt_status, "DELIVERED");
