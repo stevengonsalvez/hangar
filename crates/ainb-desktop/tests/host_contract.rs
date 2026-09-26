@@ -7,7 +7,7 @@ use std::rc::Rc;
 use ainb_app::app::Effect;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
-use ainb_app::{Chord, CommandId, Intent, Keymap, SectionId};
+use ainb_app::{AppState, Chord, CommandId, Intent, Keymap, SectionId};
 use ainb_desktop::host::{DesktopHost, Executor};
 
 mod support;
@@ -425,31 +425,126 @@ fn a_chord_or_a_name_on_a_key_only_row_is_refused() {
 }
 
 /// A name sent off its row's screen is refused for the webview with the
-/// reason, not dropped on the way to the reducer: the answer banner's pick
-/// over the inbox page sent `session_list.select_tab` and `session_list.ask.pick`
-/// while the reducer was on its Inbox screen, and the window logged them as
-/// dispatched (#121). Back on the session list the same name runs.
+/// reason, not dropped on the way to the reducer and logged as dispatched
+/// (#121); a name no row has is refused too. Judged after the host's own
+/// reasons, so a row refused for what it writes keeps that reason wherever
+/// it is sent from.
 #[test]
-fn a_name_off_its_screen_is_refused_with_the_reason() {
+fn a_name_off_its_screen_or_with_no_row_is_refused_with_the_reason() {
     let log = Log::default();
     let mut host = host(&[SectionId::Shell], &log);
-    let name = |id: &str, args: serde_json::Value| Intent::Command(CommandId::new(id), args);
-    let select_ask = || name("session_list.select_tab", serde_json::json!({ "tab": "Ask" }));
+    let name = |id: &str| Intent::Command(CommandId::new(id), serde_json::Value::Null);
 
-    // OPEN_INBOX in inbox.ts.
-    let _ = host.dispatch(name("global.go_home", serde_json::Value::Null));
-    let _ = host.dispatch(name("home.inbox", serde_json::Value::Null));
+    // OPEN_INBOX in inbox.ts: the inbox's own sweep runs there, the session
+    // list's `open` does not.
+    let _ = host.dispatch(name("global.go_home"));
+    let _ = host.dispatch(name("home.inbox"));
     assert_eq!(host.state().shell.current_screen, "inbox");
+    assert_eq!(
+        host.refused_from_renderer(&name("inbox.mark_all_read")),
+        None
+    );
     let refusal = host
-        .refused_from_renderer(&select_ask())
-        .expect("the session list's tab row is not the inbox screen's");
-    assert_eq!(refusal.command.as_str(), "session_list.select_tab");
-    assert!(refusal.reason.contains("not active on this screen"), "{refusal:?}");
+        .refused_from_renderer(&name("session_list.refresh"))
+        .expect("the session list's row is not the inbox screen's");
+    assert_eq!(refusal.command.as_str(), "session_list.refresh");
+    assert_eq!(refusal.reason, "it is not active on this screen");
+
+    let unknown = host
+        .refused_from_renderer(&name("session_list.no_such_row"))
+        .expect("a name no row has");
+    assert_eq!(unknown.reason, "the host has no such row");
 
     // CLOSE_INBOX in inbox.ts.
-    let _ = host.dispatch(name("inbox.back", serde_json::Value::Null));
-    let _ = host.dispatch(name("home.sessions", serde_json::Value::Null));
+    let _ = host.dispatch(name("inbox.back"));
+    let _ = host.dispatch(name("home.sessions"));
     assert_eq!(host.state().shell.current_screen, "session_list");
+    assert_eq!(
+        host.refused_from_renderer(&name("session_list.refresh")),
+        None
+    );
+}
+
+/// The answer banner is drawn over every page, and its rows are the session
+/// list's: sent from the inbox, the settings or the git view, the host leaves
+/// that page for the session list first, by the reducer's own screen, and
+/// the row is then not refused (#121). Any other row sent off screen moves
+/// nothing.
+#[test]
+fn the_banners_rows_bring_the_reducer_home_from_any_page() {
+    use ainb_app::app::screens::ids as screen_ids;
+    use ainb_app::components::git_view::GitViewState;
+
+    let log = Log::default();
+    let mut recorder = Recorder(Rc::clone(&log));
+    let name = |id: &str, args: serde_json::Value| Intent::Command(CommandId::new(id), args);
+    let select_ask = || {
+        name(
+            "session_list.select_tab",
+            serde_json::json!({ "tab": "Ask" }),
+        )
+    };
+
+    // The pages a person opens from the window: the inbox and the settings.
+    let mut host = host(&[SectionId::Shell], &log);
+    for page in [
+        &["global.go_home", "home.inbox"][..],
+        &["global.go_home", "home.config"][..],
+    ] {
+        for step in page {
+            let _ = host.dispatch(name(step, serde_json::Value::Null));
+        }
+        let screen = host.state().shell.current_screen.clone();
+        assert_ne!(
+            screen,
+            screen_ids::SESSION_LIST,
+            "{page:?} left the session list"
+        );
+        assert!(
+            host.refused_from_renderer(&select_ask()).is_some(),
+            "off screen on {screen}"
+        );
+
+        // Another session-list row moves nothing: still on the page.
+        host.bring_answer_home(
+            &name("session_list.refresh", serde_json::Value::Null),
+            &mut recorder,
+        );
+        assert_eq!(host.state().shell.current_screen, screen);
+
+        host.bring_answer_home(&select_ask(), &mut recorder);
+        assert_eq!(
+            host.state().shell.current_screen,
+            screen_ids::SESSION_LIST,
+            "home from {screen}"
+        );
+        assert_eq!(host.refused_from_renderer(&select_ask()), None);
+    }
+
+    // The git view, which a session opens: a state already on it.
+    scratch_home();
+    let mut state = AppState::new();
+    state.shell.current_screen = screen_ids::GIT_VIEW.to_string();
+    state.git_view.get_mut().git_view_state =
+        Some(GitViewState::new(std::path::PathBuf::from("/work/repo")));
+    let mut host = DesktopHost::hosting(
+        state,
+        Keymap::defaults(),
+        HostId::local(),
+        Subscription::only(&[SectionId::Shell]),
+        |_: FrameBatch| {},
+    )
+    .without_attention_poll();
+    assert!(
+        host.refused_from_renderer(&select_ask()).is_some(),
+        "off screen on the git view"
+    );
+    host.bring_answer_home(&select_ask(), &mut recorder);
+    assert_eq!(
+        host.state().shell.current_screen,
+        screen_ids::SESSION_LIST,
+        "home from the git view"
+    );
     assert_eq!(host.refused_from_renderer(&select_ask()), None);
 }
 
