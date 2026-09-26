@@ -263,16 +263,21 @@ impl Caller {
         }
     }
 
-    /// The actor a write from this caller is authored as: the one stamp for
-    /// every author, creator and acting-actor field a caller could otherwise
-    /// fill in itself (security review follow-up A).
+    /// The actor a write from this caller is authored as, in a typed
+    /// [`ActorRef`] column (security review follow-up A).
     ///
     /// - The operator: `claimed`, else the local member. Unchanged, because
     ///   the operator token is shared by the local surfaces and by the agents
     ///   the operator runs, which author as themselves.
     /// - A device: `member:device:<device_id>`, whatever it claimed. Pinned,
-    ///   not validated, like its `fleet/message_send.actor`, so a phone never
-    ///   comments as the operator or as an agent.
+    ///   not validated, so a phone never comments as the operator or as an
+    ///   agent. The canonical spelling is `device:<id>` ([`Caller::sender`]);
+    ///   `member:device:` exists only because `ActorKind` is member|agent and
+    ///   the typed actor columns CHECK the same two kinds. Member ids starting
+    ///   `device:` are refused wherever a member is accepted, so the two
+    ///   spellings cannot collide, and [`device_principal`] reads both as one.
+    ///   An `ActorKind::Device` and the table rebuilds are a post-tag
+    ///   follow-up.
     /// - Pal: `agent:<PAL_ACTOR>`. Pal reaches none of these methods today
     ///   ([`PAL_METHODS`]); this is the safe answer if one is ever added.
     #[must_use]
@@ -296,8 +301,21 @@ impl Caller {
         matches!(self, Self::Device { .. }) && *actor == self.stamp(None)
     }
 
-    /// The same identity as a chat-bus sender: `operator`, `device:<id>`, or
-    /// Pal's actor.
+    /// Who acts for an attributed write: the operator's `claimed` value
+    /// stands (`None` is its legacy "unattributed"); anyone else is ALWAYS
+    /// `own(self)`, never `None` and never what it claimed. The one rule every
+    /// acting-actor site uses, typed (`Caller::stamp`) or text
+    /// (`Caller::sender`).
+    pub fn acting<T>(&self, claimed: Option<T>, own: impl FnOnce(&Self) -> T) -> Option<T> {
+        match self {
+            Self::Operator => claimed,
+            Self::Device { .. } | Self::Pal { .. } => Some(own(self)),
+        }
+    }
+
+    /// The canonical string principal: `operator`, `device:<id>`, or Pal's
+    /// actor. Used for every text field (chat-bus sender, `checked_by`), and
+    /// the spelling [`device_principal`] normalises to.
     #[must_use]
     pub fn sender(&self) -> String {
         match self {
@@ -317,24 +335,36 @@ impl Caller {
     }
 }
 
-tokio::task_local! {
-    /// The caller of the request this task is serving, for the few effects
-    /// that run frames below the handler (the ACP prompt path) and so cannot
-    /// take the caller as an argument without threading it through every
-    /// shared executor.
-    static CURRENT: Caller;
-}
+/// The prefix of a device principal, `device:<device_id>`.
+pub const DEVICE_PRINCIPAL_PREFIX: &str = "device:";
 
-/// Run `request` with `caller` as [`current_sender`]'s answer.
-pub async fn serving<F: std::future::Future>(caller: Caller, request: F) -> F::Output {
-    CURRENT.scope(caller, request).await
-}
-
-/// The sender stamp of the request this task is serving, or `None` outside a
-/// request (a daemon-internal effect, which keeps its own attribution).
+/// The device id a principal names, reading BOTH spellings as one principal:
+/// the canonical `device:<id>` and the typed-column form `member:device:<id>`.
+/// `None` for any other principal. The single reader every renderer and the
+/// revoke view use, so the split spelling never shows as two identities.
 #[must_use]
-pub fn current_sender() -> Option<String> {
-    CURRENT.try_with(Caller::sender).ok()
+pub fn device_principal(principal: &str) -> Option<&str> {
+    let principal = principal.strip_prefix("member:").unwrap_or(principal);
+    principal.strip_prefix(DEVICE_PRINCIPAL_PREFIX).filter(|id| !id.is_empty())
+}
+
+/// Refuse a member id that a client could use to pass as a device: every
+/// member id starting `device:` is reserved for [`Caller::stamp`].
+///
+/// # Errors
+///
+/// `INVALID_PARAMS` naming the reserved prefix.
+pub fn refuse_reserved_member(actor: &ActorRef) -> Result<(), RpcError> {
+    if actor.kind() == ActorKind::Member && actor.id().starts_with(DEVICE_PRINCIPAL_PREFIX) {
+        return Err(RpcError {
+            code: super::INVALID_PARAMS,
+            message: format!(
+                "member ids starting `{DEVICE_PRINCIPAL_PREFIX}` are reserved for paired devices: {actor}"
+            ),
+            data: None,
+        });
+    }
+    Ok(())
 }
 
 /// Live Pal credentials: `sha256(plaintext) -> scope_key`.
@@ -1242,10 +1272,48 @@ mod tests {
         assert_eq!(laptop.sender(), "device:01J0DEVICE0000000000000000");
         assert_eq!(Caller::Operator.sender(), "operator");
 
-        // What the ACP SendPrompt path reads: the serving request's caller,
-        // and nothing outside a request.
-        assert_eq!(current_sender(), None);
-        let inside = serving(laptop.clone(), async { current_sender() }).await;
-        assert_eq!(inside.as_deref(), Some("device:01J0DEVICE0000000000000000"));
+        // `acting`: the operator's claim stands, including "unattributed";
+        // anyone else is always itself.
+        assert_eq!(Caller::Operator.acting(Some(1), |_| 9), Some(1));
+        assert_eq!(Caller::Operator.acting(None, |_| 9), None);
+        assert_eq!(laptop.acting(Some(1), |_| 9), Some(9));
+        assert_eq!(laptop.acting(None, |_| 9), Some(9));
+    }
+
+    /// Lead condition (b): one reader, both spellings, one principal.
+    #[test]
+    fn both_device_spellings_read_as_one_principal() {
+        let laptop = device(DeviceScope::DESKTOP);
+        let typed = laptop.stamp(None).to_string();
+        let canonical = laptop.sender();
+        assert_eq!(device_principal(&typed), Some("01J0DEVICE0000000000000000"));
+        assert_eq!(device_principal(&typed), device_principal(&canonical));
+        for other in [
+            "operator",
+            "member:me",
+            "agent:device:x",
+            "device:",
+            "member:device:",
+        ] {
+            assert_eq!(device_principal(other), None, "{other}");
+        }
+    }
+
+    /// Lead condition (a): a member id starting `device:` is refused, so no
+    /// client-named member can collide with a device's typed stamp.
+    #[test]
+    fn a_member_id_starting_device_is_reserved() {
+        let reserved: ActorRef = "member:device:01J0LAPTOP".parse().unwrap();
+        let refused = refuse_reserved_member(&reserved).expect_err("reserved");
+        assert_eq!(refused.code, super::super::INVALID_PARAMS);
+        for fine in [
+            "member:me",
+            "member:user-1",
+            "agent:device:x",
+            "member:devices",
+        ] {
+            let actor: ActorRef = fine.parse().unwrap();
+            assert!(refuse_reserved_member(&actor).is_ok(), "{fine}");
+        }
     }
 }
