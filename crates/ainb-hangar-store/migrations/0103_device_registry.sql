@@ -13,6 +13,12 @@
 -- hex SHA-256, the `socket_token` convention. The device's Noise static public
 -- key is stored whole: the hello compares it to the session's remote static.
 --
+-- # Display names
+--
+-- A device's name is chosen by the device that redeems, so it is bounded here
+-- rather than trusted: 1 to 64 characters, not blank, no line breaks (it is
+-- printed in logs, the CLI and the pairing toast).
+--
 -- # Scope
 --
 -- A scope is a base plus an additive admin flag, and admin exists only on base
@@ -33,7 +39,14 @@ CREATE TABLE device_invite (
         scope_admin IN (0, 1) AND (scope_admin = 0 OR scope_base = 'desktop')
     ),
     -- The name the operator suggested; the redeeming device may pick another.
-    display_name   TEXT,
+    display_name   TEXT CHECK (
+        display_name IS NULL OR (
+            length(display_name) BETWEEN 1 AND 64
+            AND trim(display_name) <> ''
+            AND instr(display_name, char(10)) = 0
+            AND instr(display_name, char(13)) = 0
+        )
+    ),
     -- Unix milliseconds.
     created_at     INTEGER NOT NULL,
     -- Unix milliseconds. A redeem is accepted up to 30 s past this.
@@ -54,7 +67,12 @@ CREATE TABLE device (
     device_id      TEXT PRIMARY KEY NOT NULL CHECK (
         length(device_id) = 26 AND device_id NOT GLOB '*[^0-9A-HJKMNP-TV-Z]*'
     ),
-    display_name   TEXT NOT NULL,
+    display_name   TEXT NOT NULL CHECK (
+        length(display_name) BETWEEN 1 AND 64
+        AND trim(display_name) <> ''
+        AND instr(display_name, char(10)) = 0
+        AND instr(display_name, char(13)) = 0
+    ),
     scope_base     TEXT NOT NULL CHECK (scope_base IN ('desktop', 'mobile', 'mobile+type')),
     scope_admin    INTEGER NOT NULL DEFAULT 0 CHECK (
         scope_admin IN (0, 1) AND (scope_admin = 0 OR scope_base = 'desktop')
