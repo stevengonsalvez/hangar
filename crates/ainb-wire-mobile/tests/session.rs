@@ -11,7 +11,7 @@ use ainb_hangar_proto::fleet::{
     FleetSession, LifecycleState, ManagementState, PaneBinding, TransportHealth,
 };
 use ainb_hangar_proto::hosts::HostId;
-use ainb_wire_mobile::api::{ConnectParams, connect_host};
+use ainb_wire_mobile::api::{ConnectParams, connect_host, mint_op_id};
 use ainb_wire_mobile::custody::DeviceKey;
 use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use ainb_wire_mobile::records::{AnswerOutcome, WireError, WireEvent};
@@ -141,9 +141,15 @@ async fn hello_roster_and_answer_round_trip_with_op_id_and_fence() {
     assert_eq!(row.process_start_fingerprint.as_deref(), Some("fp-1"));
     assert_eq!(row.version, 3);
 
-    let reply = Arc::clone(&host).answer("att-1".into(), "yes".into(), 4, None).await.unwrap();
-    assert_eq!(reply.op_id.len(), 32);
-    assert!(reply.op_id.chars().all(|c| c.is_ascii_hexdigit()));
+    // The app mints the op id before the send and keeps it for a retry.
+    let minted = mint_op_id();
+    assert_eq!(minted.len(), 32);
+    assert!(minted.chars().all(|c| c.is_ascii_hexdigit()));
+    let reply = Arc::clone(&host)
+        .answer("att-1".into(), "yes".into(), 4, minted.clone())
+        .await
+        .unwrap();
+    assert_eq!(reply.op_id, minted);
     assert_eq!(
         reply.outcome,
         AnswerOutcome::Delivered {
@@ -162,7 +168,7 @@ async fn hello_roster_and_answer_round_trip_with_op_id_and_fence() {
 
     // A retry after a lost reply sends the SAME op id.
     let again = Arc::clone(&host)
-        .answer("att-1".into(), "yes".into(), 4, Some(reply.op_id.clone()))
+        .answer("att-1".into(), "yes".into(), 4, minted.clone())
         .await
         .unwrap();
     assert_eq!(again.op_id, reply.op_id);
