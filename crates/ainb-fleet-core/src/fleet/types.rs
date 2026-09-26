@@ -224,10 +224,29 @@ pub struct FleetSession {
     pub version: u64,
 }
 
-/// Why an answer found nothing to deliver to: no discovered session runs under
-/// the id the request names. A session started before ainb minted and stored
-/// the agent's id is the usual case, and a new session is the way to a row
-/// that can be answered here. One wording for the daemon and the app.
+/// Why an answer found nothing to deliver to when the request names no id at
+/// all: the session started before ainb minted and stored the agent's id, and
+/// a new session is the way to a row that can be answered here. One wording
+/// for the daemon and the app.
+pub const STARTED_BEFORE_UPGRADE: &str =
+    "this session started before the upgrade: start a new session to answer here";
+
+/// Why an answer found nothing to deliver to when the request names an id
+/// that no discovered session runs under: the agent has exited.
+pub const AGENT_EXITED: &str = "no live session runs under this id: the agent has exited";
+
+/// The reason an answer for `session_id` has no live target: a request with
+/// no id predates the upgrade; one with an id names an agent that has exited.
+#[must_use]
+pub fn no_live_target_reason(session_id: &str) -> &'static str {
+    if session_id.is_empty() {
+        STARTED_BEFORE_UPGRADE
+    } else {
+        AGENT_EXITED
+    }
+}
+
+/// Superseded by [`no_live_target_reason`]; kept until every caller has moved.
 pub const NO_LIVE_TARGET: &str = "no live session runs under this id (started before the upgrade): start a new session to answer here";
 
 /// Unified session identity. May be backed by 1+ sources after merge.
