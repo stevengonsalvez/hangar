@@ -331,14 +331,28 @@ mod tests {
         let home = TempDir::new().unwrap();
         write_reflect_and_notifyd(home.path());
         install_claude_hooks(home.path(), Path::new("/x/notify.sh")).unwrap();
-        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
-            .unwrap();
+        install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/ainb-hook.sh"),
+            hooks::HookTransport::Http,
+        )
+        .unwrap();
         let http = read(home.path());
-        assert_eq!(hooks::installed_transport(&http), Some(hooks::HookTransport::Http));
+        assert_eq!(
+            hooks::installed_transport(&http),
+            Some(hooks::HookTransport::Http)
+        );
         assert_eq!(http["otherUserSetting"], 42);
-        install_claude_hooks_for(home.path(), Path::new("/x/notify.sh"), hooks::HookTransport::Legacy)
-            .unwrap();
-        assert_eq!(std::fs::read(claude_settings_path(home.path())).unwrap(), fresh);
+        install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/notify.sh"),
+            hooks::HookTransport::Legacy,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(claude_settings_path(home.path())).unwrap(),
+            fresh
+        );
     }
 
     #[test]
@@ -350,13 +364,28 @@ mod tests {
         let backup = settings_backup_path(home.path());
         assert!(!backup.exists(), "a legacy install never backs up");
 
-        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
-            .unwrap();
-        assert_eq!(std::fs::read(&backup).unwrap(), before, "the pre-change file");
+        install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/ainb-hook.sh"),
+            hooks::HookTransport::Http,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            before,
+            "the pre-change file"
+        );
         std::fs::remove_file(&backup).unwrap();
-        install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
-            .unwrap();
-        assert!(!backup.exists(), "a re-install of the same transport is not a change");
+        install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/ainb-hook.sh"),
+            hooks::HookTransport::Http,
+        )
+        .unwrap();
+        assert!(
+            !backup.exists(),
+            "a re-install of the same transport is not a change"
+        );
     }
 
     #[test]
@@ -366,8 +395,12 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         assert!(
-            install_claude_hooks_for(home.path(), Path::new("/x/ainb-hook.sh"), hooks::HookTransport::Http)
-                .is_err()
+            install_claude_hooks_for(
+                home.path(),
+                Path::new("/x/ainb-hook.sh"),
+                hooks::HookTransport::Http
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
@@ -380,5 +413,4 @@ mod tests {
         record_transport(ainb.path(), hooks::HookTransport::Legacy).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "legacy\n");
     }
-
 }
