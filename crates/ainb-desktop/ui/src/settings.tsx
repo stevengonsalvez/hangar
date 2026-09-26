@@ -52,9 +52,12 @@ interface Props {
  * The OpenTelemetry setup's draft, kept outside the page: the page is drawn
  * while the reducer is on its Config screen and unmounted the moment it
  * leaves, which the answer banner's pick does on its own (#121), and three
- * pasted values are not typed twice.
+ * pasted values are not typed twice. Cleared once the setup is written, and
+ * when the page is closed by its own button: a token is not kept past
+ * either.
  */
-const [otel, setOtel] = createSignal({ otlp_endpoint: "", instance_id: "", api_token: "" });
+const EMPTY_OTEL = { otlp_endpoint: "", instance_id: "", api_token: "" };
+const [otel, setOtel] = createSignal({ ...EMPTY_OTEL });
 
 export function SettingsPage(props: Props) {
   const tree = createMemo(() => settingsTree(props.config));
@@ -90,7 +93,14 @@ export function SettingsPage(props: Props) {
           classList={{ active: searching(props.config) }}
           onInput={(event) => props.run(searchIntents(event.currentTarget.value))}
         />
-        <button type="button" class="close" onClick={() => props.onClose()}>
+        <button
+          type="button"
+          class="close"
+          onClick={() => {
+            setOtel({ ...EMPTY_OTEL });
+            props.onClose();
+          }}
+        >
           Back to board
         </button>
       </header>
@@ -286,7 +296,7 @@ export function SettingsPage(props: Props) {
                   type="button"
                   onClick={() => {
                     props.onSetupWrite({ kind: "finish_open_telemetry", ...otel() });
-                    setOtel({ otlp_endpoint: "", instance_id: "", api_token: "" });
+                    setOtel({ ...EMPTY_OTEL });
                   }}
                 >
                   Finish OpenTelemetry setup
