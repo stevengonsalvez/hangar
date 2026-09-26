@@ -184,7 +184,24 @@ async function backToSessionList() {
   });
 }
 
+/** How many tab-strip answers the host has given, as the strip counts them. */
+const hostAnswers = async () => Number(await $(".tabs").getAttribute("data-host-answers"));
+
 describe("the palette over a terminal", () => {
+  // Whatever a case left behind is put away here, so one failure cannot
+  // spill into the next: a palette still open, and a question still open
+  // over the row, whose composer would otherwise hold the last case's draft.
+  afterEach(async () => {
+    if (await $(".palette-query").isExisting()) {
+      await browser.keys(["Escape"]);
+      await $(".palette-query").waitForExist({ timeout: 30_000, reverse: true });
+    }
+    if (!(await $(".answer-banner[data-request]").isExisting())) return;
+    const phase = await browser.execute(() => document.querySelector(".answer-banner[data-request] .answer-phase")?.dataset.phase ?? "");
+    if (phase === "delivered" || phase === "already_answered") return;
+    await answerBanner(await $(".answer-banner[data-request]").getAttribute("data-request"), seeded()[0]);
+  });
+
   it("takes every keystroke when the terminal already has focus", async () => {
     const session = seeded()[0];
     await ready(session);
@@ -246,7 +263,7 @@ describe("the palette over a terminal", () => {
     // banner over the row's terminal is what this case needs, not the id.
     hook(askLine(session));
     await focusTerminal(session);
-    const request = await bannerUp();
+    await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
     await click(".answer-banner .answer-composer input");
     await browser.keys(QUERY);
@@ -260,18 +277,37 @@ describe("the palette over a terminal", () => {
       session.tmux,
     );
     assert.ok(index >= 0, `the session's terminal is mounted`);
-    const before = linesRead(session);
     await browser.keys([...MOD, String(index + 1)]);
-    await browser.pause(300);
-    await browser.keys(["Enter"]);
-    await browser.waitUntil(() => linesRead(session) > before, {
-      timeout: 30_000,
-      timeoutMsg: `the terminal never took the keyboard from the composer: ${JSON.stringify(await focusState())}`,
-    });
+    // The move itself: the keyboard is on this tab's own textarea, which the
+    // shell focuses from a frame after the chord.
+    const onTerminal = () =>
+      browser.execute(
+        (tab) => document.activeElement === document.querySelector(`${tab} .xterm-helper-textarea`),
+        `.terminal[data-tab="${session.tmux}"]`,
+      );
+    let state = null;
+    await browser
+      .waitUntil(onTerminal, { timeout: 10_000 })
+      .catch(async () => {
+        state = await focusState();
+        assert.fail(`the chord never moved the keyboard from the composer: ${JSON.stringify(state)}`);
+      });
+    // And the pane hears it: an Enter through the driver reaches the agent,
+    // which echoes the (empty) line it read. The Linux driver drops a key
+    // now and then, as focusTerminal's tries allow for, so this asks more
+    // than once; the move is already proven above.
+    let read = false;
+    for (let attempt = 1; attempt <= 3 && !read; attempt += 1) {
+      const before = linesRead(session);
+      await browser.keys(["Enter"]);
+      read = await browser
+        .waitUntil(() => linesRead(session) > before, { timeout: 5_000 })
+        .then(() => true, () => false);
+    }
+    assert.ok(read, `the pane never read the Enter after the chord: ${JSON.stringify(await focusState())}; pane tail: ${paneText(session.tmux).trim().split("\n").slice(-4).join(" / ")}`);
     await shot("composer-draft-after-tab-chord");
     assert.equal(await $(".answer-banner .answer-composer input").getValue(), QUERY, "the draft stayed in the composer");
     assert.ok(!paneText(session.tmux).includes(QUERY), "the draft never reached the pane");
-    await answerBanner(request, session);
   });
 
   it("keeps the keyboard in the composer when the host opens a tab on its own", async () => {
@@ -284,7 +320,7 @@ describe("the palette over a terminal", () => {
     await ready(session);
     hook(askLine(session));
     await focusTerminal(session);
-    const request = await bannerUp();
+    await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
     await click(".answer-banner .answer-composer input");
     await browser.keys(QUERY);
@@ -294,15 +330,15 @@ describe("the palette over a terminal", () => {
     // own click handler, run by the page rather than by a pointer press that
     // would move focus off the composer before the host answered. The tab is
     // already open, so the host answers with focus on it, as for a fresh one.
-    const sent = intentsSent().length;
+    const answers = await hostAnswers();
     await browser.execute((id) => document.querySelector(`.session-row[data-session="${id}"]`).click(), session.id);
-    await browser.waitUntil(() => intentsSent().length > sent, {
+    await browser.waitUntil(async () => (await hostAnswers()) > answers, {
       timeout: 30_000,
-      timeoutMsg: "the row's click never reached the host",
+      timeoutMsg: "the host never answered the row's click with its tabs",
     });
-    // The host's answer, and the frame the shell would focus the terminal
-    // from, are both past by now.
-    await browser.pause(1_000);
+    // The frame the shell would focus the terminal from is the one after the
+    // answer: two frames on, whatever it did is done.
+    await browser.execute(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
     await browser.keys("x");
     await browser.pause(1_500);
     await shot("composer-draft-after-host-tab-open");
@@ -313,7 +349,6 @@ describe("the palette over a terminal", () => {
       `the composer lost the keyboard to ${state.active}`,
     );
     assert.ok(!paneText(session.tmux).includes(QUERY), `the draft reached the pane:\n${paneText(session.tmux)}`);
-    await answerBanner(request, session);
   });
 
   it("keeps the keystrokes when the chord lands while the tab is still opening", async () => {
