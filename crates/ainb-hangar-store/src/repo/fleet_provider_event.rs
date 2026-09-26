@@ -202,6 +202,19 @@ impl FleetProviderEventError {
     }
 }
 
+/// One tail page, newest rows first read, returned oldest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailPage {
+    /// The decoded rows, oldest first.
+    pub rows: Vec<FleetProviderEventRow>,
+    /// Whether older rows remain (a row or byte bound bit, or a row could not
+    /// be decoded).
+    pub truncated: bool,
+    /// The lowest `ingest_order` this read consumed, returned or skipped as
+    /// undecodable: where the next page back starts.
+    pub lowest_scanned: Option<i64>,
+}
+
 /// Typed access to the raw provider-event ledger.
 pub struct FleetProviderEventRepo;
 
@@ -468,6 +481,26 @@ impl FleetProviderEventRepo {
         max_rows: i64,
         max_payload_bytes: usize,
     ) -> Result<(Vec<FleetProviderEventRow>, bool), sqlx::Error> {
+        Self::list_by_session_tail_before(pool, session_key, None, max_rows, max_payload_bytes)
+            .await
+            .map(|page| (page.rows, page.truncated))
+    }
+
+    /// [`Self::list_by_session_tail`], ending strictly before `before_order`
+    /// when given: the newest page OLDER than a row the caller already holds,
+    /// oldest first, bounded the same way. `truncated` means older rows
+    /// remain; the caller pages back again from [`TailPage::lowest_scanned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the query fails.
+    pub async fn list_by_session_tail_before(
+        pool: &SqlitePool,
+        session_key: &str,
+        before_order: Option<i64>,
+        max_rows: i64,
+        max_payload_bytes: usize,
+    ) -> Result<TailPage, sqlx::Error> {
         let max_rows = max_rows.max(1);
         // One row MORE than the cap, so "was there anything older" is answered by
         // this query rather than by a second one. A session holding exactly
@@ -475,10 +508,11 @@ impl FleetProviderEventRepo {
         // only thing that distinguishes the two.
         let rows = sqlx::query(
             "SELECT ingest_order, event_id, provider, source, session_key, provider_session_id, observed_at, received_at, event_type, raw_payload, raw_blake3, projection_revision \
-             FROM fleet_provider_event WHERE session_key = ? \
+             FROM fleet_provider_event WHERE session_key = ? AND ingest_order < ? \
              ORDER BY ingest_order DESC LIMIT ?",
         )
         .bind(session_key)
+        .bind(before_order.unwrap_or(i64::MAX))
         .bind(max_rows.saturating_add(1))
         .fetch_all(pool)
         .await?;
@@ -486,7 +520,9 @@ impl FleetProviderEventRepo {
         let rows = &rows[..rows.len().min(usize::try_from(max_rows).unwrap_or(usize::MAX))];
         let mut budget = max_payload_bytes;
         let mut tail: Vec<FleetProviderEventRow> = Vec::new();
+        let mut lowest_scanned = None;
         for row in rows {
+            let order = row.try_get::<i64, _>("ingest_order").ok();
             // A row that cannot be decoded is SKIPPED, not fatal: the classifier
             // reading these same rows is documented total, and aborting here
             // would lose a whole run's view to one bad row.
@@ -495,6 +531,9 @@ impl FleetProviderEventRepo {
                 Err(error) => {
                     tracing::warn!(%session_key, %error, "skipping an undecodable transcript row");
                     truncated = true;
+                    // Scanned though not returned: the next page back starts
+                    // below it, so one bad row cannot stall a walk.
+                    lowest_scanned = order.or(lowest_scanned);
                     continue;
                 }
             };
@@ -504,10 +543,15 @@ impl FleetProviderEventRepo {
                 break;
             }
             budget = budget.saturating_sub(cost);
+            lowest_scanned = Some(row.ingest_order);
             tail.push(row);
         }
         tail.reverse();
-        Ok((tail, truncated))
+        Ok(TailPage {
+            rows: tail,
+            truncated,
+            lowest_scanned,
+        })
     }
 
     /// One PAGE of the rows [`Self::delete_acp_before`] could remove, oldest

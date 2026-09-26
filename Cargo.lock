@@ -437,13 +437,17 @@ name = "ainb-hangar-client"
 version = "0.1.0"
 dependencies = [
  "ainb-hangar-core",
+ "ainb-hangar-noise",
  "ainb-hangar-proto",
+ "ainb-hangar-secrets",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -487,6 +491,7 @@ dependencies = [
  "ainb-plugin-notifyd",
  "ainb-plugin-session-reader",
  "ainb-plugin-types-sessions",
+ "ainb-term",
  "ainb-web",
  "anyhow",
  "assert_cmd",
@@ -868,7 +873,10 @@ dependencies = [
 name = "ainb-term"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "tattoy-wezterm-escape-parser",
  "tattoy-wezterm-term",
+ "unicode-segmentation",
 ]
 
 [[package]]

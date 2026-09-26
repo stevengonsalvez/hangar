@@ -345,6 +345,7 @@ async fn a_pre_marker_home_completes_without_duplicates() {
         model_source: "Raw".to_string(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     SessionsRepo::upsert(pool, &prior[0]).await.unwrap();
 

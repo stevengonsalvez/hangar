@@ -61,6 +61,11 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 /// The bash hook script, baked into the binary.
 const HOOK_SCRIPT: &str = include_str!("../../../plugins/ainb-hooks/hooks/notify.sh");
 
+/// The HTTP-transport hook script, baked into the binary. `ainb fleet atc
+/// setup --hooks=http` points the managed entries at it; it posts each event
+/// to the hangar daemon's loopback listener (hooks-and-answers).
+const HTTP_HOOK_SCRIPT: &str = include_str!("../../../plugins/ainb-hooks/hooks/ainb-hook.sh");
+
 /// The Stop-hook stall guard, baked into the binary. Claude reaches it through
 /// the plugin directory; Codex has no plugin runtime, so it needs the same
 /// extract-and-point treatment as `notify.sh`.
@@ -527,6 +532,17 @@ pub fn auto_repair_hook_binary(paths: &Paths) -> Result<bool> {
 /// latest from the binary).
 pub fn extract_hook_script(paths: &Paths) -> Result<PathBuf> {
     extract_script(canonical_hook_script(paths), HOOK_SCRIPT)
+}
+
+/// Canonical on-disk path of the HTTP-transport hook script.
+pub fn canonical_http_hook_script(paths: &Paths) -> PathBuf {
+    paths.base.join("hooks").join("ainb-hook.sh")
+}
+
+/// Extract the embedded `ainb-hook.sh` beside `notify.sh`, executable. Same
+/// idempotent overwrite semantics.
+pub fn extract_http_hook_script(paths: &Paths) -> Result<PathBuf> {
+    extract_script(canonical_http_hook_script(paths), HTTP_HOOK_SCRIPT)
 }
 
 /// Canonical on-disk path of the extracted stall guard.

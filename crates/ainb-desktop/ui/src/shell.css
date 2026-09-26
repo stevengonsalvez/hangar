@@ -1,21 +1,30 @@
+/*
+ * The sheet's own names, mapped onto the design tokens (theme/tokens.css).
+ * Rules below still say --panel or --gold; each resolves to a token, so the
+ * palette and light/dark live in one file. `--border` and `--muted` are token
+ * names themselves: `--border` is now the quiet hairline, and secondary text
+ * reads `--muted-foreground`.
+ */
 :root {
-  --bg: rgb(25, 25, 35);
-  --panel: rgb(30, 30, 40);
-  --border: rgb(100, 149, 237);
-  --gold: rgb(255, 215, 0);
-  --green: rgb(100, 200, 100);
-  --text: rgb(220, 220, 230);
-  --muted: rgb(120, 120, 140);
-  --highlight: rgb(40, 40, 60);
-  --red: rgb(230, 90, 90);
-  color-scheme: dark;
-  font-family: ui-sans-serif, system-ui, sans-serif;
+  --bg: var(--background);
+  --panel: var(--card);
+  --gold: var(--state-needs);
+  --green: var(--state-done);
+  --blue: var(--state-working);
+  --idle: var(--state-idle);
+  --text: var(--foreground);
+  --highlight: var(--accent);
+  --red: var(--state-error);
+  font-family: var(--font-sans);
 }
 
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
+  font-size: var(--text-row);
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
 }
 
 .shell {
@@ -24,44 +33,128 @@ body {
   height: 100vh;
 }
 
-.header {
+/* The titlebar: 36px, the app name at the left and the window's global
+   actions at the right. `data-tauri-drag-region` makes the bar itself move
+   the window; the buttons inside it are not part of that region, so they
+   keep taking clicks. */
+.titlebar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 8px 16px;
+  gap: 12px;
+  height: var(--h-titlebar);
+  min-height: var(--h-titlebar);
+  padding-inline: 12px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
 }
 
-.header .counts {
-  display: flex;
-  gap: 12px;
-  margin-left: auto;
-  font-family: ui-monospace, monospace;
-  color: var(--muted);
+/* macOS draws traffic lights over the window's own top-left corner
+   (`tauri.conf.json`'s `titleBarStyle: "Overlay"`): pad clear of them
+   instead of drawing the app name under them. */
+.titlebar.mac {
+  padding-inline-start: 80px;
 }
 
-.header .count.attention {
+.titlebar-app {
+  font-size: var(--text-sub);
+  font-weight: 600;
+  color: var(--muted-foreground);
+}
+
+.titlebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-inline-start: auto;
+}
+
+.titlebar-search,
+.inbox-button,
+.settings {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.titlebar-search:hover,
+.inbox-button:hover,
+.settings:hover {
+  background: var(--highlight);
+}
+
+.titlebar-search[aria-pressed="true"],
+.inbox-button[aria-pressed="true"],
+.settings[aria-pressed="true"] {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+/* The status bar: 24px, the window's own footer. Small and quiet, the way
+   Orca's is: a host id, one daemon dot, and the counts a person must act on. */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--h-statusbar);
+  min-height: var(--h-statusbar);
+  padding-inline: 12px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+}
+
+.statusbar-host {
+  font-family: var(--font-mono);
+}
+
+.statusbar-daemon-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--idle);
+}
+
+.statusbar-daemon-dot.ok {
+  background: var(--green);
+}
+
+.statusbar-daemon-dot.connecting {
+  background: var(--idle);
+}
+
+.statusbar-daemon-dot.warn {
+  background: var(--gold);
+}
+
+.statusbar-daemon-dot.error {
+  background: var(--red);
+}
+
+.statusbar-counts {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-inline-start: auto;
+  font-family: var(--font-mono);
+}
+
+.statusbar-needs {
   color: var(--gold);
 }
 
 /* Development builds only: frames the store refused (#1132). */
-.header .count.ignored {
-  color: var(--muted);
+.statusbar-ignored {
   font-style: italic;
-}
-
-.header .settings {
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 2px 10px;
-}
-
-.header .settings[aria-pressed="true"] {
-  border-color: var(--gold);
-  color: var(--gold);
 }
 
 .banner {
@@ -71,7 +164,7 @@ body {
   padding: 8px 16px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .banner.connected {
@@ -105,7 +198,7 @@ body {
   padding: 8px 16px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   white-space: pre-wrap;
 }
@@ -117,20 +210,30 @@ body {
 }
 
 .sidebar {
-  width: 260px;
+  width: 280px;
   flex-shrink: 0;
   overflow-y: auto;
-  padding: 8px 0;
+  padding-block: 8px;
   border-right: 1px solid var(--border);
-  background: var(--panel);
+  /* Lighter than the canvas, the way Orca's worktree sidebar reads against
+     the darker work area beside it (`tokens.css`'s `--sidebar` role). */
+  background: var(--sidebar);
 }
 
-.nav-title {
+.sidebar-head {
   display: flex;
+  align-items: baseline;
   gap: 8px;
-  padding: 4px 12px;
-  color: var(--gold);
-  font-weight: bold;
+  padding-inline: 12px;
+  padding-block-end: 4px;
+}
+
+.sidebar-title {
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
 }
 
 .stale {
@@ -139,27 +242,111 @@ body {
 }
 
 .sidebar .empty {
-  margin: 4px 12px;
-  color: var(--muted);
+  margin-inline: 12px;
+  color: var(--muted-foreground);
+}
+
+/* A project group: a native disclosure, so collapsing one needs no keyboard
+   handling and no click-target math of its own (`sidebar.tsx`). */
+.workspace {
+  display: block;
 }
 
 .workspace-name {
-  padding: 6px 12px 2px;
-  color: var(--muted);
-  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  cursor: pointer;
+  list-style: none;
 }
 
-/* A long name ends in an ellipsis inside the row instead of widening it. */
-.workspace-name,
-.session-row .name,
-.session-row .branch {
+.workspace-name::-webkit-details-marker {
+  display: none;
+}
+
+/* The disclosure triangle this rule draws instead: a small chevron that
+   turns with the details' own `open`, never a second, JS-tracked copy of
+   the state `sidebar.tsx` already reads off the DOM. */
+.workspace-name::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-inline-end: 1px solid var(--muted-foreground);
+  border-block-end: 1px solid var(--muted-foreground);
+  transform: rotate(-45deg);
+  transition: transform var(--dur-fast) var(--ease-out-expo);
+}
+
+.workspace:not([open]) .workspace-name::before {
+  transform: rotate(45deg);
+}
+
+.workspace-name-text {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.workspace ul {
+.workspace-count {
+  margin-inline-start: auto;
+  font-family: var(--font-mono);
+}
+
+.worktree-cards {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.worktree-card {
+  padding: 6px 12px 4px;
+}
+
+.worktree-card-title {
+  font-size: var(--text-row);
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worktree-card-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  padding-block-end: 2px;
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+}
+
+.worktree-card-meta .branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+
+.git-counts {
+  flex-shrink: 0;
+  color: var(--green);
+  font-family: var(--font-mono);
+}
+
+.worktree-card-meta .model {
+  flex-shrink: 0;
+}
+
+.agent-rows {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -168,48 +355,98 @@ body {
 .session-row {
   width: 100%;
   border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
   display: grid;
-  /* Both labels shrink; the branch keeps at most 100px of the 260px sidebar. */
-  grid-template-columns: 12px 12px minmax(0, 1fr) minmax(0, max-content);
+  grid-template-columns: 8px minmax(0, max-content) minmax(0, 1fr);
   align-items: center;
-  gap: 6px;
-  padding: 3px 12px;
+  gap: 8px;
+  padding: 3px 8px;
 }
 
-.session-row.selected {
+
+.session-row .agent-type {
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  text-transform: uppercase;
+}
+
+.session-row .name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row:hover,
+.session-row:focus-visible {
   background: var(--highlight);
+  outline: none;
 }
 
-.session-row .cursor {
-  color: var(--green);
+/* The selected session: a primary bar on the start side and a tint strong
+   enough to tell apart from hover, which is the faint accent above. Declared
+   after hover so a hovered selected row stays selected-looking. */
+.session-row.selected,
+.session-row.selected:hover {
+  background: color-mix(in srgb, var(--primary) 18%, var(--sidebar));
+  box-shadow: inset 2px 0 0 var(--primary);
 }
 
-.session-row .branch {
-  max-width: 100px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-/* Status fills the dot; attention paints the ring around it. */
+/* Status fills the dot; attention paints a ring around it. Idle is the
+   quiet default; every other state overrides the fill, the ring, or both. */
 .ring {
+  display: inline-block;
+  flex-shrink: 0;
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--muted);
+  background: var(--idle);
   box-shadow: 0 0 0 2px transparent;
 }
 
-.ring.running {
-  background: var(--green);
+.ring.idle,
+.ring.stopped {
+  background: var(--idle);
 }
 
 .ring.error {
   background: var(--red);
+}
+
+/* Working: the compositor spinner, a rotating ring drawn in fixed steps
+   rather than eased, the way a busy indicator should read rather than a
+   smooth clock (`--dur-base` already zeroes under reduced motion). */
+.ring.running {
+  position: relative;
+  background: var(--blue);
+}
+
+.ring.running::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--blue);
+  animation: ring-spin 800ms steps(8, end) infinite;
+}
+
+@keyframes ring-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ring.running::after {
+    animation: none;
+    border-color: var(--blue);
+  }
 }
 
 [data-ring="ask"] .ring,
@@ -219,17 +456,21 @@ body {
 }
 
 [data-ring="err"] .ring {
+  background: var(--red);
   box-shadow: 0 0 0 2px var(--red);
 }
 
+/* Done, until acked (ack lands in P4): a filled mint dot rather than the
+   working spinner or the idle default. */
 [data-ring="done"] .ring {
-  box-shadow: 0 0 0 2px var(--border);
+  background: var(--state-done);
+  box-shadow: 0 0 0 2px var(--state-done);
 }
 
-.session-row:hover,
+/* The hover tint is faint on purpose; the keyboard gets a real ring. */
 .session-row:focus-visible {
-  background: var(--highlight);
-  outline: none;
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
 }
 
 .workarea {
@@ -246,15 +487,18 @@ body {
 
 .workarea > .empty {
   margin: 16px;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .tabs {
   display: flex;
-  gap: 4px;
-  min-height: 30px;
-  padding: 6px 12px;
+  align-items: stretch;
+  gap: 2px;
+  height: var(--h-tabs);
+  min-height: var(--h-tabs);
+  padding-inline: 8px;
   overflow-x: auto;
+  background: var(--card);
   border-bottom: 1px solid var(--border);
 }
 
@@ -262,16 +506,28 @@ body {
   display: flex;
   align-items: center;
   flex-shrink: 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  position: relative;
+  background: var(--card);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
 }
 
+/* The active tab lifts slightly off the row and carries a bottom bar rather
+   than a full border, so several open tabs still read as one flat strip. */
 .tab.active {
-  border-color: var(--gold);
+  background: color-mix(in srgb, var(--foreground) 8%, var(--card));
+}
+
+.tab.active::after {
+  content: "";
+  position: absolute;
+  inset-inline: 4px;
+  bottom: 0;
+  height: 2px;
+  background: color-mix(in srgb, var(--foreground) 60%, var(--card));
 }
 
 .tab[data-state="detached"] .tab-title {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .tab[data-state="reconnecting"] .tab-title {
@@ -288,21 +544,32 @@ body {
 
 .tab-title {
   max-width: 180px;
-  padding: 2px 4px 2px 10px;
+  padding: 0 4px 0 10px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: var(--text-sub);
 }
 
 .tab-close {
   padding: 2px 8px;
-  color: var(--muted);
+  color: var(--muted-foreground);
+  /* Visible on hover or keyboard focus, so the strip stays quiet until a
+     tab is actually in play; still reachable by keyboard either way. */
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out-expo);
+}
+
+.tab:hover .tab-close,
+.tab:focus-within .tab-close {
+  opacity: 1;
 }
 
 .terminal {
   position: relative;
   flex: 1;
   min-height: 0;
+  background: var(--terminal-bg);
 }
 
 .xterm-host {
@@ -317,7 +584,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 12px;
-  background: rgba(25, 25, 35, 0.8);
+  background: color-mix(in srgb, var(--terminal-bg) 80%, transparent);
   color: var(--gold);
 }
 
@@ -353,7 +620,7 @@ body {
   display: flex;
   justify-content: center;
   padding-top: 12vh;
-  background: rgba(25, 25, 35, 0.6);
+  background: color-mix(in srgb, var(--background) 60%, transparent);
 }
 
 .palette {
@@ -405,7 +672,7 @@ body {
 }
 
 .palette-row.inactive .palette-title {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .palette-title,
@@ -416,19 +683,19 @@ body {
 }
 
 .palette-detail {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
 .palette-chord {
   margin-left: auto;
   color: var(--gold);
-  font-family: ui-monospace, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
 .palette .empty {
-  color: var(--muted);
+  color: var(--muted-foreground);
   padding: 10px 14px;
 }
 
@@ -489,7 +756,7 @@ body {
 }
 
 .board-count {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .board-column[data-state="waiting"] {
@@ -509,7 +776,7 @@ body {
 .elsewhere {
   margin: 0;
   padding: 0 10px 10px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -538,6 +805,12 @@ body {
   outline: none;
 }
 
+.board-card:focus-visible,
+.attention-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+
 .board-card:disabled,
 .attention-row:disabled {
   cursor: default;
@@ -558,7 +831,7 @@ body {
 
 .card-line,
 .row-detail {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -639,8 +912,8 @@ body {
 .answer-option:focus-visible,
 .answer-composer input:focus-visible,
 .answer-composer button:focus-visible {
-  border-color: var(--green);
-  outline: 2px solid var(--green);
+  border-color: var(--ring);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -669,7 +942,7 @@ body {
 .answer-phase {
   margin: 0;
   min-height: 1em;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -710,7 +983,7 @@ body {
 .acp-close {
   border: none;
   background: none;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font: inherit;
   cursor: pointer;
 }
@@ -722,7 +995,7 @@ body {
 
 .acp-status {
   margin: 8px 12px 0;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -742,7 +1015,7 @@ body {
 }
 
 .acp-kind {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
   text-transform: uppercase;
 }
@@ -755,7 +1028,7 @@ body {
 .acp-chunk[data-kind="Thought"] .acp-body,
 .acp-chunk[data-kind="Usage"] .acp-body,
 .acp-chunk[data-kind="Lifecycle"] .acp-body {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .acp-chunk[data-kind="Permission"] .acp-kind,
@@ -764,7 +1037,7 @@ body {
 }
 
 .acp-cut {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
 }
 
@@ -851,7 +1124,7 @@ body {
   padding: 2px 0;
   text-align: center;
   border: none;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .settings-node button.active {
@@ -900,7 +1173,7 @@ body {
 .settings-page .empty,
 .readonly-note {
   margin: 4px 0 0;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -924,7 +1197,7 @@ body {
   border-radius: 6px;
   padding: 6px 10px;
   background: var(--panel);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -941,7 +1214,7 @@ body {
 }
 
 .daemons-panel th {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
 }
 
@@ -1013,7 +1286,7 @@ body {
 
 .review-file-cut {
   grid-column: 1 / -1;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
 }
 
@@ -1029,7 +1302,7 @@ body {
 .hook-health {
   margin: 8px 0 0;
   padding-left: 18px;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -1084,7 +1357,7 @@ body {
      telling the reducer, and the next frame would drag it back. scrollTop is
      still settable, which is how the frame's own offset is applied. */
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -1102,7 +1375,7 @@ body {
 }
 
 .review-status {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .review-hunk {
@@ -1111,7 +1384,7 @@ body {
   margin: 0;
   padding: 4px 10px;
   background: var(--highlight);
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .review-hunk.current {
@@ -1121,11 +1394,11 @@ body {
 .review-expand {
   margin: 0;
   padding: 2px 10px;
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .review-hidden {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .review-row {
@@ -1139,20 +1412,20 @@ body {
 }
 
 .review-row[data-kind="added"] {
-  background: rgb(30, 50, 35);
+  background: color-mix(in srgb, var(--state-done) 14%, var(--background));
 }
 
 .review-row[data-kind="removed"] {
-  background: rgb(55, 32, 35);
+  background: color-mix(in srgb, var(--state-error) 14%, var(--background));
 }
 
 .review-emph {
-  background: rgb(60, 70, 45);
+  background: color-mix(in srgb, var(--state-needs) 22%, var(--background));
   border-radius: 2px;
 }
 
 .review-lineno {
-  color: var(--muted);
+  color: var(--muted-foreground);
   text-align: right;
   user-select: none;
 }
@@ -1177,7 +1450,7 @@ body {
   border-radius: 6px;
   padding: 6px 10px;
   background: var(--panel);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -1202,7 +1475,7 @@ body {
 }
 
 .stats-figure dt {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
 }
 
@@ -1235,12 +1508,12 @@ body {
 .stats-bar {
   width: 100%;
   min-height: 1px;
-  background: var(--border);
+  background: var(--state-working);
   border-radius: 2px 2px 0 0;
 }
 
 .stats-date {
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 9px;
   overflow: hidden;
   white-space: nowrap;
@@ -1280,7 +1553,7 @@ body {
 
 .stats-repo {
   display: block;
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 11px;
   font-weight: normal;
 }
@@ -1334,7 +1607,7 @@ body {
   border-radius: 6px;
   padding: 6px 10px;
   background: var(--panel);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -1356,7 +1629,7 @@ body {
   gap: 10px;
   padding: 6px 8px;
   border-bottom: 1px solid var(--highlight);
-  color: var(--muted);
+  color: var(--muted-foreground);
   font-size: 12px;
 }
 
@@ -1375,7 +1648,7 @@ body {
 }
 
 .inbox-when {
-  color: var(--muted);
+  color: var(--muted-foreground);
   white-space: nowrap;
 }
 
@@ -1399,7 +1672,7 @@ body {
   border-radius: 8px;
   background: var(--panel);
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -1432,6 +1705,11 @@ body {
   outline: none;
 }
 
+.commit-row:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
 .commit-sha {
   color: var(--gold);
 }
@@ -1444,10 +1722,35 @@ body {
 
 .commit-author,
 .commit-date {
-  color: var(--muted);
+  color: var(--muted-foreground);
 }
 
 .commits .empty {
   margin: 8px 10px;
-  color: var(--muted);
+  color: var(--muted-foreground);
+}
+
+/* One keyboard ring for every chrome control, the same opaque token rows use:
+   a focus mark must never depend on a hover tint. */
+.titlebar button:focus-visible,
+.statusbar button:focus-visible,
+.workspace-name:focus-visible,
+.tab button:focus-visible,
+.sidebar-head button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+/* Text for assistive technology only: present in the accessibility tree,
+   drawn nowhere. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }

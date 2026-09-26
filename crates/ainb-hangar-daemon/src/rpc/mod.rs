@@ -758,8 +758,12 @@ where
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    guard.subscriptions.attention =
-                        Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
+                    guard.subscriptions.attention = Some(spawn_attention_forwarder(
+                        rx,
+                        filter,
+                        authenticated.caller.clone(),
+                        out_tx.clone(),
+                    ));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
                     if let Some(old) = guard.subscriptions.fleet.take() {
                         old.abort();
@@ -926,6 +930,10 @@ struct ConnectionTeardown {
     registry: connections::ConnectionRegistry,
     events: EventSink,
     armed: bool,
+    /// The row is removed but its `ConnectionsChanged` has not gone out yet.
+    /// A second removal would find nothing and announce nothing, so a `Drop`
+    /// in this window must only announce.
+    announce: bool,
 }
 
 impl ConnectionTeardown {
@@ -936,16 +944,23 @@ impl ConnectionTeardown {
             registry,
             events,
             armed: true,
+            announce: false,
         }
     }
 
     /// The normal end: run the teardown now, and disarm the `Drop` path only
-    /// once the row is gone. An abort during the removal's await therefore
-    /// still reaches `Drop`, which retries it; a repeated removal is a no-op
-    /// that announces nothing.
+    /// once the row is gone and announced. An abort during the removal's
+    /// await still reaches `Drop`, which retries it; an abort after the row
+    /// went but before its announcement reaches `Drop` with `announce` set,
+    /// which then only announces.
     async fn finish(mut self) {
         std::mem::take(&mut self.subscriptions).abort_all();
-        release_registry_row(&self.registry, self.conn_id, &self.events).await;
+        if self.registry.remove(self.conn_id).await {
+            // Set with no await in between, so no abort can land between the
+            // removal and the flag.
+            self.announce = true;
+            emit_connections_changed(&self.events, &self.registry).await;
+        }
         self.armed = false;
     }
 }
@@ -965,8 +980,13 @@ impl Drop for ConnectionTeardown {
         let registry = self.registry.clone();
         let events = self.events.clone();
         let conn_id = self.conn_id;
+        let announce_only = self.announce;
         runtime.spawn(async move {
-            release_registry_row(&registry, conn_id, &events).await;
+            if announce_only {
+                emit_connections_changed(&events, &registry).await;
+            } else {
+                release_registry_row(&registry, conn_id, &events).await;
+            }
         });
     }
 }
@@ -1120,6 +1140,7 @@ fn attention_subscribe_filter(req: &RpcRequest) -> Option<String> {
 fn spawn_attention_forwarder(
     mut rx: broadcast::Receiver<ainb_hangar_proto::events::HangarEvent>,
     filter: Option<String>,
+    caller: auth::Caller,
     out: mpsc::Sender<Vec<u8>>,
 ) -> tokio::task::JoinHandle<()> {
     use ainb_hangar_proto::events::HangarEvent;
@@ -1127,6 +1148,13 @@ fn spawn_attention_forwarder(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // The attention stream is two families: the inbox, and the
+                    // live surface registry riding it. A device receives only
+                    // the families its scope grants, so `ConnectionsChanged`
+                    // never reaches a non-admin (RECONCILED C6).
+                    if !caller.receives(attention_stream_family(&event)) {
+                        continue;
+                    }
                     // Optional workspace narrowing: applies only to the
                     // workspace-bearing AttentionRaised. A `None`-workspace (host)
                     // event never matches a filter, so a narrowed subscription
@@ -1149,6 +1177,23 @@ fn spawn_attention_forwarder(
             }
         }
     })
+}
+
+/// The event family of one event on the attention stream.
+fn attention_stream_family(
+    event: &ainb_hangar_proto::events::HangarEvent,
+) -> ainb_hangar_proto::devices::EventFamily {
+    use ainb_hangar_proto::devices::EventFamily;
+    use ainb_hangar_proto::events::HangarEvent;
+    // Named, not defaulted: an event a later change puts on this broadcast
+    // is `Unknown`, which no scope receives, until it is classified here.
+    match event {
+        HangarEvent::AttentionRaised { .. } | HangarEvent::AttentionAnswered { .. } => {
+            EventFamily::Attention
+        }
+        HangarEvent::ConnectionsChanged { .. } => EventFamily::Connections,
+        _ => EventFamily::Unknown,
+    }
 }
 
 /// Spawn a gapless durable Fleet revision forwarder.
@@ -1558,7 +1603,7 @@ async fn dispatch_as_connection(
         req.method != tests::PANIC_METHOD,
         "a test injected a handler panic"
     );
-    let result = match caller.authorize(&req.method) {
+    let result = match caller.authorize(&req.method, &req.params) {
         // Every mutation goes through the ledger guard, so "generic dedupe at
         // dispatch for every mutation" (D18) is a property of THIS line rather
         // than of ~96 hand-written transactions. A read, or a mutation whose
@@ -1833,7 +1878,9 @@ async fn handle(
         // `attention/subscribe` acks with the current OPEN snapshot; the live
         // fleet-wide forwarder is the stream side (see `serve_conn`).
         methods::ATTENTION_SUBSCRIBE => handle_attention_subscribe(pool, req).await,
-        methods::ATTENTION_ANSWER => handle_attention_answer(pool, req, events, connection).await,
+        methods::ATTENTION_ANSWER => {
+            handle_attention_answer(pool, req, events, caller, connection).await
+        }
         methods::ATC_REGISTER => handle_atc_register(pool, req).await,
         methods::ATC_LIST => handle_atc_list(pool).await,
         methods::ATC_RETRY_LIST => handle_atc_retry_list(pool, req).await,
@@ -1956,6 +2003,15 @@ async fn handle_fleet_action(
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::fleet::FleetActionParams =
         parse_params(req, "{ session_key, expected_version, request_id, action }")?;
+    // D18 fence, checked before the `writing` receipt: a refused action never
+    // claims it began writing.
+    enforce_session_fence(
+        pool,
+        methods::FLEET_ACTION,
+        params.mutation.fence.as_ref(),
+        &params.session_key,
+    )
+    .await?;
     // The D18 `writing` boundary for this family. It is set HERE, one frame
     // above `execute_fleet_action`, rather than beside the `send-keys` itself:
     // the executor lives in `fleet.rs`, which another lane owns, and nothing
@@ -2427,6 +2483,33 @@ async fn handle_fleet_message_send(
             }
         }
     }
+    // A paired device is pinned the same way, to the id its credential names
+    // (RECONCILED T12, S2): a phone that could write `actor: "operator"` would
+    // post as the human. Pinned, not validated: whatever it sent is replaced.
+    if let Some(device_id) = caller.device_id() {
+        params.actor = Some(format!("device:{device_id}"));
+    }
+    if let Some(fence) = params.mutation.fence.as_ref() {
+        // A lifecycle clock is one session's, so a fenced send names exactly
+        // one target: fanning one clock across several sessions would check
+        // all but one of them against a value nobody read.
+        // Counted the way the send will deliver: blanks dropped and
+        // duplicates folded, so `["s1", "s1"]` is still one target.
+        let mut distinct: Vec<&str> = params
+            .targets
+            .iter()
+            .map(String::as_str)
+            .filter(|target| !target.trim().is_empty())
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let [target] = distinct.as_slice() else {
+            return Err(invalid_params(
+                "a fenced fleet/message_send must name exactly one target",
+            ));
+        };
+        enforce_session_fence(pool, methods::FLEET_MESSAGE_SEND, Some(fence), target).await?;
+    }
     let span = tracing::info_span!(
         "fleet.message.send",
         request_id = %params.request_id,
@@ -2451,6 +2534,82 @@ async fn handle_fleet_message_send(
     let sent = message_send_inner(pool, params, events).instrument(span).await;
     mutation::mark_active_receipt(pool, message_send_receipt(sent.as_ref()), None, now_ms).await;
     sent
+}
+
+/// Enforce the D18 fence a PTY-effecting fleet call carried (F-1).
+///
+/// - `fleet/message_send` is fenced on the lifecycle clock the client read:
+///   a later `lifecycle_updated_at` means the agent moved on since the client
+///   looked, and the prompt is refused with `turn_advanced` rather than typed
+///   into a turn the client never saw.
+/// - `fleet/action` is fenced on the session incarnation: a different one
+///   means a new process owns the name, and the action is refused with
+///   `incarnation_mismatch` rather than aimed at it.
+///
+/// No fence keeps today's contract. A fence of the other kind is a malformed
+/// request. A session the store does not know is left to the handler, which
+/// already answers for it. The check runs before the `writing` receipt, so a
+/// refusal never claims an effect began; it is a check-then-send, and a turn
+/// that advances between the two is the race the next fenced call catches.
+async fn enforce_session_fence(
+    pool: &SqlitePool,
+    method: &str,
+    fence: Option<&ainb_hangar_proto::mutation::Fence>,
+    session_key: &str,
+) -> Result<(), RpcError> {
+    use ainb_hangar_proto::mutation::{Fence, REASON_INCARNATION_MISMATCH, REASON_TURN_ADVANCED};
+    use ainb_hangar_store::repo::fleet::FleetRepo;
+
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    let expected_kind = match method {
+        methods::FLEET_ACTION => "session_incarnation",
+        _ => "lifecycle_updated_at",
+    };
+    let fits = matches!(
+        (method, fence),
+        (methods::FLEET_ACTION, Fence::SessionIncarnation { .. })
+            | (
+                methods::FLEET_MESSAGE_SEND,
+                Fence::LifecycleUpdatedAt { .. }
+            )
+    );
+    if !fits {
+        return Err(invalid_params(&format!(
+            "{method} is fenced on {expected_kind}, not this fence kind"
+        )));
+    }
+    let Some(row) = FleetRepo::get_session(pool, session_key)
+        .await
+        .map_err(|error| store_err(&error))?
+    else {
+        return Ok(());
+    };
+    match fence {
+        Fence::LifecycleUpdatedAt {
+            lifecycle_updated_at,
+        } if row.lifecycle_updated_at > *lifecycle_updated_at => Err(mutation::rejected(
+            REASON_TURN_ADVANCED,
+            format!(
+                "{session_key} moved on since it was read (lifecycle {} > {lifecycle_updated_at}); \
+                 nothing was sent",
+                row.lifecycle_updated_at
+            ),
+        )),
+        Fence::SessionIncarnation {
+            session_incarnation,
+        } if row.session_incarnation.as_deref() != Some(session_incarnation.as_str()) => {
+            Err(mutation::rejected(
+                REASON_INCARNATION_MISMATCH,
+                format!(
+                    "{session_key} is a different process than the one that was read; \
+                     nothing was done"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The D18 receipt state a completed `fleet/message_send` earns.
@@ -3104,12 +3263,20 @@ async fn handle_fleet_transcript_list(
 
     require_fleet_capability(FLEET_CAPABILITY_TRANSCRIPT_READ)?;
     let params: FleetTranscriptListParams =
-        parse_params(req, "{ session_key, after_order?, limit }")?;
+        parse_params(req, "{ session_key, after_order?, before_order?, limit }")?;
     if params.session_key.trim().is_empty() {
         return Err(invalid_params("session_key must not be empty"));
     }
     if params.after_order.is_some_and(|order| order < 0) {
         return Err(invalid_params("after_order must be non-negative"));
+    }
+    if params.before_order.is_some_and(|order| order < 0) {
+        return Err(invalid_params("before_order must be non-negative"));
+    }
+    if params.after_order.is_some() && params.before_order.is_some() {
+        return Err(invalid_params(
+            "after_order and before_order are exclusive: page forward or back, not both",
+        ));
     }
     let limit = i64::from(params.limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX));
     // A transcript read with NO cursor answers with the newest page, because
@@ -3129,7 +3296,7 @@ async fn handle_fleet_transcript_list(
     // and truncation flag included. A tail is bounded twice because a chunk's
     // payload has no ceiling of its own, and which bound bit is not inferable
     // from the row count, so it rides the wire.
-    let (rows, truncated) = match params.after_order {
+    let (rows, truncated, lowest_scanned) = match params.after_order {
         Some(after_order) => FleetProviderEventRepo::list_by_session_after(
             pool,
             &params.session_key,
@@ -3142,21 +3309,40 @@ async fn handle_fleet_transcript_list(
         // updates. It answers "what came after this row", so stopping early
         // has nothing to admit: `next_after_order` already tells the caller
         // where to resume.
-        .map(|rows| (within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES), false)),
-        None => {
-            FleetProviderEventRepo::list_by_session_tail(
-                pool,
-                &params.session_key,
-                limit,
-                FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        .map(|rows| {
+            (
+                within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES),
+                false,
+                None,
             )
-            .await
-        }
+        }),
+        // No forward cursor: the newest page, or with `before_order` the
+        // newest page strictly older than it (a phone scrolling back). Both
+        // are the tail read, bounded by rows and bytes, with `truncated`
+        // meaning older rows remain.
+        None => FleetProviderEventRepo::list_by_session_tail_before(
+            pool,
+            &params.session_key,
+            params.before_order,
+            limit,
+            FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        )
+        .await
+        .map(|page| (page.rows, page.truncated, page.lowest_scanned)),
     }
     .map_err(|error| store_err(&error))?;
     let chunks: Vec<_> = rows.iter().map(transcript_chunk_wire).collect();
     to_value(&FleetTranscriptListResult {
-        next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+        // A backward page is not a place to walk forward from.
+        next_after_order: if params.before_order.is_some() {
+            None
+        } else {
+            chunks.last().map(|chunk| chunk.ingest_order)
+        },
+        // Where the next page back starts: the lowest order scanned, which
+        // is below the first chunk when the oldest rows reached could not be
+        // decoded, so a walk back never stalls on them.
+        next_before_order: if truncated { lowest_scanned } else { None },
         chunks,
         truncated,
     })
@@ -4833,7 +5019,7 @@ pub(crate) async fn execute_fleet_action(
         None,
     )
     .await
-    .map_err(fleet_repo_err)?;
+    .map_err(action_target_err)?;
     // The fingerprint gate is a STALENESS check for providers whose session row
     // carries the one request they are blocked on. An ACP session can be blocked
     // on SEVERAL at once (an adapter running parallel tool calls raises a
@@ -7206,6 +7392,23 @@ fn action_receipt_wire(
         session_version: row.session_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+/// [`fleet_repo_err`] for the `fleet/action` target check, except that a stale
+/// `expected_version` is a D18 refusal (`-32008`, reason `conflict`) rather
+/// than a malformed request: the client's view of the session moved on, and
+/// a surface renders a refusal where it would show a parameter error as a
+/// bug. The ledger abandons it like the fence refusals, so re-reading the
+/// session and resending under the same request id works.
+fn action_target_err(error: ainb_hangar_store::repo::fleet::FleetRepoError) -> RpcError {
+    use ainb_hangar_store::repo::fleet::FleetRepoError;
+    match error {
+        FleetRepoError::StaleVersion { .. } => mutation::rejected(
+            ainb_hangar_proto::mutation::REASON_CONFLICT,
+            format!("{error}; nothing was done, re-read the session and retry"),
+        ),
+        other => fleet_repo_err(other),
     }
 }
 
@@ -13212,12 +13415,13 @@ async fn handle_attention_answer(
     pool: &SqlitePool,
     req: &RpcRequest,
     events: &EventSink,
+    caller: &auth::Caller,
     connection: Option<&ConnectionRow>,
 ) -> Result<serde_json::Value, RpcError> {
     let mut params: ainb_hangar_proto::snapshots::AnswerParams =
         parse_params(req, "{ attention_id, answer, answered_by, is_answer? }")?;
-    if let Some(connection) = connection {
-        params.answered_by = crate::answer::answered_by(connection);
+    if let Some(stamp) = crate::answer::answered_by_caller(caller, connection) {
+        params.answered_by = stamp;
     }
     let result = crate::answer::answer(pool, events, &params, SystemClock.now_ms())
         .await
@@ -13694,6 +13898,7 @@ fn session_row_to_entry(
         model_source: row.model_source,
         codex_model: row.codex_model,
         codex_thread_id: row.codex_thread_id,
+        claude_session_id: row.claude_session_id,
     }
 }
 
@@ -13714,6 +13919,7 @@ fn session_entry_to_row(
         model_source: entry.model_source,
         codex_model: entry.codex_model,
         codex_thread_id: entry.codex_thread_id,
+        claude_session_id: entry.claude_session_id,
     }
 }
 
@@ -14368,6 +14574,466 @@ mod tests {
         }
     }
 
+    /// RECONCILED C6: `ConnectionsChanged` rides the attention stream, so the
+    /// attention forwarder drops it for a device without the Connections
+    /// family and still forwards the inbox events around it. An admin gets it.
+    #[tokio::test]
+    async fn connections_changed_never_reaches_a_non_admin_device() {
+        use ainb_hangar_proto::devices::DeviceScope;
+        use ainb_hangar_proto::events::HangarEvent;
+
+        async fn forwarded(scope: DeviceScope) -> Vec<String> {
+            let (tx, rx) = broadcast::channel(8);
+            let (out_tx, mut out_rx) = mpsc::channel(8);
+            let caller = auth::Caller::Device {
+                device_id: "01J0DEVICE".to_string(),
+                scope,
+            };
+            let forwarder = spawn_attention_forwarder(rx, None, caller, out_tx);
+            tx.send(HangarEvent::ConnectionsChanged {
+                connections: Vec::new(),
+            })
+            .unwrap();
+            // An event nobody classified for this stream is `Unknown`, which
+            // no scope receives, the admin included.
+            tx.send(HangarEvent::IssueDeleted {
+                issue_id: ainb_hangar_core::ids::IssueId::from_str("i1").unwrap(),
+            })
+            .unwrap();
+            tx.send(HangarEvent::AttentionAnswered {
+                attention_id: "a1".to_string(),
+                by: "tui@host".to_string(),
+            })
+            .unwrap();
+            drop(tx);
+            let mut kinds = Vec::new();
+            while let Some(frame) = out_rx.recv().await {
+                let text = String::from_utf8(frame).unwrap();
+                let body = &text[text.find("\r\n\r\n").unwrap() + 4..];
+                let value: serde_json::Value = serde_json::from_str(body).unwrap();
+                kinds.push(value["params"]["event"].as_str().unwrap().to_string());
+            }
+            forwarder.await.unwrap();
+            kinds
+        }
+
+        for scope in [
+            DeviceScope::DESKTOP,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::MOBILE,
+        ] {
+            assert_eq!(forwarded(scope).await, ["attention_answered"], "{scope:?}");
+        }
+        assert_eq!(
+            forwarded(DeviceScope::DESKTOP_ADMIN).await,
+            ["connections_changed", "attention_answered"]
+        );
+    }
+
+    /// RECONCILED T12/S2: a device's `fleet/message_send` is written as
+    /// `device:<id>`, whatever `actor` it sent, the operator's name included.
+    #[tokio::test]
+    async fn a_device_message_is_pinned_to_its_own_actor() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        let phone = auth::Caller::Device {
+            device_id: "01J0PHONE".to_string(),
+            scope: ainb_hangar_proto::devices::DeviceScope::MOBILE,
+        };
+        let sent = dispatch_as(
+            store.pool(),
+            &req(
+                methods::FLEET_MESSAGE_SEND,
+                serde_json::json!({
+                    "actor": "operator",
+                    "targets": ["s1"],
+                    "text": "status?",
+                    "request_id": "req-phone",
+                }),
+            ),
+            &health(),
+            &sink(),
+            &phone,
+        )
+        .await;
+        assert!(sent.error.is_none(), "{:?}", sent.error);
+        let message_id = sent.result.as_ref().unwrap()["message_id"].as_str().unwrap().to_string();
+        let sender: String = sqlx::query_scalar("SELECT sender FROM fleet_message WHERE id = ?")
+            .bind(&message_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(sender, "device:01J0PHONE");
+
+        // #71 review: request_id is global, yet a device cannot read back the
+        // operator's message by reusing its id. The D18 ledger keys the op id
+        // per principal and refuses it as foreign before the message dedupe
+        // is reached; the phone retrying its own id still replays.
+        let send = |caller: auth::Caller, request_id: &'static str| {
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(
+                    &pool,
+                    &req(
+                        methods::FLEET_MESSAGE_SEND,
+                        serde_json::json!({
+                            "actor": "operator",
+                            "targets": ["s1"],
+                            "text": "status?",
+                            "request_id": request_id,
+                        }),
+                    ),
+                    &health(),
+                    &sink(),
+                    &caller,
+                )
+                .await
+            }
+        };
+        let operator = send(auth::Caller::Operator, "req-operator").await;
+        assert!(operator.error.is_none(), "{:?}", operator.error);
+        let stolen = send(phone.clone(), "req-operator").await;
+        assert_eq!(
+            stolen
+                .error
+                .as_ref()
+                .and_then(|e| e.data.as_ref())
+                .map(|data| data["mutation"]["reason"].clone()),
+            Some(serde_json::json!("op_id_foreign")),
+            "{stolen:?}"
+        );
+        assert!(stolen.result.is_none(), "no message leaks back: {stolen:?}");
+        let own = send(phone.clone(), "req-phone").await;
+        assert!(own.error.is_none(), "{:?}", own.error);
+        assert_eq!(
+            own.result.as_ref().unwrap()["message_id"],
+            message_id.as_str()
+        );
+    }
+
+    /// A store with one fleet session at a known lifecycle clock and
+    /// incarnation, for the F-1 fence tests.
+    async fn fenced_session_store() -> (tempfile::TempDir, Store) {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        sqlx::query(
+            "UPDATE fleet_session SET lifecycle_updated_at = 10, session_incarnation = 'proc-a' \
+             WHERE session_key = 's1'",
+        )
+        .execute(store.pool())
+        .await
+        .expect("set the fenced columns");
+        (home, store)
+    }
+
+    async fn call(store: &Store, method: &str, params: serde_json::Value) -> RpcResponse {
+        dispatch_as(
+            store.pool(),
+            &req(method, params),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await
+    }
+
+    fn rejection_reason(response: &RpcResponse) -> Option<String> {
+        let error = response.error.as_ref()?;
+        (error.code == ainb_hangar_proto::mutation::MUTATION_REJECTED).then_some(())?;
+        error.data.as_ref()?[ainb_hangar_proto::mutation::ACK_KEY]["reason"]
+            .as_str()
+            .map(ToString::to_string)
+    }
+
+    /// F-1: a prompt fenced on a lifecycle clock the session has moved past
+    /// is refused `turn_advanced` and writes nothing; a retry under the same
+    /// request_id with the current clock sends.
+    #[tokio::test]
+    async fn a_stale_lifecycle_fence_refuses_the_prompt_and_a_current_one_sends() {
+        let (_home, store) = fenced_session_store().await;
+        let send = |request_id: &str, clock: i64| {
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": request_id,
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": clock},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_TURN_ADVANCED),
+            "{stale:?}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused send persists nothing");
+        // A fence refusal is NOT this op id's answer: the fingerprint strips
+        // the fence, so the phone re-reads the clock and retries under the
+        // SAME request_id, and that retry sends.
+        let retried = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 10)).await;
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the retry delivered exactly once");
+    }
+
+    /// F-1: a fenced send names one session, and the fence kind must be the
+    /// method's own.
+    #[tokio::test]
+    async fn a_fenced_prompt_names_one_target_with_its_own_fence_kind() {
+        let (_home, store) = fenced_session_store().await;
+        let two = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s2"],
+                "text": "go on",
+                "request_id": "req-two",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            two.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{two:?}"
+        );
+        // #139 review: counted after the send's own normalisation, so a
+        // repeated or blank target still names one session.
+        let repeated = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s1", " "],
+                "text": "go on",
+                "request_id": "req-repeated",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_ne!(
+            repeated.error.as_ref().map(|e| e.message.as_str()),
+            Some("a fenced fleet/message_send must name exactly one target"),
+            "{repeated:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": "req-kind",
+                "fence": {"kind": "session_incarnation", "session_incarnation": "proc-a"},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
+    }
+
+    /// F-1: an action fenced on another process's incarnation is refused
+    /// `incarnation_mismatch` before any receipt; the matching incarnation
+    /// passes the fence (whatever the action itself then answers).
+    #[tokio::test]
+    async fn an_action_fenced_on_another_incarnation_is_refused() {
+        let (_home, store) = fenced_session_store().await;
+        let action = |request_id: &str, incarnation: &str| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": request_id,
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "session_incarnation", "session_incarnation": incarnation},
+            })
+        };
+
+        let other = call(&store, methods::FLEET_ACTION, action("req-other", "proc-b")).await;
+        assert_eq!(
+            rejection_reason(&other).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{other:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-other'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action claims no receipt");
+
+        // The same request_id with the fence re-read passes the fence: the
+        // refusal was not recorded as that op id's answer.
+        let same = call(&store, methods::FLEET_ACTION, action("req-other", "proc-a")).await;
+        assert_ne!(
+            rejection_reason(&same).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{same:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_ACTION,
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": "req-kind",
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
+    }
+
+    /// WP13, the scope rows for R2's terminal methods, driven through the real
+    /// dispatch path. A device the table refuses gets `UNAUTHORIZED` before
+    /// any handler runs. A device the table allows passes the gate and meets
+    /// the dark switch instead: `METHOD_NOT_FOUND` until R2's handlers land
+    /// (RECONCILED M13). So the scope gate never stands in for the dark
+    /// switch, and neither hides the other.
+    ///
+    /// The remaining WP13 checks need R2's handlers: `terminal/input` from
+    /// `mobile+type` succeeding (WP9b), and a stream never receiving another
+    /// stream's frames (WP9a, RECONCILED M12).
+    #[tokio::test]
+    async fn terminal_methods_are_gated_by_scope_before_the_dark_switch() {
+        use ainb_hangar_proto::devices::DeviceScope;
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        // Each method gets its own real params shape, checked against its
+        // typed struct below, so the gate is exercised with what a client
+        // sends and a stricter parser later cannot fail it for the wrong
+        // reason.
+        let session = serde_json::json!({"host_id": "local", "session_key": "s1"});
+        let watch = serde_json::json!({"session": session, "want_input": false});
+        let typing = serde_json::json!({"session": session, "want_input": true});
+        let detach = serde_json::json!({"stream_id": 1});
+        let ack = serde_json::json!({"stream_id": 1, "consumed": 0});
+        let scrollback = serde_json::json!({"stream_id": 1, "before_row": 0, "rows": 10});
+        let input = serde_json::json!({"stream_id": 1, "data": "ls\n"});
+        let floor = serde_json::json!({"stream_id": 1, "action": "acquire"});
+        let resize = serde_json::json!({"stream_id": 1, "cols": 80, "rows": 24});
+        {
+            use ainb_hangar_proto::terminal::{
+                TerminalAckParams, TerminalAttachParams, TerminalDetachParams, TerminalFloorParams,
+                TerminalInputParams, TerminalResizeParams, TerminalScrollbackParams,
+            };
+            serde_json::from_value::<TerminalAttachParams>(watch.clone()).expect("attach");
+            serde_json::from_value::<TerminalAttachParams>(typing.clone()).expect("attach");
+            serde_json::from_value::<TerminalDetachParams>(detach.clone()).expect("detach");
+            serde_json::from_value::<TerminalAckParams>(ack.clone()).expect("ack");
+            serde_json::from_value::<TerminalScrollbackParams>(scrollback.clone())
+                .expect("scrollback");
+            serde_json::from_value::<TerminalInputParams>(input.clone()).expect("input");
+            serde_json::from_value::<TerminalFloorParams>(floor.clone()).expect("floor");
+            serde_json::from_value::<TerminalResizeParams>(resize.clone()).expect("resize");
+        }
+        let attach_with = |want_input: serde_json::Value| {
+            serde_json::json!({
+                "session": {"host_id": "local", "session_key": "s1"},
+                "want_input": want_input,
+            })
+        };
+        let omitted = serde_json::json!({
+            "session": {"host_id": "local", "session_key": "s1"},
+        });
+        // Non-bool `want_input` does not parse as `TerminalAttachParams`, so
+        // it earns no params rule: the watch-only grant is refused whatever
+        // the value looks like, and a scope that allows attach outright still
+        // passes the gate (the handler's own parse answers it, once it lands).
+        let number = attach_with(serde_json::json!(1));
+        let string_false = attach_with(serde_json::json!("false"));
+        let null = attach_with(serde_json::Value::Null);
+        let object = attach_with(serde_json::json!({"want_input": false}));
+        // (method, params, which scopes the table lets through)
+        let cases: [(&str, &serde_json::Value, [bool; 4]); 13] = [
+            // [mobile, mobile+type, desktop, desktop+admin]
+            (methods::TERMINAL_ATTACH, &watch, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &typing, [false, true, true, true]),
+            // Omitted is the serde default, `false`: watch-only is earned.
+            (methods::TERMINAL_ATTACH, &omitted, [true, true, true, true]),
+            (methods::TERMINAL_ATTACH, &number, [false, true, true, true]),
+            (
+                methods::TERMINAL_ATTACH,
+                &string_false,
+                [false, true, true, true],
+            ),
+            (methods::TERMINAL_ATTACH, &null, [false, true, true, true]),
+            (methods::TERMINAL_ATTACH, &object, [false, true, true, true]),
+            (methods::TERMINAL_DETACH, &detach, [true, true, true, true]),
+            (methods::TERMINAL_ACK, &ack, [true, true, true, true]),
+            (
+                methods::TERMINAL_SCROLLBACK,
+                &scrollback,
+                [true, true, true, true],
+            ),
+            (methods::TERMINAL_INPUT, &input, [false, true, true, true]),
+            (methods::TERMINAL_FLOOR, &floor, [false, true, true, true]),
+            (methods::TERMINAL_RESIZE, &resize, [false, true, true, true]),
+        ];
+        let scopes = [
+            DeviceScope::MOBILE,
+            DeviceScope::MOBILE_TYPE,
+            DeviceScope::DESKTOP,
+            DeviceScope::DESKTOP_ADMIN,
+        ];
+        for (method, params, allowed) in cases {
+            for (scope, allowed) in scopes.into_iter().zip(allowed) {
+                let device = auth::Caller::Device {
+                    device_id: "01J0DEVICE".to_string(),
+                    scope,
+                };
+                let request = RpcRequest {
+                    jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+                    id: RpcId::Number(1),
+                    method: method.to_string(),
+                    params: params.clone(),
+                };
+                let response =
+                    dispatch_as(store.pool(), &request, &health(), &sink(), &device).await;
+                let code = response.error.as_ref().map(|e| e.code);
+                let expected = if allowed {
+                    METHOD_NOT_FOUND
+                } else {
+                    ainb_hangar_proto::auth::UNAUTHORIZED
+                };
+                assert_eq!(code, Some(expected), "{method} {params} for {scope:?}");
+            }
+        }
+    }
+
     /// The request loop is transport-generic: an in-memory duplex stream, with
     /// no unix socket and no peer credentials, is served exactly like the
     /// unix leg. A good hello is listed and answered, a request dispatches,
@@ -14482,6 +15148,61 @@ mod tests {
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
         );
+    }
+
+    /// A stale `expected_version` on `fleet/action` is a D18 refusal the phone
+    /// can render (`-32008`, reason `conflict`), not an `INVALID_PARAMS`, and
+    /// it is abandoned in the ledger: no receipt is written, and a retry under
+    /// the SAME request id with the re-read version passes the check.
+    #[tokio::test]
+    async fn a_stale_action_version_is_a_conflict_refusal_that_can_be_retried() {
+        let (_home, store) = fenced_session_store().await;
+        let interrupt = |version: i64| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": version,
+                "request_id": "req-stale-version",
+                "action": {"action": "interrupt"},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_ACTION, interrupt(5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_CONFLICT),
+            "{stale:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action writes no receipt");
+
+        // The retry with the re-read version RUNS: the refusal was never this
+        // request id's recorded answer.
+        let retried = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert!(
+            retried.error.is_none(),
+            "the retry succeeds: {:?}",
+            retried.error
+        );
+        let ack = &retried.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "created", "{ack}");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 1, "the retry wrote exactly one receipt");
+
+        // And from then on the op id has an answer: the same call replays it.
+        let again = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert!(again.error.is_none(), "{:?}", again.error);
+        let ack = &again.result.as_ref().unwrap()[ainb_hangar_proto::mutation::ACK_KEY];
+        assert_eq!(ack["outcome"], "replayed", "{ack}");
     }
 
     /// The method the test seam in `dispatch_as_connection` panics on.
@@ -14634,6 +15355,29 @@ mod tests {
         }
     }
 
+    /// #100 review: a teardown dropped after its row was removed but before
+    /// the removal was announced still announces it. A second removal finds
+    /// nothing, so without the flag the announcement would be lost for good.
+    #[tokio::test]
+    async fn a_teardown_dropped_between_removal_and_announcement_still_announces() {
+        use ainb_hangar_proto::events::HangarEvent;
+
+        let registry = connections::ConnectionRegistry::new();
+        let broker = EventBroker::new();
+        let mut announcements = broker.subscribe_attention();
+        let mut teardown = ConnectionTeardown::new(7, registry.clone(), broker.sink());
+        teardown.announce = true;
+        drop(teardown);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), announcements.recv())
+            .await
+            .expect("the spawned announcement runs")
+            .expect("event");
+        assert!(
+            matches!(event, HangarEvent::ConnectionsChanged { .. }),
+            "{event:?}"
+        );
+    }
+
     /// Review follow-up C: a peer that never reads cannot pin the writer. The
     /// socket buffer fills, the one frame in flight misses the deadline, the
     /// writer ends, and the next queued frame fails, which is what ends the
@@ -14668,7 +15412,10 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
-        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_millis(200));
+        // Per frame, and well above scheduler jitter on a loaded runner: the
+        // property is that a reading peer is never cut off, not how tight the
+        // bound is.
+        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_secs(2));
         let reader = tokio::spawn(async move {
             let mut total = 0usize;
             let mut buf = [0u8; 4096];
@@ -14722,6 +15469,239 @@ mod tests {
         .await
         .expect("a dead writer must not leave the read loop waiting");
         assert!(matches!(waited, NextRequest::WriterGone), "{waited:?}");
+    }
+
+    /// F4 and F2: a byte-capped backward page, and an oldest row that cannot
+    /// be decoded. The byte bound stops a page early with `truncated` and a
+    /// cursor at its first row; the bad row is skipped but still moves the
+    /// cursor below it, so the walk ends instead of asking for it forever.
+    #[tokio::test]
+    async fn backward_pages_stop_on_the_byte_budget_and_step_past_a_bad_row() {
+        use ainb_hangar_proto::fleet::FLEET_TRANSCRIPT_LIST_MAX_BYTES;
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let pool = store.pool();
+        let big = "x".repeat(FLEET_TRANSCRIPT_LIST_MAX_BYTES / 3);
+        let events: Vec<_> = (0..10)
+            .map(|n| NewFleetProviderEvent {
+                event_id: format!("big-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("big".to_string()),
+                provider_session_id: None,
+                observed_at: n,
+                received_at: n,
+                event_type: "agent_message_chunk".to_string(),
+                raw_payload: format!("{{\"n\":{n},\"pad\":\"{big}\"}}"),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(pool, &events).await.expect("seed");
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            async move { dispatch_as(pool, &request, &health(), &sink(), &auth::Caller::Operator).await }
+        };
+        let orders_of = |result: &serde_json::Value| -> Vec<i64> {
+            result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["ingest_order"].as_i64().unwrap())
+                .collect()
+        };
+
+        // Byte-capped: 100 rows asked, each a third of the budget.
+        let mut seen = Vec::new();
+        let mut before: Option<i64> = None;
+        let mut pages = 0;
+        loop {
+            let mut params = serde_json::json!({"session_key": "big", "limit": 100});
+            if let Some(before) = before {
+                params["before_order"] = serde_json::json!(before);
+            }
+            let page = list(params).await;
+            let result = page.result.clone().expect("a page");
+            let orders = orders_of(&result);
+            assert!(
+                orders.len() <= 3,
+                "the byte budget caps the page: {}",
+                orders.len()
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+            if result["truncated"] != true {
+                assert!(result.get("next_before_order").is_none());
+                break;
+            }
+            assert_eq!(
+                result["next_before_order"].as_i64(),
+                orders.first().copied()
+            );
+            before = result["next_before_order"].as_i64();
+            assert!(pages < 20, "the walk must end");
+        }
+        assert_eq!(seen.len(), 10, "every row once");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+
+        // F2: the oldest row cannot be decoded.
+        sqlx::query("UPDATE fleet_provider_event SET raw_payload = x'ff' WHERE event_id = 'big-0'")
+            .execute(pool)
+            .await
+            .expect("corrupt the oldest row");
+        let bad_order = seen[0];
+        let mut before = Some(seen[1]);
+        let mut steps = 0;
+        let mut stepped_past = false;
+        while let Some(cursor) = before {
+            let page = list(serde_json::json!({
+                "session_key": "big", "before_order": cursor, "limit": 100,
+            }))
+            .await;
+            let result = page.result.clone().expect("a page");
+            assert!(
+                orders_of(&result).is_empty(),
+                "the bad row is never returned"
+            );
+            if result["next_before_order"].as_i64() == Some(bad_order) {
+                stepped_past = true;
+            }
+            before = result["next_before_order"].as_i64();
+            steps += 1;
+            assert!(steps < 5, "a bad oldest row must not stall the walk back");
+        }
+        assert!(
+            stepped_past,
+            "the cursor moved to the bad row's order, below it next"
+        );
+    }
+
+    /// `fleet/transcript_list { before_order }` on a dense session: 1000 rows
+    /// for the watched session interleaved with 1000 for another, so its
+    /// orders are not contiguous. Paging back from the newest page with
+    /// `before_order` = the first order held returns 100 rows at a time, each
+    /// page ascending and strictly older, no row twice and none skipped,
+    /// `truncated` until the oldest page. The request cap holds at 100, and
+    /// both cursors together are refused.
+    #[tokio::test]
+    async fn transcript_list_pages_back_with_before_order_on_a_dense_session() {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let event = |session: &str, n: usize| NewFleetProviderEvent {
+            event_id: format!("{session}-{n}"),
+            provider: "claude".to_string(),
+            source: "acp".to_string(),
+            session_key: Some(session.to_string()),
+            provider_session_id: None,
+            observed_at: 1_000 + i64::try_from(n).unwrap(),
+            received_at: 1_000 + i64::try_from(n).unwrap(),
+            event_type: "agent_message_chunk".to_string(),
+            raw_payload: format!("{{\"n\":{n}}}"),
+        };
+        let mut batch = Vec::new();
+        for n in 0..1000 {
+            batch.push(event("dense", n));
+            batch.push(event("other", n));
+        }
+        FleetProviderEventRepo::append_batch(store.pool(), &batch).await.expect("seed");
+
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(&pool, &request, &health(), &sink(), &auth::Caller::Operator).await
+            }
+        };
+        let page_of = |response: &RpcResponse| {
+            let result = response.result.as_ref().expect("a page");
+            let orders: Vec<i64> = result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|chunk| {
+                    assert_eq!(chunk["session_key"], "dense", "only the watched session");
+                    chunk["ingest_order"].as_i64().unwrap()
+                })
+                .collect();
+            (orders, result["truncated"].as_bool().unwrap_or(false))
+        };
+
+        // The newest page, then back until the start.
+        let newest = list(serde_json::json!({"session_key": "dense", "limit": 100})).await;
+        let (mut orders, mut truncated) = page_of(&newest);
+        let mut seen: Vec<i64> = orders.clone();
+        let mut pages = 1;
+        let mut next_before = newest.result.as_ref().unwrap()["next_before_order"].as_i64();
+        while truncated {
+            // F2: the walk follows the daemon's cursor, the first order here.
+            let before = next_before.expect("a truncated page names where to go back");
+            assert_eq!(before, orders[0]);
+            let older = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            (orders, truncated) = page_of(&older);
+            next_before = older.result.as_ref().unwrap()["next_before_order"].as_i64();
+            // F3: a backward page never offers a forward cursor.
+            assert!(
+                older.result.as_ref().unwrap().get("next_after_order").is_none(),
+                "page {pages}"
+            );
+            assert_eq!(orders.len(), 100, "page {pages}");
+            assert!(
+                orders.windows(2).all(|w| w[0] < w[1]),
+                "ascending within a page"
+            );
+            assert!(
+                *orders.last().unwrap() < before,
+                "strictly before the cursor"
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(next_before, None, "nothing older remains");
+        assert_eq!(seen.len(), 1000, "every row once");
+
+        // F4: a cursor at, or below, the first row, and a cursor of 0, are
+        // empty, complete pages.
+        for before in [seen[0], seen[0] - 1, 0] {
+            let empty = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            let result = empty.result.as_ref().expect("a page");
+            assert_eq!(result["chunks"].as_array().unwrap().len(), 0, "{before}");
+            assert_eq!(result["truncated"], false, "{before}");
+            assert!(result.get("next_before_order").is_none(), "{before}");
+            assert!(result.get("next_after_order").is_none(), "{before}");
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "no row twice, none out of order"
+        );
+
+        // The cap: asking for more than 100 still answers 100.
+        let capped = list(serde_json::json!({
+            "session_key": "dense", "before_order": i64::MAX, "limit": 5000,
+        }))
+        .await;
+        assert_eq!(page_of(&capped).0.len(), 100);
+
+        // Exclusive cursors, and no negative cursor.
+        for bad in [
+            serde_json::json!({"session_key": "dense", "after_order": 1, "before_order": 9, "limit": 10}),
+            serde_json::json!({"session_key": "dense", "before_order": -1, "limit": 10}),
+        ] {
+            let refused = list(bad).await;
+            assert_eq!(refused.error.as_ref().map(|e| e.code), Some(INVALID_PARAMS));
+        }
     }
 
     /// A workspace subscription owns both the durable event forwarder and the

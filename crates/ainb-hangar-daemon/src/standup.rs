@@ -760,6 +760,7 @@ mod tests {
 
     fn session(id: &str) -> Session {
         Session {
+            provider_session_id: None,
             id: id.to_string(),
             cwd: format!("/work/{id}"),
             pid: None,

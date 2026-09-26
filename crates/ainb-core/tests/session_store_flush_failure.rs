@@ -63,6 +63,7 @@ fn a_write_that_fails_while_the_quit_waits_is_reported_as_not_written() {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     };
     let mut store = SessionStore::default();
     store.upsert(session.clone());

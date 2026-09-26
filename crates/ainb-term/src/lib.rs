@@ -10,6 +10,14 @@
 //! advance matches tmux 3.4 on every glyph tested, and only with
 //! [`UNICODE_VERSION`] set to 14; the unit test below pins that table.
 
+pub mod canon;
+pub mod control;
+pub mod emulator;
+pub mod floor;
+pub mod seed;
+pub mod snapshot;
+pub mod viewer;
+
 use std::sync::Arc;
 
 use wezterm_term::color::ColorPalette;

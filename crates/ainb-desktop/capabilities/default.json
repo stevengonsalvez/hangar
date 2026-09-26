@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core IPC for the shell's own commands and events.",
+  "description": "The main window: core IPC for the shell's own commands and events, and dragging the window by its own titlebar (the native one is overlaid on macOS).",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
 }
