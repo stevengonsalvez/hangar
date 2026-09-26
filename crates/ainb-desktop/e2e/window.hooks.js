@@ -27,19 +27,37 @@ export const mochaHooks = {
     if (process.platform !== "darwin") return;
     await browser.setWindowRect(0, 30, 1280, 800);
     let state = "unknown";
+    // The last error the page read itself threw, kept apart from the wait's
+    // own: a session that died or a page that stopped answering is not a
+    // hidden window, and must not be reported as one.
+    let unreadable = null;
     try {
       await browser.waitUntil(
         async () => {
-          state = await browser.execute(() => document.visibilityState);
+          try {
+            state = await browser.execute(() => document.visibilityState);
+            unreadable = null;
+          } catch (error) {
+            unreadable = error;
+            return false;
+          }
           return state === "visible";
         },
         { timeout: VISIBLE_WITHIN_MS, interval: 250 },
       );
-    } catch {
+    } catch (error) {
+      if (unreadable !== null) {
+        throw new Error(
+          `the window's visibility could not be read for ${VISIBLE_WITHIN_MS / 1000} s after it was ` +
+            `placed on screen: ${unreadable.message ?? unreadable}`,
+          { cause: unreadable },
+        );
+      }
       throw new Error(
         `the window is still occluded ${VISIBLE_WITHIN_MS / 1000} s after it was placed on screen ` +
           `(document.visibilityState is "${state}"): an occluded WKWebView runs no animation frames, ` +
           "so this spec cannot run",
+        { cause: error },
       );
     }
   },
