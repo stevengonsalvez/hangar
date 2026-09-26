@@ -20,7 +20,7 @@ test("hosts, sessions, session and pair are reachable from the root", async () =
   expect(screen).toHavePathname(`/host/${FAKE_HOST_A}/session/claude:hangar`);
 
   fireEvent.press(screen.getByTestId("tab-terminal"));
-  expect(screen.getByTestId("terminal-placeholder")).toBeTruthy();
+  expect(await screen.findByTestId("terminal")).toBeTruthy();
 });
 
 test("pairing a pasted offer adds the host", async () => {
