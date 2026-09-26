@@ -81,6 +81,16 @@ pub enum Event {
         /// Pongs received.
         pongs_received: u64,
     },
+    /// A `terminal/ack` was refused or lost; the frames it covered were
+    /// still delivered to the app.
+    AckFailed {
+        /// The stream.
+        stream_id: u64,
+        /// The bytes the ack carried.
+        consumed: u64,
+        /// The error's words.
+        detail: String,
+    },
     /// A reconnect was scheduled.
     Backoff {
         /// The attempt, 0-based.

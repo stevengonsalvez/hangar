@@ -170,6 +170,64 @@ async fn pair_redeems_once_stores_the_token_in_custody_and_connects_by_host_id()
 }
 
 #[tokio::test]
+async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
+    // Redeem succeeds (the single-use invite is burned), then the host
+    // drops the socket at hello. Today's bug: 0 pairings saved, token lost.
+    let redeemed = Arc::new(AtomicBool::new(false));
+    let peer = spawn(
+        issuing_host(Arc::clone(&redeemed), Some(4503)),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let dir_s = dir.path().to_string_lossy().into_owned();
+    let err = pair(
+        offer_for(&peer, peer.host_pubkey, vec![live(&peer)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(4503),
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(redeemed.load(Ordering::SeqCst), "the invite was consumed");
+    let saved = list_pairings(dir_s.clone()).unwrap();
+    assert_eq!(saved.len(), 1, "the pairing is saved before hello");
+    assert_eq!(saved[0].device_id, DEVICE_ID);
+
+    // The saved token works on the next connect, against the same host once
+    // it answers hello.
+    let steady = spawn(
+        issuing_host(Arc::new(AtomicBool::new(true)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let mut record = saved.into_iter().next().unwrap();
+    record.endpoints[0].url = steady.url.clone();
+    record.host_static_pubkey = steady.host_pubkey.to_vec();
+    let token = TOKEN;
+    ainb_wire_mobile::pairing::save(dir.path(), record, token).unwrap();
+    let host = connect_host(ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(host.hello().scope.as_deref(), Some("mobile+type"));
+    assert_eq!(steady.params_of("auth/hello")[0]["token"], TOKEN);
+}
+
+#[tokio::test]
 async fn an_offer_with_another_key_is_peer_changed_and_an_expired_one_is_refused() {
     let redeemed = Arc::new(AtomicBool::new(false));
     let peer = spawn(

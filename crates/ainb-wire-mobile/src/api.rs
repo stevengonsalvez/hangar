@@ -625,6 +625,9 @@ impl MobileHost {
                             seq,
                             frame,
                         },
+                        // Only a frame that does not decode lands here; an
+                        // ack failure is handled inside and the frame
+                        // still arrives above.
                         Err(e) => WireEvent::Other {
                             method: format!("{}: {e}", methods::TERMINAL_FRAME),
                         },
@@ -790,6 +793,12 @@ impl MobileHost {
         )
         .await
         .map_err(WireError::protocol)?
+    }
+
+    /// How many `terminal/ack` calls were refused or lost since connect;
+    /// each is also a line in the connection log.
+    pub fn terminal_acks_failed(&self) -> u64 {
+        self.streams.acks_failed()
     }
 
     /// The last `limit` lines of this host's connection log, oldest first.

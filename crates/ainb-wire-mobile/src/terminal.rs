@@ -337,9 +337,20 @@ struct StreamAcct {
 #[derive(Debug, Default)]
 pub struct Streams {
     accts: Mutex<HashMap<StreamId, StreamAcct>>,
+    acks_failed: std::sync::atomic::AtomicU64,
 }
 
 impl Streams {
+    fn ack_failed(&self) {
+        self.acks_failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many acks were refused or lost since connect.
+    #[must_use]
+    pub fn acks_failed(&self) -> u64 {
+        self.acks_failed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn open(&self, stream_id: StreamId) {
         self.accts.lock().unwrap().insert(stream_id, StreamAcct::default());
     }
@@ -371,6 +382,12 @@ impl Streams {
 
 /// Decode a `terminal/frame` notification, account its bytes, and send the
 /// ack when one is due. Returns the frame for the app.
+///
+/// The frame is delivered whatever happens to the ack: a refused or lost
+/// `terminal/ack` is logged as [`crate::connlog::Event::AckFailed`] and
+/// counted, and the daemon's window closing is the `data_gap {paused}` the
+/// app already handles. The only error here is a frame that does not
+/// decode.
 pub(crate) async fn on_frame(
     session: &Session,
     streams: &Streams,
@@ -382,7 +399,7 @@ pub(crate) async fn on_frame(
     if matches!(frame, TerminalFrameRecord::Closed { .. }) {
         streams.close(params.stream_id);
     } else if let Some(consumed) = streams.consume(params.stream_id, bytes) {
-        let _: TerminalAckResult = session
+        let ack: Result<TerminalAckResult, WireError> = session
             .call(
                 methods::TERMINAL_ACK,
                 &TerminalAckParams {
@@ -390,7 +407,17 @@ pub(crate) async fn on_frame(
                     consumed,
                 },
             )
-            .await?;
+            .await;
+        if let Err(e) = ack {
+            streams.ack_failed();
+            if let Some(log) = session.log() {
+                log.log(crate::connlog::Event::AckFailed {
+                    stream_id: params.stream_id,
+                    consumed,
+                    detail: e.to_string(),
+                });
+            }
+        }
     }
     Ok((params.stream_id, params.seq, frame))
 }
