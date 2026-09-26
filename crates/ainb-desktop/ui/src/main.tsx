@@ -33,13 +33,7 @@ import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
 import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
-import {
-  type ComposerFields,
-  type CreateState,
-  type CreatedWorktree,
-  type PendingWorktree,
-  toArgs,
-} from "./composer.ts";
+import { createComposerFlow } from "./composer.ts";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { Titlebar } from "./titlebar.tsx";
@@ -53,6 +47,7 @@ import {
   openRowIntent,
   rowOf,
   stepTab,
+  acceleratorAllowedUnderModal,
   terminalMayTakeFocus,
   type Accelerator,
   type RendererIntent,
@@ -166,7 +161,7 @@ function Shell() {
    */
   const focusTab = (key: string, byHost: boolean) =>
     requestAnimationFrame(() => {
-      if (terminalMayTakeFocus({ palette: palette(), byHost, active: document.activeElement })) {
+      if (terminalMayTakeFocus({ palette: palette(), composer: composer.open(), byHost, active: document.activeElement })) {
         focusers.get(key)?.();
       }
     });
@@ -300,51 +295,22 @@ function Shell() {
     else setPalette(true);
   };
 
-  // The composer: mounted only while open, like the palette. Its own request
-  // is tracked here rather than inside it, so Cancel (or Esc) closing the
-  // view never stops a create already running on the host, and the sidebar's
-  // pending card keeps drawing until the host answers.
-  const [composerOpen, setComposerOpen] = createSignal(false);
-  const [createState, setCreateState] = createSignal<CreateState>({ kind: "idle" });
-  const [pending, setPending] = createSignal<PendingWorktree | null>(null);
-  const openComposer = () => {
-    // Reopening over a request that already finished (or failed) starts
-    // fresh; reopening over one still running shows it running, rather than
-    // silently dropping back to idle while the host is still working.
-    if (createState().kind !== "creating") setCreateState({ kind: "idle" });
-    setComposerOpen(true);
-  };
-  const closeComposer = () => {
-    setComposerOpen(false);
-    const key = active();
-    if (key !== null) focusers.get(key)?.();
-    else sidebar?.focus();
-  };
-  const createWorktree = (fields: ComposerFields) => {
-    const args = toArgs(fields);
-    setPending({ projectPath: fields.projectPath, name: fields.name.trim() || "New worktree" });
-    setCreateState({ kind: "creating" });
-    void invoke<CreatedWorktree>("worktree_create", { args })
-      .then((result) => setCreateState({ kind: "done", result }))
-      .catch((error: unknown) => setCreateState({ kind: "failed", message: String(error) }));
-  };
-  // The request settles independently of whether its view is still open
-  // (Cancel closed it, or it never was): a finished create always clears the
-  // pending card, and a failure the composer is not open to show becomes a
-  // toast instead of vanishing.
-  createEffect(
-    on(createState, (state) => {
-      if (state.kind === "done") {
-        setPending(null);
-        setComposerOpen(false);
-      } else if (state.kind === "failed") {
-        setPending(null);
-        if (!composerOpen()) toast(state.message);
-      }
-    }),
-  );
+  // The composer: mounted only while open, like the palette. Its request's
+  // progress lives in the flow (`composer.ts`), not in the view, so Cancel
+  // closing the view never stops a create already running on the host.
+  const composer = createComposerFlow({
+    toast: (message) => toast(message),
+    restoreFocus: () => {
+      const key = active();
+      if (key !== null) focusers.get(key)?.();
+      else sidebar?.focus();
+    },
+  });
 
   const onAccelerator = (shell: Accelerator) => {
+    // A modal owns the keyboard: no chord may switch or close a tab, or focus
+    // a terminal, behind the open composer.
+    if (composer.open() && !acceleratorAllowedUnderModal(shell)) return;
     switch (shell.kind) {
       case "tab": {
         const tab = tabs()[shell.index];
@@ -373,7 +339,7 @@ function Shell() {
         togglePalette();
         return;
       case "new":
-        openComposer();
+        composer.openComposer();
         return;
     }
   };
@@ -390,6 +356,7 @@ function Shell() {
   // it handled, so they do not run twice.
   const onKey = (event: KeyboardEvent) => {
     if (event.defaultPrevented) return;
+
     const shell = accelerator(event, MAC);
     if (shell) {
       event.preventDefault();
@@ -518,257 +485,270 @@ function Shell() {
 
   return (
     <main class="shell">
-      <Titlebar
-        mac={MAC}
-        searchOpen={palette()}
-        onSearch={togglePalette}
-        inboxOpen={inboxOpen()}
-        inboxUnread={inboxUnread()}
-        onInbox={() => (inboxOpen() ? closeInbox() : openInbox())}
-        settingsOpen={settings()}
-        onSettings={() => (settings() ? closeSettings() : openSettings())}
-      />
-      <Show when={sidecar().state !== "connected"}>
-        <div class={`banner ${sidecar().state}`} role="status">
-          <span>{banner()}</span>
-          <Show when={retryable(sidecar())}>
-            <span class="actions">
-              <Show when={(sidecar() as { has_log?: boolean }).has_log}>
+      {/* Everything but the composer and the toasts: inert while the
+          composer is open, so neither a click nor Tab can reach the shell
+          behind the modal. `display: contents` keeps the layout. */}
+      <div
+        class="shell-content"
+        ref={(element) => createEffect(() => element.toggleAttribute("inert", composer.open()))}
+      >
+        <Titlebar
+          mac={MAC}
+          searchOpen={palette()}
+          onSearch={togglePalette}
+          inboxOpen={inboxOpen()}
+          inboxUnread={inboxUnread()}
+          onInbox={() => (inboxOpen() ? closeInbox() : openInbox())}
+          settingsOpen={settings()}
+          onSettings={() => (settings() ? closeSettings() : openSettings())}
+        />
+        <Show when={sidecar().state !== "connected"}>
+          <div class={`banner ${sidecar().state}`} role="status">
+            <span>{banner()}</span>
+            <Show when={retryable(sidecar())}>
+              <span class="actions">
+                <Show when={(sidecar() as { has_log?: boolean }).has_log}>
+                  <button
+                    type="button"
+                    onClick={async () => setLog((await invoke<string | null>("show_log")) ?? "")}
+                  >
+                    Show log
+                  </button>
+                </Show>
                 <button
                   type="button"
-                  onClick={async () => setLog((await invoke<string | null>("show_log")) ?? "")}
+                  onClick={() => {
+                    setLog(null);
+                    void invoke("retry_sidecar");
+                  }}
                 >
-                  Show log
+                  Retry
                 </button>
+              </span>
+            </Show>
+          </div>
+        </Show>
+        <Show when={log() !== null}>
+          <pre class="sidecar-log" aria-label="Sidecar log">
+            {log()}
+          </pre>
+        </Show>
+        <div class="body">
+          <Sidebar
+            sessions={sessions()}
+            stale={sessionsStale()}
+            loading={loading()}
+            pending={composer.pending()}
+            onOpen={openSession}
+            onNew={composer.openComposer}
+            ref={(element) => (sidebar = element)}
+          />
+          <section class="workarea">
+            <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
+              <span class="tab board-tab" classList={{ active: showing("board") }}>
+                <button
+                  type="button"
+                  class="tab-title"
+                  aria-current={showing("board") ? "page" : undefined}
+                  onClick={() => {
+                    closeTranscript();
+                    setPane("board");
+                  }}
+                >
+                  Board
+                </button>
+              </span>
+              <span class="tab review-tab" classList={{ active: showing("review") }}>
+                <button
+                  type="button"
+                  class="tab-title"
+                  aria-current={showing("review") ? "page" : undefined}
+                  onClick={() => {
+                    closeTranscript();
+                    setPane("review");
+                  }}
+                >
+                  Review
+                </button>
+              </span>
+              <span class="tab commits-tab" classList={{ active: showing("commits") }}>
+                <button
+                  type="button"
+                  class="tab-title"
+                  aria-current={showing("commits") ? "page" : undefined}
+                  onClick={() => {
+                    closeTranscript();
+                    setPane("commits");
+                  }}
+                >
+                  Commits
+                </button>
+              </span>
+              <span class="tab stats-tab" classList={{ active: showing("stats") }}>
+                <button
+                  type="button"
+                  class="tab-title"
+                  aria-current={showing("stats") ? "page" : undefined}
+                  onClick={() => {
+                    closeTranscript();
+                    setPane("stats");
+                  }}
+                >
+                  Stats
+                </button>
+              </span>
+              {/* The ACP card's own place in the strip, where the session's
+                  terminal tab would be if it had a pane. */}
+              <Show when={transcriptKey()}>
+                {(key) => (
+                  <span class="tab transcript-tab active" data-state="transcript">
+                    <button type="button" class="tab-title" aria-current="page">
+                      {key()}
+                    </button>
+                    <button
+                      type="button"
+                      class="tab-close"
+                      aria-label={`Close ${key()}`}
+                      onClick={() => {
+                        closeTranscript();
+                        setPane("board");
+                      }}
+                    >
+                      ×
+                    </button>
+                  </span>
+                )}
               </Show>
-              <button
-                type="button"
-                onClick={() => {
-                  setLog(null);
-                  void invoke("retry_sidecar");
-                }}
-              >
-                Retry
-              </button>
-            </span>
-          </Show>
-        </div>
-      </Show>
-      <Show when={log() !== null}>
-        <pre class="sidecar-log" aria-label="Sidecar log">
-          {log()}
-        </pre>
-      </Show>
-      <div class="body">
-        <Sidebar
-          sessions={sessions()}
-          stale={sessionsStale()}
-          loading={loading()}
-          pending={pending()}
-          onOpen={openSession}
-          onNew={openComposer}
-          ref={(element) => (sidebar = element)}
-        />
-        <section class="workarea">
-          <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
-            <span class="tab board-tab" classList={{ active: showing("board") }}>
-              <button
-                type="button"
-                class="tab-title"
-                aria-current={showing("board") ? "page" : undefined}
-                onClick={() => {
-                  closeTranscript();
-                  setPane("board");
-                }}
-              >
-                Board
-              </button>
-            </span>
-            <span class="tab review-tab" classList={{ active: showing("review") }}>
-              <button
-                type="button"
-                class="tab-title"
-                aria-current={showing("review") ? "page" : undefined}
-                onClick={() => {
-                  closeTranscript();
-                  setPane("review");
-                }}
-              >
-                Review
-              </button>
-            </span>
-            <span class="tab commits-tab" classList={{ active: showing("commits") }}>
-              <button
-                type="button"
-                class="tab-title"
-                aria-current={showing("commits") ? "page" : undefined}
-                onClick={() => {
-                  closeTranscript();
-                  setPane("commits");
-                }}
-              >
-                Commits
-              </button>
-            </span>
-            <span class="tab stats-tab" classList={{ active: showing("stats") }}>
-              <button
-                type="button"
-                class="tab-title"
-                aria-current={showing("stats") ? "page" : undefined}
-                onClick={() => {
-                  closeTranscript();
-                  setPane("stats");
-                }}
-              >
-                Stats
-              </button>
-            </span>
-            {/* The ACP card's own place in the strip, where the session's
-                terminal tab would be if it had a pane. */}
+              <For each={tabs()}>
+                {(tab) => (
+                  <span
+                    class="tab"
+                    classList={{ active: showing("terminal") && tab.key === active() }}
+                    data-state={tab.state}
+                  >
+                    <button
+                      type="button"
+                      class="tab-title"
+                      aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
+                      onClick={() => choose(tab)}
+                    >
+                      {title(tab)}
+                    </button>
+                    <button
+                      type="button"
+                      class="tab-close"
+                      aria-label={`Close ${title(tab)}`}
+                      onClick={() => void invoke("terminal_close", { key: tab.key })}
+                    >
+                      ×
+                    </button>
+                  </span>
+                )}
+              </For>
+            </nav>
+            {/* One banner per open request, latched for a short grace across
+                frames that carry none (#1266): `AnswerSlot`. */}
+            <AnswerSlot question={question()} ask={ask()} run={answer} />
             <Show when={transcriptKey()}>
               {(key) => (
-                <span class="tab transcript-tab active" data-state="transcript">
-                  <button type="button" class="tab-title" aria-current="page">
-                    {key()}
-                  </button>
-                  <button
-                    type="button"
-                    class="tab-close"
-                    aria-label={`Close ${key()}`}
-                    onClick={() => {
-                      closeTranscript();
-                      setPane("board");
-                    }}
-                  >
-                    ×
-                  </button>
-                </span>
+                <AcpCard
+                  sessionKey={key()}
+                  view={transcriptView(fleet(), key())}
+                  onClose={() => {
+                    closeTranscript();
+                    setPane("board");
+                  }}
+                />
               )}
             </Show>
-            <For each={tabs()}>
-              {(tab) => (
-                <span
-                  class="tab"
-                  classList={{ active: showing("terminal") && tab.key === active() }}
-                  data-state={tab.state}
-                >
-                  <button
-                    type="button"
-                    class="tab-title"
-                    aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
-                    onClick={() => choose(tab)}
-                  >
-                    {title(tab)}
-                  </button>
-                  <button
-                    type="button"
-                    class="tab-close"
-                    aria-label={`Close ${title(tab)}`}
-                    onClick={() => void invoke("terminal_close", { key: tab.key })}
-                  >
-                    ×
-                  </button>
-                </span>
-              )}
-            </For>
-          </nav>
-          {/* One banner per open request, latched for a short grace across
-              frames that carry none (#1266): `AnswerSlot`. */}
-          <AnswerSlot question={question()} ask={ask()} run={answer} />
-          <Show when={transcriptKey()}>
-            {(key) => (
-              <AcpCard
-                sessionKey={key()}
-                view={transcriptView(fleet(), key())}
+            <Show when={inboxOpen()}>
+              <Inbox
+                inbox={inbox()}
+                onChoose={dispatch}
                 onClose={() => {
-                  closeTranscript();
+                  closeInbox();
                   setPane("board");
                 }}
               />
-            )}
-          </Show>
-          <Show when={inboxOpen()}>
-            <Inbox
-              inbox={inbox()}
-              onChoose={dispatch}
-              onClose={() => {
-                closeInbox();
-                setPane("board");
-              }}
-            />
-          </Show>
-          <Show when={settings()}>
-            <SettingsPage
-              config={config()}
-              revision={configRevision(store, host())}
-              hangar={hangar()}
-              sidecar={sidecar()}
-              setup={setup()}
-              run={(intents) => void run(intents)}
-              onSetupWrite={setupWrite}
-              onRefreshSetup={refreshSetup}
-              onClose={() => {
-                closeSettings();
-                setPane("board");
-              }}
-            />
-          </Show>
-          <Show when={showing("review")}>
-            <Review gitView={gitView()} stale={gitViewStale()} onChoose={dispatch} />
-          </Show>
-          <Show when={showing("commits")}>
-            <Commits gitView={gitView()} stale={gitViewStale()} onChoose={dispatch} />
-          </Show>
-          <Show when={showing("stats")}>
-            <Stats usage={usage()} stale={usageStale()} />
-          </Show>
-          <Show when={showing("board")}>
-            <Board
-              agentStatus={agentStatus()}
-              fleet={fleet()}
-              sessions={sessions()}
-              elsewhere={elsewhere()}
-              onChoose={dispatch}
-              onOpenTranscript={openTranscript}
-            />
-          </Show>
-          <Show when={showing("terminal") && tabs().length === 0}>
-            <p class="empty">Choose a session to open its terminal</p>
-          </Show>
-          {/* Keyed by tab key, not by the tab object each event replaces: a
-              terminal stays mounted, and keeps its buffer, while its tab is listed. */}
-          <For each={tabKeys()}>
-            {(key) => (
-              <Show when={tabs().find((tab) => tab.key === key)}>
-                {(tab) => (
-                  <TerminalView
-                    tab={tab()}
-                    title={title(tab())}
-                    active={showing("terminal") && key === active()}
-                    mac={MAC}
-                    onAccelerator={onAccelerator}
-                    onLeave={() => sidebar?.focus()}
-                    focusRef={(focus) => focusers.set(key, focus)}
-                  />
-                )}
-              </Show>
-            )}
-          </For>
-        </section>
+            </Show>
+            <Show when={settings()}>
+              <SettingsPage
+                config={config()}
+                revision={configRevision(store, host())}
+                hangar={hangar()}
+                sidecar={sidecar()}
+                setup={setup()}
+                run={(intents) => void run(intents)}
+                onSetupWrite={setupWrite}
+                onRefreshSetup={refreshSetup}
+                onClose={() => {
+                  closeSettings();
+                  setPane("board");
+                }}
+              />
+            </Show>
+            <Show when={showing("review")}>
+              <Review gitView={gitView()} stale={gitViewStale()} onChoose={dispatch} />
+            </Show>
+            <Show when={showing("commits")}>
+              <Commits gitView={gitView()} stale={gitViewStale()} onChoose={dispatch} />
+            </Show>
+            <Show when={showing("stats")}>
+              <Stats usage={usage()} stale={usageStale()} />
+            </Show>
+            <Show when={showing("board")}>
+              <Board
+                agentStatus={agentStatus()}
+                fleet={fleet()}
+                sessions={sessions()}
+                elsewhere={elsewhere()}
+                onChoose={dispatch}
+                onOpenTranscript={openTranscript}
+              />
+            </Show>
+            <Show when={showing("terminal") && tabs().length === 0}>
+              <p class="empty">Choose a session to open its terminal</p>
+            </Show>
+            {/* Keyed by tab key, not by the tab object each event replaces: a
+                terminal stays mounted, and keeps its buffer, while its tab is listed. */}
+            <For each={tabKeys()}>
+              {(key) => (
+                <Show when={tabs().find((tab) => tab.key === key)}>
+                  {(tab) => (
+                    <TerminalView
+                      tab={tab()}
+                      title={title(tab())}
+                      active={showing("terminal") && key === active()}
+                      mac={MAC}
+                      onAccelerator={onAccelerator}
+                      onLeave={() => sidebar?.focus()}
+                      focusRef={(focus) => focusers.set(key, focus)}
+                    />
+                  )}
+                </Show>
+              )}
+            </For>
+          </section>
+        </div>
+        <Statusbar
+          host={host()}
+          sidecar={sidecar()}
+          needsYou={needsYou()}
+          idle={idle()}
+          // A development build shows frames the store refused (#1132).
+          framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
+        />
+        <Show when={palette()}>
+          <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
+        </Show>
       </div>
-      <Statusbar
-        host={host()}
-        sidecar={sidecar()}
-        needsYou={needsYou()}
-        idle={idle()}
-        // A development build shows frames the store refused (#1132).
-        framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
-      />
-      <Show when={palette()}>
-        <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
-      </Show>
-      <Show when={composerOpen()}>
-        <Composer sessions={sessions()} state={createState()} onSubmit={createWorktree} onClose={closeComposer} />
+      <Show when={composer.open()}>
+        <Composer
+          sessions={sessions()}
+          state={composer.state()}
+          onSubmit={composer.submit}
+          onClose={composer.closeComposer}
+        />
       </Show>
       <div class="toasts" aria-live="polite">
         <Show when={updateLine(updatePhase())}>{(line) => <div class="toast update-status">{line()}</div>}</Show>
