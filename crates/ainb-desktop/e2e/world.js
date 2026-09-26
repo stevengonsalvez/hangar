@@ -10,7 +10,7 @@
 // is stopped through its own verb.
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { OWNER_FILE } from "./cleanup.js";
 import { dirname, join, resolve } from "node:path";
@@ -146,7 +146,16 @@ export function up(sessions = 2) {
   // kept here for a caller that builds a world on its own.
   freshBundle();
 
-  const root = mkdtempSync(join(tmpdir(), "ainb-e2e-"));
+  // The world is reached through a symlink, and everything in it (the repo
+  // ainb clones, the worktree it runs the agent in) is named by that path:
+  // what a person's HOME or checkout under a symlinked directory gives ainb.
+  // The agent itself reports its canonical cwd, through every link (#132).
+  // The link's name is SHORTER than the directory's: the daemon's socket
+  // path sits two characters under macOS's 104-byte unix socket limit at the
+  // directory's own length, and a longer name leaves the daemon unreachable.
+  const real = mkdtempSync(join(tmpdir(), "ainb-e2e-"));
+  const root = join(tmpdir(), `ainb-e2e-l${real.slice(-4)}`);
+  symlinkSync(real, root);
   // The run that owns this world, so a later run's cleanup leaves it alone
   // while this process lives (cleanup.js).
   writeFileSync(join(root, OWNER_FILE), String(process.pid));
@@ -218,12 +227,15 @@ export function seed() {
  */
 export function raiseHook(session, { event, matcher, payload }) {
   const pane = run("tmux", ["display-message", "-p", "-t", `=${session.tmux}:`, "#{pane_id}"]).trim();
+  // The cwd as Claude reports it: canonical, through every symlink, which is
+  // not the path ainb was given for the worktree (#132).
+  const cwd = realpathSync(session.cwd);
   return run(
     AINB_BIN,
-    ["fleet", "atc", "hook", "--event", event, "--matcher", matcher, "--session-id", session.claude, "--cwd", session.cwd],
+    ["fleet", "atc", "hook", "--event", event, "--matcher", matcher, "--session-id", session.claude, "--cwd", cwd],
     {
-      cwd: session.cwd,
-      input: JSON.stringify({ session_id: session.claude, cwd: session.cwd, hook_event_name: event, ...payload }),
+      cwd,
+      input: JSON.stringify({ session_id: session.claude, cwd, hook_event_name: event, ...payload }),
       stdio: ["pipe", "pipe", "pipe"],
       env: { TMUX_PANE: pane },
     },
@@ -273,7 +285,18 @@ export function down() {
   }
   // A daemon still writing can hold a directory open for a moment.
   try {
-    rmSync(world().root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    // The root is a symlink (see `up`): the link goes, and then the directory
+  // it named, which a recursive remove of the link never enters.
+  let real = null;
+  try {
+    real = realpathSync(world().root);
+  } catch {
+    // Already gone.
+  }
+  rmSync(world().root, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  if (real !== null && real !== world().root) {
+    rmSync(real, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  }
   } catch (error) {
     console.warn(`the world at ${world().root} was left behind: ${error.message}`);
   }
