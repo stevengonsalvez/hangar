@@ -36,8 +36,22 @@ use rand::RngCore as _;
 use sqlx::SqlitePool;
 use zeroize::Zeroizing;
 
-/// The keychain account the key is stored under, in [`Scope::Global`].
+/// The prefix of the keychain account the key is stored under, in
+/// [`Scope::Global`]; see [`keychain_account`].
 pub const KEYCHAIN_ACCOUNT: &str = "peer.host_static_key";
+
+/// The keychain account for one Hangar home: [`KEYCHAIN_ACCOUNT`] plus the
+/// first 16 hex digits of the home path's BLAKE3 hash.
+///
+/// The keychain is per user, not per home, so a fixed account would give
+/// every home on the account one Noise static key: a device paired to one
+/// host would then accept the other, and two homes minting at once would
+/// overwrite each other's key.
+#[must_use]
+pub fn keychain_account(hangar_home: &Path) -> String {
+    let digest = blake3::hash(hangar_home.as_os_str().as_encoded_bytes());
+    format!("{KEYCHAIN_ACCOUNT}.{}", &digest.to_hex()[..16])
+}
 
 /// The `0600` fallback file inside a resolved Hangar home:
 /// `{hangar_home}/hangar/host_static.key`, holding the 32 raw secret bytes.
@@ -110,7 +124,7 @@ impl std::fmt::Debug for HostStaticKey {
 /// Where the key in force is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Custody {
-    /// The OS keychain, [`Scope::Global`] / [`KEYCHAIN_ACCOUNT`].
+    /// The OS keychain, [`Scope::Global`] / [`keychain_account`].
     Keychain,
     /// The `0600` file at this path.
     File(PathBuf),
@@ -169,8 +183,8 @@ pub enum HostKeyError {
     /// Nothing was changed: every paired device pins the recorded key.
     #[error(
         "the host key in force ({in_force}) is not the recorded one ({recorded}); \
-         nothing was changed. Restore the original key, or change it deliberately \
-         with `ainb hangar host-key rotate`"
+         nothing was changed. Restore the original key; changing it deliberately \
+         needs host key rotation, which is not available yet"
     )]
     KeyChanged {
         /// The recorded public key, hex.
@@ -182,13 +196,17 @@ pub enum HostKeyError {
     /// moved. Nothing was minted, so restoring it is still possible.
     #[error(
         "a host public key is recorded but the host key is missing; nothing was minted. \
-         Restore the key, or replace it deliberately with `ainb hangar host-key rotate`"
+         Restore the key; replacing it deliberately needs host key rotation, which is \
+         not available yet"
     )]
     KeyMissing,
     /// A stored key is not 32 bytes.
     #[error("the stored host key is {0} bytes, not 32")]
     Malformed(usize),
     /// The public half could not be recorded in `daemon_identity`.
+    /// The blocking load task did not finish (it panicked).
+    #[error("the host key load did not finish: {0}")]
+    Task(String),
     #[error("recording the host public key: {0}")]
     Store(#[from] sqlx::Error),
 }
@@ -199,6 +217,9 @@ pub enum HostKeyError {
 /// # Errors
 ///
 /// [`HostKeyError`] when the key cannot be read or kept safely.
+// Boot goes through `ensure`, which decides from the recorded key whether a
+// mint is allowed; this always-mint form is the tests' entry point.
+#[cfg(test)]
 pub fn load_or_mint(
     backend: &dyn SecretBackend,
     hangar_home: &Path,
@@ -221,7 +242,8 @@ fn load(
             minted: false,
         });
     }
-    match backend.get(&Scope::Global, KEYCHAIN_ACCOUNT) {
+    let account = keychain_account(hangar_home);
+    match backend.get(&Scope::Global, &account) {
         Ok(Some(stored)) => Ok(Loaded {
             key: HostStaticKey::from_stored(stored.as_bytes())?,
             custody: Custody::Keychain,
@@ -230,7 +252,7 @@ fn load(
         Ok(None) if !may_mint => Err(HostKeyError::KeyMissing),
         Ok(None) => {
             let key = HostStaticKey::generate();
-            match backend.put(&Scope::Global, KEYCHAIN_ACCOUNT, key.secret()) {
+            match backend.put(&Scope::Global, &account, key.secret()) {
                 Ok(()) => Ok(Loaded {
                     key,
                     custody: Custody::Keychain,
@@ -261,22 +283,27 @@ fn load(
 /// silently re-identify the host. The operator restores the key or rotates it
 /// deliberately (R1-17).
 ///
-/// `backend` is `Sync` because the borrow lives across the store write, and
-/// the boot future that awaits this must stay `Send`.
+/// The keychain and file work runs on the blocking pool: a keychain call can
+/// wait on an interactive prompt, and on the boot task it would keep the
+/// shutdown signal from being polled until the prompt was answered.
 ///
 /// # Errors
 ///
 /// [`HostKeyError`] from [`load_or_mint`], or when the row cannot be written.
 pub async fn ensure(
     pool: &SqlitePool,
-    backend: &(dyn SecretBackend + Sync),
+    backend: std::sync::Arc<dyn SecretBackend + Send + Sync>,
     hangar_home: &Path,
 ) -> Result<Loaded, HostKeyError> {
     // The recorded key decides whether a key may be minted at all: with one
     // recorded, a missing key is a loss to restore, and a freshly minted and
     // persisted key beside it would only shadow the restore.
     let recorded = DaemonIdentityRepo::host_static_pubkey(pool).await?;
-    let loaded = load(backend, hangar_home, recorded.is_none())?;
+    let may_mint = recorded.is_none();
+    let home = hangar_home.to_path_buf();
+    let loaded = tokio::task::spawn_blocking(move || load(backend.as_ref(), &home, may_mint))
+        .await
+        .map_err(|error| HostKeyError::Task(error.to_string()))??;
     match DaemonIdentityRepo::record_host_static_pubkey(pool, loaded.key.public()).await? {
         PubkeyRecord::Recorded | PubkeyRecord::Unchanged => Ok(loaded),
         PubkeyRecord::Differs { recorded } => Err(HostKeyError::KeyChanged {
@@ -361,7 +388,13 @@ fn mint_to_file(key: HostStaticKey, path: PathBuf) -> Result<Loaded, HostKeyErro
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(file_error)?;
     }
-    let temporary = path.with_extension(format!("key.tmp-{}", std::process::id()));
+    // The pid alone can repeat after a reboot and meet a stale temporary left
+    // by a crash; a random suffix cannot.
+    let temporary = path.with_extension(format!(
+        "key.tmp-{}-{:016x}",
+        std::process::id(),
+        rand::rngs::OsRng.next_u64()
+    ));
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -516,7 +549,10 @@ mod tests {
         assert!(!second.minted);
         assert_eq!(first.key.public(), second.key.public());
         assert!(
-            keychain.get(&Scope::Global, KEYCHAIN_ACCOUNT).expect("get").is_none(),
+            keychain
+                .get(&Scope::Global, &keychain_account(home.path()))
+                .expect("get")
+                .is_none(),
             "a home whose key is in the file never mints a keychain key"
         );
     }
@@ -553,11 +589,33 @@ mod tests {
         );
     }
 
+    /// #82 review: the keychain is per user, so the account is per home. Two
+    /// homes sharing one keychain mint and keep two keys, and neither reads
+    /// the other's.
+    #[test]
+    fn two_homes_on_one_keychain_keep_separate_keys() {
+        let (a, b) = (
+            tempfile::tempdir().expect("a"),
+            tempfile::tempdir().expect("b"),
+        );
+        assert_ne!(keychain_account(a.path()), keychain_account(b.path()));
+        assert!(keychain_account(a.path()).starts_with("peer.host_static_key."));
+        let keychain = InMemoryBackend::new();
+        let key_a = load_or_mint(&keychain, a.path()).expect("mint a");
+        let key_b = load_or_mint(&keychain, b.path()).expect("mint b");
+        assert!(key_a.minted && key_b.minted);
+        assert_ne!(key_a.key.public(), key_b.key.public());
+        let again_a = load_or_mint(&keychain, a.path()).expect("reread a");
+        assert_eq!(again_a.key.public(), key_a.key.public());
+    }
+
     #[test]
     fn a_short_stored_key_is_refused() {
         let home = tempfile::tempdir().expect("home");
         let keychain = InMemoryBackend::new();
-        keychain.put(&Scope::Global, KEYCHAIN_ACCOUNT, &[1, 2, 3]).expect("put");
+        keychain
+            .put(&Scope::Global, &keychain_account(home.path()), &[1, 2, 3])
+            .expect("put");
 
         let refused = load_or_mint(&keychain, home.path()).expect_err("3 bytes");
         assert!(matches!(refused, HostKeyError::Malformed(3)), "{refused:?}");
@@ -664,24 +722,34 @@ mod tests {
             "the column stays NULL until the key exists"
         );
 
-        let keychain = InMemoryBackend::new();
-        let first = ensure(store.pool(), &keychain, home.path()).await.expect("ensure");
+        let keychain = std::sync::Arc::new(InMemoryBackend::new());
+        let first = ensure(store.pool(), keychain.clone(), home.path()).await.expect("ensure");
         let recorded = DaemonIdentityRepo::host_static_pubkey(store.pool()).await.expect("read");
         assert_eq!(recorded.as_deref(), Some(&first.key.public()[..]));
 
-        let again = ensure(store.pool(), &keychain, home.path()).await.expect("ensure");
+        let again = ensure(store.pool(), keychain.clone(), home.path()).await.expect("ensure");
         assert_eq!(again.key.public(), first.key.public());
 
         // A keychain that holds NO key, with one recorded: a loss to restore.
         // Nothing is minted into it, so the restore is still possible.
-        let empty = InMemoryBackend::new();
-        let missing = ensure(store.pool(), &empty, home.path())
+        let empty = std::sync::Arc::new(InMemoryBackend::new());
+        let missing = ensure(store.pool(), empty.clone(), home.path())
             .await
             .expect_err("a recorded key that is gone must not be replaced by a new one");
         assert!(matches!(missing, HostKeyError::KeyMissing), "{missing:?}");
-        assert!(missing.to_string().contains("host-key rotate"), "{missing}");
         assert!(
-            empty.get(&Scope::Global, KEYCHAIN_ACCOUNT).expect("get").is_none(),
+            missing.to_string().contains("not available yet"),
+            "{missing}"
+        );
+        assert!(
+            !missing.to_string().contains("host-key rotate"),
+            "no such command"
+        );
+        assert!(
+            empty
+                .get(&Scope::Global, &keychain_account(home.path()))
+                .expect("get")
+                .is_none(),
             "nothing was minted into the keychain"
         );
         assert!(
@@ -690,15 +758,15 @@ mod tests {
         );
 
         // A different keychain holds a different key: refused, not adopted.
-        let other = InMemoryBackend::new();
+        let other = std::sync::Arc::new(InMemoryBackend::new());
         other
             .put(
                 &Scope::Global,
-                KEYCHAIN_ACCOUNT,
+                &keychain_account(home.path()),
                 HostStaticKey::generate().secret(),
             )
             .expect("put");
-        let refused = ensure(store.pool(), &other, home.path())
+        let refused = ensure(store.pool(), other.clone(), home.path())
             .await
             .expect_err("a different key must not replace the recorded one");
         let HostKeyError::KeyChanged { recorded, in_force } = &refused else {
@@ -706,7 +774,10 @@ mod tests {
         };
         assert_eq!(recorded, &hex(first.key.public()));
         assert_ne!(in_force, recorded);
-        assert!(refused.to_string().contains("host-key rotate"), "{refused}");
+        assert!(
+            refused.to_string().contains("not available yet"),
+            "{refused}"
+        );
         let still = DaemonIdentityRepo::host_static_pubkey(store.pool()).await.expect("read");
         assert_eq!(still.as_deref(), Some(&first.key.public()[..]));
     }
