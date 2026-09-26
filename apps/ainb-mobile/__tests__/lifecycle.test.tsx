@@ -1,9 +1,9 @@
-import { act } from "@testing-library/react-native";
+import { act, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { reset } from "../src/attention/store";
-import { connectHost, liveHosts, onAppState, resetLifecycle } from "../src/lifecycle";
-import { FakeWire, FAKE_HOST_A } from "../src/wire/fake";
+import { backoffMs, connectHost, liveHosts, onAppState, resetLifecycle } from "../src/lifecycle";
+import { FakeWire, FAKE_HOST_A, FAKE_HOST_B } from "../src/wire/fake";
 import { setWire } from "../src/wire";
 
 let fake: FakeWire;
@@ -18,8 +18,22 @@ function ask(id: string) {
   return { id, sessionId: "s-1", sessionKey: "claude:hangar", kind: "ask_user_question", version: 1, createdAt: 1, payload: { question: `q ${id}` } };
 }
 
+const hellos = async () => (await fake.connectionLog()).filter((l) => l.event === "hello").length;
+const closes = async () => (await fake.connectionLog()).filter((l) => l.event === "close").length;
+
+test("launch connects every paired host once, so a banner can arrive without opening a screen", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  expect(await screen.findByTestId("banner-att-1")).toBeTruthy(); // no host screen was opened
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(true);
+  expect(fake.isConnected(FAKE_HOST_B)).toBe(false); // unreachable: the dial failed, nothing crashed
+  await act(async () => {
+    await connectHost(fake, FAKE_HOST_A); // idempotent: no second dial
+  });
+  expect(await hellos()).toBe(1);
+  expect(liveHosts().get(FAKE_HOST_A)?.replay).toBe("complete"); // first connect asked for a snapshot
+});
+
 test("background closes the socket; foreground replays from the cursor and shows each new banner once", async () => {
-  // The sessions screen connects the host itself (connectHost).
   const screen = renderRouter("./app", { initialUrl: `/host/${FAKE_HOST_A}` });
   await screen.findByText("hangar");
   await screen.findByTestId("banner-att-1");
@@ -27,7 +41,7 @@ test("background closes the socket; foreground replays from the cursor and shows
 
   await act(() => onAppState(fake, "background"));
   expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
-  const before = liveHosts().get(FAKE_HOST_A)!.cursor;
+  const before = liveHosts().get(FAKE_HOST_A)!.cursor!;
 
   // While we are away the daemon commits 20 fleet events and one new ASK.
   fake.advance(FAKE_HOST_A, 20);
@@ -47,19 +61,86 @@ test("background closes the socket; foreground replays from the cursor and shows
   await act(() => onAppState(fake, "background"));
   await act(() => onAppState(fake, "active"));
   expect(screen.getByText("2 waiting · claude:hangar")).toBeTruthy();
-  const log = await fake.connectionLog();
-  expect(log.filter((l) => l.event === "close")).toHaveLength(2);
-  expect(log.filter((l) => l.event === "hello")).toHaveLength(3);
+  expect(await closes()).toBe(2);
+  expect(await hellos()).toBe(3);
 });
 
 test("an answer made elsewhere while backgrounded retires the row on foreground", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
-  await act(async () => {
-    await connectHost(fake, FAKE_HOST_A);
-  });
   await screen.findByTestId("banner-att-1");
   await act(() => onAppState(fake, "background"));
   fake.answeredElsewhere(FAKE_HOST_A, "att-1", "desktop@laptop");
   await act(() => onAppState(fake, "active"));
   expect(screen.queryByTestId("banner-att-1")).toBeNull();
+});
+
+test("iOS inactive changes nothing; only background closes", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(() => onAppState(fake, "inactive"));
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(true);
+  expect(await closes()).toBe(0);
+  await act(() => onAppState(fake, "background"));
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+});
+
+test("a background that begins while a foreground connect is in flight leaves no socket open", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(() => onAppState(fake, "background"));
+  // Foreground and background back to back: the connect from the first must not outlive the second.
+  const p1 = onAppState(fake, "active");
+  const p2 = onAppState(fake, "background");
+  await act(async () => {
+    await Promise.all([p1, p2]);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await waitFor(async () => expect(fake.isConnected(FAKE_HOST_A)).toBe(false));
+});
+
+test("a hook that throws or hangs does not stop the sockets from closing", async () => {
+  const { beforeBackground } = require("../src/lifecycle") as typeof import("../src/lifecycle");
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  beforeBackground(() => {
+    throw new Error("detach blew up");
+  });
+  beforeBackground(() => new Promise<void>(() => undefined)); // never settles
+  void onAppState(fake, "background");
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(false), { timeout: 5000 });
+});
+
+test("a retryable close redials with backoff; a latching close does not", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4503, "draining"));
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 }); // redialled after about 1 s
+
+  await act(async () => fake.dropConnection(FAKE_HOST_A, 4403, "revoked"));
+  await act(async () => {
+    jest.advanceTimersByTime(70_000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  expect(await hellos()).toBe(2);
+});
+
+test("backoff doubles from 1 s to a 60 s ceiling with a quarter of jitter", () => {
+  const low = () => 0; // -25 percent
+  const high = () => 1; // +25 percent
+  expect(backoffMs(0, () => 0.5)).toBe(1000);
+  expect(backoffMs(1, () => 0.5)).toBe(2000);
+  expect(backoffMs(0, low)).toBe(750);
+  expect(backoffMs(0, high)).toBe(1250);
+  expect(backoffMs(9, () => 0.5)).toBe(60_000);
+  expect(backoffMs(9, high)).toBe(75_000);
+});
+
+test("a resync request resubscribes from a snapshot", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  fake.advance(FAKE_HOST_A, 5, true); // the phone missed these
+  expect(liveHosts().get(FAKE_HOST_A)?.cursor).toBe(0);
+  await act(async () => fake.resyncRequired(FAKE_HOST_A));
+  await waitFor(() => expect(liveHosts().get(FAKE_HOST_A)?.cursor).toBe(5));
 });
