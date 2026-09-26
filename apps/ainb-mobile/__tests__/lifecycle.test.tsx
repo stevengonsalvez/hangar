@@ -217,3 +217,53 @@ test("a host that fails to connect at launch enters the redial loop", async () =
   await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
   expect(await screen.findByTestId("banner-att-1")).toBeTruthy();
 });
+
+test("a connect refused with 4403 shows the latch and is never redialled", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(() => onAppState(fake, "background"));
+  fake.refuseNextConnectWith = { code: 4403, reason: "revoked" };
+  await act(() => onAppState(fake, "active"));
+  expect(await screen.findByText("revoked or expired, pair again")).toBeTruthy();
+  const hellos0 = await hellos();
+  await act(async () => {
+    jest.advanceTimersByTime(130_000); // two full backoff ceilings
+  });
+  expect(await hellos()).toBe(hellos0);
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+});
+
+test("a connect refused with an unknown code stops the loop; a refused 4429 keeps it with retry-after", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, undefined));
+  fake.refuseNextConnectWith = { code: 4999 };
+  await act(async () => {
+    jest.advanceTimersByTime(1100); // the redial is refused with 4999
+  });
+  await act(async () => {
+    jest.advanceTimersByTime(130_000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  expect(await screen.findByText("closed with an unknown code, check the host")).toBeTruthy();
+  const log = await fake.connectionLog();
+  expect(log.filter((l) => l.event === "refused")).toHaveLength(1);
+});
+
+test("a redial refused with 4429 and retry-after keeps dialling after that floor", async () => {
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByTestId("banner-att-1");
+  await act(async () => fake.dropConnection(FAKE_HOST_A, undefined));
+  fake.refuseNextConnectWith = { code: 4429, reason: "retry-after=7" };
+  await act(async () => {
+    jest.advanceTimersByTime(1100); // first redial: refused 4429, floor 7 s
+  });
+  await act(async () => {
+    jest.advanceTimersByTime(5000);
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await act(async () => {
+    jest.advanceTimersByTime(2500);
+  });
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+});
