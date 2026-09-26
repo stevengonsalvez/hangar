@@ -67,7 +67,8 @@ test("mobile+type: the toggle acquires the floor and resizes to the phone's fit;
   fireEvent.press(screen.getByTestId("key-tab"));
   expect(fake.inputs).toEqual([]);
   await tick();
-  await waitFor(() => expect(fake.inputs).toEqual([{ streamId: 1, floorGen: 1, data: "\x1b\t" }]));
+  await waitFor(() => expect(fake.inputs).toEqual([{ streamId: 1, floorGen: 1, data: "\x1b\t", opId: expect.stringMatching(/^op-\d+$/) }]));
+  expect(fake.floorCalls).toEqual([{ streamId: 1, action: "acquire", opId: expect.stringMatching(/^op-\d+$/) }]);
 
   await act(async () => fake.floorTakenBy("claude:hangar", "desktop"));
   fireEvent.press(screen.getByTestId("key-tab"));
@@ -79,7 +80,9 @@ test("mobile+type: the toggle acquires the floor and resizes to the phone's fit;
   await waitFor(() => expect(screen.queryByTestId("floor-denied")).toBeNull());
   fireEvent.press(screen.getByTestId("key-tab"));
   await tick();
-  await waitFor(() => expect(fake.inputs.at(-1)).toEqual({ streamId: 1, floorGen: 3, data: "\t" }));
+  await waitFor(() => expect(fake.inputs.at(-1)).toEqual({ streamId: 1, floorGen: 3, data: "\t", opId: expect.stringMatching(/^op-\d+$/) }));
+  expect(new Set(fake.inputs.map((i) => i.opId)).size).toBe(fake.inputs.length); // one op id per batch, none reused
+  expect(fake.floorCalls.map((f) => f.action)).toEqual(["acquire", "take"]);
 });
 
 test("a snapshot that lands before the engine is ready is painted once it is", async () => {

@@ -75,6 +75,8 @@ export interface SessionRow {
   lifecycleUpdatedAt: number;
   /** Fence for `fleet/action{interrupt}` (`Fence::SessionIncarnation`). */
   sessionIncarnation: string;
+  /** The row version the user saw; sent back with `interrupt` so a stale view is refused, never a null. */
+  version: number;
 }
 
 /** `AttentionRow` with its payload already decoded by the crate. */
@@ -309,11 +311,12 @@ export interface WireClient {
     lifecycleUpdatedAt: number;
     opId: string;
   }): Promise<MutationAck>;
-  /** `fleet/action { interrupt }`, same op id rule. */
+  /** `fleet/action { interrupt }`, same op id rule; `version` is the row version the user acted on. */
   interrupt(req: {
     hostId: HostId;
     sessionKey: SessionKey;
     sessionIncarnation: string;
+    version: number;
     opId: string;
   }): Promise<MutationAck>;
 
@@ -334,9 +337,11 @@ export interface WireClient {
     wantInput?: boolean;
   }): Promise<TerminalAttached>;
   terminalDetach(hostId: HostId, streamId: number): Promise<void>;
-  terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string }): Promise<{ floorGen: number } | FloorDenied>;
+  /** Receipt-tier (M8): every batch carries an op id minted by `mintOpId`. */
+  terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string; opId: string }): Promise<{ floorGen: number } | FloorDenied>;
   terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome>;
-  terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied>;
+  /** Dedupe tier (M9): every floor action carries an op id. */
+  terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take"; opId: string }): Promise<FloorState | FloorDenied>;
 
   /** Lane E's `backoff_delay_ms`: jittered, 1 s doubling to a 60 s ceiling; the host's `retry_after_ms` is a floor under it. */
   backoffDelayMs(attempt: number, retryAfterMs?: number): number;

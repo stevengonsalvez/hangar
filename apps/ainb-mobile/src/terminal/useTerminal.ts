@@ -199,7 +199,8 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
     const id = stream.current;
     if (!data || id === undefined || !hostId) return;
     try {
-      const r = await wire.terminalInput({ hostId, streamId: id, floorGen: stateRef.current.floor.floorGen, data });
+      const opId = await wire.mintOpId(); // one receipt-tier op id per batch
+      const r = await wire.terminalInput({ hostId, streamId: id, floorGen: stateRef.current.floor.floorGen, data, opId });
       if ("kind" in r) patch({ denied: r.holder, floor: { holder: r.holder, floorGen: r.floorGen } });
       else patch({ denied: undefined });
     } catch (e) {
@@ -227,7 +228,8 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
       const id = stream.current;
       if (id === undefined || !hostId) return;
       try {
-        const r = await wire.terminalFloor({ hostId, streamId: id, action });
+        const opId = await wire.mintOpId();
+        const r = await wire.terminalFloor({ hostId, streamId: id, action, opId });
         if ("kind" in r) patch({ denied: r.holder, floor: { holder: r.holder, floorGen: r.floorGen } });
         else {
           patch({ floor: r, denied: undefined });
