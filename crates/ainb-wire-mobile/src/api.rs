@@ -29,6 +29,7 @@ use ainb_hangar_proto::snapshots::{
 };
 use tokio::runtime::Runtime;
 
+use crate::connlog::{ConnLog, Entry, Event};
 use crate::custody::DeviceKey;
 use crate::records::{
     AnswerReply, AttentionRecord, FleetSubscribeSummary, HelloSummary, InterruptReply,
@@ -81,10 +82,52 @@ pub fn wire_version() -> String {
     )
 }
 
-/// The reconnect delay before `attempt` (0-based), in milliseconds.
+/// The reconnect delay before `attempt` (0-based), in milliseconds, noted
+/// in the connection log under `log_dir` when one is given.
 #[uniffi::export]
-pub fn backoff_delay_ms(attempt: u32) -> u64 {
-    u64::try_from(backoff_delay(attempt).as_millis()).unwrap_or(u64::MAX)
+#[allow(clippy::needless_pass_by_value)]
+pub fn backoff_delay_ms(attempt: u32, log_dir: Option<String>) -> u64 {
+    let delay_ms = u64::try_from(backoff_delay(attempt).as_millis()).unwrap_or(u64::MAX);
+    if let Some(log) = log_dir.and_then(|d| ConnLog::open(Path::new(&d)).ok()) {
+        log.log(Event::Backoff { attempt, delay_ms });
+    }
+    delay_ms
+}
+
+/// One line of the connection log.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ConnLogEntry {
+    /// Wall clock, epoch ms.
+    pub t_ms: i64,
+    /// The event name (`connect`, `handshake`, `hello`, `close`, ...).
+    pub event: String,
+    /// The event's fields as JSON text.
+    pub detail: String,
+}
+
+impl From<Entry> for ConnLogEntry {
+    fn from(e: Entry) -> Self {
+        let mut value = serde_json::to_value(&e.event).unwrap_or_default();
+        let event = value
+            .as_object_mut()
+            .and_then(|o| o.remove("event"))
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        Self {
+            t_ms: e.t_ms,
+            event,
+            detail: value.to_string(),
+        }
+    }
+}
+
+/// The last `limit` lines of the connection log under `log_dir`, oldest
+/// first; works before any host is connected.
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)]
+pub fn read_connection_log(log_dir: String, limit: u32) -> Result<Vec<ConnLogEntry>, WireError> {
+    let log = ConnLog::open(Path::new(&log_dir))?;
+    Ok(log.tail(limit as usize).into_iter().map(ConnLogEntry::from).collect())
 }
 
 /// The fingerprint of the device key kept under `custody_dir`, minting the
@@ -154,6 +197,8 @@ pub struct ConnectParams {
     pub host_static_pubkey: Vec<u8>,
     /// The directory the device key is kept under.
     pub custody_dir: String,
+    /// The directory the connection log is kept under.
+    pub log_dir: String,
     /// The device token from redeem (`mdd_…`).
     pub device_token: String,
     /// The device id from redeem.
@@ -180,13 +225,15 @@ pub(crate) fn connect_config(params: &ConnectParams) -> Result<ConnectConfig, Wi
                 ),
             }
         })?;
-    Ok(ConnectConfig::new(
+    let mut config = ConnectConfig::new(
         params.url.clone(),
         carrier,
         host_id,
         host_static_pubkey,
         key.private().to_vec(),
-    ))
+    );
+    config.log = Some(Arc::new(ConnLog::open(Path::new(&params.log_dir))?));
+    Ok(config)
 }
 
 /// `auth/hello` on an open session, as a paired device.
@@ -208,8 +255,20 @@ pub(crate) async fn hello(
         transient: false,
         host: None,
     };
-    let result: HelloResult = session.call(methods::AUTH_HELLO, &params).await?;
-    Ok(result.into())
+    let result: Result<HelloResult, WireError> = session.call(methods::AUTH_HELLO, &params).await;
+    if let Some(log) = session.log() {
+        match &result {
+            Ok(r) => log.log(Event::Hello {
+                device_id: device_id.to_owned(),
+                protocol: r.selected_or_legacy(),
+                scope: r.scope.map(|s| s.base().as_str().to_owned()),
+            }),
+            Err(e) => log.log(Event::HelloFailed {
+                detail: e.to_string(),
+            }),
+        }
+    }
+    Ok(result?.into())
 }
 
 /// One connected, authenticated host.
@@ -531,5 +590,16 @@ impl MobileHost {
     /// The counters, for the connection log.
     pub fn stats(&self) -> SessionStats {
         self.session.stats()
+    }
+
+    /// The last `limit` lines of this host's connection log, oldest first.
+    pub fn connection_log(&self, limit: u32) -> Vec<ConnLogEntry> {
+        self.session
+            .log()
+            .map(|l| l.tail(limit as usize))
+            .unwrap_or_default()
+            .into_iter()
+            .map(ConnLogEntry::from)
+            .collect()
     }
 }
