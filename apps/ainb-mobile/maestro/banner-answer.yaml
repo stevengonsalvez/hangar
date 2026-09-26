@@ -1,13 +1,16 @@
 # M1-09 / M1-14: the two-tap banner answer.
 #
-# FakeWire build: launch with EXPO_PUBLIC_FAKE_WIRE=1; the seeded ASK
-# "Which runner do you mean?" is open on host mbp, so no pairing step runs.
-# Real daemon (M1-14): scripts/proof/scenarios/m1-phone-answer.sh installs the
-# build, mints the invite and passes the offer as OFFER; the pair step below
-# then runs and the ASK is the fixture the scenario raised.
+# Parameters come from the caller, never from the flow:
+#   OFFER        pairing offer URI; empty means the app is already paired
+#   ATTENTION_ID the open attention row's id (the scenario script knows it)
+#   QUESTION     its question text, asserted on the banner and the sheet
+#   OPTION       1-based option to answer with
+# FakeWire build values are in README.md; the real run (M1-14) gets them from
+# scripts/proof/scenarios/m1-phone-answer.sh.
 appId: com.stevengonsalvez.ainb.mobile
 env:
   OFFER: ""
+  OPTION: "2"
 ---
 - launchApp:
     clearState: true
@@ -20,23 +23,25 @@ env:
       - tapOn:
           id: "offer"
       - inputText: ${OFFER}
+      - assertVisible:
+          id: "offer-preview"
       - tapOn:
           id: "pair-submit"
       - assertVisible:
           text: "reachable"
 - assertVisible:
-    text: "Which runner do you mean?"
+    text: ${QUESTION}
 # tap 1: the banner
 - tapOn:
-    id: "banner-att-1"
+    id: "banner-${ATTENTION_ID}"
 - assertVisible:
     id: "answer-sheet"
 # tap 2: the option
 - tapOn:
-    id: "option-2"
+    id: "option-${OPTION}"
 - assertVisible:
     text: "Delivered"
 - tapOn:
     id: "answer-done"
 - assertNotVisible:
-    id: "banner-att-1"
+    id: "banner-${ATTENTION_ID}"
