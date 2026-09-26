@@ -5,7 +5,7 @@ import { concat, makeCoalescer } from "../src/terminal/engine/coalesce";
 import { decodeFromEngine, decodeInjection, encode, fromBase64, toBase64 } from "../src/terminal/engine/protocol";
 import { FIXTURES } from "../src/terminal/fixtures";
 import { withCtrl } from "../src/terminal/keys";
-import { ENGINE_URL, TerminalView, type TerminalSink } from "../src/terminal/TerminalView";
+import { ENGINE_ORIGIN, ENGINE_URL, TerminalView, type TerminalSink } from "../src/terminal/TerminalView";
 
 // The native webview is the shared jest mock (__mocks__/react-native-webview.tsx, jest.setup.ts).
 const { bridge } = webview as unknown as typeof import("../__mocks__/react-native-webview");
@@ -78,21 +78,29 @@ test("the webview is locked to the inline document and ignores a foreign page's 
   const input: string[] = [];
   render(<TerminalView onSink={() => undefined} onInput={(d) => input.push(d)} />);
   const p = bridge.props!;
-  expect(p.originWhitelist).toEqual([ENGINE_URL]);
-  expect((p.onShouldStartLoadWithRequest as (r: { url: string }) => boolean)({ url: "https://evil.example/" })).toBe(false);
-  expect((p.onShouldStartLoadWithRequest as (r: { url: string }) => boolean)({ url: ENGINE_URL })).toBe(true);
+  expect(p.originWhitelist).toEqual([ENGINE_ORIGIN]);
+  expect((p.source as { baseUrl: string }).baseUrl).toBe(ENGINE_URL);
+  const may = p.onShouldStartLoadWithRequest as (r: { url: string }) => boolean;
+  expect(may({ url: "https://evil.example/" })).toBe(false);
+  expect(may({ url: `${ENGINE_ORIGIN}/other` })).toBe(false);
+  expect(may({ url: ENGINE_URL })).toBe(true);
   expect(p.setSupportMultipleWindows).toBe(false);
   expect(p.javaScriptCanOpenWindowsAutomatically).toBe(false);
   expect(p.allowFileAccess).toBe(false);
   expect(p.mixedContentMode).toBe("never");
   expect(p.incognito).toBe(true);
 
-  await act(async () => bridge.engineMessage!(encode({ t: "ready" }), "https://evil.example/"));
-  await act(async () => bridge.engineMessage!(encode({ t: "input", data: "rm -rf\r" }), "https://evil.example/"));
+  // a foreign page, an opaque origin (what an inline page without baseUrl reports), a near miss
+  for (const from of ["https://evil.example/", "null", "https://terminal.ainb.invalid.evil.example", `${ENGINE_ORIGIN}/other`]) {
+    await act(async () => bridge.engineMessage!(encode({ t: "ready" }), from));
+    await act(async () => bridge.engineMessage!(encode({ t: "input", data: "rm -rf\r" }), from));
+  }
   expect(input).toEqual([]);
-  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
-  await act(async () => bridge.engineMessage!(encode({ t: "input", data: "ok" })));
-  expect(input).toEqual(["ok"]);
+  // the two spellings the platforms use for this page: the origin (Android WebMessageListener) and the URL (iOS, older Android)
+  await act(async () => bridge.engineMessage!(encode({ t: "ready" }), ENGINE_ORIGIN));
+  await act(async () => bridge.engineMessage!(encode({ t: "input", data: "ok" }), ENGINE_ORIGIN));
+  await act(async () => bridge.engineMessage!(encode({ t: "input", data: "ok2" }), ENGINE_URL));
+  expect(input).toEqual(["ok", "ok2"]);
 });
 
 test("the engine document carries a no-network CSP and disables link activation", () => {
@@ -107,12 +115,12 @@ test("a link activation reaches the host as a report, and the engine state is re
   const links: string[] = [];
   const states: string[] = [];
   render(<TerminalView onSink={() => undefined} onLink={(u) => links.push(u)} onEngine={(st) => states.push(st)} />);
-  await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never" }), "https://evil.example/"));
+  await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never" }), "https://evil.example/some/path?q=1"));
   expect(links).toEqual([]);
-  expect(states).toEqual(["dropped message from https://evil.example/"]);
+  expect(states).toEqual(["dropped message from https://evil.example"]); // origin only
   await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
   await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never" })));
   expect(links).toEqual(["https://example.invalid/never"]);
-  expect(states).toEqual(["dropped message from https://evil.example/", "engine ready"]);
+  expect(states).toEqual(["dropped message from https://evil.example", "engine ready"]);
   expect(decodeFromEngine(encode({ t: "link", uri: "x".repeat(2000) }))).toEqual({ t: "link", uri: "x".repeat(512) });
 });
