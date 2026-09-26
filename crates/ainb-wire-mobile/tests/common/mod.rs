@@ -50,6 +50,18 @@ pub struct PeerOpts {
     pub refuse_before_handshake: Option<(u16, String)>,
     /// Accept the WebSocket and never answer (a black hole).
     pub hang: bool,
+    /// After reading Noise message 1, drop the socket this way instead of
+    /// answering: a clean end of stream, or a TCP reset.
+    pub after_message_1: Option<DropKind>,
+}
+
+/// How a peer drops a socket after message 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropKind {
+    /// FIN, no close frame.
+    Eof,
+    /// RST (linger zero), which the reader sees as a stream error.
+    Reset,
 }
 
 impl Default for PeerOpts {
@@ -60,6 +72,7 @@ impl Default for PeerOpts {
             host_id: HostId::parse(HOST_ID).unwrap(),
             refuse_before_handshake: None,
             hang: false,
+            after_message_1: None,
         }
     }
 }
@@ -208,6 +221,14 @@ async fn serve(
     mut notify: broadcast::Receiver<(String, Value)>,
 ) -> Result<(), String> {
     let ws = tokio_tungstenite::accept_async(tcp).await.map_err(|e| e.to_string())?;
+    if opts.after_message_1 == Some(DropKind::Reset) {
+        // Linger zero turns the drop below into an RST, which is the point;
+        // tokio deprecates it because a non-zero linger blocks the drop.
+        #[allow(deprecated)]
+        ws.get_ref()
+            .set_linger(Some(std::time::Duration::ZERO))
+            .map_err(|e| e.to_string())?;
+    }
     let (mut sink, mut stream) = ws.split();
     if let Some((code, reason)) = opts.refuse_before_handshake.clone() {
         let _ = sink
@@ -231,6 +252,12 @@ async fn serve(
         Some(Ok(Message::Binary(b))) => b,
         other => return Err(format!("expected noise msg 1, got {other:?}")),
     };
+    if opts.after_message_1.is_some() {
+        // Drop both halves without a close frame: FIN, or RST under linger 0.
+        drop(sink);
+        drop(stream);
+        return Ok(());
+    }
     let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
     if hs.read_message(&msg1, &mut buf).is_err() {
         // A Noise failure is 4401 on the daemon (peer_close::UNAUTHENTICATED:
