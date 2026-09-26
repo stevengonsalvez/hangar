@@ -487,7 +487,11 @@ async fn resolve_and_send_typed(
     // name would land in whichever pane is active.
     let mut session = session.clone();
     if let Some(name) = session.tmux_session.clone() {
-        session.tmux_session = Some(crate::fleet::send::resolve_send_target(&name, pane).await?);
+        // No tmux session by that name at all: nothing to narrow, and the
+        // route decides between a refusal and a broker peer.
+        if let Some(id) = crate::fleet::send::resolve_send_pane(&name, pane).await? {
+            session.tmux_session = Some(id);
+        }
     }
     outcome_result(send(&session, text).await)
 }
