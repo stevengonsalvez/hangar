@@ -65,6 +65,9 @@ fn sessions_render_same(a: &FleetSession, b: &FleetSession) -> bool {
         confidence,
         discovered_at,
         lifecycle_updated_at,
+        // A new process owning the name is a change: it moves the value a
+        // client fences `fleet/action` on.
+        session_incarnation,
         attention_updated_at,
         model,
         reasoning_effort,
@@ -94,6 +97,7 @@ fn sessions_render_same(a: &FleetSession, b: &FleetSession) -> bool {
         && *confidence == b.confidence
         && *discovered_at == b.discovered_at
         && *lifecycle_updated_at == b.lifecycle_updated_at
+        && *session_incarnation == b.session_incarnation
         && *attention_updated_at == b.attention_updated_at
         && *model == b.model
         && *reasoning_effort == b.reasoning_effort
@@ -311,6 +315,7 @@ mod tests {
             discovered_at: 1,
             last_observed_at: 10,
             lifecycle_updated_at: 5,
+            session_incarnation: None,
             attention_updated_at: 7,
             model: None,
             reasoning_effort: None,

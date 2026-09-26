@@ -588,6 +588,11 @@ impl MobileHost {
                     &FleetTranscriptListParams {
                         session_key,
                         after_order,
+                        // The forward page only here; the backward page
+                        // (`before_order`, behind the daemon's
+                        // `fleet.transcript.page_back` capability) is the
+                        // facade's own call.
+                        before_order: None,
                         limit,
                     },
                 )
