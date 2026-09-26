@@ -97,9 +97,7 @@ impl Judge {
         if headers.contains_key("origin") {
             return Err(refuse(403, "forbidden"));
         }
-        let presented = headers
-            .get(&TOKEN_HEADER.to_ascii_lowercase())
-            .map_or("", String::as_str);
+        let presented = headers.get(&TOKEN_HEADER.to_ascii_lowercase()).map_or("", String::as_str);
         if !constant_time_eq(presented.as_bytes(), self.token.as_bytes()) {
             return Err(refuse(403, "forbidden"));
         }
@@ -117,10 +115,7 @@ impl Judge {
         if !json {
             return Err(refuse(415, "unsupported media type"));
         }
-        let length: usize = headers
-            .get("content-length")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let length: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
         if length > MAX_BODY {
             return Err(refuse(413, "payload too large"));
         }
@@ -128,10 +123,7 @@ impl Judge {
     }
 
     fn take(&self, now: Instant) -> bool {
-        let mut bucket = self
-            .bucket
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bucket = self.bucket.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         bucket.take(now)
     }
 }
@@ -245,7 +237,12 @@ mod tests {
     fn routes_methods_types_and_sizes() {
         let j = judge();
         let h = ok_headers();
-        for bad in ["/hook/gemini", "/hook/", "/hook/claude/x", "/hook/claude/hold/x"] {
+        for bad in [
+            "/hook/gemini",
+            "/hook/",
+            "/hook/claude/x",
+            "/hook/claude/hold/x",
+        ] {
             assert_eq!(j.admit("POST", bad, &h).unwrap_err().status, 404, "{bad}");
         }
         assert_eq!(j.admit("GET", "/hook/claude", &h).unwrap_err().status, 405);
@@ -253,11 +250,17 @@ mod tests {
         t.insert("content-type".into(), "text/plain".into());
         assert_eq!(j.admit("POST", "/hook/claude", &t).unwrap_err().status, 415);
         let mut t = ok_headers();
-        t.insert("content-type".into(), "application/json; charset=utf-8".into());
+        t.insert(
+            "content-type".into(),
+            "application/json; charset=utf-8".into(),
+        );
         assert!(j.admit("POST", "/hook/claude", &t).is_ok());
         let mut big = ok_headers();
         big.insert("content-length".into(), (MAX_BODY + 1).to_string());
-        assert_eq!(j.admit("POST", "/hook/claude", &big).unwrap_err().status, 413);
+        assert_eq!(
+            j.admit("POST", "/hook/claude", &big).unwrap_err().status,
+            413
+        );
     }
 
     #[test]
