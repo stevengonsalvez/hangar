@@ -18,7 +18,7 @@ export const WebView = React.forwardRef(function WebView(
 ) {
   React.useImperativeHandle(ref, () => ({ injectJavaScript: (js: string) => bridge.injected.push(js) }));
   bridge.props = props;
-  bridge.engineMessage = (raw, url = "about:blank") => props.onMessage?.({ nativeEvent: { data: raw, url } });
+  bridge.engineMessage = (raw, url = "https://terminal.ainb.invalid") => props.onMessage?.({ nativeEvent: { data: raw, url } });
   return <View testID={props.testID ?? "terminal-webview"} />;
 });
 
