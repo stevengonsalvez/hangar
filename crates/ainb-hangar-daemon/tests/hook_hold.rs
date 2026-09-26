@@ -1,0 +1,289 @@
+//! The one blocking, structured reply path, end to end over real sockets.
+//!
+//! A Claude `PermissionRequest` or `AskUserQuestion` hook POSTs to the hold
+//! route and waits. `attention/answer` (the daemon's own answer function)
+//! resolves it: the hook receives the daemon-built decision, first answer
+//! wins, duplicates join one hold, a status event showing the agent moved on
+//! ends it, and an answer that does not fit the question claims nothing.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ainb_hangar_daemon::attention_ingest::AttentionIngest;
+use ainb_hangar_daemon::events::EventBroker;
+use ainb_hangar_daemon::hook_ingress::{self, IngestSink, RESOLVED_BY_AGENT};
+use ainb_hangar_proto::mutation::MutationEnvelope;
+use ainb_hangar_proto::snapshots::{AnswerParams, AnswerResult};
+use ainb_hangar_store::Store;
+use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+
+struct World {
+    home: tempfile::TempDir,
+    store: Store,
+    broker: EventBroker,
+    running: hook_ingress::Running,
+}
+
+impl World {
+    async fn start() -> Self {
+        let home = tempfile::tempdir().unwrap();
+        let store = Store::open_in(home.path()).await.unwrap();
+        let broker = EventBroker::new();
+        let ingest = AttentionIngest::new(
+            store.pool().clone(),
+            broker.sink(),
+            home.path().join("events.jsonl"),
+            home.path().join("cursor"),
+        );
+        let sink = IngestSink::new(
+            ingest,
+            home.path().to_path_buf(),
+            store.pool().clone(),
+            broker.sink(),
+        );
+        let running = hook_ingress::start(home.path(), Arc::new(sink)).await.unwrap();
+        Self {
+            home,
+            store,
+            broker,
+            running,
+        }
+    }
+
+    fn token_line(&self) -> String {
+        let line = std::fs::read_to_string(self.home.path().join("hangar/hook-headers")).unwrap();
+        format!("{}\r\n", line.trim_end())
+    }
+
+    /// POST one hook call and return `(status, body)`.
+    async fn post(&self, path: &str, payload: &Value) -> (u16, String) {
+        let body = payload.to_string();
+        let raw = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{tok}Content-Type: application/json\r\nContent-Length: {len}\r\n\r\n{body}",
+            port = self.running.port(),
+            tok = self.token_line(),
+            len = body.len()
+        );
+        let mut s = TcpStream::connect(("127.0.0.1", self.running.port())).await.unwrap();
+        s.write_all(raw.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(20), s.read_to_end(&mut out))
+            .await
+            .expect("the hold answered")
+            .unwrap();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+        (status, body)
+    }
+
+    /// Start a hold in the background.
+    fn hold(self: &Arc<Self>, payload: Value) -> tokio::task::JoinHandle<(u16, String)> {
+        let w = self.clone();
+        tokio::spawn(async move { w.post("/hook/claude/hold", &payload).await })
+    }
+
+    async fn answer(&self, attention_id: &str, answer: &str) -> AnswerResult {
+        let params = AnswerParams {
+            attention_id: attention_id.to_string(),
+            answer: answer.to_string(),
+            answered_by: "desktop@test".to_string(),
+            is_answer: true,
+            mutation: MutationEnvelope::default(),
+        };
+        ainb_hangar_daemon::answer::answer(self.store.pool(), &self.broker.sink(), &params, 1)
+            .await
+            .unwrap()
+    }
+
+    /// Wait until the session has an open row of `kind`; return its id.
+    async fn open_row(&self, session: &str, kind: AttentionKind) -> String {
+        for _ in 0..100 {
+            let rows = AttentionRepo::list_fleet(self.store.pool()).await.unwrap();
+            if let Some(row) = rows
+                .into_iter()
+                .find(|r| r.session_id == session && r.kind == kind && r.state == "open")
+            {
+                return row.id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no open {kind:?} row for {session}");
+    }
+}
+
+fn permission(session: &str, call: &str) -> Value {
+    json!({
+        "hook_event_name": "PermissionRequest",
+        "session_id": session,
+        "cwd": "/tmp/hold-test",
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+        "tool_use_id": call,
+    })
+}
+
+fn ask(session: &str, call: &str) -> Value {
+    json!({
+        "hook_event_name": "PreToolUse",
+        "session_id": session,
+        "cwd": "/tmp/hold-test",
+        "tool_name": "AskUserQuestion",
+        "tool_use_id": call,
+        "tool_input": {"questions": [{
+            "question": "Which colour?",
+            "header": "Colour",
+            "multiSelect": false,
+            "options": [{"label": "Red", "description": ""}, {"label": "Blue", "description": ""}]
+        }]}
+    })
+}
+
+fn session(tag: &str) -> String {
+    format!("hold-{tag}-{}", std::process::id())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_answered_from_a_surface_reaches_the_held_hook_exactly() {
+    let w = Arc::new(World::start().await);
+    let s = session("approve");
+    let held = w.hold(permission(&s, "call-1"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    let result = w.answer(&id, "allow").await;
+    assert_eq!(
+        result,
+        AnswerResult::Delivered {
+            via: "hook hold".into()
+        }
+    );
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["hookSpecificOutput"]["hookEventName"],
+        "PermissionRequest"
+    );
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    assert!(!body.contains("updatedInput"));
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.state, "answered");
+    assert_eq!(row.answered_by.as_deref(), Some("desktop@test"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_hooks_join_one_hold_and_the_first_answer_wins() {
+    let w = Arc::new(World::start().await);
+    let s = session("join");
+    let first = w.hold(permission(&s, "call-2"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    let second = w.hold(permission(&s, "call-2"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let open: Vec<_> = AttentionRepo::list_fleet(w.store.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.session_id == s && r.state == "open")
+        .collect();
+    assert_eq!(open.len(), 1, "one row for one request");
+
+    let (a, b) = tokio::join!(w.answer(&id, "deny"), w.answer(&id, "allow"));
+    let delivered = [&a, &b].iter().filter(|r| matches!(r, AnswerResult::Delivered { .. })).count();
+    let lost = [&a, &b]
+        .iter()
+        .filter(|r| matches!(r, AnswerResult::AlreadyAnswered { .. }))
+        .count();
+    assert_eq!((delivered, lost), (1, 1), "{a:?} {b:?}");
+    let winner = if matches!(a, AnswerResult::Delivered { .. }) {
+        "deny"
+    } else {
+        "allow"
+    };
+    for held in [first, second] {
+        let (status, body) = held.await.unwrap();
+        assert_eq!(status, 200);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], winner);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_question_gets_its_answer_and_a_label_not_offered_claims_nothing() {
+    let w = Arc::new(World::start().await);
+    let s = session("ask");
+    let held = w.hold(ask(&s, "call-3"));
+    let id = w.open_row(&s, AttentionKind::AskUserQuestion).await;
+
+    let refused = w.answer(&id, "Green").await;
+    assert!(
+        matches!(refused, AnswerResult::NoTarget { .. }),
+        "{refused:?}"
+    );
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.state, "open", "nothing was claimed");
+
+    assert!(matches!(
+        w.answer(&id, "Blue").await,
+        AnswerResult::Delivered { .. }
+    ));
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let out = &v["hookSpecificOutput"];
+    assert_eq!(out["hookEventName"], "PreToolUse");
+    assert_eq!(out["permissionDecision"], "allow");
+    assert_eq!(out["updatedInput"]["answers"]["Which colour?"], "Blue");
+    assert_eq!(
+        out["updatedInput"]["questions"],
+        ask(&s, "call-3")["tool_input"]["questions"],
+        "the held questions, copied back verbatim"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_moving_on_ends_the_hold_and_retires_its_row() {
+    let w = Arc::new(World::start().await);
+    let s = session("moved");
+    let held = w.hold(permission(&s, "call-4"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    // Answered at the terminal: the tool ran, so its PostToolUse arrives.
+    let (status, _) = w
+        .post(
+            "/hook/claude",
+            &json!({"hook_event_name": "PostToolUse", "session_id": s, "cwd": "/tmp/hold-test",
+                    "tool_name": "Bash", "tool_use_id": "call-4"}),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 204, "the hold ends with no decision: {body}");
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.state, "answered");
+    assert_eq!(row.answered_by.as_deref(), Some(RESOLVED_BY_AGENT));
+    // And a late answer cannot type at the agent's prompt.
+    assert!(matches!(
+        w.answer(&id, "allow").await,
+        AnswerResult::AlreadyAnswered { .. }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_approval_whose_hold_ended_is_never_typed_into_a_pane() {
+    let w = Arc::new(World::start().await);
+    let s = session("ended");
+    // Raise the row through a hold, then drop the hook's connection.
+    let held = w.hold(permission(&s, "call-5"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    held.abort();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let result = w.answer(&id, "allow").await;
+    assert!(
+        matches!(
+            result,
+            AnswerResult::NoTarget { .. } | AnswerResult::DeliveryFailed { .. }
+        ),
+        "{result:?}"
+    );
+}
