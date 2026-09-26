@@ -44,6 +44,19 @@ test("elsewhere the shell's mod is ctrl+shift and plain ctrl reaches the pane", 
   assert.equal(accelerator(key("Digit1", { meta: true }), false), null);
 });
 
+test("Mod+N opens the composer: plain Mod, no Shift needed, on either platform", () => {
+  assert.deepEqual(accelerator(key("KeyN", { meta: true }), true), { kind: "new" });
+  assert.deepEqual(accelerator(key("KeyN", { ctrl: true }), false), { kind: "new" });
+
+  // Shift, Alt, or the wrong modifier for the platform: not the chord.
+  assert.equal(accelerator(key("KeyN", { meta: true, shift: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { ctrl: true, shift: true }), false), null);
+  assert.equal(accelerator(key("KeyN", { meta: true, alt: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { ctrl: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { meta: true }), false), null);
+  assert.equal(accelerator(key("KeyN"), true), null);
+});
+
 test("copy and paste are the shell's only elsewhere, and native on macOS", () => {
   assert.deepEqual(accelerator(key("KeyC", { ctrl: true, shift: true }), false), { kind: "copy" });
   assert.deepEqual(accelerator(key("KeyV", { ctrl: true, shift: true }), false), { kind: "paste" });
