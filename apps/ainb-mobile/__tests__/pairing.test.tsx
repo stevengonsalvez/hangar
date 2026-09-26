@@ -1,4 +1,4 @@
-import { fireEvent, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 import * as camera from "expo-camera";
 
@@ -26,9 +26,11 @@ test("a scanned offer fills the field, shows the decoded host, and pairs only on
   fireEvent.press(screen.getByTestId("scan"));
   await screen.findByTestId("camera");
   await waitFor(() => expect(cam.scan).toBeDefined());
-  cam.scan!("not-an-offer");
-  cam.scan!(`ainb://pair#${HOST_C}.k1`);
-  cam.scan!(`ainb://pair#${HOST_C}.k9`); // a second frame changes nothing
+  await act(async () => {
+    cam.scan!("not-an-offer");
+    cam.scan!(`ainb://pair#${HOST_C}.k1`);
+    cam.scan!(`ainb://pair#${HOST_C}.k9`); // a second frame changes nothing
+  });
   expect((await screen.findByTestId("offer")).props.value).toBe(`ainb://pair#${HOST_C}.k1`);
   expect(await screen.findByText(new RegExp(`host ${HOST_C} via lan`))).toBeTruthy();
   expect(screen).toHavePathname("/pair");
