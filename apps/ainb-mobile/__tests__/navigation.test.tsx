@@ -1,4 +1,4 @@
-import { fireEvent, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { resetLifecycle } from "../src/lifecycle";
@@ -57,8 +57,34 @@ test("interrupt sends the row version the user saw and an op id; a stale version
   expect(await screen.findByText("Interrupted")).toBeTruthy();
   expect(fake.interrupts).toEqual([{ sessionKey: "claude:hangar", version: 1, opId: expect.stringMatching(/^op-\d+$/) }]);
 
-  // the agent moved on under the user: the row they saw is stale
+  // the agent moved on under the user, silently: the row they saw is stale and the daemon says conflict (-32008)
   fake.advanceTurn(FAKE_HOST_A, "claude:hangar");
   fireEvent.press(screen.getByTestId("interrupt"));
-  expect(await screen.findByText("Not interrupted: turn_advanced")).toBeTruthy();
+  expect(await screen.findByText("Not interrupted: conflict")).toBeTruthy();
+  expect(fake.interrupts).toHaveLength(2);
+  expect(fake.interrupts[1]!.version).toBe(1); // the screen still holds the old row
+  expect(fake.interrupts[1]!.opId).not.toBe(fake.interrupts[0]!.opId); // the accepted one was retired
+});
+
+test("the interrupt op id is re-minted when the row version changes, and reused while it does not", async () => {
+  const fake = new FakeWire();
+  setWire(fake);
+  const screen = renderRouter("./app", { initialUrl: `/host/${FAKE_HOST_A}/session/claude:hangar` });
+  await screen.findAllByText(/Which runner/);
+  // make every interrupt a refusal so the op id is kept between taps
+  await act(async () => fake.advanceTurn(FAKE_HOST_A, "claude:hangar", true));
+  fireEvent.press(screen.getByTestId("interrupt"));
+  await screen.findByText("Not interrupted: conflict");
+  fireEvent.press(screen.getByTestId("interrupt"));
+  await waitFor(() => expect(fake.interrupts).toHaveLength(2));
+  expect(fake.interrupts[1]!.opId).toBe(fake.interrupts[0]!.opId); // same stale view, same op id
+  expect(fake.interrupts[1]!.version).toBe(1);
+  // the screen now learns the new row (version 2): a fresh op id goes out with it
+  await act(async () => fake.advance(FAKE_HOST_A, 1));
+  await waitFor(async () => expect((await fake.rosterStatus(FAKE_HOST_A))[0]!.version).toBe(2));
+  fireEvent.press(screen.getByTestId("interrupt"));
+  await waitFor(() => expect(fake.interrupts).toHaveLength(3));
+  expect(fake.interrupts[2]!.version).toBe(2);
+  expect(fake.interrupts[2]!.opId).not.toBe(fake.interrupts[0]!.opId);
+  expect(await screen.findByText("Interrupted")).toBeTruthy();
 });
