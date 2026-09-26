@@ -7,14 +7,13 @@
 
 use ainb_hangar_proto::agent_status::{RosterStatusResult, RosterStatusRow};
 use ainb_hangar_proto::auth::HelloResult;
-use ainb_hangar_proto::events::{AttentionRow, HangarEvent, MessageKind};
+use ainb_hangar_proto::events::{AttentionRow, HangarEvent};
 use ainb_hangar_proto::fleet::{
     FleetEvent, FleetReplayState, FleetSubscribeResult, FleetTranscriptChunk,
     FleetTranscriptListResult,
 };
 use ainb_hangar_proto::mutation::MutationAck;
 use ainb_hangar_proto::snapshots::AnswerResult;
-use ainb_hangar_proto::transcript::{AcpClassifier, acp_card_text};
 
 /// Why a call failed. Variants are what the app branches on; `message` is
 /// for the connection log and never for control flow.
@@ -537,9 +536,7 @@ pub struct InterruptReply {
     pub ack: Option<MutationReceipt>,
 }
 
-/// One ACP transcript chunk, its line decoded by the daemon's own
-/// classifier (`ainb_hangar_proto::transcript`), so the app shows the
-/// same scrubbed, length-capped text the TUI and the desktop card show.
+/// One ACP transcript chunk.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct TranscriptChunkRecord {
     /// The commit-ordered cursor.
@@ -550,65 +547,62 @@ pub struct TranscriptChunkRecord {
     pub session_key: String,
     /// `acp.<kind>`.
     pub event_type: String,
-    /// Who spoke, from the classifier's lane: `agent` (prose, thinking),
-    /// `tool` (a call or its result), `user` (`acp.user_message`), else
-    /// `system` (an error line, usage, lifecycle).
+    /// Who spoke, from the kind: `user` (`acp.user_message`), `agent`
+    /// (`acp.message`, `acp.thought`), `tool` (`acp.tool_call`), else
+    /// `system` (plan, permission, usage, lifecycle).
     pub role: String,
-    /// The line to show, from the classifier: scrubbed of credentials and
-    /// capped, one entry per line joined with `\n`. A user message and a
-    /// usage row take the card text the desktop shows. Absent when the
-    /// taxonomy carries nothing for the row, which the app renders as the
-    /// kind.
+    /// The line to show, decoded here: the body's `text`, else `content`
+    /// (a string, or the joined `text` of its parts), else `message`.
+    /// Absent when the body has none, which the app renders as the kind.
     pub text: Option<String>,
+    /// The chunk body as JSON text, for the log; the app renders `text`.
+    pub payload: String,
     /// Observation time, epoch ms.
     pub observed_at: i64,
 }
 
-/// One host's transcript decoder: the daemon's `AcpClassifier`, kept per
-/// host because a `tool_call_update` names its tool only through the
-/// earlier `tool_call` row it remembers. Feed rows oldest first.
-#[derive(Debug, Default)]
-pub struct TranscriptDecoder {
-    classifier: AcpClassifier,
+/// The role an `acp.<kind>` event type names.
+fn transcript_role(event_type: &str) -> &'static str {
+    match event_type {
+        "acp.user_message" => "user",
+        "acp.message" | "acp.thought" => "agent",
+        "acp.tool_call" => "tool",
+        _ => "system",
+    }
 }
 
-impl TranscriptDecoder {
-    /// Decode one chunk.
-    pub fn chunk(&mut self, c: FleetTranscriptChunk) -> TranscriptChunkRecord {
-        let lines = self.classifier.classify_value(&c.event_type, &c.payload);
-        let (role, text) = if let Some((kind, _)) = lines.first() {
-            let role = match kind {
-                MessageKind::Agent | MessageKind::Thinking => "agent",
-                MessageKind::ToolCall | MessageKind::ToolResult => "tool",
-                MessageKind::Error => "system",
-            };
-            let text = lines.iter().map(|(_, body)| body.as_str()).collect::<Vec<_>>().join("\n");
-            (role, Some(text))
-        } else {
-            let role = if c.event_type == "acp.user_message" {
-                "user"
-            } else {
-                "system"
-            };
-            (role, acp_card_text(&c.event_type, &c.payload))
-        };
-        TranscriptChunkRecord {
+/// The line a transcript body carries, if it carries one.
+fn transcript_text(payload: &serde_json::Value) -> Option<String> {
+    if let Some(t) = payload.get("text").and_then(serde_json::Value::as_str) {
+        return Some(t.to_owned());
+    }
+    match payload.get("content") {
+        Some(serde_json::Value::String(s)) => return Some(s.clone()),
+        Some(serde_json::Value::Array(parts)) => {
+            let joined: Vec<&str> = parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(serde_json::Value::as_str))
+                .collect();
+            if !joined.is_empty() {
+                return Some(joined.join(""));
+            }
+        }
+        _ => {}
+    }
+    payload.get("message").and_then(serde_json::Value::as_str).map(str::to_owned)
+}
+
+impl From<FleetTranscriptChunk> for TranscriptChunkRecord {
+    fn from(c: FleetTranscriptChunk) -> Self {
+        Self {
             ingest_order: c.ingest_order,
             event_id: c.event_id,
             session_key: c.session_key,
+            role: transcript_role(&c.event_type).to_owned(),
+            text: transcript_text(&c.payload),
             event_type: c.event_type,
-            role: role.to_owned(),
-            text,
+            payload: c.payload.to_string(),
             observed_at: c.observed_at,
-        }
-    }
-
-    /// Decode one page.
-    pub fn page(&mut self, r: FleetTranscriptListResult) -> TranscriptPage {
-        TranscriptPage {
-            chunks: r.chunks.into_iter().map(|c| self.chunk(c)).collect(),
-            next_after_order: r.next_after_order,
-            truncated: r.truncated,
         }
     }
 }
@@ -622,6 +616,16 @@ pub struct TranscriptPage {
     pub next_after_order: Option<i64>,
     /// Whether the uncursored tail read left older rows behind.
     pub truncated: bool,
+}
+
+impl From<FleetTranscriptListResult> for TranscriptPage {
+    fn from(r: FleetTranscriptListResult) -> Self {
+        Self {
+            chunks: r.chunks.into_iter().map(TranscriptChunkRecord::from).collect(),
+            next_after_order: r.next_after_order,
+            truncated: r.truncated,
+        }
+    }
 }
 
 /// A notification the daemon pushed, or a session-level condition.
@@ -699,11 +703,7 @@ pub enum WireEvent {
 impl WireEvent {
     /// Map a pushed notification to an event.
     #[must_use]
-    pub fn from_notification(
-        method: &str,
-        params: serde_json::Value,
-        transcript: &mut TranscriptDecoder,
-    ) -> Self {
+    pub fn from_notification(method: &str, params: serde_json::Value) -> Self {
         let other = || Self::Other {
             method: method.to_owned(),
         };
@@ -715,9 +715,7 @@ impl WireEvent {
                 .get("chunk")
                 .cloned()
                 .and_then(|c| serde_json::from_value::<FleetTranscriptChunk>(c).ok())
-                .map_or_else(other, |c| Self::TranscriptChunk {
-                    chunk: transcript.chunk(c),
-                }),
+                .map_or_else(other, |c| Self::TranscriptChunk { chunk: c.into() }),
             ainb_hangar_proto::events::EVENT_METHOD => {
                 match serde_json::from_value::<HangarEvent>(params) {
                     Ok(HangarEvent::AttentionRaised {
@@ -795,10 +793,9 @@ mod tests {
     }
 
     #[test]
-    fn transcript_chunks_take_the_daemon_classifier_lines_scrubbed_and_capped() {
-        let mut d = TranscriptDecoder::default();
-        let mut chunk = |event_type: &str, payload: serde_json::Value| {
-            d.chunk(
+    fn transcript_chunks_decode_role_and_text_in_the_crate() {
+        let chunk = |event_type: &str, payload: serde_json::Value| {
+            TranscriptChunkRecord::from(
                 serde_json::from_value::<FleetTranscriptChunk>(json!({
                     "ingest_order": 9, "event_id": "e9", "session_key": "acp:one",
                     "event_type": event_type, "payload": payload, "observed_at": 2
@@ -808,34 +805,24 @@ mod tests {
         };
         let m = chunk("acp.message", json!({"text": "hi"}));
         assert_eq!((m.role.as_str(), m.text.as_deref()), ("agent", Some("hi")));
-        let u = chunk("acp.user_message", json!({"text": "do it"}));
+        let u = chunk("acp.user_message", json!({"content": "do it"}));
         assert_eq!(
             (u.role.as_str(), u.text.as_deref()),
             ("user", Some("do it"))
         );
-        let call = chunk(
-            "acp.tool_call",
-            json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "ls", "status": "pending"}),
+        let parts = chunk(
+            "acp.thought",
+            json!({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}),
         );
-        assert_eq!(call.role, "tool");
-        assert_eq!(call.text.as_deref(), Some("ls"));
-        // The update names its tool through the call the decoder remembered.
-        let done = chunk(
-            "acp.tool_call",
-            json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}),
+        assert_eq!(parts.text.as_deref(), Some("ab"));
+        let t = chunk("acp.tool_call", json!({"message": "ran ls"}));
+        assert_eq!(
+            (t.role.as_str(), t.text.as_deref()),
+            ("tool", Some("ran ls"))
         );
-        assert_eq!(done.text.as_deref(), Some("ls  (completed)"));
-        // The classifier's scrub: a pasted key never reaches the phone.
-        let leak = chunk(
-            "acp.message",
-            json!({"text": "key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz-AA"}),
-        );
-        assert!(!leak.text.as_deref().unwrap_or("").contains("sk-ant-api03-abc"));
-        // And its cap: a megabyte of prose is cut, not shipped.
-        let long = chunk("acp.message", json!({"text": "x".repeat(100_000)}));
-        assert!(long.text.as_deref().unwrap_or("").chars().count() < 10_000);
-        let l = chunk("acp.turn_started", json!({}));
+        let l = chunk("acp.turn_completed", json!({"usage": 1}));
         assert_eq!((l.role.as_str(), l.text), ("system", None));
+        assert!(l.payload.contains("usage"));
     }
 
     #[test]
@@ -860,12 +847,10 @@ mod tests {
 
     #[test]
     fn attention_events_map_and_unknown_methods_are_other() {
-        let mut t = TranscriptDecoder::default();
         let raised = WireEvent::from_notification(
             "hangar/event",
             json!({"event": "attention_raised", "attention_id": "a1", "session_id": "s1",
                     "kind": "approval", "created_at": 7}),
-            &mut t,
         );
         assert!(
             matches!(raised, WireEvent::AttentionRaised { ref attention_id, ref kind, .. }
@@ -874,7 +859,6 @@ mod tests {
         let answered = WireEvent::from_notification(
             "hangar/event",
             json!({"event": "attention_answered", "attention_id": "a1", "by": "device:d1"}),
-            &mut t,
         );
         assert_eq!(
             answered,
@@ -884,13 +868,13 @@ mod tests {
             }
         );
         assert_eq!(
-            WireEvent::from_notification("fleet/message_event", json!({}), &mut t),
+            WireEvent::from_notification("fleet/message_event", json!({})),
             WireEvent::Other {
                 method: "fleet/message_event".into()
             }
         );
         assert_eq!(
-            WireEvent::from_notification("fleet/resync_required", json!(null), &mut t),
+            WireEvent::from_notification("fleet/resync_required", json!(null)),
             WireEvent::FleetResyncRequired
         );
     }
