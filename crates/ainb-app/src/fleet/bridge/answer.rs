@@ -116,7 +116,10 @@ pub fn resolve_reply(
     if target.cwd.is_empty() {
         return ReplyRoute::NoOpenAttention;
     }
-    let in_cwd: Vec<&AttentionRow> = rows.iter().filter(|r| r.cwd == target.cwd).collect();
+    let in_cwd: Vec<&AttentionRow> = rows
+        .iter()
+        .filter(|r| ainb_fleet_core::read::jsonl_tail::same_dir(&r.cwd, &target.cwd))
+        .collect();
     match in_cwd.len() {
         0 => ReplyRoute::NoOpenAttention,
         1 => ReplyRoute::Answer {
