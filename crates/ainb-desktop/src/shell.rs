@@ -53,7 +53,6 @@ impl<S: FrameSink> Shell<S> {
     pub fn dispatch_renderer(&self, intent: Intent) -> Option<Refusal> {
         let mut core = self.core();
         let Core { host, executor } = &mut *core;
-        host.bring_answer_home(&intent, executor);
         if let Some(refusal) = host.refused_from_renderer(&intent) {
             tracing::warn!(
                 "`{}` refused from the webview: {}",
@@ -64,6 +63,21 @@ impl<S: FrameSink> Shell<S> {
         }
         host.run(intent, executor);
         None
+    }
+
+    /// Put the reducer on the session list for the answer banner's rows
+    /// ([`DesktopHost::answer_home`]), under the lock the rows are then
+    /// dispatched under.
+    pub fn answer_home(&self) {
+        let mut core = self.core();
+        let Core { host, executor } = &mut *core;
+        host.answer_home(executor);
+    }
+
+    /// The reducer's current screen id, for a test to read.
+    #[must_use]
+    pub fn current_screen(&self) -> String {
+        self.core().host.state().shell.current_screen.clone()
     }
 
     /// Frame what moved since the last tick, and run the effects and deferred
