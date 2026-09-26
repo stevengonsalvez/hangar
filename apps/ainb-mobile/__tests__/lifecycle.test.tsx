@@ -205,3 +205,15 @@ test("a resync request resubscribes from a snapshot", async () => {
   await act(async () => fake.resyncRequired(FAKE_HOST_A));
   await waitFor(() => expect(liveHosts().get(FAKE_HOST_A)?.cursor).toBe(5));
 });
+
+test("a host that fails to connect at launch enters the redial loop", async () => {
+  fake.failNextConnect = 1;
+  const screen = renderRouter("./app", { initialUrl: "/" });
+  await screen.findByText("laptop");
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await act(async () => {
+    jest.advanceTimersByTime(1100); // first redial at 1 s
+  });
+  await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+  expect(await screen.findByTestId("banner-att-1")).toBeTruthy();
+});

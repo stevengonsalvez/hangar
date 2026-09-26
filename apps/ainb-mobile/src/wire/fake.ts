@@ -204,6 +204,7 @@ export class FakeWire implements WireClient {
     this.frame(streamId, { kind: "snapshot_end" });
     // A hyperlink in the pane output, the way any program can print one.
     this.frame(streamId, { kind: "output", data: fromBase64(FIXTURES["f4-osc8"]) });
+    if (this.floodBytesAfterSnapshot > 0) this.frame(streamId, { kind: "output", data: new Uint8Array(this.floodBytesAfterSnapshot).fill(0x2e) });
   }
 
   private denied(sessionKey: SessionKey): FloorDenied {
@@ -224,6 +225,14 @@ export class FakeWire implements WireClient {
     this.emit({ kind: "closed", hostId, code, reason });
   }
 
+  /** Extra bytes of output the fake sends right after each snapshot (before the attach reply is processed). */
+  floodBytesAfterSnapshot = 0;
+  /** When set, the next `terminalAttach` throws once. */
+  failNextAttach = false;
+  /** Deliver the snapshot BEFORE the attach reply (what a real socket can do), not on a microtask after it. */
+  snapshotBeforeReply = false;
+  /** How many attaches this fake has served. */
+  attaches = 0;
   /** When set, the next N `connect` calls fail (the redials that must be rescheduled). */
   failNextConnect = 0;
   /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
@@ -318,6 +327,11 @@ export class FakeWire implements WireClient {
 
   async terminalAttach(req: { hostId: HostId; sessionKey: SessionKey; cols?: number; rows?: number; wantInput?: boolean }): Promise<TerminalAttached> {
     this.connected(req.hostId);
+    this.attaches += 1;
+    if (this.failNextAttach) {
+      this.failNextAttach = false;
+      throw new Error("attach refused");
+    }
     const streamId = this.nextStream++;
     const st: FakeStream = { hostId: req.hostId, sessionKey: req.sessionKey, cols: req.cols ?? 80, rows: req.rows ?? 24, seq: 0, epoch: 0 };
     this.streams.set(streamId, st);
@@ -326,7 +340,8 @@ export class FakeWire implements WireClient {
       floor = { holder: { principal: "device:fake", label: "phone", streamId }, floorGen: floor.floorGen + 1 };
       this.floors.set(req.sessionKey, floor);
     }
-    queueMicrotask(() => this.snapshot(streamId));
+    if (this.snapshotBeforeReply) this.snapshot(streamId);
+    else queueMicrotask(() => this.snapshot(streamId));
     return { streamId, epoch: st.epoch, snapshotSeq: 0, cols: st.cols, rows: st.rows, floor, nativeClients: 1 };
   }
 

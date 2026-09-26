@@ -109,6 +109,7 @@ test("the engine document carries a no-network CSP and disables link activation"
   expect(TERMINAL_HTML).toContain("default-src 'none'");
   expect(TERMINAL_HTML).toContain("frame-src 'none'");
   expect(TERMINAL_HTML).toMatch(/linkHandler:\{activate:/);
+  expect(TERMINAL_HTML).toContain("disableStdin");
 });
 
 test("a link activation reaches the host as a report, and the engine state is reported", async () => {
