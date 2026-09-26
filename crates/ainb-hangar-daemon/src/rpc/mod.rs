@@ -1044,9 +1044,14 @@ fn attention_stream_family(
 ) -> ainb_hangar_proto::devices::EventFamily {
     use ainb_hangar_proto::devices::EventFamily;
     use ainb_hangar_proto::events::HangarEvent;
+    // Named, not defaulted: an event a later change puts on this broadcast
+    // is `Unknown`, which no scope receives, until it is classified here.
     match event {
+        HangarEvent::AttentionRaised { .. } | HangarEvent::AttentionAnswered { .. } => {
+            EventFamily::Attention
+        }
         HangarEvent::ConnectionsChanged { .. } => EventFamily::Connections,
-        _ => EventFamily::Attention,
+        _ => EventFamily::Unknown,
     }
 }
 
@@ -14414,6 +14419,12 @@ mod tests {
                 connections: Vec::new(),
             })
             .unwrap();
+            // An event nobody classified for this stream is `Unknown`, which
+            // no scope receives, the admin included.
+            tx.send(HangarEvent::IssueDeleted {
+                issue_id: ainb_hangar_core::ids::IssueId::from_str("i1").unwrap(),
+            })
+            .unwrap();
             tx.send(HangarEvent::AttentionAnswered {
                 attention_id: "a1".to_string(),
                 by: "tui@host".to_string(),
@@ -14486,6 +14497,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sender, "device:01J0PHONE");
+
+        // #71 review: request_id is global, yet a device cannot read back the
+        // operator's message by reusing its id. The D18 ledger keys the op id
+        // per principal and refuses it as foreign before the message dedupe
+        // is reached; the phone retrying its own id still replays.
+        let send = |caller: auth::Caller, request_id: &'static str| {
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(
+                    &pool,
+                    &req(
+                        methods::FLEET_MESSAGE_SEND,
+                        serde_json::json!({
+                            "actor": "operator",
+                            "targets": ["s1"],
+                            "text": "status?",
+                            "request_id": request_id,
+                        }),
+                    ),
+                    &health(),
+                    &sink(),
+                    &caller,
+                )
+                .await
+            }
+        };
+        let operator = send(auth::Caller::Operator, "req-operator").await;
+        assert!(operator.error.is_none(), "{:?}", operator.error);
+        let stolen = send(phone.clone(), "req-operator").await;
+        assert_eq!(
+            stolen
+                .error
+                .as_ref()
+                .and_then(|e| e.data.as_ref())
+                .map(|data| data["mutation"]["reason"].clone()),
+            Some(serde_json::json!("op_id_foreign")),
+            "{stolen:?}"
+        );
+        assert!(stolen.result.is_none(), "no message leaks back: {stolen:?}");
+        let own = send(phone.clone(), "req-phone").await;
+        assert!(own.error.is_none(), "{:?}", own.error);
+        assert_eq!(
+            own.result.as_ref().unwrap()["message_id"],
+            message_id.as_str()
+        );
     }
 
     /// A store with one fleet session at a known lifecycle clock and
