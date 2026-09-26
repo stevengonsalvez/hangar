@@ -134,3 +134,12 @@ test("the terminal tab shows the engine state and names an ignored link's host",
   await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never?x=1" })));
   expect(await screen.findByText("link ignored: example.invalid")).toBeTruthy();
 });
+
+test("frames that arrive before the attach reply is recorded are replayed, not lost", async () => {
+  // The fake delivers the snapshot on a microtask queued inside terminalAttach,
+  // which can run before the hook's continuation records the stream id.
+  const screen = await openTerminal();
+  await waitFor(() => expect(sinkCalls()).toEqual(SNAPSHOT));
+  await act(async () => bridge.engineMessage!(encode({ t: "stats", bytes: 2560, cols: 57, rows: 38 })));
+  expect(await screen.findByText("engine ready, 2560 B, 57x38")).toBeTruthy();
+});
