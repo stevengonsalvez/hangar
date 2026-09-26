@@ -209,14 +209,14 @@ pub async fn answer(
     // target leaves the row open and answerable later.
     // The pane the row was raised in, from the key ainb handed the agent:
     // aims the delivery ahead of anything discovery or the fleet row say.
-    let pane_key = match AttentionRepo::pane_key(pool, &row.id).await {
-        Ok(key) => key,
+    let pane = match AttentionRepo::pane_fingerprint(pool, &row.id).await {
+        Ok(pane) => pane,
         Err(error) => {
-            tracing::warn!(%error, attention_id = %row.id, "the row's pane key could not be read");
+            tracing::warn!(%error, attention_id = %row.id, "the row's pane could not be read");
             None
         }
     };
-    match resolve_target(&row.session_id, pane_key.as_deref(), &row.cwd).await {
+    match resolve_target(&row.session_id, pane.as_deref(), &row.cwd).await {
         // A row whose session has no pane bound (D14, issue #916) fails here
         // with the router's generic "no live session matched". Replace that
         // with the binding's own sentence so the operator is told which pane is
@@ -228,7 +228,7 @@ pub async fn answer(
         }),
         Target::Send(session) => {
             let session =
-                match with_exact_pane(pool, session, &row.session_id, pane_key.as_deref()).await {
+                match with_exact_pane(pool, session, &row.session_id, pane.as_deref()).await {
                     Ok(session) => session,
                     Err(reason) => return Ok(AnswerResult::NoTarget { reason }),
                 };
@@ -1090,7 +1090,7 @@ pub(crate) fn pick_target(ainb: &[Session], peers: &[Session], session_id: &str)
         .map_or(Pick::None, Pick::Exact)
 }
 
-async fn resolve_target(session_id: &str, pane_key: Option<&str>, cwd: &str) -> Target {
+async fn resolve_target(session_id: &str, pane: Option<&str>, cwd: &str) -> Target {
     let ainb_fut = discover_from_ainb();
     let peers_fut = tokio::task::spawn_blocking(discover_from_peers);
     let (ainb, peers_join) = tokio::join!(ainb_fut, peers_fut);
@@ -1098,14 +1098,15 @@ async fn resolve_target(session_id: &str, pane_key: Option<&str>, cwd: &str) -> 
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
     match pick_target(&ainb, &peers, session_id) {
         Pick::Exact(session) => Target::Send(session),
-        // No discovered session runs under the id, or the row names none:
-        // the pane the row was raised in, when ainb handed the agent its key
-        // and that pane is still up, is still the agent's own.
-        Pick::None => match pane_key {
-            Some(key) => match pane_session_name(key).await {
-                Some(name) => Target::Send(session_on_pane(key, &name, cwd)),
+        // Nothing discovered runs under the id: the pane the row was raised
+        // in still names the agent, as long as the pane is there. That it
+        // still runs the agent's pid, in the same tmux session, is proven by
+        // `with_exact_pane` before anything is typed.
+        Pick::None => match pane.and_then(ainb_fleet_core::send::pane_id_of) {
+            Some(id) => match ainb_fleet_core::send::pane_session(id).await {
+                Some(name) => Target::Send(session_on_pane(&name, cwd)),
                 None => Target::NoTarget(format!(
-                    "the pane {key} the row was raised in is gone: the agent has exited"
+                    "the pane {id} the row was raised in is gone: the agent has exited"
                 )),
             },
             None => Target::NoTarget(
@@ -1115,28 +1116,17 @@ async fn resolve_target(session_id: &str, pane_key: Option<&str>, cwd: &str) -> 
     }
 }
 
-/// The tmux session pane `key` belongs to now, or `None` when no pane runs
-/// under that id.
-async fn pane_session_name(key: &str) -> Option<String> {
-    let output = tokio::process::Command::new("tmux")
-        .args(["display-message", "-p", "-t", key, "#{session_name}"])
-        .output()
-        .await
-        .ok()?;
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && !name.is_empty()).then_some(name)
-}
-
-/// A session standing for the pane `key` in tmux session `name`, for a row
-/// that no discovered session claims: the delivery goes to the pane itself.
-fn session_on_pane(key: &str, name: &str, cwd: &str) -> Session {
+/// The tmux session a row's pane is in, as a send target: nothing discovered
+/// claims it, so it carries no id, and the exact pane is proven from the
+/// row's fingerprint by `with_exact_pane`.
+fn session_on_pane(name: &str, cwd: &str) -> Session {
     Session {
         id: String::new(),
         provider_session_id: None,
         cwd: cwd.to_string(),
         pid: None,
         git_root: None,
-        tmux_session: Some(key.to_string()),
+        tmux_session: Some(name.to_string()),
         workspace_name: Some(name.to_string()),
         worktree_path: None,
         peer_id: None,
@@ -1186,23 +1176,19 @@ async fn with_exact_pane(
     pool: &SqlitePool,
     mut session: Session,
     session_id: &str,
-    pane_key: Option<&str>,
+    pane: Option<&str>,
 ) -> Result<Session, String> {
     let Some(name) = session.tmux_session.clone() else {
         return Ok(session);
     };
-    // A session already standing on the pane (no discovered session claimed
-    // the row) is sent to as it is.
-    if pane_key.is_some_and(|key| key == name) {
-        return Ok(session);
-    }
-    let (hint, lookup_failed) = match pane_key {
-        // The key the hook carried outranks the fleet row: it is the pane the
-        // agent runs in, by the id ainb handed it.
-        Some(key) => (
+    let (hint, lookup_failed) = match pane {
+        // The pane the hook line carried outranks the fleet row: it is the
+        // pane the agent ran in, with the pid and the session start the
+        // resolver proves are still there.
+        Some(fingerprint) => (
             PaneHint {
                 target: None,
-                fingerprint: Some(format!("pane={key}")),
+                fingerprint: Some(fingerprint.to_string()),
             },
             None,
         ),
@@ -1867,12 +1853,12 @@ mod tests {
     }
 
     /// A row nothing discovered claims is still delivered into the pane the
-    /// hook carried the key for: the session stands on that pane, by its id,
-    /// in the tmux session it belongs to.
+    /// hook line carried: the session stands in the tmux session that pane
+    /// is in, with no id, and the exact pane is proven from the fingerprint.
     #[test]
-    fn a_session_standing_on_the_pane_targets_the_pane_by_its_id() {
-        let session = session_on_pane("%9", "dev", "/work/app");
-        assert_eq!(session.tmux_session.as_deref(), Some("%9"));
+    fn a_session_standing_on_the_pane_names_the_tmux_session_it_is_in() {
+        let session = session_on_pane("dev", "/work/app");
+        assert_eq!(session.tmux_session.as_deref(), Some("dev"));
         assert_eq!(session.workspace_name.as_deref(), Some("dev"));
         assert_eq!(session.cwd, "/work/app");
         assert!(session.id.is_empty() && session.provider_session_id.is_none());
