@@ -4797,7 +4797,7 @@ pub(crate) async fn execute_fleet_action(
         None,
     )
     .await
-    .map_err(fleet_repo_err)?;
+    .map_err(action_target_err)?;
     // The fingerprint gate is a STALENESS check for providers whose session row
     // carries the one request they are blocked on. An ACP session can be blocked
     // on SEVERAL at once (an adapter running parallel tool calls raises a
@@ -7170,6 +7170,23 @@ fn action_receipt_wire(
         session_version: row.session_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+/// [`fleet_repo_err`] for the `fleet/action` target check, except that a stale
+/// `expected_version` is a D18 refusal (`-32008`, reason `conflict`) rather
+/// than a malformed request: the client's view of the session moved on, and
+/// a surface renders a refusal where it would show a parameter error as a
+/// bug. The ledger abandons it like the fence refusals, so re-reading the
+/// session and resending under the same request id works.
+fn action_target_err(error: ainb_hangar_store::repo::fleet::FleetRepoError) -> RpcError {
+    use ainb_hangar_store::repo::fleet::FleetRepoError;
+    match error {
+        FleetRepoError::StaleVersion { .. } => mutation::rejected(
+            ainb_hangar_proto::mutation::REASON_CONFLICT,
+            format!("{error}; nothing was done, re-read the session and retry"),
+        ),
+        other => fleet_repo_err(other),
     }
 }
 
@@ -14624,6 +14641,49 @@ mod tests {
         assert!(
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
+        );
+    }
+
+    /// A stale `expected_version` on `fleet/action` is a D18 refusal the phone
+    /// can render (`-32008`, reason `conflict`), not an `INVALID_PARAMS`, and
+    /// it is abandoned in the ledger: no receipt is written, and a retry under
+    /// the SAME request id with the re-read version passes the check.
+    #[tokio::test]
+    async fn a_stale_action_version_is_a_conflict_refusal_that_can_be_retried() {
+        let (_home, store) = fenced_session_store().await;
+        let interrupt = |version: i64| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": version,
+                "request_id": "req-stale-version",
+                "action": {"action": "interrupt"},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_ACTION, interrupt(5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_CONFLICT),
+            "{stale:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-stale-version'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action writes no receipt");
+
+        let retried = call(&store, methods::FLEET_ACTION, interrupt(1)).await;
+        assert_ne!(
+            rejection_reason(&retried).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_CONFLICT),
+            "the refusal was not recorded as this request id's answer: {retried:?}"
+        );
+        assert_ne!(
+            retried.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "the retry is not refused as a reused request id: {retried:?}"
         );
     }
 
