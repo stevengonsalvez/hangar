@@ -23,6 +23,7 @@ pub fn merge_sessions(groups: Vec<Vec<Session>>) -> Vec<Session> {
 
 fn same_identity(a: &Session, b: &Session) -> bool {
     (!a.id.is_empty() && a.id == b.id)
+        || matches!((&a.provider_session_id, &b.provider_session_id), (Some(x), Some(y)) if x == y)
         || matches!((&a.peer_id, &b.peer_id), (Some(x), Some(y)) if x == y)
         || matches!((&a.tmux_session, &b.tmux_session), (Some(x), Some(y)) if x == y)
         || matches!((&a.bg_job_id, &b.bg_job_id), (Some(x), Some(y)) if x == y)
@@ -37,6 +38,7 @@ fn merge_one(a: Session, b: Session) -> Session {
     }
     Session {
         id: a.id,
+        provider_session_id: a.provider_session_id.or(b.provider_session_id),
         cwd: a.cwd,
         pid: a.pid.or(b.pid),
         git_root: a.git_root.or(b.git_root),
@@ -127,6 +129,7 @@ mod tests {
     fn session(cwd: &str, src: SessionSource, pid: Option<u32>) -> Session {
         Session {
             id: format!("{cwd}-{src:?}"),
+            provider_session_id: None,
             cwd: cwd.to_string(),
             pid,
             git_root: None,

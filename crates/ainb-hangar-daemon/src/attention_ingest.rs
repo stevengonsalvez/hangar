@@ -910,6 +910,7 @@ impl AttentionIngest {
 fn session_from(line: &HookEventLine) -> Session {
     Session {
         id: line.session_id.clone(),
+        provider_session_id: None,
         cwd: line.cwd.clone(),
         pid: None,
         git_root: None,

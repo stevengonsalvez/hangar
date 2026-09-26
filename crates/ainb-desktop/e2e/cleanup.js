@@ -7,7 +7,7 @@
 // executable it runs from, and killed by its pid.
 
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +48,10 @@ export function removeStaleWorlds(dir = tmpdir(), now = Date.now()) {
       stale = !Number.isInteger(owner) || !alive(owner);
     } catch {
       try {
-        stale = now - statSync(world).mtimeMs > UNOWNED_GRACE_MS;
+        // The entry itself, not what it points at: a world root is a symlink
+        // (world.js), and one left dangling by a half-finished remove must
+        // still count as stale rather than be skipped for good.
+        stale = now - lstatSync(world).mtimeMs > UNOWNED_GRACE_MS;
       } catch {
         continue;
       }
