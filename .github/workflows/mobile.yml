@@ -89,11 +89,13 @@ jobs:
           export RUSTFLAGS="-C link-arg=-Wl,--gc-sections"
           cargo build --release --lib --target aarch64-linux-android
           cargo build --release --lib --target x86_64-linux-android
-      # 2 MiB per ABI (M1-03). The number is printed either way.
+      # 2 MiB per ABI (M1-03). Both numbers are printed before either fails.
       - name: Size gate, 2 MiB per ABI
         run: |
-          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 2097152 arm64-v8a
-          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 2097152 x86_64
+          rc=0
+          bash scripts/size-gate.sh target/aarch64-linux-android/release/libainb_wire_mobile.so 2097152 arm64-v8a || rc=1
+          bash scripts/size-gate.sh target/x86_64-linux-android/release/libainb_wire_mobile.so 2097152 x86_64 || rc=1
+          exit $rc
 
   ios:
     name: iOS static library (macos-latest)
