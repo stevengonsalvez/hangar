@@ -102,3 +102,17 @@ test("the engine document carries a no-network CSP and disables link activation"
   expect(TERMINAL_HTML).toContain("frame-src 'none'");
   expect(TERMINAL_HTML).toMatch(/linkHandler:\{activate:/);
 });
+
+test("a link activation reaches the host as a report, and the engine state is reported", async () => {
+  const links: string[] = [];
+  const states: string[] = [];
+  render(<TerminalView onSink={() => undefined} onLink={(u) => links.push(u)} onEngine={(st) => states.push(st)} />);
+  await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never" }), "https://evil.example/"));
+  expect(links).toEqual([]);
+  expect(states).toEqual(["dropped message from https://evil.example/"]);
+  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
+  await act(async () => bridge.engineMessage!(encode({ t: "link", uri: "https://example.invalid/never" })));
+  expect(links).toEqual(["https://example.invalid/never"]);
+  expect(states).toEqual(["dropped message from https://evil.example/", "engine ready"]);
+  expect(decodeFromEngine(encode({ t: "link", uri: "x".repeat(2000) }))).toEqual({ t: "link", uri: "x".repeat(512) });
+});
