@@ -55,6 +55,7 @@ fn make_session(name: &str, ws: &str) -> SessionMetadata {
         model_source: ModelSource::Raw,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
