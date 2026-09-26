@@ -1,0 +1,7 @@
+HEARTBEAT 01
+]9999;{"v":1,"state":"working","form":"bare","n":1}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":1}\HEARTBEAT 02
+]9999;{"v":1,"state":"working","form":"bare","n":2}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":2}\HEARTBEAT 03
+]9999;{"v":1,"state":"working","form":"bare","n":3}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":3}\HEARTBEAT 04
+]9999;{"v":1,"state":"working","form":"bare","n":4}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":4}\HEARTBEAT 05
+]9999;{"v":1,"state":"working","form":"bare","n":5}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":5}\HEARTBEAT 06
+]9999;{"v":1,"state":"working","form":"bare","n":6}Ptmux;]9999;{"v":1,"state":"working","form":"dcs","n":6}\]9999;{"v":1,"state":"idle","form":"bare","n":0}done

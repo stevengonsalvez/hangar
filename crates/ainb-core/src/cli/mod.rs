@@ -132,7 +132,21 @@ EXAMPLES:
 
 Without --worktree (or --create-branch) the session runs directly in the
 checkout you point at: it shares that branch, index and working tree with your
-editor and with every other session started there. Prefer --worktree.")]
+editor and with every other session started there. Prefer --worktree.
+
+JSON OUTPUT (ainb --format json run --worktree ...):
+  For programs that start sessions. Needs --worktree or --create-branch, and
+  refuses --attach and --interactive. On success stdout is exactly one JSON
+  object on one line, and every progress message goes to stderr:
+    session_id          string   the ainb session id (UUID)
+    tmux_session_name   string   the tmux session running the agent
+    worktree_path       string   the worktree directory
+    branch              string   the branch the worktree is on
+    claude_session_id   string   the id Claude runs under (Claude only)
+    model               string   the model passed with --model
+  A field with no value is omitted, never null. Fields are only ever added,
+  never renamed or removed. Exit status 0 means the session exists; non-zero
+  means nothing is printed on stdout and the reason is on stderr.")]
 pub struct RunArgs {
     /// Remote repository (e.g., username/repo or full URL)
     #[arg(long)]
@@ -149,6 +163,22 @@ pub struct RunArgs {
     /// Use git worktree for isolation
     #[arg(long)]
     pub worktree: bool,
+
+    /// Base ref the new worktree branch starts from (needs --worktree or --create-branch)
+    //
+    // Default (flag absent): the repository's default branch, which is what
+    // `WorktreeManager::create_worktree` picks when handed no base.
+    #[arg(long, value_name = "REF")]
+    pub base: Option<String>,
+
+    /// Set from the global `--format json`, not a flag of its own.
+    //
+    // For callers that drive `ainb run` as a subprocess (the hangar daemon's
+    // `worktree/create`): stdout carries exactly one JSON object and every
+    // human-readable line moves to stderr. Filled in by the registry from the
+    // parsed `--format`, so `run --help` gains no second JSON switch.
+    #[arg(skip)]
+    pub json: bool,
 
     /// AI tool to use
     #[arg(long, value_enum, default_value_t = Tool::Claude)]
