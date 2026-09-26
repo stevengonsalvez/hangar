@@ -45,6 +45,11 @@ pub struct PeerOpts {
     pub answer_pings: bool,
     pub carrier: CarrierKind,
     pub host_id: HostId,
+    /// Close with this code and reason as soon as the WebSocket opens,
+    /// before any Noise message (a busy or draining host).
+    pub refuse_before_handshake: Option<(u16, String)>,
+    /// Accept the WebSocket and never answer (a black hole).
+    pub hang: bool,
 }
 
 impl Default for PeerOpts {
@@ -53,6 +58,8 @@ impl Default for PeerOpts {
             answer_pings: true,
             carrier: CarrierKind::Lan,
             host_id: HostId::parse(HOST_ID).unwrap(),
+            refuse_before_handshake: None,
+            hang: false,
         }
     }
 }
@@ -189,7 +196,7 @@ fn frames(opcode: Opcode, message: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn serve(
     tcp: tokio::net::TcpStream,
     host_private: Vec<u8>,
@@ -202,6 +209,18 @@ async fn serve(
 ) -> Result<(), String> {
     let ws = tokio_tungstenite::accept_async(tcp).await.map_err(|e| e.to_string())?;
     let (mut sink, mut stream) = ws.split();
+    if let Some((code, reason)) = opts.refuse_before_handshake.clone() {
+        let _ = sink
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(code),
+                reason: reason.into(),
+            })))
+            .await;
+        return Ok(());
+    }
+    if opts.hang {
+        std::future::pending::<()>().await;
+    }
     let prologue_bytes = prologue(opts.carrier, &opts.host_id).unwrap();
     let mut hs = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
         .local_private_key(&host_private)
@@ -214,8 +233,14 @@ async fn serve(
     };
     let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
     if hs.read_message(&msg1, &mut buf).is_err() {
-        // What the daemon does with a key or prologue it cannot open.
-        let _ = sink.send(Message::Close(None)).await;
+        // A Noise failure is 4401 on the daemon (peer_close::UNAUTHENTICATED:
+        // "a Noise failure, a bad token, ...").
+        let _ = sink
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4401),
+                reason: "noise".into(),
+            })))
+            .await;
         return Err("noise msg 1 rejected".into());
     }
     let n = hs.write_message(&[], &mut buf).map_err(|e| e.to_string())?;
