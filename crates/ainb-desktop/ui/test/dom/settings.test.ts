@@ -227,4 +227,14 @@ test("the OpenTelemetry draft survives the page being closed and reopened", asyn
   const again = await open(SETUP);
   assert.equal(again.container.querySelector<HTMLInputElement>('.otel input[type="url"]')?.value, "https://otlp.example.test");
   assert.equal(again.container.querySelector<HTMLInputElement>('.otel input[type="password"]')?.value, "secret");
+
+  // Closed by its own button, the draft is discarded: the token in it is
+  // not kept for a page nobody asked to keep.
+  again.container.querySelector<HTMLButtonElement>("button.close")?.click();
+  cleanup?.();
+  cleanup = undefined;
+  document.body.innerHTML = "";
+  const third = await open(SETUP);
+  assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="url"]')?.value, "");
+  assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="password"]')?.value, "");
 });
