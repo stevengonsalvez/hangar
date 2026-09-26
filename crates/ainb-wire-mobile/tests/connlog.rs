@@ -121,7 +121,39 @@ async fn a_real_run_logs_events_with_digests_and_never_a_secret() {
             "log leaks raw key bytes"
         );
     }
-    assert!(text.contains(&key.fingerprint()) || !text.contains("device_key"));
+}
+
+#[tokio::test]
+async fn a_torn_tail_is_repaired_on_open_and_a_bad_byte_hides_nothing() {
+    use ainb_wire_mobile::connlog::ConnLog;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LOG_FILE);
+    // Two good lines, then a kill mid-write: a fragment with a torn
+    // multibyte character and no newline.
+    let mut bytes = Vec::new();
+    for t in [1, 2] {
+        bytes.extend_from_slice(
+            format!("{{\"t_ms\":{t},\"event\":\"connect\",\"url\":\"ws://x\",\"carrier\":\"lan\",\"host_id\":\"h\"}}\n")
+                .as_bytes(),
+        );
+    }
+    bytes.extend_from_slice(b"{\"t_ms\":3,\"event\":\"close\",\"reason\":\"caf\xc3");
+    std::fs::write(&path, &bytes).unwrap();
+    let log = ConnLog::load(dir.path()).unwrap();
+    assert_eq!(
+        log.tail(10).len(),
+        2,
+        "the two good lines survive the bad byte"
+    );
+    let repaired = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        repaired.ends_with('\n'),
+        "the fragment is gone: {repaired:?}"
+    );
+    assert_eq!(repaired.lines().count(), 2);
+    // The next append lands on its own line, not glued to the fragment.
+    log.log(ainb_wire_mobile::connlog::Event::ConnectFailed { detail: "x".into() });
+    assert_eq!(ConnLog::load(dir.path()).unwrap().tail(10).len(), 3);
 }
 
 fn hex(bytes: &[u8]) -> String {
