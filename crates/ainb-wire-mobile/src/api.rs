@@ -287,6 +287,16 @@ pub struct MobileHost {
     session: Arc<Session>,
     hello: HelloSummary,
     streams: Streams,
+    custody_dir: std::path::PathBuf,
+    host_id: String,
+}
+
+/// The re-pair latch: a 4401 or 4403 close from the host sets it on the
+/// pairing record; only a successful pair clears it.
+fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
+    if matches!(err, WireError::Unauthenticated | WireError::Revoked) {
+        let _ = pairing::mark_repair(custody_dir, host_id, true);
+    }
 }
 
 impl std::fmt::Debug for MobileHost {
@@ -330,13 +340,20 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             Some(log),
         )
         .await?;
-        let hello = hello(&session, &token, &record.device_id, &record.display_name)
-            .await
-            .inspect_err(|_| session.close())?;
+        let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
+            Ok(hello) => hello,
+            Err(e) => {
+                session.close();
+                latch_repair(custody_dir, &params.host_id, &e);
+                return Err(e);
+            }
+        };
         Ok(Arc::new(MobileHost {
             session,
             hello,
             streams: Streams::default(),
+            custody_dir: custody_dir.to_path_buf(),
+            host_id: params.host_id.clone(),
         }))
     })
     .await
@@ -615,7 +632,12 @@ impl MobileHost {
                 }
                 SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
                 SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
-                SessionEvent::Closed { code, reason } => WireEvent::Closed { code, reason },
+                SessionEvent::Closed { code, reason } => {
+                    if let Some(closed) = self.session.closed() {
+                        latch_repair(&self.custody_dir, &self.host_id, &closed.error());
+                    }
+                    WireEvent::Closed { code, reason }
+                }
             }
         })
         .await
