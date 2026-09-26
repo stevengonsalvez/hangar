@@ -136,6 +136,8 @@ mod fsm;
 pub mod health_stats;
 /// The minted host identity's boot-time adoption of `local` fleet events (#1066).
 pub mod host_identity;
+/// The host's Noise static key (R1-02). Empty until then.
+mod host_key;
 /// The inbox aggregator: the writer that turns the live event stream into the
 /// durable notification inbox (e38.14).
 ///
@@ -206,6 +208,9 @@ pub mod pal;
 /// tier-5 discovery scan, binds when exactly one pane matches, and leaves the
 /// row `pane_unbound` when zero or two do rather than guessing.
 pub mod pane_binding;
+/// The off-box peer listener (R1-06), bound only when
+/// [`peer_listener::LISTEN_ENV`] is set at boot. Nothing binds in this tree.
+pub mod peer_listener;
 /// `gh`-backed PR status fetch behind an injectable seam (e38.34).
 ///
 /// Fetches a captured PR's CI rollup + mergeability + merge state by shelling out
@@ -365,6 +370,9 @@ pub mod task_executor;
 /// a hard [`templates::TemplateUseError::SkillNotImported`] with a sync hint and
 /// nothing is written. Idempotent by agent name within the workspace.
 pub mod templates;
+/// Terminal streams (R2), served only when [`term::STREAM_ENV`] is set at boot
+/// in a build with the `terminal-stream` feature. Nothing serves in this tree.
+pub mod term;
 /// Danger-full-access warning emission at provider invocation (P5.6).
 pub mod warnings;
 /// The local HTTP webhook ingress for webhook-triggered autopilots (e38.18).

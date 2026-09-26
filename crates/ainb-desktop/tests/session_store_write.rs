@@ -214,7 +214,84 @@ fn a_write_that_failed_before_the_flush_is_counted_as_not_written() {
         1,
         "a write whose failure no screen reported was counted as written"
     );
-    // Counted, not consumed: the report is still there for the next tick.
+    // Counted once: the update, rollback and exit paths each flush, and the
+    // drop flushes again, so a second flush must not count the same write.
+    assert_eq!(
+        executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a second flush counted the same failed write again"
+    );
     let reports = executor.take_deferred();
-    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports.is_empty(),
+        "the counted report was left on the queue: {reports:?}"
+    );
+}
+
+/// P6e: a write still running when a flush gives up is counted then, as not
+/// written. When it fails afterwards it is only logged: a report would make
+/// the next flush (the desktop flushes on several exit paths) count it again.
+///
+/// The write is held on the `sessions.json` lock, taken here, past a short
+/// flush bound; once the lock goes it runs and is refused.
+#[test]
+fn a_write_that_fails_after_the_flush_gave_up_is_not_counted_twice() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    use ainb_app::app::Persist;
+    use ainb_app::interactive::session_manager::{SessionMetadata, SessionStore};
+
+    let home = scratch_home();
+    let tmux = "tmux_desktop-p6e-late-failure".to_string();
+    let mut store = SessionStore::load();
+    store.upsert(SessionMetadata {
+        session_id: uuid::Uuid::new_v4(),
+        tmux_session_name: tmux.clone(),
+        worktree_path: home.join("work"),
+        workspace_name: "ws".to_string(),
+        created_at: serde_json::from_str("\"2026-09-19T00:00:00Z\"").expect("a timestamp"),
+        agent_type: ainb_app::models::session::SessionAgentType::default(),
+        headroom_enabled: true,
+        rtk_enabled: false,
+        skip_permissions: None,
+        model: None,
+        model_source: ainb_app::interactive::session_manager::ModelSource::default(),
+        codex_model: None,
+        codex_thread_id: None,
+    });
+    store.save().expect("seed sessions.json");
+
+    let guard = SessionStore::try_lock()
+        .expect("the sessions.json lock")
+        .expect("the sessions.json lock was already held");
+    let mut executor = ainb_desktop::executor::DesktopExecutor::new(None);
+    // Refused once it runs: the switch is on and this write expects it off.
+    let queued = executor.execute(Effect::Persist(Persist::SessionHeadroom {
+        tmux_session: tmux.clone(),
+        expected: false,
+        enabled: true,
+    }));
+    assert!(
+        queued.is_empty(),
+        "the write reported on the tick: {queued:?}"
+    );
+    assert_eq!(
+        executor.flush_session_store_writes(Duration::from_millis(200)),
+        1,
+        "the held write was not counted when the flush gave up on it"
+    );
+
+    // The write now takes the lock, runs and is refused, on a worker the
+    // flush has let go. It needs nothing but the lock just released.
+    drop(guard);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        executor.flush_session_store_writes(ainb_app::cli::util::SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a write counted when the first flush gave up was counted again"
+    );
+    let reports = executor.take_deferred();
+    assert!(
+        reports.is_empty(),
+        "the late failure was reported: {reports:?}"
+    );
 }

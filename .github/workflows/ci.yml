@@ -56,6 +56,21 @@ jobs:
           # means a fork PR can restore a cache but never write one.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
+      # The peer wire is shared with the phone crate, which cannot be rebuilt
+      # from here, so a dependency that stops compiling for a phone target has
+      # to fail this job, not a mobile build weeks later. `check` needs no
+      # linker, so the ubuntu runner covers the Apple targets too. The targets
+      # are added here, not through the toolchain action: `rust-toolchain.toml`
+      # pins the compiler cargo actually runs, and the action's `stable` is a
+      # different toolchain.
+      - name: The peer wire compiles for the five phone targets
+        run: |
+          targets="aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-linux-android x86_64-linux-android"
+          # shellcheck disable=SC2086
+          rustup target add $targets
+          for target in $targets; do
+            cargo check -p ainb-hangar-noise --target "$target"
+          done
       # An abandoned debugging probe reverts real behaviour while every doc
       # comment, test and help string around it still asserts the fix. Cheap
       # grep, runs in the fastest job.
@@ -243,13 +258,20 @@ jobs:
       #                                matrix, both directions, plus the local leg
       #   capability_catalogue         the removal-fails gate over the catalogue
       #   mutation_dedupe              the walk over the committed MUTATING_METHODS
+      #   wire_contract                the peer wire v1 golden bytes (header,
+      #                                prologue, offer URI, opcode registry)
+      #   scope_catalogue              every method classified per scope, no
+      #                                default, diffed against scopes.catalogue
+      #   v2_contract_dark             the v2-next methods and capabilities stay
+      #                                dark until each phase flips them
       #
       # `--workspace` is required: this repo's default-members covers only
       # ainb-core and ainb-hangar-daemon, and several of these live outside it.
       - run: >
           cargo nextest run --workspace --all-features --no-fail-fast
           -E 'binary(argv_golden_matrix) + binary(migration_upgrade_full_chain) + package(ainb-plugin-cts-v2)
-              + binary(skew_harness) + binary(capability_catalogue) + binary(mutation_dedupe)'
+              + binary(skew_harness) + binary(capability_catalogue) + binary(mutation_dedupe)
+              + binary(wire_contract) + binary(scope_catalogue) + binary(v2_contract_dark)'
 
   # ──────────────────────────────────────────────────────────────────────────
   # The workspace test suite on Linux. The macOS leg is nightly: its measured
