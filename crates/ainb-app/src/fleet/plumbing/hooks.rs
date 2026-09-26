@@ -135,6 +135,141 @@ pub fn managed_entry(event: &str, matcher: &str, hook_script: &str) -> Value {
     })
 }
 
+/// JSON key marking a managed entry as the HTTP transport's (hooks-and-answers).
+///
+/// A second key rather than a new value for [`ATC_MANAGED_KEY`]: a v1.29.0
+/// binary reads that key as a bool, so it still recognises, replaces and
+/// strips these entries. That is the rollback-by-downgrade guarantee.
+pub const HOOK_TRANSPORT_KEY: &str = "_ainb_hook_transport";
+
+/// Which script the managed hooks run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookTransport {
+    /// `notify.sh` on the 30 events in [`ATC_EVENTS`], through notifyd and
+    /// `ainb fleet atc hook`.
+    Legacy,
+    /// `ainb-hook.sh` on the 15 events in
+    /// [`ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS`], posting to the hangar
+    /// daemon's loopback listener.
+    Http,
+}
+
+impl HookTransport {
+    /// The spelling used by `--hooks` and the transport marker file.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Http => "http",
+        }
+    }
+
+    /// Parse `legacy` or `http`.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "legacy" => Some(Self::Legacy),
+            "http" => Some(Self::Http),
+            _ => None,
+        }
+    }
+}
+
+/// Build the HTTP-transport managed entry for `event`, pointing at
+/// `hook_script` (`ainb-hook.sh`). Keeps `AINB_MANAGED=atc` in the command and
+/// the bool [`ATC_MANAGED_KEY`], so every older strip rule still matches it.
+#[must_use]
+pub fn http_managed_entry(event: &str, hook_script: &str) -> Value {
+    let hook_script = shell_quote(hook_script);
+    let command =
+        format!("AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc {hook_script}");
+    json!({
+        ATC_MANAGED_KEY: true,
+        HOOK_TRANSPORT_KEY: HookTransport::Http.as_str(),
+        "matcher": "",
+        "hooks": [
+            { "type": "command", "command": command, "timeout": timeout_for(event) }
+        ]
+    })
+}
+
+/// Which transport the managed entries in `settings` belong to: `Http` if any
+/// entry carries the HTTP marker, `Legacy` if any other managed entry exists,
+/// `None` when nothing is managed.
+#[must_use]
+pub fn installed_transport(settings: &Value) -> Option<HookTransport> {
+    let hooks = settings.get("hooks").and_then(Value::as_object)?;
+    let mut found = None;
+    for arr in hooks.values().filter_map(Value::as_array) {
+        for entry in arr.iter().filter(|e| is_atc_managed(e)) {
+            if entry.get(HOOK_TRANSPORT_KEY).and_then(Value::as_str) == Some("http") {
+                return Some(HookTransport::Http);
+            }
+            found = Some(HookTransport::Legacy);
+        }
+    }
+    found
+}
+
+/// Replace every managed entry with the 15-event HTTP set. Every other hook
+/// (user, reflect, notifyd, the ainb-hooks plugin) is kept verbatim.
+#[must_use]
+pub fn merge_http_into(settings: Value, hook_script: &str) -> Value {
+    let mut settings = strip_managed(settings);
+    let root = settings.as_object_mut().expect("strip_managed returns an object");
+    let hooks = root.entry("hooks").or_insert_with(|| Value::Object(Map::new()));
+    if !hooks.is_object() {
+        *hooks = Value::Object(Map::new());
+    }
+    let hooks = hooks.as_object_mut().expect("ensured object");
+    for event in ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS {
+        let arr = hooks.entry(event.to_string()).or_insert_with(|| Value::Array(Vec::new()));
+        if !arr.is_array() {
+            *arr = Value::Array(Vec::new());
+        }
+        arr.as_array_mut().expect("ensured array").push(http_managed_entry(event, hook_script));
+    }
+    settings
+}
+
+/// Install the legacy set from any starting point. From HTTP it first strips
+/// the HTTP entries, so the result equals a fresh legacy install over the same
+/// user hooks; otherwise it is exactly [`merge_into`].
+#[must_use]
+pub fn merge_legacy_into(settings: Value, hook_script: &str) -> Value {
+    if installed_transport(&settings) == Some(HookTransport::Http) {
+        merge_into(strip_managed(settings), hook_script)
+    } else {
+        merge_into(settings, hook_script)
+    }
+}
+
+/// Remove every managed entry, and drop an event array only when removing
+/// ours emptied it (a user's own empty array is left alone).
+#[must_use]
+pub fn strip_managed(mut settings: Value) -> Value {
+    if !settings.is_object() {
+        return Value::Object(Map::new());
+    }
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return settings;
+    };
+    let mut emptied = Vec::new();
+    for (event, arr) in hooks.iter_mut() {
+        if let Some(a) = arr.as_array_mut() {
+            let before = a.len();
+            a.retain(|e| !is_atc_managed(e));
+            if a.is_empty() && before > 0 {
+                emptied.push(event.clone());
+            }
+        }
+    }
+    for event in emptied {
+        hooks.shift_remove(&event);
+    }
+    settings
+}
+
 /// Merge the ATC lifecycle hooks into a parsed `settings.json` value, preserving
 /// every existing hook (user-authored, reflect, notifyd). Idempotent: a second
 /// call with the same `hook_script` produces an identical result.
@@ -451,5 +586,108 @@ mod tests {
         let merged_once = merge_into(base.clone(), "/x/notify.sh");
         let round = merge_into(strip_from(merged_once.clone()), "/x/notify.sh");
         assert_eq!(merged_once, round);
+    }
+
+    fn managed_events(settings: &Value) -> Vec<String> {
+        settings["hooks"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, arr)| arr.as_array().unwrap().iter().any(is_atc_managed))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    #[test]
+    fn http_set_is_the_fifteen_events_and_keeps_every_other_hook() {
+        let legacy = merge_into(settings_with_reflect_and_notifyd(), "/x/notify.sh");
+        let http = merge_http_into(legacy, "/x/ainb-hook.sh");
+        let mut events = managed_events(&http);
+        events.sort();
+        let mut want: Vec<String> = ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect();
+        want.sort();
+        assert_eq!(events, want);
+        assert!(events.iter().any(|e| e == "Notification"));
+        assert!(events.iter().any(|e| e == "Elicitation"));
+        // No legacy entry survives, and nothing of ours on a dropped event.
+        for event in ["Setup", "PreCompact", "PermissionDenied", "ElicitationResult"] {
+            assert!(
+                commands_for(&http, event).iter().all(|c| !c.contains("AINB_MANAGED")),
+                "{event}"
+            );
+        }
+        assert!(!http["hooks"].as_object().unwrap().contains_key("Setup"));
+        // Reflect and notifyd hooks are untouched.
+        assert!(commands_for(&http, "PreCompact").iter().any(|c| c.contains("precompact_reflect.py")));
+        let stop = commands_for(&http, "Stop");
+        assert!(stop.iter().any(|c| c.contains("stop_reflect.py")));
+        assert!(stop.iter().any(|c| c == "AINB_AGENT=claude /x/notify.sh"));
+        assert!(stop.iter().any(|c| c.contains("ainb-hook.sh")));
+        assert_eq!(installed_transport(&http), Some(HookTransport::Http));
+    }
+
+    #[test]
+    fn http_entries_block_only_on_the_two_holding_events() {
+        let http = merge_http_into(json!({}), "/x/ainb-hook.sh");
+        for event in ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS {
+            let entry = &http["hooks"][event][0];
+            let want = if matches!(event, "PermissionRequest" | "PreToolUse") { 660 } else { 10 };
+            assert_eq!(entry["hooks"][0]["timeout"], want, "{event}");
+            let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+            assert_eq!(
+                cmd,
+                format!("AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc '/x/ainb-hook.sh'")
+            );
+        }
+    }
+
+    #[test]
+    fn an_older_binarys_strip_rule_removes_http_entries() {
+        // v1.29.0 strips by the bool tag or the AINB_MANAGED=atc marker.
+        let http = merge_http_into(settings_with_reflect_and_notifyd(), "/x/ainb-hook.sh");
+        let stripped = strip_from(http);
+        assert_eq!(installed_transport(&stripped), None);
+        assert_eq!(stripped, strip_from(settings_with_reflect_and_notifyd()));
+    }
+
+    #[test]
+    fn legacy_after_http_equals_a_fresh_legacy_install() {
+        let fresh = merge_into(settings_with_reflect_and_notifyd(), "/x/notify.sh");
+        let there = merge_http_into(fresh.clone(), "/x/ainb-hook.sh");
+        let back = merge_legacy_into(there, "/x/notify.sh");
+        assert_eq!(
+            serde_json::to_string_pretty(&back).unwrap(),
+            serde_json::to_string_pretty(&fresh).unwrap()
+        );
+        assert_eq!(installed_transport(&back), Some(HookTransport::Legacy));
+    }
+
+    #[test]
+    fn http_install_is_idempotent() {
+        let once = merge_http_into(settings_with_reflect_and_notifyd(), "/x/ainb-hook.sh");
+        let twice = merge_http_into(once.clone(), "/x/ainb-hook.sh");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn strip_managed_keeps_a_users_own_empty_array() {
+        // An empty array on an event we never manage is the user's; an array
+        // we emptied by removing our own entry goes.
+        let settings = json!({ "hooks": { "SomeFutureEvent": [] } });
+        let merged = merge_into(settings, "/x/notify.sh");
+        let stripped = strip_managed(merged);
+        assert_eq!(stripped["hooks"]["SomeFutureEvent"], json!([]));
+        assert!(!stripped["hooks"].as_object().unwrap().contains_key("Setup"));
+    }
+
+    #[test]
+    fn transport_spellings_round_trip() {
+        for t in [HookTransport::Legacy, HookTransport::Http] {
+            assert_eq!(HookTransport::parse(t.as_str()), Some(t));
+        }
+        assert_eq!(HookTransport::parse("socket"), None);
     }
 }
