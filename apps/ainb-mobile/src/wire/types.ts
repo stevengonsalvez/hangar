@@ -185,8 +185,12 @@ export type WireEvent =
   | { kind: "reachability"; hostId: HostId; reachability: Reachability; sinceMs?: number }
   | { kind: "transcript_line"; hostId: HostId; sessionKey: SessionKey; entry: TranscriptEntry }
   | { kind: "terminal_frame"; hostId: HostId; streamId: number; seq: number; frame: TerminalFrame }
-  /** The socket closed; `code` is the peer close code when there was one (T9). */
-  | { kind: "closed"; hostId: HostId; code?: number; reason?: string }
+  /**
+   * The socket closed (the crate's `WireEvent::Closed`): `code` when the host
+   * sent one, the crate's verdict `retryable` (false for a close the phone
+   * asked for), and `retryAfterMs` from the close reason.
+   */
+  | { kind: "closed"; hostId: HostId; code?: number; reason: string; retryable: boolean; retryAfterMs?: number }
   /** The event stream fell behind: resubscribe from the cursor. */
   | { kind: "lagged"; hostId: HostId }
   /** The daemon asks for a fresh snapshot: resubscribe without a cursor. */
@@ -194,52 +198,61 @@ export type WireEvent =
 
 export type Unsubscribe = () => void;
 
-/** Why a dial failed. Only `network` and a retryable `close` code may ever be redialled. */
-export type PeerCloseKind = "network" | "close" | "peer_changed" | "not_paired" | "custody" | "protocol" | "offer";
+/** The crate's `WireError` variant a failed call maps to (lane E #111). */
+export type WireErrorKind =
+  | "connect"
+  | "peer_changed"
+  | "handshake"
+  | "protocol"
+  | "rpc"
+  | "timeout"
+  | "closed"
+  | "offer"
+  | "custody"
+  | "not_paired";
 
 /**
- * A `connect` that failed, typed so the lifecycle can decide about a redial
- * without guessing. Lane E's `connect_host` answers with a `WireError` and no
- * close event; the adapter maps it to this class as follows:
+ * A failed `connect` (or any facade call), carrying the crate's own verdict
+ * on whether a redial makes sense. The adapter maps `WireError` one to one:
  *
- * | WireError                | kind           | code  | redial                     |
- * |--------------------------|----------------|-------|----------------------------|
- * | Network / Io / Timeout   | `network`      |       | yes, backoff               |
- * | Closed { code, reason }  | `close`        | code  | only 1013, 4429, 4503      |
- * | Revoked (or expired)     | `close`        | 4403  | no, row shows re-pair      |
- * | Unauthenticated          | `close`        | 4401  | no, row shows re-pair      |
- * | Incompatible             | `close`        | 4409  | no, row shows update       |
- * | PeerChanged (key differs)| `peer_changed` |       | no, row latches re-pair    |
- * | NotPaired                | `not_paired`   |       | no                         |
- * | Custody (key store)      | `custody`      |       | no                         |
- * | Protocol (bad frame)     | `protocol`     |       | no                         |
- * | Offer (bad or expired)   | `offer`        |       | no                         |
+ * | WireError                                  | kind           | retryable | retryAfterMs   |
+ * |--------------------------------------------|----------------|-----------|----------------|
+ * | Connect { message }                        | `connect`      | true      |                |
+ * | Timeout { method }                         | `timeout`      | true      |                |
+ * | Closed { code, reason, retryable, retry_after_ms } | `closed` | as given  | as given       |
+ * | PeerChanged                                | `peer_changed` | false     |                |
+ * | Handshake { message }                      | `handshake`    | false     |                |
+ * | Protocol { message }                       | `protocol`     | false     |                |
+ * | Rpc { code, message, reason, data }        | `rpc`          | false     |                |
+ * | Offer { message }                          | `offer`        | false     |                |
+ * | Custody { message }                        | `custody`      | false     |                |
+ * | NotPaired { host_id }                      | `not_paired`   | false     |                |
  *
- * Anything that is not one of these, including a plain `Error`, is treated
- * as "stop": the loop is fail-closed. The latch itself (`HostRow.repair`,
- * `notice`) lives in lane E's pairing record (#98 `mark_repair`) and is read
- * from `hosts()`; the app keeps no copy.
+ * `Closed` with `code: None, retryable: true` is a network loss and redials;
+ * the crate alone decides `retryable` (peer_close.rs T9 for a coded close,
+ * never for a close the phone asked for itself) and `retry_after_ms` (the
+ * `retry-after=<s>` close reason). The app parses nothing and keeps no code
+ * table of its own. The latch itself lives in the crate's pairing record and
+ * is read back as `HostRow.repair`.
  */
 export class PeerCloseError extends Error {
-  readonly kind: PeerCloseKind;
+  readonly kind: WireErrorKind;
   readonly code?: number;
   readonly reason?: string;
-  constructor(kind: PeerCloseKind, code?: number, reason?: string) {
-    super(kind === "close" && code !== undefined ? `peer closed ${code}${reason ? `: ${reason}` : ""}` : `${kind}${reason ? `: ${reason}` : ""}`);
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  constructor(kind: WireErrorKind, opts: { code?: number; reason?: string; retryable?: boolean; retryAfterMs?: number } = {}) {
+    super(
+      kind === "closed"
+        ? `session closed (${opts.code ?? "no code"})${opts.reason ? `: ${opts.reason}` : ""}`
+        : `${kind}${opts.reason ? `: ${opts.reason}` : ""}`,
+    );
     this.name = "PeerCloseError";
     this.kind = kind;
-    this.code = code;
-    this.reason = reason;
-  }
-
-  /** A network failure: the one failure the loop redials on its own. */
-  static network(reason?: string): PeerCloseError {
-    return new PeerCloseError("network", undefined, reason);
-  }
-
-  /** A peer close with a T9 code. */
-  static closed(code: number, reason?: string): PeerCloseError {
-    return new PeerCloseError("close", code, reason);
+    this.code = opts.code;
+    this.reason = opts.reason;
+    this.retryable = opts.retryable ?? (kind === "connect" || kind === "timeout");
+    this.retryAfterMs = opts.retryAfterMs;
   }
 }
 
@@ -319,8 +332,8 @@ export interface WireClient {
   terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome>;
   terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied>;
 
-  /** Lane E's `backoff_delay_ms`: jittered, 1 s doubling to a 60 s ceiling; a host's `retry-after` is a floor under it. */
-  backoffDelayMs(attempt: number, retryAfterSecs?: number): number;
+  /** Lane E's `backoff_delay_ms`: jittered, 1 s doubling to a 60 s ceiling; the host's `retry_after_ms` is a floor under it. */
+  backoffDelayMs(attempt: number, retryAfterMs?: number): number;
 
   connectionLog(): Promise<LogLine[]>;
   deviceKeyFingerprint(): Promise<string>;
