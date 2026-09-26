@@ -94,7 +94,7 @@ fn flush_session_store_writes(handle: &tauri::AppHandle) {
         Some(0) => {}
         Some(dropped) => tracing::warn!(
             dropped,
-            "session-store writes were still queued when the app went"
+            "session-store writes were not written when the app went"
         ),
         None => tracing::warn!(
             "the shell was busy for the whole bound; queued session-store writes were not drained"

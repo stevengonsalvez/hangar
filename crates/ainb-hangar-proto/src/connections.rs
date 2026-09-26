@@ -23,6 +23,9 @@ pub enum SurfaceKind {
     /// inside a TUI or a desktop shell. Its hello names that host separately,
     /// so its own `pid` stays the plugin's and a host is never misnamed.
     Plugin,
+    /// A paired phone on the off-box peer leg (M1). Additive: an older daemon
+    /// decodes it as [`Self::Unknown`].
+    Mobile,
     /// Legacy or unrecognised client which supplied no surface metadata, or a
     /// kind a newer client sends that this build does not know.
     #[serde(other)]
@@ -40,7 +43,48 @@ impl SurfaceKind {
             Self::Cli => "cli",
             Self::Copilot => "copilot",
             Self::Plugin => "plugin",
+            Self::Mobile => "mobile",
             Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl SurfaceKind {
+    /// The kind a LOCAL (unix-leg) hello may claim.
+    ///
+    /// [`Self::Mobile`] is a peer-leg identity the daemon derives from a paired
+    /// device's credential, never a label a local process may give itself, so
+    /// a local claim of it is recorded as [`Self::Unknown`]. Every other kind
+    /// passes through.
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        match self {
+            Self::Mobile => Self::Unknown,
+            other => other,
+        }
+    }
+}
+
+impl SurfaceInfo {
+    /// This surface as a local (unix-leg) hello may declare it; see
+    /// [`SurfaceKind::for_local_leg`].
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        Self {
+            kind: self.kind.for_local_leg(),
+            pid: self.pid,
+        }
+    }
+}
+
+impl SurfaceHost {
+    /// This host claim as a local (unix-leg) hello may declare it; see
+    /// [`SurfaceKind::for_local_leg`].
+    #[must_use]
+    pub const fn for_local_leg(self) -> Self {
+        Self {
+            kind: self.kind.for_local_leg(),
+            pid: self.pid,
         }
     }
 }
@@ -188,6 +232,67 @@ mod tests {
             wire.get("host_surface").is_none(),
             "absent unless a host was verified"
         );
+    }
+
+    /// M1: the phone kind has a stable name, and an older decoder that lacks
+    /// it reads `unknown` (the `#[serde(other)]` arm) instead of failing.
+    #[test]
+    fn the_mobile_kind_is_named_and_additive() {
+        #[derive(Deserialize, Debug, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderKind {
+            Tui,
+            #[serde(other)]
+            Unknown,
+        }
+
+        assert_eq!(
+            serde_json::to_string(&SurfaceKind::Mobile).unwrap(),
+            "\"mobile\""
+        );
+        assert_eq!(SurfaceKind::Mobile.as_str(), "mobile");
+        let back: SurfaceKind = serde_json::from_str("\"mobile\"").unwrap();
+        assert_eq!(back, SurfaceKind::Mobile);
+        let older: OlderKind = serde_json::from_str("\"mobile\"").unwrap();
+        assert_eq!(older, OlderKind::Unknown);
+        assert_ne!(
+            serde_json::from_str::<OlderKind>("\"tui\"").unwrap(),
+            OlderKind::Unknown
+        );
+    }
+
+    /// A local process cannot claim to be a phone: the local leg records the
+    /// claim as `unknown`, and leaves every other kind alone.
+    #[test]
+    fn a_local_hello_cannot_declare_mobile() {
+        assert_eq!(SurfaceKind::Mobile.for_local_leg(), SurfaceKind::Unknown);
+        for kind in [
+            SurfaceKind::Tui,
+            SurfaceKind::Web,
+            SurfaceKind::Desktop,
+            SurfaceKind::Cli,
+            SurfaceKind::Copilot,
+            SurfaceKind::Plugin,
+            SurfaceKind::Unknown,
+        ] {
+            assert_eq!(kind.for_local_leg(), kind);
+        }
+        let info = SurfaceInfo {
+            kind: SurfaceKind::Mobile,
+            pid: 9,
+        };
+        assert_eq!(
+            info.for_local_leg(),
+            SurfaceInfo {
+                kind: SurfaceKind::Unknown,
+                pid: 9
+            }
+        );
+        let host = SurfaceHost {
+            kind: SurfaceKind::Mobile,
+            pid: 4,
+        };
+        assert_eq!(host.for_local_leg().kind, SurfaceKind::Unknown);
     }
 
     #[test]

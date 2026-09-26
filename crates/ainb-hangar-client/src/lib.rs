@@ -23,9 +23,15 @@
 /// The part-2 chat and Pal calls, in their own file so two parallel
 /// landings dedup across a boundary instead of inside one `impl` list.
 mod chat;
+/// Paired hosts: `pair`, `list`, `forget` (R1, lane A). Empty until then.
+pub mod pairings;
+/// The off-box peer transport: WS + Noise IK (R1, lane A). Empty until then.
+pub mod peer;
 /// The one long-lived connection a running surface holds (#963).
 mod presence;
 pub mod reconnect;
+/// Terminal streams over any leg (R2, lane D). Empty until then.
+pub mod terminal;
 
 pub use ainb_hangar_proto::sessions::{
     WorkspaceSessionDeleteParams, WorkspaceSessionDeleteResult, WorkspaceSessionEntry,
