@@ -34,7 +34,9 @@ use ainb_hangar_core::clock::{HangarClock, SystemClock};
 use ainb_hangar_core::token::{TokenKind, mint, sha256_hex};
 use ainb_hangar_proto::auth::{DeviceInfo, HelloParams, HelloResult, UNAUTHORIZED};
 use ainb_hangar_proto::connections::{SurfaceHost, SurfaceInfo};
-use ainb_hangar_proto::devices::{CallParams, DeviceScope, EventFamily, Grantor};
+use ainb_hangar_proto::devices::{
+    BaseScope, CallParams, DeviceScope, EventFamily, Grantor, ScopeColumn,
+};
 use ainb_hangar_proto::fleet::FleetActionParams;
 use ainb_hangar_proto::protocol::{
     PROTOCOL_INCOMPATIBLE, ProtocolRange, catalogue_strings, negotiate,
@@ -167,49 +169,36 @@ impl Caller {
                 data: None,
             }),
             Self::Device { scope, .. } => {
-                let allowed = match method {
-                    methods::FLEET_ACTION => {
-                        match serde_json::from_value::<FleetActionParams>(params.clone()) {
-                            Ok(typed) => ainb_hangar_proto::devices::method_allowed(
-                                scope,
-                                method,
-                                &CallParams::FleetAction(&typed.action),
-                            ),
-                            Err(_) => ainb_hangar_proto::devices::method_allowed(
-                                scope,
-                                method,
-                                &CallParams::Untyped,
-                            ),
-                        }
-                    }
-                    methods::TERMINAL_ATTACH => {
-                        match serde_json::from_value::<TerminalAttachParams>(params.clone()) {
-                            Ok(typed) => ainb_hangar_proto::devices::method_allowed(
-                                scope,
-                                method,
-                                &CallParams::TerminalAttach(&typed),
-                            ),
-                            Err(_) => ainb_hangar_proto::devices::method_allowed(
-                                scope,
-                                method,
-                                &CallParams::Untyped,
-                            ),
-                        }
-                    }
-                    _ => ainb_hangar_proto::devices::method_allowed(
-                        scope,
-                        method,
-                        &CallParams::Untyped,
-                    ),
+                use serde::Deserialize as _;
+                // Typed straight from the borrowed params (no clone); a body
+                // that does not parse is checked as untyped, which the table
+                // answers for the method alone.
+                let action = (method == methods::FLEET_ACTION)
+                    .then(|| FleetActionParams::deserialize(params).ok())
+                    .flatten();
+                let attach = (method == methods::TERMINAL_ATTACH)
+                    .then(|| TerminalAttachParams::deserialize(params).ok())
+                    .flatten();
+                let call = match (&action, &attach) {
+                    (Some(typed), _) => CallParams::FleetAction(&typed.action),
+                    (_, Some(typed)) => CallParams::TerminalAttach(typed),
+                    _ => CallParams::Untyped,
                 };
-                if allowed {
+                if ainb_hangar_proto::devices::method_allowed(scope, method, &call) {
                     Ok(())
                 } else {
+                    // The scope's full name (`desktop+admin`, not `desktop`),
+                    // and "with these params" only when the params decided.
+                    let with_params = if matches!(call, CallParams::Untyped) {
+                        ""
+                    } else {
+                        " with these params"
+                    };
                     Err(RpcError {
                         code: UNAUTHORIZED,
                         message: format!(
-                            "a device with scope {} may not call {method} with these params",
-                            scope.base().as_str()
+                            "a device with scope {} may not call {method}{with_params}",
+                            scope.column().map_or("unknown", ScopeColumn::as_str)
                         ),
                         data: None,
                     })
@@ -236,8 +225,9 @@ impl Caller {
     /// - a device grants only when it is itself `admin`; the scope table
     ///   already refuses `device/*` to non-admins, and this keeps the rule true
     ///   if a row ever changes;
-    /// - no device may change the scope of an `admin` device, so one admin
-    ///   desktop cannot demote another. Only the operator can.
+    /// - a device rescopes only a phone (`mobile` or `mobile+type`, never
+    ///   `admin`), so one admin desktop cannot demote another, nor a plain
+    ///   laptop the operator granted. Only the operator can.
     ///
     /// Pal grants nothing.
     #[must_use]
@@ -245,9 +235,15 @@ impl Caller {
         match self {
             Self::Operator => Grantor::Operator.may_grant(target),
             Self::Pal { .. } => false,
+            // An admin desktop moves a phone between the two phone scopes
+            // and no further (`Grantor::may_grant`): the subject must be a
+            // phone too, so it cannot demote a laptop the operator granted.
             Self::Device { scope, .. } => {
                 scope.admin()
-                    && !subject.is_some_and(DeviceScope::admin)
+                    && subject.is_none_or(|subject| {
+                        !subject.admin()
+                            && matches!(subject.base(), BaseScope::Mobile | BaseScope::MobileType)
+                    })
                     && Grantor::Device(*scope).may_grant(target)
             }
         }
@@ -1085,11 +1081,40 @@ mod tests {
         }
     }
 
-    /// DECISIONS (PR-0 follow-up): a device grants only when it is admin, on
-    /// top of `Grantor::may_grant`, and no device may change an admin device's
-    /// scope, so one admin desktop cannot demote another. The operator can.
+    /// #71 review: a refusal names the scope in full (`desktop+admin`, not
+    /// `desktop`) and says "with these params" only when the params decided.
     #[test]
-    fn only_an_admin_grants_and_no_device_rescopes_an_admin() {
+    fn a_refusal_names_the_full_scope_and_blames_params_only_when_they_decided() {
+        let outright = device(DeviceScope::DESKTOP_ADMIN)
+            .authorize(methods::HANGAR_DAEMON_CONFIG_SET, &serde_json::json!({}))
+            .expect_err("operator-only");
+        assert_eq!(
+            outright.message,
+            "a device with scope desktop+admin may not call hangar/daemon_config_set"
+        );
+        let by_params = device(DeviceScope::MOBILE)
+            .authorize(
+                methods::FLEET_ACTION,
+                &serde_json::json!({
+                    "session_key": "s1",
+                    "expected_version": 1,
+                    "request_id": "r1",
+                    "action": {"action": "kill"},
+                }),
+            )
+            .expect_err("a phone may not kill");
+        assert!(
+            by_params.message.ends_with("with these params"),
+            "{}",
+            by_params.message
+        );
+    }
+
+    /// DECISIONS (PR-0 follow-up): a device grants only when it is admin, on
+    /// top of `Grantor::may_grant`, and rescopes only a phone, so one admin
+    /// desktop cannot demote another or a plain desktop. The operator can.
+    #[test]
+    fn only_an_admin_grants_and_a_device_rescopes_only_phones() {
         let admin = device(DeviceScope::DESKTOP_ADMIN);
         let phone = Some(DeviceScope::MOBILE_TYPE);
         assert!(admin.may_grant(DeviceScope::MOBILE, phone));
@@ -1103,6 +1128,11 @@ mod tests {
             !admin.may_grant(DeviceScope::MOBILE, Some(DeviceScope::DESKTOP_ADMIN)),
             "an admin desktop may not demote another admin"
         );
+        assert!(
+            !admin.may_grant(DeviceScope::MOBILE, Some(DeviceScope::DESKTOP)),
+            "nor a plain desktop the operator granted"
+        );
+        assert!(admin.may_grant(DeviceScope::MOBILE_TYPE, Some(DeviceScope::MOBILE)));
 
         for scope in [
             DeviceScope::DESKTOP,
