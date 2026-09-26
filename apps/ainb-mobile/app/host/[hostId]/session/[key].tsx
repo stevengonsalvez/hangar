@@ -63,14 +63,16 @@ export default function Session() {
       }
     });
 
-  const interruptOp = useRef<string | undefined>(undefined);
+  // One op id per row version: a retry of the same view reuses it, a new version mints anew,
+  // so a stale interrupt can never replay under an id minted for an older row.
+  const interruptOp = useRef<{ version: number; opId: string } | undefined>(undefined);
   const interrupt = () =>
     guarded(async () => {
       if (!hostId || !key || !row) return;
-      interruptOp.current ??= await wire.mintOpId();
+      if (interruptOp.current?.version !== row.version) interruptOp.current = { version: row.version, opId: await wire.mintOpId() };
       // the version of the row the user saw: a stale view is refused, never a null on the wire
-      const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation, version: row.version, opId: interruptOp.current });
-      interruptOp.current = undefined;
+      const ack = await wire.interrupt({ hostId, sessionKey: key, sessionIncarnation: row.sessionIncarnation, version: row.version, opId: interruptOp.current.opId });
+      if (ack.status === "accepted") interruptOp.current = undefined;
       setNotice(ack.status === "accepted" ? "Interrupted" : `Not interrupted: ${ack.reason ?? ack.status}`);
     });
 
