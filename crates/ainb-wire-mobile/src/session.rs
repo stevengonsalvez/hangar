@@ -153,33 +153,23 @@ pub struct Closed {
 }
 
 impl Closed {
-    /// The error a call on this closed session gets.
+    /// The error a call on this closed session gets: [`WireError::Closed`]
+    /// with the code and the crate's classification of it.
     #[must_use]
     pub fn error(&self) -> WireError {
-        let retry_after_ms = self
-            .reason
-            .strip_prefix(peer_close::RETRY_AFTER_PREFIX)
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|secs| secs.saturating_mul(1000));
-        match self.code {
-            Some(peer_close::UNAUTHENTICATED) => WireError::Unauthenticated,
-            Some(peer_close::REVOKED) => WireError::Revoked,
-            Some(peer_close::PROTOCOL_INCOMPATIBLE) => WireError::Incompatible,
-            Some(peer_close::RATE_LIMITED) => WireError::RateLimited { retry_after_ms },
-            Some(peer_close::OVER_CAPACITY) => WireError::OverCapacity { retry_after_ms },
-            Some(peer_close::DRAINING) => WireError::Draining,
-            code => WireError::Closed {
-                code,
-                reason: self.reason.clone(),
-            },
+        let (retryable, retry_after_ms) = classify_close(self.code, &self.reason);
+        WireError::Closed {
+            code: self.code,
+            reason: self.reason.clone(),
+            retryable,
+            retry_after_ms,
         }
     }
 
-    /// The error for a close that arrived before Noise message 2, classified
-    /// by its code: only an identity refusal (4401, the daemon's word for a
-    /// Noise failure) is [`WireError::PeerChanged`]; a revocation, an
-    /// incompatible protocol, a busy or draining host keep their meaning; a
-    /// close with no code is a network loss and retryable.
+    /// The error for a close that arrived before Noise message 2: only an
+    /// identity refusal (4401, the daemon's word for a Noise failure) is
+    /// [`WireError::PeerChanged`]; a close with no code is a network loss;
+    /// every other code keeps its meaning through [`Self::error`].
     #[must_use]
     pub fn handshake_error(&self) -> WireError {
         match self.code {
@@ -189,6 +179,26 @@ impl Closed {
             },
             _ => self.error(),
         }
+    }
+}
+
+/// The one close-code table: whether a close is retryable, and the host's
+/// `retry-after` in milliseconds when the reason names one. No code is a
+/// network loss (retryable); 4429, 1013 and 4503 are retryable; 4401, 4403,
+/// 4409 are not; a code this build does not know is not retryable until a
+/// person looks.
+#[must_use]
+pub fn classify_close(code: Option<u16>, reason: &str) -> (bool, Option<u64>) {
+    let retry_after_ms = reason
+        .strip_prefix(peer_close::RETRY_AFTER_PREFIX)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| secs.saturating_mul(1000));
+    match code {
+        None => (true, None),
+        Some(peer_close::RATE_LIMITED | peer_close::OVER_CAPACITY | peer_close::DRAINING) => {
+            (true, retry_after_ms)
+        }
+        Some(_) => (false, None),
     }
 }
 
@@ -435,7 +445,13 @@ impl Session {
             .map_err(handshake_error)?;
         let mut buf = vec![0u8; MAX_NOISE_MESSAGE];
         let n = hs.write_message(&[], &mut buf).map_err(handshake_error)?;
-        sink.send(Message::Binary(buf[..n].to_vec())).await.map_err(handshake_error)?;
+        // A send that fails here is the socket going away, not a Noise
+        // failure: retryable.
+        sink.send(Message::Binary(buf[..n].to_vec()))
+            .await
+            .map_err(|e| WireError::Connect {
+                message: format!("send of handshake message 1 failed: {e}"),
+            })?;
         let reply = loop {
             match stream.next().await {
                 Some(Ok(Message::Binary(b))) => break b,
@@ -457,7 +473,13 @@ impl Session {
                 Some(Ok(other)) => {
                     return Err(handshake_error(format!("unexpected {other:?}")));
                 }
-                Some(Err(e)) => return Err(handshake_error(e)),
+                // A stream error while waiting for message 2 (a TCP reset,
+                // a torn socket) is a network loss, not an identity failure.
+                Some(Err(e)) => {
+                    return Err(WireError::Connect {
+                        message: format!("connection lost waiting for the handshake reply: {e}"),
+                    });
+                }
             }
         };
         // Message 2 authenticates the responder's static key; a different one
@@ -626,6 +648,8 @@ impl Session {
             || WireError::Closed {
                 code: None,
                 reason: "writer gone".to_owned(),
+                retryable: true,
+                retry_after_ms: None,
             },
             |c| c.error(),
         )
