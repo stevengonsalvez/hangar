@@ -246,15 +246,20 @@ pub fn stamp_rows(
     use ainb_hangar_proto::agent_status::AgentState;
     use std::collections::HashMap;
 
-    // How many rows on each side claim a given cwd. A cwd that is not 1:1 is
-    // not evidence of identity.
+    // How many rows on each side claim a given directory. A directory that
+    // is not 1:1 is not evidence of identity. Counted by the directory's one
+    // spelling (`canonical_dir`): the daemon holds the cwd as the agent
+    // reported it, canonical, and a local row holds the path ainb was given,
+    // and two spellings of one directory counted apart would let either side
+    // look unique and stamp the wrong agent's state.
+    use ainb_fleet_core::read::jsonl_tail::canonical_dir;
     let mut local_per_cwd: HashMap<String, usize> = HashMap::new();
     for row in rows.iter() {
-        *local_per_cwd.entry(row.session.cwd.clone()).or_default() += 1;
+        *local_per_cwd.entry(canonical_dir(&row.session.cwd)).or_default() += 1;
     }
-    let mut daemon_per_cwd: HashMap<&str, usize> = HashMap::new();
+    let mut daemon_per_cwd: HashMap<String, usize> = HashMap::new();
     for row in status {
-        *daemon_per_cwd.entry(row.cwd.as_str()).or_default() += 1;
+        *daemon_per_cwd.entry(canonical_dir(&row.cwd)).or_default() += 1;
     }
 
     let mut claimed = vec![false; rows.len()];
@@ -270,8 +275,9 @@ pub fn stamp_rows(
             .filter(|id| !id.is_empty());
         let by_identity = identity.and_then(|id| rows.iter().position(|row| row.session.id == id));
         let by_unique_cwd = || {
-            (daemon_per_cwd.get(status_row.cwd.as_str()).copied() == Some(1)
-                && local_per_cwd.get(status_row.cwd.as_str()).copied() == Some(1))
+            let key = canonical_dir(&status_row.cwd);
+            (daemon_per_cwd.get(&key).copied() == Some(1)
+                && local_per_cwd.get(&key).copied() == Some(1))
             .then(|| {
                 rows.iter().position(|row| {
                     ainb_fleet_core::read::jsonl_tail::same_dir(&row.session.cwd, &status_row.cwd)
