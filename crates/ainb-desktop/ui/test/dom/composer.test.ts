@@ -127,7 +127,6 @@ test("filling the form and submitting calls worktree_create with the exact args"
       agent: "claude",
       model: null,
       prompt: "fix the login bug",
-      name: null,
     },
   });
 });
