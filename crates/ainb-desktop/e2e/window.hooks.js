@@ -11,6 +11,13 @@
 /** How long the window has to read visible once it has been given a frame. */
 const VISIBLE_WITHIN_MS = 10_000;
 
+/**
+ * A visibility read that runs this long is a page that stopped answering. A
+ * read that throws takes over a second to reject on the embedded driver, so
+ * this sits well clear of that; one that answers takes milliseconds.
+ */
+const SLOW_READ_MS = 5_000;
+
 export const mochaHooks = {
   /**
    * Put the window on screen on macOS, and fail the spec when it will not go.
@@ -26,38 +33,72 @@ export const mochaHooks = {
   async beforeAll() {
     if (process.platform !== "darwin") return;
     await browser.setWindowRect(0, 30, 1280, 800);
+    // What the reads did, kept by the poll itself. wdio's timer rejects at its
+    // deadline without waiting for a read in flight, and waits out a first
+    // read that hangs until the driver's own script timeout, so its rejection
+    // alone cannot tell a hidden window from a page that stopped answering.
     let state = "unknown";
-    // Whether a page read was still running when the wait gave up. wdio's
-    // timer rejects at its deadline without waiting for a read in flight, so
-    // a page that stopped answering would otherwise look like a window that
-    // is still hidden.
-    let reading = false;
+    let answered = false;
+    let lastError = null;
+    let lastReadMs = 0;
+    let inFlight = null;
     try {
       await browser.waitUntil(
         async () => {
-          reading = true;
+          const started = Date.now();
+          const read = browser.execute(() => document.visibilityState);
+          inFlight = { read, started };
           try {
-            state = await browser.execute(() => document.visibilityState);
+            state = await read;
+            answered = true;
+            lastError = null;
+          } catch (error) {
+            lastError = error;
+            throw error;
           } finally {
-            reading = false;
+            lastReadMs = Date.now() - started;
+            inFlight = null;
           }
           return state === "visible";
         },
         { timeout: VISIBLE_WITHIN_MS, interval: 250 },
       );
     } catch (error) {
-      if (reading) {
+      // A read still running at the deadline gets a grace to settle, and is
+      // then judged by what it did rather than by when the timer fired.
+      if (inFlight !== null) {
+        const { read, started } = inFlight;
+        const settled = await Promise.race([
+          read.then(
+            () => true,
+            () => true,
+          ),
+          new Promise((resolve) => setTimeout(() => resolve(false), SLOW_READ_MS)),
+        ]);
+        if (!settled) {
+          throw new Error(
+            `the page did not answer a visibility read for ${((Date.now() - started) / 1000).toFixed(1)} s: ` +
+              "the session or the webview has stopped responding",
+            { cause: error },
+          );
+        }
+        // The late read landed visible: the window made it after all.
+        if (lastError === null && state === "visible") return;
+      }
+      if (lastError !== null && lastReadMs >= SLOW_READ_MS) {
         throw new Error(
-          `the page did not answer a visibility read before the ${VISIBLE_WITHIN_MS / 1000} s wait ran out ` +
-            `(the last answer read "${state}"): the session or the webview has stopped responding`,
-          { cause: error },
+          `the page did not answer a visibility read for ${(lastReadMs / 1000).toFixed(1)} s: ` +
+            "the session or the webview has stopped responding",
+          { cause: lastError },
         );
       }
-      // wdio words its rejection by how the last poll ended: "timed out" when
-      // the page answered and was not visible, "failed with the following
-      // reason" when the last read itself threw.
-      if (!/timed out/i.test(error.message)) {
-        throw new Error(`the window's visibility could not be read: ${error.message}`, { cause: error });
+      if (lastError !== null) {
+        throw new Error(`the window's visibility could not be read: ${lastError.message ?? lastError}`, {
+          cause: lastError,
+        });
+      }
+      if (!answered) {
+        throw new Error(`no visibility read completed in the ${VISIBLE_WITHIN_MS / 1000} s wait`, { cause: error });
       }
       throw new Error(
         `the window is still occluded ${VISIBLE_WITHIN_MS / 1000} s after it was placed on screen ` +
