@@ -115,6 +115,8 @@ export interface MutationAck {
   outcome?: "created" | "replayed";
   status: "accepted" | "rejected" | "unknown";
   reason?: string;
+  /** The JSON-RPC error code behind a refusal: `-32008` MUTATION_REJECTED (stale fence or version, `reason` says which), `-32009` MUTATION_UNKNOWN. */
+  code?: number;
   receipt?: "claimed" | "writing" | "delivered" | "failed" | "unknown";
 }
 
