@@ -25,8 +25,9 @@ const term = new Terminal({
   fontFamily: "Menlo, monospace",
   scrollback: 2000,
   theme: { background: "#191923", foreground: "#DCDCE6" },
-  // OSC 8 links in pane output never activate: the webview must not navigate.
-  linkHandler: { activate: () => undefined },
+  // OSC 8 links in pane output never navigate: the handler only reports the
+  // activation to the host, which shows it and opens nothing either.
+  linkHandler: { activate: (_event, uri) => post({ t: "link", uri }) },
 });
 term.loadAddon(new Unicode11Addon());
 term.unicode.activeVersion = "11";
