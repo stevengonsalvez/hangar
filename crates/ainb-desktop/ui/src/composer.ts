@@ -13,6 +13,8 @@
 // two types are replaced by an import from there, same as `PaletteEntry` is
 // in `palette.ts`.
 
+import { invoke } from "@tauri-apps/api/core";
+import { createSignal, type Accessor } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 
 /** `crates/ainb-hangar-proto/src/spawn.rs::SpawnAgent::tool_arg`, the daemon's
@@ -168,24 +170,28 @@ function textOk(value: string, max: number): boolean {
   return value.trim() !== "" && byteLength(value) <= max && !CONTROL_CHAR.test(value);
 }
 
-/** `ainb_hangar_proto::spawn::ref_ok`'s conservative subset of
- * `git check-ref-format`: no leading `-` (it would reach `ainb run` and git
- * as a flag), no whitespace, no `..`, no `@{`, none of `~^:?*[\`, no leading
- * or trailing `/` or `.`, no `.lock` suffix. */
+/** `ainb_hangar_proto::spawn::ref_ok`: a conservative subset of
+ * `git check-ref-format`, over the whole name and per `/` component.
+ *
+ * Whole name: no leading `-` (it would reach `ainb run` and git as a flag),
+ * no whitespace, none of `~^:?*[\`, no `..`, no `@{`, not `@` alone, no
+ * trailing `/` or `.`. Each component: not empty, no leading `.`, no `.lock`
+ * suffix. The daemon's table of cases (`spawn_validation.json`) pins both
+ * sides to the same answers. */
 function refOk(value: string, max: number): boolean {
   if (!textOk(value, max)) return false;
-  const bad =
+  const wholeBad =
     value.startsWith("-") ||
-    value.startsWith("/") ||
+    value === "@" ||
     value.endsWith("/") ||
-    value.startsWith(".") ||
     value.endsWith(".") ||
-    value.toLowerCase().endsWith(".lock") ||
     value.includes("..") ||
     value.includes("@{") ||
-    value.includes("//") ||
     /[\s~^:?*[\\]/.test(value);
-  return !bad;
+  const partBad = value
+    .split("/")
+    .some((part) => part === "" || part.startsWith(".") || part.toLowerCase().endsWith(".lock"));
+  return !(wholeBad || partBad);
 }
 
 /** The composer's own fields that carry a possible error, so a message can
@@ -279,4 +285,77 @@ export type CreateState =
 export interface PendingWorktree {
   projectPath: string;
   name: string;
+}
+
+/** What the create flow needs from the window it runs in. */
+export interface ComposerFlowDeps {
+  /** The host call. Absent: the real `worktree_create` command. */
+  create?(args: CreateWorktreeArgs): Promise<CreatedWorktree>;
+  /** A failure that lands after the view closed, so it is not lost. */
+  toast(message: string): void;
+  /** Where the keyboard goes when the view closes. */
+  restoreFocus(): void;
+}
+
+/** The composer's open state, its request's progress, and the sidebar's
+ * pending card, with the actions that move them. */
+export interface ComposerFlow {
+  open: Accessor<boolean>;
+  state: Accessor<CreateState>;
+  pending: Accessor<PendingWorktree | null>;
+  openComposer(): void;
+  closeComposer(): void;
+  submit(fields: ComposerFields): void;
+}
+
+/**
+ * The create flow the window runs, in one place so the window and its test
+ * run the same code. The request's progress lives here, not in the view:
+ * Cancel (or Esc) closing the view never stops a create already on the
+ * host, the pending card draws until the host answers, a success closes the
+ * view, and a failure the view is no longer open to show becomes a toast.
+ */
+export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
+  const create = deps.create ?? ((args: CreateWorktreeArgs) => invoke<CreatedWorktree>("worktree_create", { args }));
+  const [open, setOpen] = createSignal(false);
+  const [state, setState] = createSignal<CreateState>({ kind: "idle" });
+  const [pending, setPending] = createSignal<PendingWorktree | null>(null);
+
+  const closeComposer = () => {
+    if (!open()) return;
+    setOpen(false);
+    deps.restoreFocus();
+  };
+  return {
+    open,
+    state,
+    pending,
+    openComposer() {
+      // Reopening over a finished or failed request starts fresh; reopening
+      // over one still running shows it running.
+      if (state().kind !== "creating") setState({ kind: "idle" });
+      setOpen(true);
+    },
+    closeComposer,
+    submit(fields) {
+      // The view disables Create while invalid; this is the same check, so a
+      // stray Enter can never send what the daemon would refuse.
+      if (state().kind === "creating" || validate(fields).length > 0) return;
+      setPending({ projectPath: fields.projectPath, name: fields.name.trim() || "New worktree" });
+      setState({ kind: "creating" });
+      create(toArgs(fields)).then(
+        (result) => {
+          setPending(null);
+          setState({ kind: "done", result });
+          closeComposer();
+        },
+        (error: unknown) => {
+          setPending(null);
+          const message = String(error);
+          setState({ kind: "failed", message });
+          if (!open()) deps.toast(message);
+        },
+      );
+    },
+  };
 }
