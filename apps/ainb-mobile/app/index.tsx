@@ -5,14 +5,14 @@ import { colors } from "../src/theme";
 import { useWireQuery } from "../src/wire/context";
 
 /** Copy for the latch values lane E's record can carry; an unknown value still shows and still blocks. */
-const REPAIR_COPY: Record<string, string> = {
+export const REPAIR_COPY: Record<string, string> = {
   revoked: "revoked or expired, pair again",
-  identity: "host no longer accepts this device, pair again",
+  unauthenticated: "host no longer accepts this device, pair again",
   peer_changed: "host key changed, pair again with a fresh offer",
 };
-const NOTICE_COPY: Record<string, string> = {
-  update_required: "update the app or the host",
-  unknown_close: "closed with an unknown code, check the host",
+export const NOTICE_COPY: Record<string, string> = {
+  incompatible: "update the app or the host",
+  unknown_code: "closed with an unknown code, check the host",
 };
 
 export default function Hosts() {
