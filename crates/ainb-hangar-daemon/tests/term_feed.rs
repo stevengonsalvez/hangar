@@ -21,7 +21,9 @@
 //! * the held grapheme is flushed on idle;
 //! * a session name carrying a quote and a semicolon never reaches the
 //!   control stream, so it cannot inject a command;
-//! * a resize read while the seed is in flight is never lost.
+//! * a resize read while the seed is in flight is never lost;
+//! * a similarly named session never captures the feed (exact match);
+//! * a pane killed inside a multi-pane window ends the feed with pane_gone.
 
 #![cfg(feature = "terminal-stream")]
 
@@ -169,6 +171,20 @@ fn trimmed(rows: Vec<String>) -> Vec<String> {
     rows.into_iter().map(|r| r.trim_end().to_string()).collect()
 }
 
+/// Wait until `row` is on screen. A loaded runner can leave a flooding pane
+/// unchanged for hundreds of milliseconds, so "quiet" alone does not mean
+/// "finished"; the sentinel does.
+fn wait_for_row(tmux: &Tmux, session: &str, row: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline {
+        if tmux.capture(session).iter().any(|r| r == row) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{row} never appeared on screen");
+}
+
 /// Wait until the pane stops changing.
 fn wait_quiet(tmux: &Tmux, session: &str) -> Vec<String> {
     let mut last = tmux.capture(session);
@@ -224,19 +240,16 @@ async fn the_seed_is_ordered_against_the_tail_and_the_feed_never_resizes() {
     // The tail: new output after the seed reaches the emulator in order.
     tmux.send(&session, "for i in 6 7 8; do echo after-$i; done");
     let deadline = Instant::now() + Duration::from_secs(5);
-    let mut saw_output = false;
     loop {
         if let Ok(Ok(FeedEvent::Output { data, .. })) =
             tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
         {
-            saw_output = true;
             if data.windows(7).any(|w| w == b"after-8") {
                 break;
             }
         }
         assert!(Instant::now() < deadline, "tail never arrived");
     }
-    assert!(saw_output);
     // The snapshot's offset equals the bytes the emulator holds, read under
     // the one lock, and matches what the status reports afterwards.
     let (epoch, seq, cols, rows, bytes) = handle.snapshot(0).expect("seeded");
@@ -307,6 +320,7 @@ async fn a_real_pause_is_continued_and_reseeded_with_no_wrong_row() {
         matches!(e, FeedEvent::Seeded { epoch: 2, .. })
     })
     .await;
+    wait_for_row(&tmux, &session, "FLOOD-DONE");
     let expected = wait_quiet(&tmux, &session);
     assert!(expected.iter().any(|r| r == "FLOOD-DONE"), "{expected:?}");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -367,6 +381,9 @@ async fn a_continue_printed_by_the_pane_never_reseeds() {
         commands.iter().filter(|c| c.starts_with("capture-pane")).count(),
         1
     );
+    // The parser lifts those two rows out of the capture reply; the feed
+    // puts them back, so the seeded grid still matches row for row.
+    assert_eq!(rows_of(&handle), trimmed(tmux.capture(&session)));
     handle.stop().await;
 }
 
@@ -641,5 +658,95 @@ async fn a_resize_read_during_the_seed_is_never_lost() {
     assert_eq!(size, (100, 30), "the emulator follows the pane's size");
     assert_eq!(rows_of(&handle), trimmed(tmux.capture(&session)));
     assert_eq!(handle.status().epoch, 1, "no second seed was needed");
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prefix_sibling_session_never_captures_the_feed() {
+    if !Tmux::available() {
+        eprintln!("SKIP: tmux not installed");
+        return;
+    }
+    let mut tmux = Tmux::start();
+    let session = tmux.session("pfx", "sh", 60, 10);
+    // `pfx-<pid>` is a prefix of `pfx-<pid>0`; without `=` tmux would match
+    // the sibling once the watched session is gone.
+    let sibling = format!("{session}0");
+    tmux.cmd(&[
+        "new-session",
+        "-d",
+        "-s",
+        &sibling,
+        "-x",
+        "60",
+        "-y",
+        "10",
+        "sh",
+    ]);
+    tmux.sessions.push(sibling.clone());
+    let handle = FeedHandle::spawn(config(&tmux, &session));
+    let mut rx = handle.subscribe();
+    next_matching(&mut rx, Duration::from_secs(5), |e| {
+        matches!(e, FeedEvent::Seeded { epoch: 1, .. })
+    })
+    .await;
+    tmux.kill_session(&session);
+    let closed = next_matching(&mut rx, Duration::from_secs(10), |e| {
+        matches!(e, FeedEvent::Closed { .. })
+    })
+    .await;
+    assert_eq!(
+        closed,
+        FeedEvent::Closed {
+            reason: "session_gone".to_string()
+        }
+    );
+    assert_eq!(handle.status().epoch, 1, "never re-seeded from the sibling");
+    assert_eq!(handle.status().attaches, 1);
+    handle.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pane_killed_inside_a_multi_pane_window_ends_the_feed_with_pane_gone() {
+    if !Tmux::available() {
+        eprintln!("SKIP: tmux not installed");
+        return;
+    }
+    let mut tmux = Tmux::start();
+    let session = tmux.session("split", "sh", 80, 20);
+    let watched = tmux.cmd(&["display-message", "-p", "-t", &session, "#{pane_id}"]);
+    let watched = watched.trim().to_string();
+    tmux.cmd(&["split-window", "-t", &session, "sh"]);
+    let handle = FeedHandle::spawn(config(&tmux, &watched));
+    let mut rx = handle.subscribe();
+    next_matching(&mut rx, Duration::from_secs(5), |e| {
+        matches!(e, FeedEvent::Seeded { epoch: 1, .. })
+    })
+    .await;
+    // The window stays (the sibling pane keeps it), so tmux sends no
+    // %window-close and no %exit: only the blank size reply says it.
+    eprintln!("kill-pane {watched} on {}", tmux.socket.display());
+    tmux.cmd(&["kill-pane", "-t", &watched]);
+    next_matching(&mut rx, Duration::from_secs(10), |e| {
+        matches!(
+            e,
+            FeedEvent::Gap {
+                reason: GapReason::SessionGone,
+                ..
+            }
+        )
+    })
+    .await;
+    let closed = next_matching(&mut rx, Duration::from_secs(5), |e| {
+        matches!(e, FeedEvent::Closed { .. })
+    })
+    .await;
+    assert_eq!(
+        closed,
+        FeedEvent::Closed {
+            reason: "pane_gone".to_string()
+        }
+    );
+    assert!(handle.status().client_pid.is_none());
     handle.stop().await;
 }
