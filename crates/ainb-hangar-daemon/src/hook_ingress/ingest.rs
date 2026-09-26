@@ -11,19 +11,36 @@
 
 use std::path::{Path, PathBuf};
 
+use ainb_hangar_core::channel::ChannelSet;
+use ainb_hangar_proto::events::HangarEvent;
 use ainb_hangar_proto::hooks::HookSource;
+use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttention};
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 
+use super::hold::{HOLD_DEADLINE, HeldRequest, HoldRegistry};
 use super::{HookEvent, HookReply, HookSink};
 use crate::attention_ingest::AttentionIngest;
+use crate::events::EventSink;
+
+/// `answered_by` on an approval row the agent moved past without an answer
+/// through the daemon (it was answered at the terminal, or the tool ran).
+pub const RESOLVED_BY_AGENT: &str = "resolved:agent";
+/// `answered_by` on an approval row whose hold ended with no decision (the
+/// deadline passed, the hook went away): the agent's own prompt took over.
+pub const RESOLVED_NATIVE: &str = "resolved:native";
 
 /// Largest payload embedded inline in a line, as `ainb fleet atc hook` caps it.
 pub const MAX_INLINE_PAYLOAD: usize = 3 * 1024;
 
-/// Feeds admitted hook calls to the attention ingest.
+/// Feeds admitted hook calls to the attention ingest, and holds the blocking
+/// ones for a human.
 pub struct IngestSink {
     ingest: AttentionIngest,
     hangar_home: PathBuf,
+    pool: SqlitePool,
+    events: EventSink,
+    holds: &'static HoldRegistry,
 }
 
 impl std::fmt::Debug for IngestSink {
@@ -36,12 +53,202 @@ impl std::fmt::Debug for IngestSink {
 
 impl IngestSink {
     /// A sink over its own [`AttentionIngest`] (same pool, event sink and
-    /// paths as the tail's) and the hangar home the sidecars live under.
+    /// paths as the tail's), the hangar home the sidecars live under, and the
+    /// store and event sink approval rows are raised on. Holds go to the
+    /// process's [`super::hold::registry`].
     #[must_use]
-    pub const fn new(ingest: AttentionIngest, hangar_home: PathBuf) -> Self {
+    pub fn new(
+        ingest: AttentionIngest,
+        hangar_home: PathBuf,
+        pool: SqlitePool,
+        events: EventSink,
+    ) -> Self {
+        Self::with_registry(ingest, hangar_home, pool, events, super::hold::registry())
+    }
+
+    /// [`Self::new`] over an explicit registry (tests).
+    #[must_use]
+    pub const fn with_registry(
+        ingest: AttentionIngest,
+        hangar_home: PathBuf,
+        pool: SqlitePool,
+        events: EventSink,
+        holds: &'static HoldRegistry,
+    ) -> Self {
         Self {
             ingest,
             hangar_home,
+            pool,
+            events,
+            holds,
+        }
+    }
+
+    /// Hold a blocking request for a human. `NoContent` for anything that
+    /// does not hold, cannot be registered, or ends without a decision.
+    async fn hold(&self, event: &HookEvent, event_id: &str, now_ms: i64) -> HookReply {
+        let Some(request) = HeldRequest::from_payload(&event.payload) else {
+            return HookReply::NoContent;
+        };
+        let text = |k: &str| event.payload.get(k).and_then(Value::as_str).unwrap_or_default();
+        let session = text("session_id");
+        if session.is_empty() {
+            return HookReply::NoContent;
+        }
+        let key = hold_key(session, &event.payload);
+        let attention_id = match &request {
+            HeldRequest::Permission => {
+                self.raise_approval(event, session, event_id, &key, now_ms).await
+            }
+            // The ingest already raised (or joined) the question's row.
+            HeldRequest::Ask { .. } => AttentionRepo::open_ask_ids_for_session(&self.pool, session)
+                .await
+                .ok()
+                .and_then(|ids| ids.last().cloned()),
+        };
+        let Some(attention_id) = attention_id else {
+            return HookReply::NoContent;
+        };
+        let Some(waiter) = self.holds.register(&key, &attention_id, request) else {
+            tracing::warn!("hook ingress: hold registry full; the agent prompts itself");
+            return HookReply::NoContent;
+        };
+        match waiter.wait(HOLD_DEADLINE).await {
+            Some((request, decision)) => {
+                request.render(&decision).map_or(HookReply::NoContent, HookReply::Json)
+            }
+            None => {
+                // No decision reached this hook: its own prompt takes over.
+                self.retire_approval(&attention_id, RESOLVED_NATIVE).await;
+                HookReply::NoContent
+            }
+        }
+    }
+
+    /// Raise (or find) the `approval` row a Claude permission request holds on.
+    async fn raise_approval(
+        &self,
+        event: &HookEvent,
+        session: &str,
+        event_id: &str,
+        key: &str,
+        now_ms: i64,
+    ) -> Option<String> {
+        let p = &event.payload;
+        let context = json!({
+            "source": "hook_hold",
+            "tool_name": p.get("tool_name"),
+            "tool_input": p.get("tool_input"),
+            "tool_use_id": p.get("tool_use_id"),
+        });
+        let channels: ChannelSet =
+            crate::notify::resolve_channels(&self.pool, AttentionKind::Approval, None).await;
+        let row = NewAttention {
+            id: format!("att:{session}:{event_id}"),
+            session_id: session.to_string(),
+            cwd: p.get("cwd").and_then(Value::as_str).unwrap_or_default().to_string(),
+            workspace_id: None,
+            kind: AttentionKind::Approval,
+            payload: context.to_string(),
+            degraded: false,
+            created_at: now_ms,
+            raise_transcript: p
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            channels,
+        };
+        let request_key = format!("hold:{key}");
+        match AttentionRepo::insert_if_absent(&self.pool, &row, Some(&request_key)).await {
+            Ok(true) => {
+                self.events.emit_attention(HangarEvent::AttentionRaised {
+                    attention_id: row.id.clone(),
+                    session_id: row.session_id.clone(),
+                    workspace_id: None,
+                    kind: AttentionKind::Approval.as_str().to_string(),
+                    degraded: false,
+                    created_at: now_ms,
+                    channels,
+                });
+                Some(row.id)
+            }
+            // A duplicate of a request already open: join its row.
+            Ok(false) => AttentionRepo::open_approval_ids_for_session(&self.pool, session)
+                .await
+                .ok()
+                .and_then(|ids| ids.last().cloned()),
+            Err(e) => {
+                tracing::warn!(error = %e, "hook ingress: approval row insert failed");
+                None
+            }
+        }
+    }
+
+    /// Close an approval row that ended without an answer through the daemon.
+    async fn retire_approval(&self, attention_id: &str, by: &str) {
+        let now =
+            ainb_hangar_core::clock::HangarClock::now_ms(&ainb_hangar_core::clock::SystemClock);
+        if let Ok(Some(row)) = AttentionRepo::get(&self.pool, attention_id).await {
+            if row.kind == AttentionKind::Approval
+                && AttentionRepo::mark_answered_if_open(&self.pool, attention_id, by, "", now)
+                    .await
+                    .unwrap_or(0)
+                    > 0
+            {
+                self.events.emit_attention(HangarEvent::AttentionAnswered {
+                    attention_id: attention_id.to_string(),
+                    by: by.to_string(),
+                });
+            }
+        }
+    }
+
+    /// A status event that shows the agent moved past a held request ends it:
+    /// the same tool's `PostToolUse`/`PostToolUseFailure`, or a new prompt,
+    /// a stop, or the session's end. The hold (if still live) answers `{}`,
+    /// and the approval row it raised is retired, live hold or not.
+    async fn release_passed(&self, event: &HookEvent) {
+        let p = &event.payload;
+        let Some(session) = p.get("session_id").and_then(Value::as_str) else {
+            return;
+        };
+        let name = p.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
+        let this_call = match name {
+            "PostToolUse" | "PostToolUseFailure" => {
+                Some(p.get("tool_use_id").and_then(Value::as_str))
+            }
+            "UserPromptSubmit" | "Stop" | "SessionEnd" => None,
+            _ => return,
+        };
+        let keys = match this_call {
+            Some(_) => vec![hold_key(session, p)],
+            None => self.holds.keys_for_session(session),
+        };
+        for key in keys {
+            self.holds.cancel(&key);
+        }
+        let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await
+        else {
+            return;
+        };
+        for id in open {
+            let Ok(Some(row)) = AttentionRepo::get(&self.pool, &id).await else {
+                continue;
+            };
+            let Ok(payload) = serde_json::from_str::<Value>(&row.payload) else {
+                continue;
+            };
+            if payload.get("source").and_then(Value::as_str) != Some("hook_hold") {
+                continue;
+            }
+            let same_call = match this_call {
+                None => true,
+                Some(call) => payload.get("tool_use_id").and_then(Value::as_str) == call,
+            };
+            if same_call {
+                self.retire_approval(&id, RESOLVED_BY_AGENT).await;
+            }
         }
     }
 }
@@ -58,12 +265,16 @@ impl HookSink for IngestSink {
             let raw = event.payload.to_string();
             let stored = persist_sidecar(&self.hangar_home, &event_id, &raw).is_ok();
             let line = event_line(&event, &event_id, now_ms, &raw, stored);
-            if self.ingest.ingest_line(&line.to_string(), now_ms).await {
-                HookReply::NoContent
+            if !self.ingest.ingest_line(&line.to_string(), now_ms).await {
+                // A store fault: 503 makes a status hook spool the event, and
+                // the next daemon start replays it. A hold never spools.
+                return HookReply::Unavailable;
+            }
+            if event.hold {
+                self.hold(&event, &event_id, now_ms).await
             } else {
-                // A store fault: 503 makes the hook spool the event, and the
-                // next daemon start replays it.
-                HookReply::Unavailable
+                self.release_passed(&event).await;
+                HookReply::NoContent
             }
         })
     }
@@ -114,6 +325,22 @@ pub fn event_line(
         "payload": inline,
         "raw_payload_ref": raw_stored.then_some(event_id),
     })
+}
+
+/// The stable key of one held request: the session and the tool call it is
+/// about (`tool_use_id`), so a duplicate hook for the same call joins the
+/// live hold instead of opening a second one.
+fn hold_key(session: &str, payload: &Value) -> String {
+    let call = payload.get("tool_use_id").and_then(Value::as_str).map_or_else(
+        || {
+            // No id: the tool and its input name the call.
+            let tool = payload.get("tool_name").map(Value::to_string).unwrap_or_default();
+            let input = payload.get("tool_input").map(Value::to_string).unwrap_or_default();
+            format!("{tool}:{input}")
+        },
+        str::to_string,
+    );
+    format!("{session}:{call}")
 }
 
 /// The event's discriminator, read from the payload as `ainb fleet atc hook`
