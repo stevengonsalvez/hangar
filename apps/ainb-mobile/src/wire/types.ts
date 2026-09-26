@@ -25,8 +25,13 @@ export interface HostRow {
    * `identity` (unauthenticated: "identity changed, re-pair"). Kept with
    * the pairing record so it survives a restart; a 4503 rescope never sets it.
    */
-  repair?: "revoked" | "identity";
-  /** A close nobody should redial through: 4409 (update one side) or a code this build does not know. */
+  /** Also `peer_changed`: the host's static key no longer matches the pinned one, a fresh offer and never a redial. Read from lane E's pairing record (#98 `mark_repair`), no copy kept. */
+  repair?: "revoked" | "identity" | "peer_changed";
+  /**
+   * A state nobody should redial through: 4409 (update one side), a code this
+   * build does not know, or a host whose static key no longer matches the
+   * pinned one (`peer_changed`: ask the operator for a fresh offer).
+   */
   notice?: "update_required" | "unknown_close";
 }
 
@@ -189,21 +194,58 @@ export type WireEvent =
 
 export type Unsubscribe = () => void;
 
+/** Why a dial failed. Only `network` and a retryable `close` code may ever be redialled. */
+export type PeerCloseKind = "network" | "close" | "peer_changed" | "not_paired" | "custody" | "protocol" | "offer";
+
 /**
- * A `connect` refused by the peer with a close code (T9): lane E's
- * `connect_host` answers `Err(Revoked)` and friends with no close event, so
- * the code travels on the rejection instead. `code` undefined is a plain
- * network failure, the only kind worth redialling on its own.
+ * A `connect` that failed, typed so the lifecycle can decide about a redial
+ * without guessing. Lane E's `connect_host` answers with a `WireError` and no
+ * close event; the adapter maps it to this class as follows:
+ *
+ * | WireError                | kind           | code  | redial                     |
+ * |--------------------------|----------------|-------|----------------------------|
+ * | Network / Io / Timeout   | `network`      |       | yes, backoff               |
+ * | Closed { code, reason }  | `close`        | code  | only 1013, 4429, 4503      |
+ * | Revoked (or expired)     | `close`        | 4403  | no, row shows re-pair      |
+ * | Unauthenticated          | `close`        | 4401  | no, row shows re-pair      |
+ * | Incompatible             | `close`        | 4409  | no, row shows update       |
+ * | PeerChanged (key differs)| `peer_changed` |       | no, row latches re-pair    |
+ * | NotPaired                | `not_paired`   |       | no                         |
+ * | Custody (key store)      | `custody`      |       | no                         |
+ * | Protocol (bad frame)     | `protocol`     |       | no                         |
+ * | Offer (bad or expired)   | `offer`        |       | no                         |
+ *
+ * Anything that is not one of these, including a plain `Error`, is treated
+ * as "stop": the loop is fail-closed. The latch itself (`HostRow.repair`,
+ * `notice`) lives in lane E's pairing record (#98 `mark_repair`) and is read
+ * from `hosts()`; the app keeps no copy.
  */
 export class PeerCloseError extends Error {
+  readonly kind: PeerCloseKind;
   readonly code?: number;
   readonly reason?: string;
-  constructor(code: number | undefined, reason?: string) {
-    super(code === undefined ? (reason ?? "connect failed") : `peer closed ${code}${reason ? `: ${reason}` : ""}`);
+  constructor(kind: PeerCloseKind, code?: number, reason?: string) {
+    super(kind === "close" && code !== undefined ? `peer closed ${code}${reason ? `: ${reason}` : ""}` : `${kind}${reason ? `: ${reason}` : ""}`);
     this.name = "PeerCloseError";
+    this.kind = kind;
     this.code = code;
     this.reason = reason;
   }
+
+  /** A network failure: the one failure the loop redials on its own. */
+  static network(reason?: string): PeerCloseError {
+    return new PeerCloseError("network", undefined, reason);
+  }
+
+  /** A peer close with a T9 code. */
+  static closed(code: number, reason?: string): PeerCloseError {
+    return new PeerCloseError("close", code, reason);
+  }
+}
+
+/** `instanceof` plus the name, since two copies of this module can exist in one bundle. */
+export function isPeerCloseError(e: unknown): e is PeerCloseError {
+  return e instanceof PeerCloseError || (typeof e === "object" && e !== null && (e as { name?: unknown }).name === "PeerCloseError");
 }
 
 export interface WireClient {
