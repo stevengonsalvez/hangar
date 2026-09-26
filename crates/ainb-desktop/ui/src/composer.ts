@@ -6,50 +6,32 @@
 //   ComposerFields ──validate──▶ FieldError[] (empty = may submit)
 //                  ──toArgs────▶ CreateWorktreeArgs ──invoke("worktree_create")──▶ daemon
 //
-// `CreateWorktreeArgs` and `CreatedWorktree` below mirror
-// `crates/ainb-desktop/src/create.rs` on `desktop/p3b-desktop-create`
-// (`CreateWorktreeArgs`, `CreatedWorktree`). That phase's TypeScript bindings
-// (`bindings/Desktop.ts`) are not on this branch yet; once they land, these
-// two types are replaced by an import from there, same as `PaletteEntry` is
-// in `palette.ts`.
+// `CreateWorktreeArgs`, `CreatedWorktree` and `SpawnAgent` are generated
+// from the host (`bindings/Desktop.ts`), so the payload and the list of
+// agents are written once, in Rust.
 
 import { invoke } from "@tauri-apps/api/core";
 import { createSignal, type Accessor } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
+import type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent } from "../../bindings/Desktop.ts";
 
-/** `crates/ainb-hangar-proto/src/spawn.rs::SpawnAgent::tool_arg`, the daemon's
- * own wire strings for the agent CLIs the composer offers. */
-export type SpawnAgentId = "claude" | "codex" | "gemini" | "copilot" | "antigravity";
+export type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent };
 
-/** The agent segmented control's rows, in the order Orca lists them. */
-export const SPAWN_AGENTS: readonly { id: SpawnAgentId; label: string }[] = [
-  { id: "claude", label: "Claude" },
-  { id: "codex", label: "Codex" },
-  { id: "gemini", label: "Gemini" },
-  { id: "copilot", label: "Copilot" },
-  { id: "antigravity", label: "Antigravity" },
-];
+/** The agent segmented control's labels, in the order Orca lists them. A
+ * `Record` over the generated `SpawnAgent`, so an agent added in Rust fails
+ * the type check here until it has a label. */
+const SPAWN_AGENT_LABELS: Record<SpawnAgent, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  gemini: "Gemini",
+  copilot: "Copilot",
+  antigravity: "Antigravity",
+};
 
-/** Mirrors `crates/ainb-desktop/src/create.rs::CreateWorktreeArgs`; see the
- * module comment. */
-export interface CreateWorktreeArgs {
-  repo_path: string;
-  branch: string | null;
-  base: string | null;
-  agent: SpawnAgentId;
-  model: string | null;
-  prompt: string | null;
-  name: string | null;
-}
-
-/** Mirrors `crates/ainb-desktop/src/create.rs::CreatedWorktree`; see the
- * module comment. */
-export interface CreatedWorktree {
-  session_id: string;
-  tmux_session_name: string;
-  worktree_path: string;
-  branch: string;
-}
+/** The agent segmented control's rows. */
+export const SPAWN_AGENTS: readonly { id: SpawnAgent; label: string }[] = (
+  Object.keys(SPAWN_AGENT_LABELS) as SpawnAgent[]
+).map((id) => ({ id, label: SPAWN_AGENT_LABELS[id] }));
 
 /** The composer's own fields, before anything is derived or sent. Every
  * value is a plain string, even the ones that end up `null` on the wire: a
@@ -63,7 +45,7 @@ export interface ComposerFields {
    * own Branch field is blank. Parsing a `#PR` or a URL out of it is a later
    * phase (reserved, hidden here); a plain name is all this slice reads. */
   name: string;
-  agent: SpawnAgentId;
+  agent: SpawnAgent;
   model: string;
   prompt: string;
   /** Advanced: an explicit branch, overriding the preview. */
@@ -147,7 +129,7 @@ export function effectiveBranch(fields: ComposerFields): string | null {
   return explicit !== "" ? explicit : branchPreview(fields.name);
 }
 
-/** Longest accepted `name`, `branch`, `base` or `model`, in bytes: mirrors
+/** Longest accepted `branch`, `base` or `model`, in bytes: mirrors
  * `ainb_hangar_proto::spawn::SPAWN_FIELD_MAX`. */
 export const SPAWN_FIELD_MAX = 200;
 
@@ -262,10 +244,6 @@ export function toArgs(fields: ComposerFields): CreateWorktreeArgs {
     agent: fields.agent,
     model: trimmedOrNull(fields.model),
     prompt: promptOrNull(fields.prompt),
-    // No field in this slice maps to the daemon's tmux session name: the
-    // Name field only ever feeds the branch preview above. Absent, so the
-    // daemon mints its own `<workspace>-<id8>`.
-    name: null,
   };
 }
 
