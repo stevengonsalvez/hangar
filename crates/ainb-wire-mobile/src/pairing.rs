@@ -110,7 +110,13 @@ fn with_index<T>(
     let out = change(&mut records);
     let tmp = custody_dir.join(format!("{INDEX_FILE}.tmp"));
     let body = serde_json::to_vec_pretty(&records).map_err(index_error)?;
-    std::fs::write(&tmp, body)
+    std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, &body)?;
+            // Durable before the rename: a power loss after the rename
+            // must not leave an empty index behind the new name.
+            f.sync_all()
+        })
         .and_then(|()| std::fs::rename(&tmp, custody_dir.join(INDEX_FILE)))
         .map_err(index_error)?;
     let _ = lock.unlock();
@@ -256,7 +262,18 @@ pub(crate) async fn pair(
     )
     .await;
     session.close();
-    Ok((record, hello?))
+    match hello {
+        Ok(hello) => Ok((record, hello)),
+        Err(e) => {
+            // The pairing stays saved to retry; a 4401 or 4403 on the very
+            // first hello is still the host refusing this device, so the
+            // re-pair latch is set exactly as it would be on a later connect.
+            if matches!(e, WireError::Unauthenticated | WireError::Revoked) {
+                mark_repair(custody_dir, &record.host_id, true)?;
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn redeem(
