@@ -22,7 +22,8 @@ function walk(dir) {
 
 function check(file) {
   const rel = relative(root, file);
-  if (rel.startsWith("src/wire/") || rel.startsWith("scripts/")) return;
+  // src/terminal/engine/ is the webview bridge: app-internal, never the daemon wire.
+  if (rel.startsWith("src/wire/") || rel.startsWith("src/terminal/engine/") || rel.startsWith("scripts/")) return;
   const lines = readFileSync(file, "utf8").split("\n");
   lines.forEach((line, i) => {
     for (const { re, why } of rules) if (re.test(line)) offenders.push(`${rel}:${i + 1}: ${why}`);
