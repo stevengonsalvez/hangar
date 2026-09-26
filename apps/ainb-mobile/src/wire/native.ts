@@ -229,8 +229,8 @@ export function mutationVerdict(e: unknown): MutationAck | undefined {
   if (err?.tag !== "Rpc") return undefined;
   const code = Number(err.inner?.code);
   const reason = err.inner?.reason ?? err.inner?.message;
-  if (code === MUTATION_REJECTED) return { status: "rejected", reason };
-  if (code === MUTATION_UNKNOWN) return { status: "unknown", reason };
+  if (code === MUTATION_REJECTED) return { status: "rejected", reason, code };
+  if (code === MUTATION_UNKNOWN) return { status: "unknown", reason, code };
   return undefined;
 }
 
