@@ -866,7 +866,9 @@ dependencies = [
 name = "ainb-term"
 version = "0.1.0"
 dependencies = [
+ "tattoy-wezterm-escape-parser",
  "tattoy-wezterm-term",
+ "unicode-segmentation",
 ]
 
 [[package]]
