@@ -35,7 +35,7 @@
 //! (`answer_acp`) with the same first-answer-wins claim and no tmux at all.
 
 use ainb_fleet_core::discover::{discover_from_ainb, discover_from_peers, merge_sessions};
-use ainb_fleet_core::send::send;
+use ainb_fleet_core::send::{PaneHint, resolve_send_target, send};
 use ainb_fleet_core::types::{SendOutcome, Session};
 use ainb_hangar_proto::connections::ConnectionRow;
 use ainb_hangar_proto::events::HangarEvent;
@@ -207,7 +207,16 @@ pub async fn answer(
 
     // C1: resolve the delivery target BEFORE claiming, so an ambiguous / dead
     // target leaves the row open and answerable later.
-    match resolve_target(&row.session_id).await {
+    // The pane the row was raised in, from the key ainb handed the agent:
+    // aims the delivery ahead of anything discovery or the fleet row say.
+    let pane_key = match AttentionRepo::pane_key(pool, &row.id).await {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::warn!(%error, attention_id = %row.id, "the row's pane key could not be read");
+            None
+        }
+    };
+    match resolve_target(&row.session_id, pane_key.as_deref(), &row.cwd).await {
         // A row whose session has no pane bound (D14, issue #916) fails here
         // with the router's generic "no live session matched". Replace that
         // with the binding's own sentence so the operator is told which pane is
@@ -218,7 +227,11 @@ pub async fn answer(
                 .unwrap_or(reason),
         }),
         Target::Send(session) => {
-            let session = with_exact_pane(pool, session, &row.session_id).await;
+            let session =
+                match with_exact_pane(pool, session, &row.session_id, pane_key.as_deref()).await {
+                    Ok(session) => session,
+                    Err(reason) => return Ok(AnswerResult::NoTarget { reason }),
+                };
             // Claim the answer. A second surface that also resolved a target loses
             // this flip (0 rows) and delivers nothing.
             if let Some(lost) = claim(pool, params, now_ms).await? {
@@ -1077,7 +1090,7 @@ pub(crate) fn pick_target(ainb: &[Session], peers: &[Session], session_id: &str)
         .map_or(Pick::None, Pick::Exact)
 }
 
-async fn resolve_target(session_id: &str) -> Target {
+async fn resolve_target(session_id: &str, pane_key: Option<&str>, cwd: &str) -> Target {
     let ainb_fut = discover_from_ainb();
     let peers_fut = tokio::task::spawn_blocking(discover_from_peers);
     let (ainb, peers_join) = tokio::join!(ainb_fut, peers_fut);
@@ -1085,30 +1098,129 @@ async fn resolve_target(session_id: &str) -> Target {
     let peers: Vec<Session> = peers_join.ok().and_then(Result::ok).unwrap_or_default();
     match pick_target(&ainb, &peers, session_id) {
         Pick::Exact(session) => Target::Send(session),
-        Pick::None => Target::NoTarget(ainb_fleet_core::types::NO_LIVE_TARGET.to_string()),
+        // No discovered session runs under the id, or the row names none:
+        // the pane the row was raised in, when ainb handed the agent its key
+        // and that pane is still up, is still the agent's own.
+        Pick::None => match pane_key {
+            Some(key) => match pane_session_name(key).await {
+                Some(name) => Target::Send(session_on_pane(key, &name, cwd)),
+                None => Target::NoTarget(format!(
+                    "the pane {key} the row was raised in is gone: the agent has exited"
+                )),
+            },
+            None => Target::NoTarget(
+                ainb_fleet_core::types::no_live_target_reason(session_id).to_string(),
+            ),
+        },
     }
 }
 
-/// `session` with its delivery target narrowed to the hook's own pane.
+/// The tmux session pane `key` belongs to now, or `None` when no pane runs
+/// under that id.
+async fn pane_session_name(key: &str) -> Option<String> {
+    let output = tokio::process::Command::new("tmux")
+        .args(["display-message", "-p", "-t", key, "#{session_name}"])
+        .output()
+        .await
+        .ok()?;
+    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && !name.is_empty()).then_some(name)
+}
+
+/// A session standing for the pane `key` in tmux session `name`, for a row
+/// that no discovered session claims: the delivery goes to the pane itself.
+fn session_on_pane(key: &str, name: &str, cwd: &str) -> Session {
+    Session {
+        id: String::new(),
+        provider_session_id: None,
+        cwd: cwd.to_string(),
+        pid: None,
+        git_root: None,
+        tmux_session: Some(key.to_string()),
+        workspace_name: Some(name.to_string()),
+        worktree_path: None,
+        peer_id: None,
+        bg_job_id: None,
+        transcript_path: None,
+        sources: vec![ainb_fleet_core::types::SessionSource::Ainb],
+        summary: None,
+        last_seen_ms: None,
+    }
+}
+
+/// What the store knows about the agent's pane for `session_id`, and the
+/// lookup failure to say when it knew nothing for that reason.
+async fn pane_hint(pool: &SqlitePool, session_id: &str) -> (PaneHint, Option<String>) {
+    if session_id.is_empty() {
+        return (PaneHint::default(), None);
+    }
+    match FleetRepo::pane_for_provider_session(pool, session_id).await {
+        Ok(Some((target, fingerprint))) => (
+            PaneHint {
+                target,
+                fingerprint,
+            },
+            None,
+        ),
+        Ok(None) => (PaneHint::default(), None),
+        Err(error) => (PaneHint::default(), Some(error.to_string())),
+    }
+}
+
+/// `session` with its delivery target narrowed to the hook's own pane, as a
+/// stable pane id.
 ///
 /// Discovery names the tmux SESSION, and a send to a session lands in its
 /// active pane: with the session split, that is whichever pane the person
 /// last used, not the agent's. The fleet row the hook registered under the
-/// agent's session id carries the exact target (`session:window.pane`), and
-/// that is what the answer is typed into. A row that names none leaves the
-/// session as discovered.
-async fn with_exact_pane(pool: &SqlitePool, mut session: Session, session_id: &str) -> Session {
-    if session_id.is_empty() {
-        return session;
+/// agent's session id carries the pane's fingerprint, whose id tmux never
+/// renumbers, and the index target it was observed at, which tmux does
+/// renumber when a lower pane closes; [`resolve_send_target`] takes the id
+/// first. A row that names no pane, or a store that could not be asked, is
+/// typed into only while the session has exactly one pane.
+///
+/// # Errors
+///
+/// Why nothing may be typed, for the row to stay open with.
+async fn with_exact_pane(
+    pool: &SqlitePool,
+    mut session: Session,
+    session_id: &str,
+    pane_key: Option<&str>,
+) -> Result<Session, String> {
+    let Some(name) = session.tmux_session.clone() else {
+        return Ok(session);
+    };
+    // A session already standing on the pane (no discovered session claimed
+    // the row) is sent to as it is.
+    if pane_key.is_some_and(|key| key == name) {
+        return Ok(session);
     }
-    match FleetRepo::tmux_target_for_provider_session(pool, session_id).await {
-        Ok(Some(target)) => session.tmux_session = Some(target),
-        Ok(None) => {}
-        Err(error) => {
-            tracing::warn!(%error, "the hook's pane could not be read; sending to the session")
+    let (hint, lookup_failed) = match pane_key {
+        // The key the hook carried outranks the fleet row: it is the pane the
+        // agent runs in, by the id ainb handed it.
+        Some(key) => (
+            PaneHint {
+                target: None,
+                fingerprint: Some(format!("pane={key}")),
+            },
+            None,
+        ),
+        None => pane_hint(pool, session_id).await,
+    };
+    if let Some(error) = &lookup_failed {
+        tracing::warn!(%error, "the hook's pane could not be looked up; only a single-pane session is typed into");
+    }
+    match resolve_send_target(&name, &hint).await {
+        Ok(pane) => {
+            session.tmux_session = Some(pane);
+            Ok(session)
         }
+        Err(reason) => Err(match lookup_failed {
+            Some(error) => format!("the agent's pane could not be looked up ({error}); {reason}"),
+            None => reason,
+        }),
     }
-    session
 }
 
 #[cfg(test)]
@@ -1702,6 +1814,79 @@ mod tests {
         let broker = crate::events::EventBroker::new();
         let sink = broker.sink();
         (broker, sink)
+    }
+
+    /// The pane hint is the store's record for the agent's session id; an
+    /// id nothing was recorded for, or none at all, gives an empty hint and
+    /// no lookup failure to report.
+    #[tokio::test]
+    async fn the_pane_hint_is_read_off_the_fleet_row_for_the_session_id() {
+        use ainb_hangar_store::repo::fleet::{
+            FleetSessionPatch, NewFleetEvent, ObservationAuthority,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        FleetRepo::apply_event(
+            store.pool(),
+            &NewFleetEvent {
+                event_id: "e-hint".to_string(),
+                session_key: "claude:sid-hint".to_string(),
+                observed_at: 100,
+                authority: ObservationAuthority::Inferred,
+                event_type: "observation".to_string(),
+                payload: "{}".to_string(),
+                patch: FleetSessionPatch {
+                    provider: Some("claude".to_string()),
+                    provider_session_id: Some("sid-hint".to_string()),
+                    tmux_target: Some("dev:1.1".to_string()),
+                    process_start_fingerprint: Some("pane=%3;pid=9;session_started=8".to_string()),
+                    ..FleetSessionPatch::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        let (hint, failed) = pane_hint(store.pool(), "sid-hint").await;
+        assert_eq!(
+            hint,
+            PaneHint {
+                target: Some("dev:1.1".to_string()),
+                fingerprint: Some("pane=%3;pid=9;session_started=8".to_string()),
+            }
+        );
+        assert_eq!(failed, None);
+        assert_eq!(
+            pane_hint(store.pool(), "sid-unknown").await,
+            (PaneHint::default(), None)
+        );
+        assert_eq!(
+            pane_hint(store.pool(), "").await,
+            (PaneHint::default(), None)
+        );
+    }
+
+    /// A row nothing discovered claims is still delivered into the pane the
+    /// hook carried the key for: the session stands on that pane, by its id,
+    /// in the tmux session it belongs to.
+    #[test]
+    fn a_session_standing_on_the_pane_targets_the_pane_by_its_id() {
+        let session = session_on_pane("%9", "dev", "/work/app");
+        assert_eq!(session.tmux_session.as_deref(), Some("%9"));
+        assert_eq!(session.workspace_name.as_deref(), Some("dev"));
+        assert_eq!(session.cwd, "/work/app");
+        assert!(session.id.is_empty() && session.provider_session_id.is_none());
+    }
+
+    /// A request with no id predates the upgrade; one whose id no session
+    /// runs under names an agent that has exited.
+    #[test]
+    fn the_no_target_reason_tells_the_two_apart() {
+        use ainb_fleet_core::types::{AGENT_EXITED, STARTED_BEFORE_UPGRADE, no_live_target_reason};
+        assert_eq!(no_live_target_reason(""), STARTED_BEFORE_UPGRADE);
+        assert_eq!(no_live_target_reason("claude-uuid"), AGENT_EXITED);
+        assert!(STARTED_BEFORE_UPGRADE.contains("start a new session"));
+        assert!(AGENT_EXITED.contains("exited"));
     }
 
     #[tokio::test]
