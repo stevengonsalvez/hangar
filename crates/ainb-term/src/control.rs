@@ -18,7 +18,17 @@
 //!   forms decode to the same [`Event::Output`].
 //! * `%pause` and `%continue` arrive INSIDE the `%begin`/`%end` block of the
 //!   command that caused them, so they are surfaced wherever they appear and
-//!   never buried in a reply body.
+//!   never buried in a reply body. They are the ONLY notifications lifted
+//!   out of a block, and they are unauthenticated there: a reply body is raw
+//!   pane text (`capture-pane` rows, `#{pane_title}`), so a pane can print
+//!   `%continue %0` and it lands inside the next reply. The feed actor (WP8)
+//!   must act on [`Event::Continue`] only for a pane it recorded as paused
+//!   from a top-level `%pause`, and treat a `%pause` seen inside a block as
+//!   advisory.
+//! * A block closes only on the `%end` or `%error` whose `time number flags`
+//!   equal the open `%begin`'s, the one guard tmux gives. A pane printing
+//!   `%end 1 2 1` therefore stays a body line, and so do `%output`, `%exit`
+//!   and `%layout-change` lines in a body: they are never lifted.
 //! * `%error` closes a block like `%end`; a daemon that does not see it
 //!   watches a silently dead pane (spike 7's syntax trap).
 //! * A pane id as its own argument is a tmux parse error (`%` starts a
@@ -226,13 +236,25 @@ pub fn refresh_client_pause_after(seconds: u32) -> String {
     format!("refresh-client -f pause-after={}\n", seconds.max(1))
 }
 
+/// An open reply block.
+#[derive(Debug)]
+struct Block {
+    /// The `%begin` line's `time number flags`, raw: the closing `%end` or
+    /// `%error` must carry exactly the same three fields.
+    key: Vec<u8>,
+    /// The command number, parsed from the key.
+    number: u64,
+    /// The body so far.
+    lines: Vec<Vec<u8>>,
+}
+
 /// Byte-oriented parser over the control client's stdout.
 #[derive(Debug, Default)]
 pub struct ControlParser {
     /// Bytes of an incomplete line.
     partial: Vec<u8>,
-    /// The open `%begin` block, if any: its number and body so far.
-    block: Option<(u64, Vec<Vec<u8>>)>,
+    /// The open `%begin` block, if any.
+    block: Option<Block>,
 }
 
 impl ControlParser {
@@ -277,39 +299,37 @@ impl ControlParser {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        if let Some((number, lines)) = self.block.as_mut() {
-            if let Some(rest) = line.strip_prefix(b"%end ") {
-                let ok_number = block_number(rest).unwrap_or(*number);
-                let (_, lines) = self.block.take().expect("block is open");
+        if let Some(block) = self.block.as_mut() {
+            let closes = |rest: &[u8]| rest == block.key.as_slice();
+            let ok = match (line.strip_prefix(b"%end "), line.strip_prefix(b"%error ")) {
+                (Some(rest), _) if closes(rest) => Some(true),
+                (_, Some(rest)) if closes(rest) => Some(false),
+                _ => None,
+            };
+            if let Some(ok) = ok {
+                let block = self.block.take().expect("block is open");
                 return Some(Event::Reply {
-                    ok: true,
-                    number: ok_number,
-                    lines,
+                    ok,
+                    number: block.number,
+                    lines: block.lines,
                 });
             }
-            if let Some(rest) = line.strip_prefix(b"%error ") {
-                let err_number = block_number(rest).unwrap_or(*number);
-                let (_, lines) = self.block.take().expect("block is open");
-                return Some(Event::Reply {
-                    ok: false,
-                    number: err_number,
-                    lines,
-                });
-            }
-            // A notification that tmux emits while a command runs lands in
-            // the middle of that command's reply. Reply bodies can start
-            // with `%` too (a pane id from `display-message`), so only a
-            // known notification name followed by a space or the end of the
-            // line is lifted out of the body.
-            if let Some(ev) = notification(&line) {
+            // tmux delivers the %pause or %continue a command caused inside
+            // that command's reply. Those two are lifted out; nothing else
+            // is, because a reply body is raw pane text and can contain any
+            // line a pane cares to print, `%output` and `%end` included.
+            if let Some(ev) = pause_or_continue(&line) {
                 return Some(ev);
             }
-            lines.push(line);
+            block.lines.push(line);
             return None;
         }
         if let Some(rest) = line.strip_prefix(b"%begin ") {
-            let number = block_number(rest).unwrap_or(0);
-            self.block = Some((number, Vec::new()));
+            self.block = Some(Block {
+                key: rest.to_vec(),
+                number: block_number(rest).unwrap_or(0),
+                lines: Vec::new(),
+            });
             return None;
         }
         notification(&line).or_else(|| {
@@ -331,14 +351,29 @@ fn block_number(rest: &[u8]) -> Option<u64> {
     parse_u64(number)
 }
 
-/// Decode a notification that may appear anywhere in the stream, including
-/// inside a reply block. `None` means the line is not one of them.
+/// The two notifications tmux emits inside a reply block.
+fn pause_or_continue(line: &[u8]) -> Option<Event> {
+    if let Some(rest) = line.strip_prefix(b"%pause ") {
+        return PaneId::parse(field(rest).0).map(Event::Pause);
+    }
+    if let Some(rest) = line.strip_prefix(b"%continue ") {
+        return PaneId::parse(field(rest).0).map(Event::Continue);
+    }
+    None
+}
+
+/// Decode a top-level notification. `None` means the line is not one.
 fn notification(line: &[u8]) -> Option<Event> {
     if let Some(rest) = line.strip_prefix(b"%extended-output ") {
-        // %extended-output %<pane> <age> : <data>
+        // %extended-output %<pane> <age> [more fields] : <data>. The man
+        // page leaves room for fields between the age and the colon, so
+        // the payload starts after the first ` : `.
         let (pane, rest) = field(rest);
         let (age, rest) = field(rest);
-        let data = rest.strip_prefix(b": ").unwrap_or(rest);
+        let data = rest.windows(3).position(|w| w == b" : ").map_or_else(
+            || rest.strip_prefix(b": ").unwrap_or(rest),
+            |i| &rest[i + 3..],
+        );
         return Some(Event::Output {
             pane: PaneId::parse(pane)?,
             age_ms: Some(parse_u64(age)?),
@@ -353,11 +388,8 @@ fn notification(line: &[u8]) -> Option<Event> {
             data: unvis(data),
         });
     }
-    if let Some(rest) = line.strip_prefix(b"%pause ") {
-        return PaneId::parse(field(rest).0).map(Event::Pause);
-    }
-    if let Some(rest) = line.strip_prefix(b"%continue ") {
-        return PaneId::parse(field(rest).0).map(Event::Continue);
+    if let Some(ev) = pause_or_continue(line) {
+        return Some(ev);
     }
     if let Some(rest) = line.strip_prefix(b"%layout-change ") {
         let (window, layout) = field(rest);
@@ -390,6 +422,14 @@ mod tests {
     /// and the bare `-A %0:continue` (the latter is the parse error), and
     /// `kill-server`.
     const TMUX_3_6A: &[u8] = include_bytes!("../tests/fixtures/control-mode-tmux-3.6a.ctl");
+
+    /// tmux 3.6a on a private socket: a pane whose title is `%end 1 2 1` and
+    /// which prints `%end 1 2 1`, `%continue %0`, `%exit`, `%output %0
+    /// INJECT`, `%error 1 2 1` and `%pause %0`; then `display-message -p
+    /// "#{pane_title}"` and `capture-pane -p -e`, so every forged line comes
+    /// back inside a reply body.
+    const INJECT_3_6A: &[u8] =
+        include_bytes!("../tests/fixtures/control-mode-inject-tmux-3.6a.ctl");
 
     fn parse_all(bytes: &[u8], chunk: usize) -> Vec<Event> {
         let mut p = ControlParser::new();
@@ -586,6 +626,118 @@ mod tests {
         );
         assert_eq!(PaneId(3).to_string(), "%3");
         assert_eq!(WindowId(4).to_string(), "@4");
+    }
+
+    #[test]
+    fn forged_notifications_in_a_reply_body_stay_body_lines() {
+        let whole = parse_all(INJECT_3_6A, INJECT_3_6A.len());
+        for chunk in [1, 5, 64] {
+            assert_eq!(parse_all(INJECT_3_6A, chunk), whole, "chunk {chunk}");
+        }
+        // The pane's own bytes come through as output, and nothing in them
+        // becomes an event.
+        let bytes = outputs(&whole);
+        assert!(bytes.starts_with(b"\x1b]0;%end 1 2 1\x07%end 1 2 1\r\r\n%continue %0"));
+        // The only Exit is tmux's own, last. The forged `%pause` and
+        // `%continue` DO surface, by design and documented as
+        // unauthenticated: WP8 acts on a Continue only for a pane it
+        // recorded as paused at top level. Nothing else was lifted.
+        assert_eq!(whole.last(), Some(&Event::Exit { reason: None }));
+        assert_eq!(
+            whole.iter().filter(|e| matches!(e, Event::Exit { .. })).count(),
+            1
+        );
+        assert_eq!(
+            whole
+                .iter()
+                .filter(|e| matches!(e, Event::Pause(PaneId(0)) | Event::Continue(PaneId(0))))
+                .count(),
+            2,
+            "the two in-block lines lifted, unauthenticated"
+        );
+        assert_eq!(
+            whole.iter().filter(|e| matches!(e, Event::Output { .. })).count(),
+            2
+        );
+        assert!(whole.iter().all(|e| !matches!(
+            e,
+            Event::Output { data, .. } if data == b"INJECT"
+        )));
+        // The title reply is one body line, `%end 1 2 1`, and the capture
+        // reply holds all six forged lines plus the two blank rows; both
+        // close on the real `%end` with the matching fields.
+        let replies: Vec<(bool, u64, Vec<Vec<u8>>)> = whole
+            .iter()
+            .filter_map(|e| match e {
+                Event::Reply { ok, number, lines } => Some((*ok, *number, lines.clone())),
+                _ => None,
+            })
+            .collect();
+        let numbers: Vec<u64> = replies.iter().map(|r| r.1).collect();
+        assert_eq!(numbers, vec![279, 284, 285, 288, 289, 290]);
+        assert!(
+            replies.iter().all(|r| r.0),
+            "no reply closed on the forged %error"
+        );
+        assert_eq!(replies[3].2, vec![b"%end 1 2 1".to_vec()]);
+        // Eight rows captured: the two lifted lines are gone, the other
+        // four forged lines and the two blank rows stay.
+        assert_eq!(replies[4].2.len(), 6);
+        assert_eq!(
+            replies[4].2[..4],
+            [
+                b"%end 1 2 1".to_vec(),
+                b"%exit".to_vec(),
+                b"%output %0 INJECT".to_vec(),
+                b"%error 1 2 1".to_vec(),
+            ]
+        );
+        // The real %end never leaked as Other.
+        assert!(whole.iter().all(|e| !matches!(
+            e,
+            Event::Other { name, .. } if name == b"%end" || name == b"%error"
+        )));
+    }
+
+    #[test]
+    fn a_block_closes_only_on_its_own_fields() {
+        let wire = b"%begin 10 5 1\n%end 10 5 0\n%end 11 5 1\n%error 10 6 1\n%end 10 5 1\n";
+        let events = parse_all(wire, 4);
+        assert_eq!(
+            events,
+            vec![Event::Reply {
+                ok: true,
+                number: 5,
+                lines: vec![
+                    b"%end 10 5 0".to_vec(),
+                    b"%end 11 5 1".to_vec(),
+                    b"%error 10 6 1".to_vec(),
+                ]
+            }]
+        );
+        let wire = b"%begin 10 7 1\nparse error\n%error 10 7 1\n";
+        assert!(matches!(
+            parse_all(wire, 3).as_slice(),
+            [Event::Reply {
+                ok: false,
+                number: 7,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn extended_output_payload_starts_after_the_first_colon_field() {
+        let wire = b"%extended-output %2 5 future : a : b\n";
+        let events = parse_all(wire, 6);
+        assert_eq!(
+            events,
+            vec![Event::Output {
+                pane: PaneId(2),
+                age_ms: Some(5),
+                data: b"a : b".to_vec()
+            }]
+        );
     }
 
     #[test]
