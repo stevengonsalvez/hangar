@@ -108,6 +108,25 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
   }
 }
 
+/** The shape of a focused element this needs: `document.activeElement` fits. */
+interface FocusedLike {
+  tagName: string;
+  className: string;
+}
+
+/**
+ * Whether `active`, the element with the keyboard, is a text field that is
+ * not the terminal's own: the palette's query, the answer banner's composer,
+ * the settings search. A terminal asked to take focus while one of these has
+ * it would take the keystrokes meant for it (#47), so it stands down.
+ */
+export function keyboardTaken(active: FocusedLike | null | undefined): boolean {
+  if (!active) return false;
+  const tag = active.tagName.toUpperCase();
+  if (tag !== "INPUT" && tag !== "TEXTAREA") return false;
+  return !active.className.split(/\s+/).includes("xterm-helper-textarea");
+}
+
 /** A tracker that answers `true` for the second Esc within `ESC_ESC_MS`. */
 export function escEsc(windowMs = ESC_ESC_MS): (now: number) => boolean {
   let last = -Infinity;

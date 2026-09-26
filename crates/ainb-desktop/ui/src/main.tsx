@@ -40,6 +40,7 @@ import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar
 import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
   accelerator,
+  keyboardTaken,
   openRowIntent,
   rowOf,
   stepTab,
@@ -136,14 +137,29 @@ function Shell() {
   );
   let sidebar: HTMLElement | undefined;
 
+  /**
+   * Give the keyboard to `key`'s terminal, on the next frame so a tab that
+   * was just listed has mounted. Not while the palette is open, and not
+   * while another text field has the keyboard (the answer banner's composer,
+   * the settings search): the host answers a tab open on its own schedule,
+   * and an accelerator lands whenever it is pressed, so either can arrive
+   * after the chord that opened the palette or the click that put the cursor
+   * in the composer. Focus taken then sends the keystrokes meant for that
+   * field, Escape among them, to the agent's pane (#47). The palette gives
+   * the keyboard back to the active tab when it closes.
+   */
+  const focusTab = (key: string) =>
+    requestAnimationFrame(() => {
+      if (!palette() && !keyboardTaken(document.activeElement)) focusers.get(key)?.();
+    });
   const activate = (key: string | null) => {
     setActive(key);
     if (key !== null) {
       setPane("terminal");
       closeTranscript();
       closeSettings();
+      focusTab(key);
     }
-    if (key !== null) requestAnimationFrame(() => focusers.get(key)?.());
   };
   const showTabs = (view: TabsView) => {
     setTabs(view.tabs);
@@ -157,7 +173,7 @@ function Shell() {
       // a terminal; this is the strip tidying up after itself.
       const next = view.tabs[0]?.key ?? null;
       setActive(next);
-      if (next !== null && pane() === "terminal") requestAnimationFrame(() => focusers.get(next)?.());
+      if (next !== null && pane() === "terminal") focusTab(next);
     }
   };
   // A refused intent comes back with the row and the reason: say so, or a

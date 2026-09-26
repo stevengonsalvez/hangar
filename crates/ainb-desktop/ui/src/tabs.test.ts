@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { accelerator, escEsc, openRowIntent, rowOf, stepTab, type Tab } from "./tabs.ts";
+import { accelerator, escEsc, keyboardTaken, openRowIntent, rowOf, stepTab, type Tab } from "./tabs.ts";
 
 const key = (code: string, mods: Partial<{ meta: boolean; ctrl: boolean; shift: boolean; alt: boolean }> = {}) => ({
   code,
@@ -67,4 +67,16 @@ test("a tab reopens through its session-list row", () => {
   assert.deepEqual(openRowIntent({ session: "u-1" }), {
     Command: ["session_list.select_row", { target: { session: "u-1" }, open: true }],
   });
+});
+
+test("a terminal stands down while a text field that is not its own has the keyboard", () => {
+  assert.equal(keyboardTaken({ tagName: "INPUT", className: "palette-query" }), true);
+  assert.equal(keyboardTaken({ tagName: "input", className: "" }), true);
+  assert.equal(keyboardTaken({ tagName: "TEXTAREA", className: "some other" }), true);
+  // The terminal's own textarea is where it wants to be.
+  assert.equal(keyboardTaken({ tagName: "TEXTAREA", className: "xterm-helper-textarea" }), false);
+  // A button, the body, or nothing focused: the terminal may take it.
+  assert.equal(keyboardTaken({ tagName: "BUTTON", className: "session-row" }), false);
+  assert.equal(keyboardTaken({ tagName: "BODY", className: "" }), false);
+  assert.equal(keyboardTaken(null), false);
 });
