@@ -16,12 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ainb_hangar_proto::hooks::{
-    render_headers_file, HookEndpoint, ENDPOINT_FILE_NAME, HEADERS_FILE_NAME, SPOOL_DIR_NAME,
+    ENDPOINT_FILE_NAME, HEADERS_FILE_NAME, HookEndpoint, SPOOL_DIR_NAME, render_headers_file,
 };
 
 const TOKEN: &str = "5e0c8a51-3d7b-4d0e-9c1a-7b4e2f6a9d10";
-const ALLOW: &str =
-    r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
+const ALLOW: &str = r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#;
 
 fn script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -160,12 +159,7 @@ fn fire(home: &Path, event: &str, payload: &str, env: &[(&str, &str)]) -> (Strin
     }
     let started = Instant::now();
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(payload.as_bytes())
-        .unwrap();
+    child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "the hook always exits 0");
     (String::from_utf8(out.stdout).unwrap(), started.elapsed())
@@ -292,14 +286,20 @@ fn with_no_daemon_non_tool_events_spool_and_tool_events_do_not() {
         &[("AINB_PANE_KEY", "v1:p1")],
     );
     assert_eq!(out, "{}\n");
-    assert!(spool_lines(home.path()).is_empty(), "tool events never spool");
+    assert!(
+        spool_lines(home.path()).is_empty(),
+        "tool events never spool"
+    );
     let (out, _) = fire(
         home.path(),
         "PermissionRequest",
         r#"{"hook_event_name":"PermissionRequest","session_id":"s3"}"#,
         &[("AINB_PANE_KEY", "v1:p1")],
     );
-    assert_eq!(out, "{}\n", "a hold with no daemon falls to the agent's prompt");
+    assert_eq!(
+        out, "{}\n",
+        "a hold with no daemon falls to the agent's prompt"
+    );
     let lines = spool_lines(home.path());
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].0, "v1:p1.jsonl");
@@ -318,7 +318,11 @@ fn spool_names_are_sanitised() {
     assert_eq!(lines.len(), 1);
     assert_eq!(lines[0].0, "v1:___a_b_c.jsonl");
     let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
-    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 1, "nothing escaped");
+    assert_eq!(
+        std::fs::read_dir(dir).unwrap().count(),
+        1,
+        "nothing escaped"
+    );
 }
 
 #[test]
@@ -380,13 +384,20 @@ fn the_token_never_appears_in_any_process_argv() {
         .filter(|l| l.contains("curl") && l.contains(&f.port.to_string()))
         .collect();
     assert_eq!(curl.len(), 1, "exactly our curl is running: {ps}");
-    assert!(curl[0].contains("-H @"), "headers come from the file: {}", curl[0]);
+    assert!(
+        curl[0].contains("-H @"),
+        "headers come from the file: {}",
+        curl[0]
+    );
     assert!(
         !ps.contains(TOKEN),
         "the token is visible in some process argv"
     );
     let (out, _) = hook.join().unwrap();
-    assert_eq!(out, "{}\n", "a stalled hold falls back to the agent's prompt");
+    assert_eq!(
+        out, "{}\n",
+        "a stalled hold falls back to the agent's prompt"
+    );
 }
 
 #[test]
