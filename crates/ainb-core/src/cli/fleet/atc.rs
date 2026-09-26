@@ -175,7 +175,16 @@ be removed ({e}); `ainb fleet atc repair {}` re-asserts a single scheduler",
     // Stop hook commits its completion to the parent's inbox. Opt out with
     // `--no-hooks` (tests / poll-only deployments).
     let mut hooks_installed = false;
-    if !matches.get_flag("no-hooks") {
+    let transport = matches
+        .get_one::<String>("hooks")
+        .and_then(|raw| plumbing::hooks::HookTransport::parse(raw))
+        .unwrap_or(plumbing::hooks::HookTransport::Legacy);
+    if !matches.get_flag("no-hooks") && transport == plumbing::hooks::HookTransport::Http {
+        match install_http_hooks() {
+            Ok(()) => hooks_installed = true,
+            Err(e) => eprintln!("warning: http hooks not installed: {e:#}"),
+        }
+    } else if !matches.get_flag("no-hooks") {
         if let Some(home) = dirs::home_dir() {
             let script = ainb_plugin_notifyd::install::canonical_hook_script(
                 &ainb_plugin_notifyd::paths::Paths::under(home.join(".agents-in-a-box")),
@@ -185,8 +194,20 @@ be removed ({e}); `ainb fleet atc repair {}` re-asserts a single scheduler",
             let paths_nd = ainb_plugin_notifyd::paths::Paths::under(home.join(".agents-in-a-box"));
             let _ = ainb_plugin_notifyd::install::extract_hook_script(&paths_nd);
             let _ = ainb_plugin_notifyd::install::extract_hook_bin(&paths_nd);
-            match plumbing::settings::install_claude_hooks(&home, &script) {
-                Ok(_) => hooks_installed = true,
+            match plumbing::settings::install_claude_hooks_for(
+                &home,
+                &script,
+                plumbing::hooks::HookTransport::Legacy,
+            ) {
+                Ok(_) => {
+                    hooks_installed = true;
+                    if let Some(hangar_home) = hook_hangar_home() {
+                        let _ = plumbing::settings::record_transport(
+                            &hangar_home,
+                            plumbing::hooks::HookTransport::Legacy,
+                        );
+                    }
+                }
                 Err(e) => tracing::warn!("failed to install lifecycle hooks: {e}"),
             }
         }
@@ -2731,6 +2752,53 @@ This is ATC's durable, human-readable memory. Append one dated line per action\n
 (cleared / escalated / skipped) so decisions survive context compaction.\n\n\
 - provisioned\n"
     )
+}
+
+
+/// The hangar home a hook script resolves: `$AINB_HANGAR_HOME`, else
+/// `$AINB_HOME`, else `~/.agents-in-a-box` (the same order `ainb-hook.sh`
+/// applies).
+fn hook_hangar_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("AINB_HANGAR_HOME")
+        .or_else(|| std::env::var_os("AINB_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".agents-in-a-box")))
+}
+
+/// `atc setup --hooks=http`: point the managed Claude hooks at `ainb-hook.sh`.
+///
+/// Refuses unless the hangar daemon is publishing its hook endpoint (started
+/// with `AINB_HANGAR_HOOK_LISTEN`), so a session never loses its status to a
+/// spool nothing drains. Rewrites the managed entries in place (15 events),
+/// backs the settings up once, and records the transport so `notify.sh`
+/// stands down. `--hooks=legacy` reverses it.
+fn install_http_hooks() -> anyhow::Result<()> {
+    let home = dirs::home_dir().context("no home directory")?;
+    let hangar_home = hook_hangar_home().context("no hangar home")?;
+    let endpoint = hangar_home
+        .join("hangar")
+        .join(ainb_hangar_proto::hooks::ENDPOINT_FILE_NAME);
+    let text = std::fs::read_to_string(&endpoint).with_context(|| {
+        format!(
+            "the hangar daemon is not publishing a hook endpoint at {}; start it with AINB_HANGAR_HOOK_LISTEN=1",
+            endpoint.display()
+        )
+    })?;
+    let parsed = ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
+        .map_err(|e| anyhow::anyhow!("unreadable hook endpoint {}: {e}", endpoint.display()))?;
+    anyhow::ensure!(
+        parsed.headers_path.exists(),
+        "the hook endpoint names a headers file that does not exist"
+    );
+    let paths = ainb_plugin_notifyd::paths::Paths::under(hangar_home.clone());
+    let script = ainb_plugin_notifyd::install::extract_http_hook_script(&paths)?;
+    plumbing::settings::install_claude_hooks_for(
+        &home,
+        &script,
+        plumbing::hooks::HookTransport::Http,
+    )?;
+    plumbing::settings::record_transport(&hangar_home, plumbing::hooks::HookTransport::Http)?;
+    Ok(())
 }
 
 #[cfg(test)]
