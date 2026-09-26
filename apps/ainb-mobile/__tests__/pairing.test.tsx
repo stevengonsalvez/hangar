@@ -34,7 +34,8 @@ test("a scanned offer fills the field, shows the decoded host, and pairs only on
   fireEvent.press(screen.getByTestId("pair-submit"));
   await waitFor(() => expect(screen).toHavePathname("/"));
   expect(await screen.findByText("phone")).toBeTruthy();
-  expect((await fake.connectionLog()).at(-1)).toMatchObject({ hostId: HOST_C, event: "paired" });
+  // paired, then connected at once (the lifecycle dials a new host without a screen visit)
+  expect((await fake.connectionLog()).slice(-2).map((l) => `${l.hostId?.slice(-5)}:${l.event}`)).toEqual(["CCCCC:paired", "CCCCC:hello"]);
 });
 
 test("a deep link prefills the offer", async () => {
@@ -59,7 +60,7 @@ test("a second offer for the same host with a different key is refused as peer_c
 
 test("a 4403 close latches the host to re-pair; a 4503 does not", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
-  await screen.findByText("mbp");
+  await screen.findByText("laptop");
   fake.closedBy(FAKE_HOST_A, 4503);
   await waitFor(() => expect((screen.getByText("reachable"))).toBeTruthy());
   expect(screen.queryByTestId(`repair-${FAKE_HOST_A}`)).toBeNull();
@@ -80,7 +81,7 @@ test("a 4403 close latches the host to re-pair; a 4503 does not", async () => {
 
 test("a 4401 close latches identity re-pair", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
-  await screen.findByText("mbp");
+  await screen.findByText("laptop");
   fake.closedBy(FAKE_HOST_A, 4401);
   expect(await screen.findByText("host no longer accepts this device, pair again")).toBeTruthy();
   fireEvent.press(screen.getByTestId(`host-${FAKE_HOST_A}`));
@@ -89,7 +90,7 @@ test("a 4401 close latches identity re-pair", async () => {
 
 test("4409 and an unknown close code park the host row without a re-pair latch", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
-  await screen.findByText("gcp");
+  await screen.findByText("server");
   fake.closedBy("01K5B0000000000000000BBBBB", 4409);
   expect(await screen.findByText("update the app or the host")).toBeTruthy();
   fake.closedBy("01K5B0000000000000000BBBBB", 4999);
