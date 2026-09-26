@@ -1031,6 +1031,41 @@ mod tests {
     }
 
     #[test]
+    fn the_close_table_follows_the_proto_and_treats_standard_codes_as_network_loss() {
+        assert_eq!(classify_close(None, "eof"), (true, None));
+        assert_eq!(classify_close(Some(1001), "going away"), (true, None));
+        assert_eq!(classify_close(Some(1011), ""), (true, None));
+        assert_eq!(
+            classify_close(Some(4429), "retry-after=7"),
+            (true, Some(7000))
+        );
+        assert_eq!(classify_close(Some(1013), ""), (true, None));
+        assert_eq!(
+            classify_close(Some(4503), "retry-after=2"),
+            (true, Some(2000))
+        );
+        assert_eq!(classify_close(Some(4401), ""), (false, None));
+        assert_eq!(classify_close(Some(4403), "retry-after=9"), (false, None));
+        assert_eq!(classify_close(Some(4409), ""), (false, None));
+        assert_eq!(classify_close(Some(4999), ""), (false, None));
+    }
+
+    #[test]
+    fn a_reassembled_message_past_the_cap_is_a_protocol_error_not_a_buffer() {
+        let mut reasm = Reassembler::default();
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..16 {
+            assert!(reasm.push(false, &chunk).unwrap().is_none());
+        }
+        assert!(reasm.push(false, &[0u8; 1]).is_err());
+        // The buffer is dropped with the error, so the next message starts clean.
+        assert_eq!(
+            reasm.push(true, b"ok").unwrap().as_deref(),
+            Some(&b"ok"[..])
+        );
+    }
+
+    #[test]
     fn rpc_messages_fragment_and_reassemble() {
         let big = vec![7u8; MAX_FRAME_PAYLOAD * 2 + 5];
         let frames = rpc_frames(&big);
