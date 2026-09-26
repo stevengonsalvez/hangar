@@ -82,6 +82,16 @@ pub async fn execute(args: RunArgs) -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("ainb/session-{}", &session_id.to_string()[..8]));
 
+        // A branch that already exists keeps its own history: git checks it
+        // out as it is, and a --base would be silently ignored. Refuse the
+        // pair before anything is created instead of starting the session
+        // somewhere the caller did not ask for.
+        if args.base.is_some() && local_branch_exists(&repo_path, &branch) {
+            anyhow::bail!(
+                "--base cannot apply: branch '{branch}' already exists, and an existing branch keeps its own history. Pick a new --create-branch name, or drop --base."
+            );
+        }
+
         info!("Creating worktree for branch: {}", branch);
 
         let worktree_info = manager
@@ -345,12 +355,15 @@ pub async fn execute(args: RunArgs) -> Result<()> {
         let created = CreatedSession {
             session_id,
             tmux_session_name: &tmux_name,
-            worktree_path: &work_dir,
+            worktree_path: work_dir.to_string_lossy(),
             branch: &branch_name,
             claude_session_id: claude_session_id.as_deref(),
             model: model.as_deref(),
         };
-        println!("{}", serde_json::to_string(&created)?);
+        println!(
+            "{}",
+            serde_json::to_string(&created).expect("text fields always serialize")
+        );
     } else {
         println!();
         println!("Session created successfully!");
@@ -417,11 +430,16 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 ///
 /// Field names are a wire contract with that caller. Add fields; never rename
 /// or remove one.
+///
+/// Every field is text, so serializing cannot fail: a failure here would come
+/// after the session exists and leave it running with nothing reported.
 #[derive(Debug, serde::Serialize)]
 struct CreatedSession<'a> {
     session_id: Uuid,
     tmux_session_name: &'a str,
-    worktree_path: &'a std::path::Path,
+    /// A non-UTF-8 directory is reported lossily; the tmux session name is
+    /// the handle a caller attaches by.
+    worktree_path: std::borrow::Cow<'a, str>,
     branch: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_session_id: Option<&'a str>,
@@ -439,15 +457,38 @@ fn human(json: bool, line: std::fmt::Arguments<'_>) {
     }
 }
 
+/// Whether `branch` is already a local branch of the repository at `repo`.
+fn local_branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Flag combinations refused before anything is created.
 ///
 /// `--base` picks where a NEW branch starts, so without a worktree it would
 /// silently run in the checkout at whatever is checked out. `--format json`
-/// promises one JSON object on stdout, which attaching would hand to tmux.
+/// reports a worktree it created, and promises one JSON object on stdout,
+/// which attaching would hand to tmux.
 fn validate_run_flags(args: &RunArgs) -> Result<()> {
     if args.base.is_some() && !args.worktree && args.create_branch.is_none() {
         anyhow::bail!(
             "--base needs --worktree or --create-branch: it picks where the new branch starts"
+        );
+    }
+    if args.json && !args.worktree && args.create_branch.is_none() {
+        anyhow::bail!(
+            "--format json needs --worktree or --create-branch: it reports a worktree it created"
         );
     }
     if args.json && (args.attach || args.interactive) {
@@ -1817,12 +1858,13 @@ mod tests {
         for (attach, interactive) in [(true, false), (false, true)] {
             let args = RunArgs {
                 json: true,
+                worktree: true,
                 attach,
                 interactive,
                 ..run_args()
             };
             let err = validate_run_flags(&args).expect_err("json + attach must be refused");
-            assert!(err.to_string().contains("--format json"), "got: {err}");
+            assert!(err.to_string().contains("--attach"), "got: {err}");
         }
         let ok = RunArgs {
             json: true,
@@ -1831,6 +1873,18 @@ mod tests {
             ..run_args()
         };
         assert!(validate_run_flags(&ok).is_ok());
+    }
+
+    /// The JSON names a worktree this run created; in a shared checkout
+    /// there is none, so the combination is refused up front.
+    #[test]
+    fn json_without_isolation_is_refused() {
+        let args = RunArgs {
+            json: true,
+            ..run_args()
+        };
+        let err = validate_run_flags(&args).expect_err("json without a worktree");
+        assert!(err.to_string().contains("--worktree"), "got: {err}");
     }
 
     /// The JSON line is a wire contract with the daemon: these field names
@@ -1842,7 +1896,7 @@ mod tests {
         let line = serde_json::to_value(CreatedSession {
             session_id: id,
             tmux_session_name: "tmux_t",
-            worktree_path: &dir,
+            worktree_path: dir.to_string_lossy(),
             branch: "ainb/t",
             claude_session_id: None,
             model: Some("opus"),
