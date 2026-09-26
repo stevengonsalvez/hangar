@@ -71,42 +71,42 @@ test("a session with no workspace_path falls back to the project path, folding w
   assert.equal(cards[0].sessions.length, 2);
 });
 
-test("cards sort by most recent last_accessed first", () => {
+test("cards sort newest created first", () => {
   const cards = worktreeCards(
     [
-      session({ id: "stale", workspace_path: "/repo/old", last_accessed: "2024-01-01T00:00:00Z" }),
-      session({ id: "fresh", workspace_path: "/repo/new", last_accessed: "2024-06-01T00:00:00Z" }),
+      session({ id: "stale", workspace_path: "/repo/old", created_at: "2024-01-01T00:00:00Z" }),
+      session({ id: "fresh", workspace_path: "/repo/new", created_at: "2024-06-01T00:00:00Z" }),
     ],
     "/repo",
   );
   assert.deepEqual(cards.map((card) => card.key), ["/repo/new", "/repo/old"]);
 });
 
-test("a session missing last_accessed sorts to the bottom, never throws", () => {
+test("a session missing created_at sorts to the bottom, never throws", () => {
   const cards = worktreeCards(
     [
-      session({ id: "no-clock", workspace_path: "/repo/unknown", last_accessed: undefined as unknown as string }),
-      session({ id: "dated", workspace_path: "/repo/dated", last_accessed: "2024-06-01T00:00:00Z" }),
+      session({ id: "no-clock", workspace_path: "/repo/unknown", created_at: undefined as unknown as string }),
+      session({ id: "dated", workspace_path: "/repo/dated", created_at: "2024-06-01T00:00:00Z" }),
     ],
     "/repo",
   );
   assert.deepEqual(cards.map((card) => card.key), ["/repo/dated", "/repo/unknown"]);
 });
 
-test("a card's title, branch and model come from its most recently accessed session", () => {
+test("a card's title, branch and model come from its newest session", () => {
   const [card] = worktreeCards(
     [
       session({
         id: "older",
         workspace_path: "/repo/wt",
-        last_accessed: "2024-01-01T00:00:00Z",
+        created_at: "2024-01-01T00:00:00Z",
         branch_name: "ainb/older",
         model: "haiku",
       }),
       session({
         id: "newer",
         workspace_path: "/repo/wt",
-        last_accessed: "2024-06-01T00:00:00Z",
+        created_at: "2024-06-01T00:00:00Z",
         branch_name: "ainb/newer",
         model: "opus",
         display_name: "Fix the flake",
@@ -196,4 +196,15 @@ test("collapsed projects read as empty, and write as a no-op, when storage is ab
   assert.deepEqual(readCollapsed(undefined), new Set());
   assert.deepEqual(readCollapsed(new ThrowingStorage()), new Set());
   assert.doesNotThrow(() => writeCollapsed(new ThrowingStorage(), new Set(["x"])));
+});
+
+test("opening a session does not move its card: the order is by creation", () => {
+  const sessions = [
+    session({ id: "old", workspace_path: "/repo/old", created_at: "2024-01-01T00:00:00Z", last_accessed: "2024-09-01T00:00:00Z" }),
+    session({ id: "new", workspace_path: "/repo/new", created_at: "2024-06-01T00:00:00Z", last_accessed: "2024-06-01T00:00:00Z" }),
+  ];
+  assert.deepEqual(
+    worktreeCards(sessions, "/repo").map((card) => card.key),
+    ["/repo/new", "/repo/old"],
+  );
 });
