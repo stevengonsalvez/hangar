@@ -822,6 +822,32 @@ impl FleetRepo {
         Ok(result.rows_affected())
     }
 
+    /// Stamp ONE row `restored_unconfirmed`: the daemon's terminal feed for
+    /// this session was lost (R2 WP8, CRITIQUE 13). Until a tier 0/1 event
+    /// confirms the row again, its present-tense state rests on evidence
+    /// from before the gap, the same claim a daemon restart makes for every
+    /// row in [`Self::mark_restored_unconfirmed`].
+    ///
+    /// An `EXITED` row is left alone for the same reason as there. Returns
+    /// whether the row was stamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the update fails.
+    pub async fn mark_session_restored_unconfirmed(
+        pool: &SqlitePool,
+        session_key: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE fleet_session SET restored_unconfirmed = 1 \
+             WHERE session_key = ? AND lifecycle_state != 'EXITED' AND restored_unconfirmed = 0",
+        )
+        .bind(session_key)
+        .execute(pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Apply one normalized event inside a CALLER-OWNED transaction, without
     /// committing it.
     ///
@@ -2608,6 +2634,68 @@ mod tests {
         // does no work per boot beyond the rows it still cannot name.
         let second = FleetRepo::backfill_display_names(store.pool(), derive).await.unwrap();
         assert_eq!(second, 0, "second boot names nothing new");
+    }
+
+    /// A lost terminal feed stamps only the session it watched, and a later
+    /// hook event clears it like any other stamp.
+    #[tokio::test]
+    async fn a_lost_feed_stamps_one_session_and_a_hook_clears_it() {
+        let (_dir, store) = store().await;
+        let running = |id: &str, key: &str, at: i64| {
+            event(
+                id,
+                key,
+                at,
+                ObservationAuthority::Authoritative,
+                FleetSessionPatch {
+                    provider: Some("claude".to_string()),
+                    lifecycle_state: Some("RUNNING".to_string()),
+                    tier: Some("hook".to_string()),
+                    ..FleetSessionPatch::default()
+                },
+            )
+        };
+        FleetRepo::apply_event(store.pool(), &running("e-a", "claude:s-a", 100))
+            .await
+            .unwrap();
+        FleetRepo::apply_event(store.pool(), &running("e-b", "claude:s-b", 100))
+            .await
+            .unwrap();
+
+        let stamped = FleetRepo::mark_session_restored_unconfirmed(store.pool(), "claude:s-a")
+            .await
+            .unwrap();
+        assert!(stamped);
+        let row = |key: &str| {
+            let pool = store.pool().clone();
+            let key = key.to_string();
+            async move { FleetRepo::get_session(&pool, &key).await.unwrap().unwrap() }
+        };
+        assert!(row("claude:s-a").await.restored_unconfirmed);
+        assert!(
+            !row("claude:s-b").await.restored_unconfirmed,
+            "the other session is untouched"
+        );
+        assert!(
+            !FleetRepo::mark_session_restored_unconfirmed(store.pool(), "claude:s-a")
+                .await
+                .unwrap(),
+            "a second stamp is a no-op"
+        );
+        assert!(
+            !FleetRepo::mark_session_restored_unconfirmed(store.pool(), "claude:none")
+                .await
+                .unwrap(),
+            "an unknown session stamps nothing"
+        );
+
+        FleetRepo::apply_event(store.pool(), &running("e-a2", "claude:s-a", 200))
+            .await
+            .unwrap();
+        assert!(
+            !row("claude:s-a").await.restored_unconfirmed,
+            "a hook event confirms it again"
+        );
     }
 
     /// A hydrated row is a memory until this incarnation confirms it, and only

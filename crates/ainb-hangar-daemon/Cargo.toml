@@ -39,6 +39,11 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
 ]
+# R2 terminal streams. OFF by default so a release build never links
+# `ainb-term` (and the wezterm emulator behind it); CI compiles and tests it
+# through `--all-features`. With the feature on, the streams still only serve
+# when `AINB_TERMINAL_STREAM=1` is set at boot (see `term::STREAM_ENV`).
+terminal-stream = ["dep:ainb-term"]
 
 [[bin]]
 name = "ainb-hangar-daemon"
@@ -50,6 +55,9 @@ path = "src/lib.rs"
 
 [dependencies]
 ainb-hangar-store = { path = "../ainb-hangar-store" }
+# The headless pane emulator, snapshot and control-mode parser (R2). Optional:
+# only the `terminal-stream` feature links it.
+ainb-term = { path = "../ainb-term", optional = true }
 ainb-hangar-core = { path = "../ainb-hangar-core" }
 # Platform credential store (Keychain on macOS) behind one trait. The daemon is
 # UNSANDBOXED, so it resolves the claude credential here and injects it into the
