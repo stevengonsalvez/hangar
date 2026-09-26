@@ -683,8 +683,11 @@ start_desktop() {
   local booted=$SECONDS
   if ! wait_for 60 daemon_running; then
     check "the daemon the window starts answers on its socket within 60 s of the first batch (waited $((SECONDS - booted)) s; status: $("$AINB_BIN" hangar daemon status 2>&1 | head -1))" false
-  elif ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
-    check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - booted)) s since the first batch)" false
+  else
+    local answered=$SECONDS
+    if ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
+      check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - answered)) s since it answered)" false
+    fi
   fi
 }
 
