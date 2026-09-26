@@ -508,17 +508,12 @@ where
 {
     // The single writer: every outbound frame is queued here so a pushed event
     // can never split a response frame (or vice versa).
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if write_half.write_all(&frame).await.is_err() {
-                break;
-            }
-            if write_half.flush().await.is_err() {
-                break;
-            }
-        }
-    });
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+    let writer = spawn_writer(
+        write_half,
+        out_rx,
+        idle_timeout_from_env(WRITE_DEADLINE_ENV, DEFAULT_WRITE_DEADLINE),
+    );
 
     // Gate 2 — first-frame token auth: the connection's first frame must be a
     // valid `auth/hello`. Unauthenticated or wrong-token connections get an
@@ -590,13 +585,18 @@ where
             },
         )
         .await;
-    if listed {
-        emit_connections_changed(&events, &registry).await;
-    }
     // The connection's event subscriptions: at most one forwarder per stream,
     // and a re-subscribe replaces it (last subscribe wins, no duplicate
     // delivery). See [`Subscriptions`] for what each one carries.
-    let mut subscriptions = Subscriptions::default();
+    //
+    // The guard owns them from here to the end of the connection, so the
+    // teardown runs on every exit: the read loop ending, a handler panic, or
+    // the task being aborted. It is built with no await between it and the
+    // insert, so an abort during the announcement below still removes the row.
+    let mut guard = ConnectionTeardown::new(connection.conn_id, registry.clone(), events.clone());
+    if listed {
+        emit_connections_changed(&events, &registry).await;
+    }
 
     // Idle read timeout so an abandoned / half-open client connection cannot pin
     // this per-connection task (and its fd) forever. Request/response clients
@@ -613,7 +613,7 @@ where
         idle_timeout_from_env(SUBSCRIBED_IDLE_TIMEOUT_ENV, DEFAULT_SUBSCRIBED_IDLE_TIMEOUT);
     let served: std::io::Result<()> = async {
         while let Some(body) = {
-            let subscribed = subscriptions.any_live();
+            let subscribed = guard.subscriptions.any_live();
             let window = if subscribed {
                 subscribed_idle_timeout
             } else {
@@ -694,7 +694,7 @@ where
             if let Ok(req) = &req {
                 if acked && req.method == methods::WORKSPACE_SUBSCRIBE {
                     if let Ok(Some(ws)) = resolve(&pool, req).await {
-                        if let Some(old) = subscriptions.workspace.take() {
+                        if let Some(old) = guard.subscriptions.workspace.take() {
                             old.abort();
                         }
                         // Register the LIVE forwarder FIRST so no event emitted
@@ -711,7 +711,7 @@ where
                         // with no durable replay behind it, so one missed in
                         // that window is gone, not merely late.
                         let ws_rx = pending_workspace_rx.unwrap_or_else(|| broker.subscribe());
-                        subscriptions.workspace =
+                        guard.subscriptions.workspace =
                             Some(spawn_event_forwarder(ws_rx, ws.clone(), out_tx.clone()));
                         // A2: the same subscription's TRANSCRIPT half, drained
                         // from its own broadcast so a chatty run cannot evict the
@@ -726,12 +726,12 @@ where
                         // by `banner_hides_on_task_finished_event`); the visible
                         // effect is a banner clearing a beat early, or a first
                         // transcript line missed before it opens.
-                        if let Some(old) = subscriptions.task_stream.take() {
+                        if let Some(old) = guard.subscriptions.task_stream.take() {
                             old.abort();
                         }
                         let rx = pending_task_stream_rx
                             .unwrap_or_else(|| broker.subscribe_task_stream());
-                        subscriptions.task_stream =
+                        guard.subscriptions.task_stream =
                             Some(spawn_event_forwarder(rx, ws.clone(), out_tx.clone()));
                         // T1 resume: a client that carried a `since_seq` catches
                         // up on every durable event after that cursor before it
@@ -749,15 +749,15 @@ where
                     // by workspace — it carries the no-workspace host sessions —
                     // with an OPTIONAL narrowing when the client passed a
                     // workspace_id.
-                    if let Some(old) = subscriptions.attention.take() {
+                    if let Some(old) = guard.subscriptions.attention.take() {
                         old.abort();
                     }
                     let filter = attention_subscribe_filter(req);
                     let rx = pending_attention_rx.unwrap_or_else(|| broker.subscribe_attention());
-                    subscriptions.attention =
+                    guard.subscriptions.attention =
                         Some(spawn_attention_forwarder(rx, filter, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_SUBSCRIBE {
-                    if let Some(old) = subscriptions.fleet.take() {
+                    if let Some(old) = guard.subscriptions.fleet.take() {
                         old.abort();
                     }
                     let head_revision = resp
@@ -768,14 +768,14 @@ where
                         .and_then(serde_json::Value::as_i64)
                         .unwrap_or_default();
                     let rx = pending_fleet_rx.unwrap_or_else(|| broker.subscribe_fleet());
-                    subscriptions.fleet = Some(spawn_fleet_forwarder(
+                    guard.subscriptions.fleet = Some(spawn_fleet_forwarder(
                         pool.clone(),
                         rx,
                         head_revision,
                         out_tx.clone(),
                     ));
                 } else if acked && req.method == methods::FLEET_MESSAGE_SUBSCRIBE {
-                    if let Some(old) = subscriptions.message.take() {
+                    if let Some(old) = guard.subscriptions.message.take() {
                         old.abort();
                     }
                     // An explicit after_id wins; otherwise start from the head
@@ -789,21 +789,21 @@ where
                             .map(ToString::to_string)
                     });
                     let rx = pending_message_rx.unwrap_or_else(|| broker.subscribe_message());
-                    subscriptions.message = Some(spawn_message_forwarder(
+                    guard.subscriptions.message = Some(spawn_message_forwarder(
                         pool.clone(),
                         rx,
                         start_id,
                         out_tx.clone(),
                     ));
-                    if let Some(old) = subscriptions.notification.take() {
+                    if let Some(old) = guard.subscriptions.notification.take() {
                         old.abort();
                     }
                     let notify_rx =
                         pending_notification_rx.unwrap_or_else(|| broker.subscribe_notifications());
-                    subscriptions.notification =
+                    guard.subscriptions.notification =
                         Some(spawn_notification_forwarder(notify_rx, out_tx.clone()));
                 } else if acked && req.method == methods::FLEET_TRANSCRIPT_SUBSCRIBE {
-                    if let Some(old) = subscriptions.transcript.take() {
+                    if let Some(old) = guard.subscriptions.transcript.take() {
                         old.abort();
                     }
                     if let Ok(params) = serde_json::from_value::<
@@ -819,7 +819,7 @@ where
                         });
                         let rx =
                             pending_transcript_rx.unwrap_or_else(|| broker.subscribe_transcript());
-                        subscriptions.transcript = Some(spawn_transcript_forwarder(
+                        guard.subscriptions.transcript = Some(spawn_transcript_forwarder(
                             pool.clone(),
                             rx,
                             params.session_key,
@@ -834,15 +834,9 @@ where
     }
     .await;
 
-    teardown(
-        subscriptions,
-        &registry,
-        connection.conn_id,
-        &events,
-        out_tx,
-        writer,
-    )
-    .await;
+    guard.finish().await;
+    drop(out_tx);
+    let _ = writer.await;
     served
 }
 
@@ -910,26 +904,120 @@ impl Subscriptions {
     }
 }
 
-/// Close an authenticated connection: stop its forwarders, drop its registry
-/// row, then let the writer drain what is queued and exit.
+/// The teardown of one authenticated connection, run exactly once on every
+/// exit: stop its forwarders, then drop its registry row.
 ///
-/// The one teardown for every leg and every way the read loop ends (EOF, the
-/// idle bound, a read fault). A revoke (R1-08) ends the same loop, so it runs
-/// this too, and R2 hangs its floor release here once rather than per leg.
-async fn teardown(
+/// The one teardown for every leg and every way a connection ends. The read
+/// loop's normal end (EOF, the idle bound, a read fault, and a revoke in R1-08,
+/// which ends the same loop) calls [`ConnectionTeardown::finish`]. A handler
+/// panic or an aborted task never reaches that line, so `Drop` runs the same
+/// steps instead: the forwarders are aborted at once, and the registry row,
+/// behind an async lock, is removed on a spawned task. Either way the
+/// connection's outbound sender goes with its task, so the writer drains and
+/// exits once the forwarders holding clones of it are gone. R2 hangs its floor
+/// release here, once, for both paths.
+struct ConnectionTeardown {
     subscriptions: Subscriptions,
+    conn_id: u64,
+    registry: connections::ConnectionRegistry,
+    events: EventSink,
+    armed: bool,
+}
+
+impl ConnectionTeardown {
+    fn new(conn_id: u64, registry: connections::ConnectionRegistry, events: EventSink) -> Self {
+        Self {
+            subscriptions: Subscriptions::default(),
+            conn_id,
+            registry,
+            events,
+            armed: true,
+        }
+    }
+
+    /// The normal end: run the teardown now, and disarm the `Drop` path only
+    /// once the row is gone. An abort during the removal's await therefore
+    /// still reaches `Drop`, which retries it; a repeated removal is a no-op
+    /// that announces nothing.
+    async fn finish(mut self) {
+        std::mem::take(&mut self.subscriptions).abort_all();
+        release_registry_row(&self.registry, self.conn_id, &self.events).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionTeardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        std::mem::take(&mut self.subscriptions).abort_all();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            // No runtime means the daemon is exiting and the in-memory
+            // registry goes with it.
+            return;
+        };
+        let registry = self.registry.clone();
+        let events = self.events.clone();
+        let conn_id = self.conn_id;
+        runtime.spawn(async move {
+            release_registry_row(&registry, conn_id, &events).await;
+        });
+    }
+}
+
+/// Remove a closed connection's registry row, and tell subscribers when the
+/// row was listed.
+async fn release_registry_row(
     registry: &connections::ConnectionRegistry,
     conn_id: u64,
     events: &EventSink,
-    out_tx: mpsc::Sender<Vec<u8>>,
-    writer: tokio::task::JoinHandle<()>,
 ) {
-    subscriptions.abort_all();
     if registry.remove(conn_id).await {
         emit_connections_changed(events, registry).await;
     }
-    drop(out_tx);
-    let _ = writer.await;
+}
+
+/// Longest one outbound frame may take to write before the connection is
+/// dropped. A peer that stops reading fills its socket buffer, and without a
+/// bound the writer would wait on it forever: every forwarder then blocks on the
+/// full queue and the connection's task is pinned. Generous, because a slow
+/// but live client is not a dead one.
+const DEFAULT_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Operator override (milliseconds) for [`DEFAULT_WRITE_DEADLINE`].
+const WRITE_DEADLINE_ENV: &str = "AINB_HANGAR_RPC_WRITE_DEADLINE_MS";
+
+/// The connection's single writer: drain `frames` onto `write_half` one frame
+/// at a time, so a pushed event can never split a response frame (or vice
+/// versa). Ends when every sender is gone, on a write fault, or when one frame
+/// cannot be written and flushed within `deadline`. Ending drops the receiver,
+/// so the read loop's next queue fails and the connection closes.
+fn spawn_writer<W>(
+    mut write_half: W,
+    mut frames: mpsc::Receiver<Vec<u8>>,
+    deadline: std::time::Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        while let Some(frame) = frames.recv().await {
+            let written = tokio::time::timeout(deadline, async {
+                write_half.write_all(&frame).await?;
+                write_half.flush().await
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_elapsed) => {
+                    tracing::debug!(?deadline, "hangar rpc: peer stopped reading; closing");
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Outbound frame queue depth per connection (responses + pushed events).
@@ -1426,6 +1514,13 @@ async fn dispatch_as_connection(
     connection: Option<&ConnectionRow>,
     registry: Option<&connections::ConnectionRegistry>,
 ) -> RpcResponse {
+    // Test seam: a handler that panics, so a test can prove the connection
+    // teardown still runs. Test builds only.
+    #[cfg(test)]
+    assert!(
+        req.method != tests::PANIC_METHOD,
+        "a test injected a handler panic"
+    );
     let result = match caller.authorize(&req.method) {
         // Every mutation goes through the ledger guard, so "generic dedupe at
         // dispatch for every mutation" (D18) is a property of THIS line rather
@@ -14350,6 +14445,217 @@ mod tests {
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
         );
+    }
+
+    /// The method the test seam in `dispatch_as_connection` panics on.
+    pub(super) const PANIC_METHOD: &str = "test/panic";
+
+    /// How a served connection ends in [`teardown_runs_once_on_every_exit`].
+    #[derive(Debug, Clone, Copy)]
+    enum Exit {
+        /// The client closes its end: the read loop ends normally.
+        ClientEof,
+        /// A handler panics mid-request.
+        HandlerPanic,
+        /// The connection's task is aborted.
+        Abort,
+    }
+
+    /// Security review follow-up: the teardown runs exactly once on EVERY exit.
+    /// A handler panic or an aborted task used to skip it, leaving forwarders
+    /// running and the registry row listed forever. For each exit this proves:
+    /// the registry row is gone, the client reads EOF (every forwarder that
+    /// held the writer's sender was stopped, so the writer drained and
+    /// closed), and exactly one `ConnectionsChanged` announced the removal.
+    #[tokio::test]
+    async fn teardown_runs_once_on_every_exit() {
+        use tokio::io::AsyncWriteExt as _;
+
+        async fn send<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, request: &RpcRequest) {
+            let body = serde_json::to_vec(request).expect("request serializes");
+            let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+            frame.extend_from_slice(&body);
+            writer.write_all(&frame).await.expect("write request");
+            writer.flush().await.expect("flush request");
+        }
+
+        async fn next<R: tokio::io::AsyncBufRead + Unpin>(
+            reader: &mut R,
+        ) -> Option<serde_json::Value> {
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(reader))
+                .await
+                .expect("the daemon writes a frame or closes")
+                .expect("read frame")
+                .map(|body| serde_json::from_slice(&body).expect("frame is JSON"))
+        }
+
+        let home = tempfile::tempdir().expect("temporary Hangar home");
+        let store = Store::open_in(home.path()).await.expect("open store");
+        auth::ensure_socket_token(store.pool(), home.path())
+            .await
+            .expect("ensure socket token");
+        let token = std::fs::read_to_string(ainb_hangar_proto::auth::token_file_in(home.path()))
+            .expect("read socket token");
+
+        for exit in [Exit::ClientEof, Exit::HandlerPanic, Exit::Abort] {
+            let registry = connections::ConnectionRegistry::new();
+            let broker = EventBroker::new();
+            let mut registry_events = broker.subscribe_attention();
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (read_half, write_half) = tokio::io::split(server);
+            let connection = tokio::spawn(serve_stream(
+                BufReader::new(read_half),
+                write_half,
+                PeerIdentity::Local { pid: None },
+                store.pool().clone(),
+                health(),
+                broker.clone(),
+                registry.clone(),
+            ));
+            let (read_half, mut write_half) = tokio::io::split(client);
+            let mut reader = BufReader::new(read_half);
+
+            send(
+                &mut write_half,
+                &req(
+                    methods::AUTH_HELLO,
+                    serde_json::json!({ "token": token.trim() }),
+                ),
+            )
+            .await;
+            let hello = next(&mut reader).await.expect("hello reply");
+            assert!(hello["error"].is_null(), "{exit:?}: {hello}");
+            // A live forwarder holding a clone of the writer's sender: the
+            // thing a skipped teardown leaks.
+            send(
+                &mut write_half,
+                &req(methods::ATTENTION_SUBSCRIBE, serde_json::json!({})),
+            )
+            .await;
+            let subscribed = next(&mut reader).await.expect("subscribe reply");
+            assert!(subscribed["error"].is_null(), "{exit:?}: {subscribed}");
+            assert_eq!(registry.list().await.connections.len(), 1, "{exit:?}");
+            // The insert's own announcement, before the exit under test.
+            while registry_events.try_recv().is_ok() {}
+
+            match exit {
+                Exit::ClientEof => {
+                    // One split half of a duplex does not close it; shutdown
+                    // is the client's EOF.
+                    write_half.shutdown().await.expect("client EOF");
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("EOF ends the connection");
+                    assert!(ended.expect("no panic").is_ok(), "{exit:?}");
+                }
+                Exit::HandlerPanic => {
+                    send(&mut write_half, &req(PANIC_METHOD, serde_json::json!({}))).await;
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("the panic ends the connection");
+                    assert!(
+                        ended.expect_err("the handler panicked").is_panic(),
+                        "{exit:?}"
+                    );
+                }
+                Exit::Abort => {
+                    connection.abort();
+                    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), connection)
+                        .await
+                        .expect("the abort ends the connection");
+                    assert!(
+                        ended.expect_err("the task was aborted").is_cancelled(),
+                        "{exit:?}"
+                    );
+                }
+            }
+
+            // EOF on the client: the forwarder is gone, so the writer closed.
+            assert!(
+                next(&mut reader).await.is_none(),
+                "{exit:?}: the client must read EOF, not a live stream"
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !registry.list().await.connections.is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{exit:?}: the registry row was never removed"
+                );
+                tokio::task::yield_now().await;
+            }
+            // Exactly one removal announcement, even though the normal path
+            // and `Drop` both know how to make it.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut removals = 0;
+            while let Ok(event) = registry_events.try_recv() {
+                if let HangarEvent::ConnectionsChanged { connections } = event {
+                    assert!(connections.is_empty(), "{exit:?}");
+                    removals += 1;
+                }
+            }
+            assert_eq!(removals, 1, "{exit:?}: teardown must run exactly once");
+        }
+    }
+
+    /// Review follow-up C: a peer that never reads cannot pin the writer. The
+    /// socket buffer fills, the one frame in flight misses the deadline, the
+    /// writer ends, and the next queued frame fails, which is what ends the
+    /// read loop and runs the teardown.
+    #[tokio::test]
+    async fn a_peer_that_never_reads_times_the_writer_out() {
+        let (client, server) = tokio::io::duplex(1024);
+        let (_server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        let deadline = std::time::Duration::from_millis(100);
+        let writer = spawn_writer(server_write, out_rx, deadline);
+
+        // Far more than the 1 KiB buffer, and the client reads none of it.
+        out_tx.send(vec![b'x'; 64 * 1024]).await.expect("queued");
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("the writer must give up at its deadline, not wait forever")
+            .expect("the writer must not panic");
+        assert!(
+            out_tx.send(b"next".to_vec()).await.is_err(),
+            "with the writer gone, the connection's next frame fails"
+        );
+        drop(client);
+    }
+
+    /// The deadline is per frame, not per connection: a reader that keeps up
+    /// is never cut off, however long the connection lives.
+    #[tokio::test]
+    async fn a_peer_that_reads_is_never_timed_out() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
+        let writer = spawn_writer(server_write, out_rx, std::time::Duration::from_millis(200));
+        let reader = tokio::spawn(async move {
+            let mut total = 0usize;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = client.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            total
+        });
+        for _ in 0..8 {
+            out_tx.send(vec![b'y'; 16 * 1024]).await.expect("queued");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(out_tx);
+        writer.await.expect("writer ends when the senders do");
+        // Both split halves must go before the client reads EOF.
+        drop(server_read);
+        let total = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("the client reads EOF once the server side is gone")
+            .expect("reader");
+        assert_eq!(total, 8 * 16 * 1024);
     }
 
     /// A workspace subscription owns both the durable event forwarder and the
