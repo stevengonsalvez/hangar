@@ -1,18 +1,19 @@
 // What the board and the attention list draw, projected from the frames the
-// window already holds. Projections only: `board.tsx` draws what these return,
-// and nothing here reads the store or keeps anything.
+// window already holds. Projections only: `board.tsx` draws what these
+// return, and nothing here reads the store or keeps anything.
 //
-//   agent_status.view.cards[] ──state──▶ columns
-//   fleet.fleet_snapshot[]    ──model, session_key──▶ the card's line
+//   agent_status.view.cards[] ──status.ts──▶ Orca's four buckets
+//   fleet.fleet_metadata[]    ──model, session_key──▶ the card's line
 //   sessions.workspaces[]     ──name, attention──▶ the card's title and chips
+//   acks.ts                  ──this viewer's Done acks──▶ Done vs Idle
 //
-// The grouping is the host's: a card sits in the column its `state` names, and
-// the renderer never infers a state from a lifecycle or an attention chip. Two
-// surfaces guessing differently from the same frame is the drift this seam
-// exists to remove.
+// The bucket is `status.ts`'s own mapping of the host's `state`, never
+// re-derived here from a lifecycle or an attention chip: two surfaces
+// guessing differently from the same frame is the drift this seam exists to
+// remove (P4 carries that seam from the raw `AgentState` onto the operator's
+// own four words).
 
 import type {
-  AgentState,
   AgentStatusView,
   AttentionKind,
   FleetView_Serialize,
@@ -20,24 +21,27 @@ import type {
   SessionsView_Serialize,
   Session_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { allSessions, ATTENTION_ORDER, label } from "./sessions.ts";
+import type { AckMap } from "./acks.ts";
+import { isAcked } from "./acks.ts";
+import { allSessions, ATTENTION_ORDER, label, providerId } from "./sessions.ts";
+import { deriveStatus, elicitationDetail, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
-/**
- * What each column is called, in the operator's words rather than the wire's,
- * left to right. Typed over every `AgentState`, so a state Rust adds fails to
- * compile here instead of every card in it vanishing from the board.
- */
-export const COLUMN_TITLES: Record<AgentState, string> = {
-  waiting: "Waiting on you",
+/** Orca's own board buckets, left to right. Idle also holds a card whose
+ * status is `unverifiable`: the vocabulary has no fifth column for it, so it
+ * falls in with idle and carries its own badge (`BoardCard.unverifiable`). */
+export type BoardColumnKind = "needs" | "working" | "done" | "idle";
+
+/** What each column is called, in the operator's own words. */
+export const COLUMN_TITLES: Record<BoardColumnKind, string> = {
+  needs: "Needs you",
   working: "Working",
+  done: "Done",
   idle: "Idle",
-  unverifiable: "Unverified",
-  exited: "Exited",
 };
 
 /** The columns the board draws, left to right. */
-export const COLUMNS = Object.keys(COLUMN_TITLES) as AgentState[];
+export const COLUMNS: BoardColumnKind[] = ["needs", "working", "done", "idle"];
 
 /** One card on the board. */
 export interface BoardCard {
@@ -47,7 +51,10 @@ export interface BoardCard {
   title: string;
   /** The session list row a click selects, when this card has one. */
   sessionId: string | null;
-  state: AgentState;
+  /** The operator vocabulary this card reads (`status.ts`). */
+  status: UiStatus;
+  /** This card's own turn marker, for acking it (`acks.ts`). */
+  evidenceObservedAt: number;
   /** The line under the title: provider, model, lifecycle, transport. */
   provider: string;
   model: string | null;
@@ -66,9 +73,9 @@ export interface BoardCard {
   attention: AttentionKind[];
 }
 
-/** One column: the state it holds and the cards in it. */
+/** One column: the bucket it holds and the cards in it. */
 export interface BoardColumn {
-  state: AgentState;
+  state: BoardColumnKind;
   cards: BoardCard[];
 }
 
@@ -84,12 +91,6 @@ export type BoardHealth =
   | { kind: "absent"; detail: string }
   | { kind: "stale"; behind: number }
   | { kind: "unreachable"; reason: string };
-
-/** The provider session id inside a `provider:session-id` key. */
-function providerId(sessionKey: string): string {
-  const at = sessionKey.indexOf(":");
-  return at < 0 ? sessionKey : sessionKey.slice(at + 1);
-}
 
 /**
  * Each session row by the provider session id the host correlated it with,
@@ -115,29 +116,54 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
     .sort((a, b) => ATTENTION_ORDER.indexOf(a) - ATTENTION_ORDER.indexOf(b));
 }
 
+/** `status.kind`, onto the column it draws in. `unverifiable` has no column
+ * of its own in Orca's four-bucket vocabulary, so it falls in with `idle`
+ * (`BoardCard.unverifiable` carries the badge that tells the two apart). */
+function bucketOf(status: UiStatus): BoardColumnKind {
+  switch (status.kind) {
+    case "needs":
+      return "needs";
+    case "working":
+      return "working";
+    case "done":
+      return "done";
+    case "idle":
+    case "unverifiable":
+      return "idle";
+  }
+}
+
 /**
- * The board's columns, in `COLUMNS` order, from the host's own cards.
- *
- * A card with no matching session row still draws: the agent exists whether or
- * not this window's sidebar has caught up with it, and a board that hid it
- * would hide exactly the agent a stale scan has not listed yet. Within a
- * column, an agent with something open floats to the top, then by title, so
- * the row that wants a human is the first one read.
+ * The board's columns, in `COLUMNS` order, from the host's own cards mapped
+ * through `status.ts`. An exited agent's card never appears (`deriveStatus`
+ * returns `null` for it): a process that is gone is not a status a person
+ * acts on. Within a column, an agent with something open floats to the top,
+ * then by title, so the row that wants a human is the first one read.
  */
 export function boardColumns(
   agentStatus: AgentStatusView | undefined,
   fleet: FleetView_Serialize | undefined,
   sessions: SessionsView_Serialize | undefined,
+  acks: AckMap,
 ): BoardColumn[] {
   const models = new Map((fleet?.fleet_snapshot ?? []).map((row) => [row.session_key, row.model]));
   const rows = rowsByProvider(sessions, fleet);
-  const cards: BoardCard[] = (agentStatus?.view?.cards ?? []).map((card) => {
+  const cards: BoardCard[] = [];
+  for (const card of agentStatus?.view?.cards ?? []) {
     const session = rows.get(providerId(card.session_key));
-    return {
+    const attention = chipsOf(session);
+    const status = deriveStatus(card, {
+      attention,
+      elicitation: elicitationDetail(session?.attention ?? []),
+      acked: isAcked(acks, card.session_key, card.evidence_observed_at),
+    });
+    if (status === null) continue; // exited: not a status anyone acts on.
+    cards.push({
       key: card.session_key,
       title: label(session?.name ?? card.session_key),
       sessionId: session?.id ?? null,
-      state: card.state,
+      status,
+      evidenceObservedAt: card.evidence_observed_at,
       provider: card.provider,
       model: models.get(card.session_key) ?? null,
       lifecycle: card.lifecycle,
@@ -145,13 +171,13 @@ export function boardColumns(
       waitKind: card.wait_kind,
       hasOpenRequest: card.has_open_request,
       acp: card.provider === "acp",
-      attention: chipsOf(session),
-    };
-  });
+      attention,
+    });
+  }
   return COLUMNS.map((state) => ({
     state,
     cards: cards
-      .filter((card) => card.state === state)
+      .filter((card) => bucketOf(card.status) === state)
       .sort(
         (a, b) =>
           Number(b.hasOpenRequest) - Number(a.hasOpenRequest) || a.title.localeCompare(b.title),
