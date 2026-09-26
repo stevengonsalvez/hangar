@@ -77,11 +77,17 @@ pub enum WireError {
         /// Why.
         message: String,
     },
-    /// The device key could not be read or minted.
+    /// A device secret could not be read, minted or stored.
     #[error("key custody: {message}")]
     Custody {
         /// Why.
         message: String,
+    },
+    /// No pairing is saved for the host.
+    #[error("not paired with {host_id}")]
+    NotPaired {
+        /// The host.
+        host_id: String,
     },
 }
 
