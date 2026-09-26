@@ -61,6 +61,11 @@ pub struct PairingRecord {
     pub expires_at_ms: i64,
     /// When the pairing happened, epoch ms.
     pub paired_at_ms: i64,
+    /// The re-pair latch: set when the session layer sees a 4401 or 4403
+    /// close from this host, cleared only by a successful pair. The app
+    /// shows it as `HostRow.repair` and keeps no copy.
+    #[serde(default)]
+    pub repair: bool,
 }
 
 fn token_secret(host_id: &str) -> String {
@@ -108,6 +113,20 @@ pub fn save(custody_dir: &Path, record: PairingRecord, token: &str) -> Result<()
     records.retain(|r| r.host_id != record.host_id);
     records.push(record);
     write_index(custody_dir, &records)
+}
+
+/// Set or clear the re-pair latch on `host_id`; absent is not an error.
+pub fn mark_repair(custody_dir: &Path, host_id: &str, repair: bool) -> Result<(), WireError> {
+    let mut records = list(custody_dir)?;
+    let mut changed = false;
+    for r in records.iter_mut().filter(|r| r.host_id == host_id) {
+        changed |= r.repair != repair;
+        r.repair = repair;
+    }
+    if changed {
+        write_index(custody_dir, &records)?;
+    }
+    Ok(())
 }
 
 /// Forget a pairing: the token and the record. Absent is not an error.
@@ -203,6 +222,7 @@ pub(crate) async fn pair(
         admin: redeemed.scope.admin(),
         expires_at_ms: redeemed.expires_at_ms,
         paired_at_ms: now_ms(),
+        repair: false,
     };
     save(custody_dir, record.clone(), &redeemed.device_token)?;
     Ok((record, hello))
@@ -257,7 +277,24 @@ mod tests {
             admin: false,
             expires_at_ms: 1,
             paired_at_ms: 2,
+            repair: false,
         }
+    }
+
+    #[test]
+    fn the_repair_latch_sets_clears_and_survives_an_old_index() {
+        let dir = tempfile::tempdir().unwrap();
+        save(dir.path(), record("h1"), "mdd_one").unwrap();
+        mark_repair(dir.path(), "h1", true).unwrap();
+        assert!(find(dir.path(), "h1").unwrap().unwrap().repair);
+        mark_repair(dir.path(), "nope", true).unwrap();
+        mark_repair(dir.path(), "h1", false).unwrap();
+        assert!(!find(dir.path(), "h1").unwrap().unwrap().repair);
+        // An index written before the field reads as not latched.
+        let mut old = serde_json::to_value(vec![record("h2")]).unwrap();
+        old[0].as_object_mut().unwrap().remove("repair");
+        std::fs::write(dir.path().join(INDEX_FILE), old.to_string()).unwrap();
+        assert!(!find(dir.path(), "h2").unwrap().unwrap().repair);
     }
 
     #[test]
