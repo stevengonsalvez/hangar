@@ -1850,6 +1850,15 @@ async fn handle_fleet_action(
 ) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::fleet::FleetActionParams =
         parse_params(req, "{ session_key, expected_version, request_id, action }")?;
+    // D18 fence, checked before the `writing` receipt: a refused action never
+    // claims it began writing.
+    enforce_session_fence(
+        pool,
+        methods::FLEET_ACTION,
+        params.mutation.fence.as_ref(),
+        &params.session_key,
+    )
+    .await?;
     // The D18 `writing` boundary for this family. It is set HERE, one frame
     // above `execute_fleet_action`, rather than beside the `send-keys` itself:
     // the executor lives in `fleet.rs`, which another lane owns, and nothing
@@ -2327,6 +2336,17 @@ async fn handle_fleet_message_send(
     if let Some(device_id) = caller.device_id() {
         params.actor = Some(format!("device:{device_id}"));
     }
+    if let Some(fence) = params.mutation.fence.as_ref() {
+        // A lifecycle clock is one session's, so a fenced send names exactly
+        // one target: fanning one clock across several sessions would check
+        // all but one of them against a value nobody read.
+        let [target] = params.targets.as_slice() else {
+            return Err(invalid_params(
+                "a fenced fleet/message_send must name exactly one target",
+            ));
+        };
+        enforce_session_fence(pool, methods::FLEET_MESSAGE_SEND, Some(fence), target).await?;
+    }
     let span = tracing::info_span!(
         "fleet.message.send",
         request_id = %params.request_id,
@@ -2351,6 +2371,82 @@ async fn handle_fleet_message_send(
     let sent = message_send_inner(pool, params, events).instrument(span).await;
     mutation::mark_active_receipt(pool, message_send_receipt(sent.as_ref()), None, now_ms).await;
     sent
+}
+
+/// Enforce the D18 fence a PTY-effecting fleet call carried (F-1).
+///
+/// - `fleet/message_send` is fenced on the lifecycle clock the client read:
+///   a later `lifecycle_updated_at` means the agent moved on since the client
+///   looked, and the prompt is refused with `turn_advanced` rather than typed
+///   into a turn the client never saw.
+/// - `fleet/action` is fenced on the session incarnation: a different one
+///   means a new process owns the name, and the action is refused with
+///   `incarnation_mismatch` rather than aimed at it.
+///
+/// No fence keeps today's contract. A fence of the other kind is a malformed
+/// request. A session the store does not know is left to the handler, which
+/// already answers for it. The check runs before the `writing` receipt, so a
+/// refusal never claims an effect began; it is a check-then-send, and a turn
+/// that advances between the two is the race the next fenced call catches.
+async fn enforce_session_fence(
+    pool: &SqlitePool,
+    method: &str,
+    fence: Option<&ainb_hangar_proto::mutation::Fence>,
+    session_key: &str,
+) -> Result<(), RpcError> {
+    use ainb_hangar_proto::mutation::{Fence, REASON_INCARNATION_MISMATCH, REASON_TURN_ADVANCED};
+    use ainb_hangar_store::repo::fleet::FleetRepo;
+
+    let Some(fence) = fence else {
+        return Ok(());
+    };
+    let expected_kind = match method {
+        methods::FLEET_ACTION => "session_incarnation",
+        _ => "lifecycle_updated_at",
+    };
+    let fits = matches!(
+        (method, fence),
+        (methods::FLEET_ACTION, Fence::SessionIncarnation { .. })
+            | (
+                methods::FLEET_MESSAGE_SEND,
+                Fence::LifecycleUpdatedAt { .. }
+            )
+    );
+    if !fits {
+        return Err(invalid_params(&format!(
+            "{method} is fenced on {expected_kind}, not this fence kind"
+        )));
+    }
+    let Some(row) = FleetRepo::get_session(pool, session_key)
+        .await
+        .map_err(|error| store_err(&error))?
+    else {
+        return Ok(());
+    };
+    match fence {
+        Fence::LifecycleUpdatedAt {
+            lifecycle_updated_at,
+        } if row.lifecycle_updated_at > *lifecycle_updated_at => Err(mutation::rejected(
+            REASON_TURN_ADVANCED,
+            format!(
+                "{session_key} moved on since it was read (lifecycle {} > {lifecycle_updated_at}); \
+                 nothing was sent",
+                row.lifecycle_updated_at
+            ),
+        )),
+        Fence::SessionIncarnation {
+            session_incarnation,
+        } if row.session_incarnation.as_deref() != Some(session_incarnation.as_str()) => {
+            Err(mutation::rejected(
+                REASON_INCARNATION_MISMATCH,
+                format!(
+                    "{session_key} is a different process than the one that was read; \
+                     nothing was done"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The D18 receipt state a completed `fleet/message_send` earns.
@@ -3004,12 +3100,20 @@ async fn handle_fleet_transcript_list(
 
     require_fleet_capability(FLEET_CAPABILITY_TRANSCRIPT_READ)?;
     let params: FleetTranscriptListParams =
-        parse_params(req, "{ session_key, after_order?, limit }")?;
+        parse_params(req, "{ session_key, after_order?, before_order?, limit }")?;
     if params.session_key.trim().is_empty() {
         return Err(invalid_params("session_key must not be empty"));
     }
     if params.after_order.is_some_and(|order| order < 0) {
         return Err(invalid_params("after_order must be non-negative"));
+    }
+    if params.before_order.is_some_and(|order| order < 0) {
+        return Err(invalid_params("before_order must be non-negative"));
+    }
+    if params.after_order.is_some() && params.before_order.is_some() {
+        return Err(invalid_params(
+            "after_order and before_order are exclusive: page forward or back, not both",
+        ));
     }
     let limit = i64::from(params.limit.clamp(1, FLEET_TRANSCRIPT_LIST_MAX));
     // A transcript read with NO cursor answers with the newest page, because
@@ -3029,7 +3133,7 @@ async fn handle_fleet_transcript_list(
     // and truncation flag included. A tail is bounded twice because a chunk's
     // payload has no ceiling of its own, and which bound bit is not inferable
     // from the row count, so it rides the wire.
-    let (rows, truncated) = match params.after_order {
+    let (rows, truncated, lowest_scanned) = match params.after_order {
         Some(after_order) => FleetProviderEventRepo::list_by_session_after(
             pool,
             &params.session_key,
@@ -3042,21 +3146,40 @@ async fn handle_fleet_transcript_list(
         // updates. It answers "what came after this row", so stopping early
         // has nothing to admit: `next_after_order` already tells the caller
         // where to resume.
-        .map(|rows| (within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES), false)),
-        None => {
-            FleetProviderEventRepo::list_by_session_tail(
-                pool,
-                &params.session_key,
-                limit,
-                FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        .map(|rows| {
+            (
+                within_bytes(rows, FLEET_TRANSCRIPT_LIST_MAX_BYTES),
+                false,
+                None,
             )
-            .await
-        }
+        }),
+        // No forward cursor: the newest page, or with `before_order` the
+        // newest page strictly older than it (a phone scrolling back). Both
+        // are the tail read, bounded by rows and bytes, with `truncated`
+        // meaning older rows remain.
+        None => FleetProviderEventRepo::list_by_session_tail_before(
+            pool,
+            &params.session_key,
+            params.before_order,
+            limit,
+            FLEET_TRANSCRIPT_LIST_MAX_BYTES,
+        )
+        .await
+        .map(|page| (page.rows, page.truncated, page.lowest_scanned)),
     }
     .map_err(|error| store_err(&error))?;
     let chunks: Vec<_> = rows.iter().map(transcript_chunk_wire).collect();
     to_value(&FleetTranscriptListResult {
-        next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+        // A backward page is not a place to walk forward from.
+        next_after_order: if params.before_order.is_some() {
+            None
+        } else {
+            chunks.last().map(|chunk| chunk.ingest_order)
+        },
+        // Where the next page back starts: the lowest order scanned, which
+        // is below the first chunk when the oldest rows reached could not be
+        // decoded, so a walk back never stalls on them.
+        next_before_order: if truncated { lowest_scanned } else { None },
         chunks,
         truncated,
     })
@@ -13595,6 +13718,7 @@ fn session_row_to_entry(
         model_source: row.model_source,
         codex_model: row.codex_model,
         codex_thread_id: row.codex_thread_id,
+        claude_session_id: row.claude_session_id,
     }
 }
 
@@ -13615,6 +13739,7 @@ fn session_entry_to_row(
         model_source: entry.model_source,
         codex_model: entry.codex_model,
         codex_thread_id: entry.codex_thread_id,
+        claude_session_id: entry.claude_session_id,
     }
 }
 
@@ -14363,6 +14488,185 @@ mod tests {
         assert_eq!(sender, "device:01J0PHONE");
     }
 
+    /// A store with one fleet session at a known lifecycle clock and
+    /// incarnation, for the F-1 fence tests.
+    async fn fenced_session_store() -> (tempfile::TempDir, Store) {
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        sqlx::query(
+            "INSERT INTO fleet_session \
+             (session_key, provider, cwd, capabilities, discovered_at, last_observed_at, version) \
+             VALUES ('s1', 'claude', '/work', '{\"send_prompt\":true}', 1, 1, 1)",
+        )
+        .execute(store.pool())
+        .await
+        .expect("seed session");
+        sqlx::query(
+            "UPDATE fleet_session SET lifecycle_updated_at = 10, session_incarnation = 'proc-a' \
+             WHERE session_key = 's1'",
+        )
+        .execute(store.pool())
+        .await
+        .expect("set the fenced columns");
+        (home, store)
+    }
+
+    async fn call(store: &Store, method: &str, params: serde_json::Value) -> RpcResponse {
+        dispatch_as(
+            store.pool(),
+            &req(method, params),
+            &health(),
+            &sink(),
+            &auth::Caller::Operator,
+        )
+        .await
+    }
+
+    fn rejection_reason(response: &RpcResponse) -> Option<String> {
+        let error = response.error.as_ref()?;
+        (error.code == ainb_hangar_proto::mutation::MUTATION_REJECTED).then_some(())?;
+        error.data.as_ref()?[ainb_hangar_proto::mutation::ACK_KEY]["reason"]
+            .as_str()
+            .map(ToString::to_string)
+    }
+
+    /// F-1: a prompt fenced on a lifecycle clock the session has moved past
+    /// is refused `turn_advanced` and writes nothing; a retry under the same
+    /// request_id with the current clock sends.
+    #[tokio::test]
+    async fn a_stale_lifecycle_fence_refuses_the_prompt_and_a_current_one_sends() {
+        let (_home, store) = fenced_session_store().await;
+        let send = |request_id: &str, clock: i64| {
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": request_id,
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": clock},
+            })
+        };
+
+        let stale = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 5)).await;
+        assert_eq!(
+            rejection_reason(&stale).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_TURN_ADVANCED),
+            "{stale:?}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused send persists nothing");
+        // A fence refusal is NOT this op id's answer: the fingerprint strips
+        // the fence, so the phone re-reads the clock and retries under the
+        // SAME request_id, and that retry sends.
+        let retried = call(&store, methods::FLEET_MESSAGE_SEND, send("req-stale", 10)).await;
+        assert!(retried.error.is_none(), "{:?}", retried.error);
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_message")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the retry delivered exactly once");
+    }
+
+    /// F-1: a fenced send names one session, and the fence kind must be the
+    /// method's own.
+    #[tokio::test]
+    async fn a_fenced_prompt_names_one_target_with_its_own_fence_kind() {
+        let (_home, store) = fenced_session_store().await;
+        let two = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1", "s2"],
+                "text": "go on",
+                "request_id": "req-two",
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            two.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{two:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_MESSAGE_SEND,
+            serde_json::json!({
+                "targets": ["s1"],
+                "text": "go on",
+                "request_id": "req-kind",
+                "fence": {"kind": "session_incarnation", "session_incarnation": "proc-a"},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
+    }
+
+    /// F-1: an action fenced on another process's incarnation is refused
+    /// `incarnation_mismatch` before any receipt; the matching incarnation
+    /// passes the fence (whatever the action itself then answers).
+    #[tokio::test]
+    async fn an_action_fenced_on_another_incarnation_is_refused() {
+        let (_home, store) = fenced_session_store().await;
+        let action = |request_id: &str, incarnation: &str| {
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": request_id,
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "session_incarnation", "session_incarnation": incarnation},
+            })
+        };
+
+        let other = call(&store, methods::FLEET_ACTION, action("req-other", "proc-b")).await;
+        assert_eq!(
+            rejection_reason(&other).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{other:?}"
+        );
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_action_receipt WHERE request_id = 'req-other'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 0, "a refused action claims no receipt");
+
+        // The same request_id with the fence re-read passes the fence: the
+        // refusal was not recorded as that op id's answer.
+        let same = call(&store, methods::FLEET_ACTION, action("req-other", "proc-a")).await;
+        assert_ne!(
+            rejection_reason(&same).as_deref(),
+            Some(ainb_hangar_proto::mutation::REASON_INCARNATION_MISMATCH),
+            "{same:?}"
+        );
+
+        let wrong_kind = call(
+            &store,
+            methods::FLEET_ACTION,
+            serde_json::json!({
+                "session_key": "s1",
+                "expected_version": 1,
+                "request_id": "req-kind",
+                "action": {"action": "interrupt"},
+                "fence": {"kind": "lifecycle_updated_at", "lifecycle_updated_at": 10},
+            }),
+        )
+        .await;
+        assert_eq!(
+            wrong_kind.error.as_ref().map(|e| e.code),
+            Some(INVALID_PARAMS),
+            "{wrong_kind:?}"
+        );
+    }
+
     /// The request loop is transport-generic: an in-memory duplex stream, with
     /// no unix socket and no peer credentials, is served exactly like the
     /// unix leg. A good hello is listed and answered, a request dispatches,
@@ -14477,6 +14781,239 @@ mod tests {
             registry.list().await.connections.is_empty(),
             "a refused hello is never listed"
         );
+    }
+
+    /// F4 and F2: a byte-capped backward page, and an oldest row that cannot
+    /// be decoded. The byte bound stops a page early with `truncated` and a
+    /// cursor at its first row; the bad row is skipped but still moves the
+    /// cursor below it, so the walk ends instead of asking for it forever.
+    #[tokio::test]
+    async fn backward_pages_stop_on_the_byte_budget_and_step_past_a_bad_row() {
+        use ainb_hangar_proto::fleet::FLEET_TRANSCRIPT_LIST_MAX_BYTES;
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let pool = store.pool();
+        let big = "x".repeat(FLEET_TRANSCRIPT_LIST_MAX_BYTES / 3);
+        let events: Vec<_> = (0..10)
+            .map(|n| NewFleetProviderEvent {
+                event_id: format!("big-{n}"),
+                provider: "claude".to_string(),
+                source: "acp".to_string(),
+                session_key: Some("big".to_string()),
+                provider_session_id: None,
+                observed_at: n,
+                received_at: n,
+                event_type: "agent_message_chunk".to_string(),
+                raw_payload: format!("{{\"n\":{n},\"pad\":\"{big}\"}}"),
+            })
+            .collect();
+        FleetProviderEventRepo::append_batch(pool, &events).await.expect("seed");
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            async move { dispatch_as(pool, &request, &health(), &sink(), &auth::Caller::Operator).await }
+        };
+        let orders_of = |result: &serde_json::Value| -> Vec<i64> {
+            result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["ingest_order"].as_i64().unwrap())
+                .collect()
+        };
+
+        // Byte-capped: 100 rows asked, each a third of the budget.
+        let mut seen = Vec::new();
+        let mut before: Option<i64> = None;
+        let mut pages = 0;
+        loop {
+            let mut params = serde_json::json!({"session_key": "big", "limit": 100});
+            if let Some(before) = before {
+                params["before_order"] = serde_json::json!(before);
+            }
+            let page = list(params).await;
+            let result = page.result.clone().expect("a page");
+            let orders = orders_of(&result);
+            assert!(
+                orders.len() <= 3,
+                "the byte budget caps the page: {}",
+                orders.len()
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+            if result["truncated"] != true {
+                assert!(result.get("next_before_order").is_none());
+                break;
+            }
+            assert_eq!(
+                result["next_before_order"].as_i64(),
+                orders.first().copied()
+            );
+            before = result["next_before_order"].as_i64();
+            assert!(pages < 20, "the walk must end");
+        }
+        assert_eq!(seen.len(), 10, "every row once");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+
+        // F2: the oldest row cannot be decoded.
+        sqlx::query("UPDATE fleet_provider_event SET raw_payload = x'ff' WHERE event_id = 'big-0'")
+            .execute(pool)
+            .await
+            .expect("corrupt the oldest row");
+        let bad_order = seen[0];
+        let mut before = Some(seen[1]);
+        let mut steps = 0;
+        let mut stepped_past = false;
+        while let Some(cursor) = before {
+            let page = list(serde_json::json!({
+                "session_key": "big", "before_order": cursor, "limit": 100,
+            }))
+            .await;
+            let result = page.result.clone().expect("a page");
+            assert!(
+                orders_of(&result).is_empty(),
+                "the bad row is never returned"
+            );
+            if result["next_before_order"].as_i64() == Some(bad_order) {
+                stepped_past = true;
+            }
+            before = result["next_before_order"].as_i64();
+            steps += 1;
+            assert!(steps < 5, "a bad oldest row must not stall the walk back");
+        }
+        assert!(
+            stepped_past,
+            "the cursor moved to the bad row's order, below it next"
+        );
+    }
+
+    /// `fleet/transcript_list { before_order }` on a dense session: 1000 rows
+    /// for the watched session interleaved with 1000 for another, so its
+    /// orders are not contiguous. Paging back from the newest page with
+    /// `before_order` = the first order held returns 100 rows at a time, each
+    /// page ascending and strictly older, no row twice and none skipped,
+    /// `truncated` until the oldest page. The request cap holds at 100, and
+    /// both cursors together are refused.
+    #[tokio::test]
+    async fn transcript_list_pages_back_with_before_order_on_a_dense_session() {
+        use ainb_hangar_store::repo::fleet_provider_event::{
+            FleetProviderEventRepo, NewFleetProviderEvent,
+        };
+
+        let home = tempfile::tempdir().expect("home");
+        let store = Store::open_in(home.path()).await.expect("store");
+        let event = |session: &str, n: usize| NewFleetProviderEvent {
+            event_id: format!("{session}-{n}"),
+            provider: "claude".to_string(),
+            source: "acp".to_string(),
+            session_key: Some(session.to_string()),
+            provider_session_id: None,
+            observed_at: 1_000 + i64::try_from(n).unwrap(),
+            received_at: 1_000 + i64::try_from(n).unwrap(),
+            event_type: "agent_message_chunk".to_string(),
+            raw_payload: format!("{{\"n\":{n}}}"),
+        };
+        let mut batch = Vec::new();
+        for n in 0..1000 {
+            batch.push(event("dense", n));
+            batch.push(event("other", n));
+        }
+        FleetProviderEventRepo::append_batch(store.pool(), &batch).await.expect("seed");
+
+        let list = |params: serde_json::Value| {
+            let request = req(methods::FLEET_TRANSCRIPT_LIST, params);
+            let pool = store.pool().clone();
+            async move {
+                dispatch_as(&pool, &request, &health(), &sink(), &auth::Caller::Operator).await
+            }
+        };
+        let page_of = |response: &RpcResponse| {
+            let result = response.result.as_ref().expect("a page");
+            let orders: Vec<i64> = result["chunks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|chunk| {
+                    assert_eq!(chunk["session_key"], "dense", "only the watched session");
+                    chunk["ingest_order"].as_i64().unwrap()
+                })
+                .collect();
+            (orders, result["truncated"].as_bool().unwrap_or(false))
+        };
+
+        // The newest page, then back until the start.
+        let newest = list(serde_json::json!({"session_key": "dense", "limit": 100})).await;
+        let (mut orders, mut truncated) = page_of(&newest);
+        let mut seen: Vec<i64> = orders.clone();
+        let mut pages = 1;
+        let mut next_before = newest.result.as_ref().unwrap()["next_before_order"].as_i64();
+        while truncated {
+            // F2: the walk follows the daemon's cursor, the first order here.
+            let before = next_before.expect("a truncated page names where to go back");
+            assert_eq!(before, orders[0]);
+            let older = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            (orders, truncated) = page_of(&older);
+            next_before = older.result.as_ref().unwrap()["next_before_order"].as_i64();
+            // F3: a backward page never offers a forward cursor.
+            assert!(
+                older.result.as_ref().unwrap().get("next_after_order").is_none(),
+                "page {pages}"
+            );
+            assert_eq!(orders.len(), 100, "page {pages}");
+            assert!(
+                orders.windows(2).all(|w| w[0] < w[1]),
+                "ascending within a page"
+            );
+            assert!(
+                *orders.last().unwrap() < before,
+                "strictly before the cursor"
+            );
+            seen.splice(0..0, orders.iter().copied());
+            pages += 1;
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(next_before, None, "nothing older remains");
+        assert_eq!(seen.len(), 1000, "every row once");
+
+        // F4: a cursor at, or below, the first row, and a cursor of 0, are
+        // empty, complete pages.
+        for before in [seen[0], seen[0] - 1, 0] {
+            let empty = list(serde_json::json!({
+                "session_key": "dense", "before_order": before, "limit": 100,
+            }))
+            .await;
+            let result = empty.result.as_ref().expect("a page");
+            assert_eq!(result["chunks"].as_array().unwrap().len(), 0, "{before}");
+            assert_eq!(result["truncated"], false, "{before}");
+            assert!(result.get("next_before_order").is_none(), "{before}");
+            assert!(result.get("next_after_order").is_none(), "{before}");
+        }
+        assert!(
+            seen.windows(2).all(|w| w[0] < w[1]),
+            "no row twice, none out of order"
+        );
+
+        // The cap: asking for more than 100 still answers 100.
+        let capped = list(serde_json::json!({
+            "session_key": "dense", "before_order": i64::MAX, "limit": 5000,
+        }))
+        .await;
+        assert_eq!(page_of(&capped).0.len(), 100);
+
+        // Exclusive cursors, and no negative cursor.
+        for bad in [
+            serde_json::json!({"session_key": "dense", "after_order": 1, "before_order": 9, "limit": 10}),
+            serde_json::json!({"session_key": "dense", "before_order": -1, "limit": 10}),
+        ] {
+            let refused = list(bad).await;
+            assert_eq!(refused.error.as_ref().map(|e| e.code), Some(INVALID_PARAMS));
+        }
     }
 
     /// A workspace subscription owns both the durable event forwarder and the

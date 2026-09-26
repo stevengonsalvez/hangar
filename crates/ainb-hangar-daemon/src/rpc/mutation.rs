@@ -34,9 +34,9 @@
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
-    REASON_ALREADY_ANSWERED_BY, REASON_EFFECTS_AMBIGUOUS, REASON_LEDGER_SATURATED,
-    REASON_NO_TARGET, REASON_NOT_DELIVERED, REASON_OP_EXPIRED, REASON_OP_ID_FOREIGN,
-    REASON_REPLY_LOST, ReceiptState,
+    REASON_ALREADY_ANSWERED_BY, REASON_EFFECTS_AMBIGUOUS, REASON_INCARNATION_MISMATCH,
+    REASON_LEDGER_SATURATED, REASON_NO_TARGET, REASON_NOT_DELIVERED, REASON_OP_EXPIRED,
+    REASON_OP_ID_FOREIGN, REASON_REPLY_LOST, REASON_TURN_ADVANCED, ReceiptState,
 };
 use ainb_hangar_proto::{RpcError, RpcRequest, methods};
 use ainb_hangar_store::repo::mutation_ledger::{
@@ -211,6 +211,17 @@ fn with_ack(mut value: Value, ack: &MutationAck) -> Value {
         }
     }
     value
+}
+
+/// A D18 refusal: [`MUTATION_REJECTED`](ainb_hangar_proto::mutation::MUTATION_REJECTED)
+/// with a rejected ack carrying `reason`, the shape every mutation refusal
+/// takes so a client branches on the reason, never on the message text.
+pub(crate) fn rejected(reason: &str, message: String) -> RpcError {
+    ack_error(
+        ainb_hangar_proto::mutation::MUTATION_REJECTED,
+        message,
+        &MutationAck::rejected(reason),
+    )
 }
 
 /// An error envelope carrying the ack in `data`.
@@ -549,6 +560,24 @@ where
         }
     }
 
+    // The same holds for a fence the handler refused as an RPC error (F-1:
+    // `turn_advanced`, `incarnation_mismatch`). The fingerprint strips the
+    // fence, so recording the refusal would replay it to every retry under
+    // this op id, even one carrying a freshly read fence. Abandoned instead,
+    // before any `writing` receipt, so the retry runs for real.
+    if let Err(error) = &result {
+        if let Some(reason) = fence_refusal(error) {
+            let _ = MutationLedgerRepo::abandon(pool, &key).await;
+            return Err(with_error_ack(
+                error.clone(),
+                &MutationAck::refused(
+                    ainb_hangar_proto::mutation::MutationOutcome::Created,
+                    reason,
+                ),
+            ));
+        }
+    }
+
     match &result {
         Ok(value) => {
             let encoded = stored::encode_ok(value);
@@ -595,11 +624,14 @@ where
         }
         Err(error) => {
             let encoded = stored::encode_err(error);
+            // A handler that refused with a D18 reason (a fence) keeps it; any
+            // other refusal is named by its code, as before.
+            let reason = handler_reason(error).unwrap_or_else(|| error.code.to_string());
             MutationLedgerRepo::record_reply(
                 pool,
                 &key,
                 ainb_hangar_store::repo::mutation_ledger::STATUS_REJECTED,
-                Some(&error.code.to_string()),
+                Some(&reason),
                 Some(&encoded),
                 settled_ms,
             )
@@ -613,12 +645,34 @@ where
                 &MutationAck {
                     outcome: Some(ainb_hangar_proto::mutation::MutationOutcome::Created),
                     status: MutationStatus::Rejected,
-                    reason: Some(error.code.to_string()),
+                    reason: Some(reason),
                     receipt: None,
                 },
             ))
         }
     }
+}
+
+/// A handler refusal that a stale FENCE caused, which must not be recorded as
+/// the op id's answer (see the abandon path in [`guard`]).
+fn fence_refusal(error: &RpcError) -> Option<&'static str> {
+    match handler_reason(error)?.as_str() {
+        REASON_TURN_ADVANCED => Some(REASON_TURN_ADVANCED),
+        REASON_INCARNATION_MISMATCH => Some(REASON_INCARNATION_MISMATCH),
+        _ => None,
+    }
+}
+
+/// The D18 reason a handler already put on its refusal through [`rejected`],
+/// so the ledger's ack does not overwrite `turn_advanced` with `-32008`.
+fn handler_reason(error: &RpcError) -> Option<String> {
+    error
+        .data
+        .as_ref()?
+        .get(ACK_KEY)?
+        .get("reason")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
