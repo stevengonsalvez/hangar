@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::hosts::HostId;
 
 /// One session on one host.
+#[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionRef {
     /// The host that owns the session.

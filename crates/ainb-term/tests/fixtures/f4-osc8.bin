@@ -1,0 +1,6 @@
+links:
+]8;;https://example.invalid/a\ALPHA]8;;\ plain
+]8;id=x1;https://example.invalid/bBRAVO]8;; plain
+]8;;https://example.invalid/c\CHAR]8;;https://example.invalid/d\DELTA]8;;\
+]8;;https://example.invalid/long\LONGLINK-abcdefghijklmnopqrstuvwxyz-0123456789-abcdefghijklmnopqrstuvwxyz]8;;\ end
+no link here

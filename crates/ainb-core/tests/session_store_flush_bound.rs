@@ -69,6 +69,7 @@ fn a_quit_waits_for_the_queued_writes_only_to_the_bound() {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     };
     let mut store = SessionStore::default();
     store.upsert(session.clone());

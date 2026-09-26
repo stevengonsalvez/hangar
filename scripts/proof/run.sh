@@ -112,8 +112,11 @@ fi
 
 if ((${#ONLY[@]} == 0)); then printf '%s\n' "${NODES[@]}" >"$PROOF_OUT/order.txt"; fi
 
-# Every world of this run lives under one temp root of its own.
-PROOF_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ainb-proof-run.XXXXXX")" || exit 2
+# Every world of this run lives under one temp root of its own, under /tmp
+# rather than $TMPDIR: each world holds two tmux socket paths, and a macOS
+# TMPDIR alone takes about half of the 103 bytes a unix socket address allows
+# (world_up still checks and fails the node when a path does not fit).
+PROOF_TMP_ROOT="$(mktemp -d /tmp/ainb-proof-run.XXXXXX)" || exit 2
 export PROOF_TMP_ROOT
 
 echo "proof: $BINARY_LINE" >&2

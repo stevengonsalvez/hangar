@@ -130,6 +130,7 @@ fn run_name_from_tmux(tmux: &str, workspace: &str) -> String {
 /// the ONE verified send path instead of a private raw send-keys (INV-2).
 fn target_to_session(target: &TargetSession) -> Session {
     Session {
+        provider_session_id: None,
         id: target.session_id.clone(),
         cwd: target.cwd.clone(),
         pid: None,

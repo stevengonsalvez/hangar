@@ -63,7 +63,7 @@ scenario() {
   capture tui after-enter
   keys tui o
   check "o attaches (a writable tmux client appears on the fixture session)" \
-    wait_for 10 bash -c "[ \$(tmux list-clients -t '=$FIXTURE_TMUX' -F '#{client_flags}' | grep -vc read-only) -ge 1 ]"
+    wait_for 10 bash -c "[ \$(env -u TMUX -u TMUX_PANE tmux -S '$PROOF_FIXTURE_SOCK' list-clients -t '=$FIXTURE_TMUX' -F '#{client_flags}' | grep -vc read-only) -ge 1 ]"
   save_output clients-after-o ftmux list-clients -t "=$FIXTURE_TMUX" -F '#{client_tty} #{client_flags}'
   capture tui after-o-attached
   keys tui C-b d

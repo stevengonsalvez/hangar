@@ -1840,6 +1840,7 @@ fn session_row_for(record: &ainb_fleet_core::session_registry::AinbSessionRecord
         model_source: record.model_source.clone(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
