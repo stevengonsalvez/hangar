@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ainb_hangar_proto::hooks::{render_headers_file, HookEndpoint, CLAUDE_HOOK_EVENTS};
+use ainb_hangar_proto::hooks::{CLAUDE_HOOK_EVENTS, HookEndpoint, render_headers_file};
 
 fn ainb_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ainb"))
@@ -119,8 +119,14 @@ fn legacy_to_http_to_legacy_rewrites_the_managed_entries_in_place() {
     events.sort_unstable();
     let mut want: Vec<&str> = CLAUDE_HOOK_EVENTS.to_vec();
     want.sort_unstable();
-    assert_eq!(events, want, "exactly the 15 events, Notification and Elicitation included");
-    assert!(http.iter().all(|(_, c)| c.contains("ainb-hook.sh") && c.contains("AINB_MANAGED=atc")));
+    assert_eq!(
+        events, want,
+        "exactly the 15 events, Notification and Elicitation included"
+    );
+    assert!(
+        http.iter()
+            .all(|(_, c)| c.contains("ainb-hook.sh") && c.contains("AINB_MANAGED=atc"))
+    );
     assert!(home.path().join("ainb/hooks/ainb-hook.sh").is_file());
     assert_eq!(
         std::fs::read_to_string(home.path().join("ainb/hooks/transport")).unwrap(),
@@ -128,11 +134,13 @@ fn legacy_to_http_to_legacy_rewrites_the_managed_entries_in_place() {
     );
     // The user's own hook and settings survive.
     assert_eq!(s["theme"], "dark");
-    assert!(s["hooks"]["Stop"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|e| e["hooks"][0]["command"] == "my-own-stop-hook"));
+    assert!(
+        s["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["hooks"][0]["command"] == "my-own-stop-hook")
+    );
     assert!(home.path().join(".claude/settings.json.ainb.bak").is_file());
 
     setup(home.path(), "legacy");
