@@ -272,7 +272,11 @@ pub fn stamp_rows(
         let by_unique_cwd = || {
             (daemon_per_cwd.get(status_row.cwd.as_str()).copied() == Some(1)
                 && local_per_cwd.get(status_row.cwd.as_str()).copied() == Some(1))
-            .then(|| rows.iter().position(|row| row.session.cwd == status_row.cwd))
+            .then(|| {
+                rows.iter().position(|row| {
+                    ainb_fleet_core::read::jsonl_tail::same_dir(&row.session.cwd, &status_row.cwd)
+                })
+            })
             .flatten()
         };
         match by_identity.or_else(by_unique_cwd) {
@@ -317,6 +321,7 @@ fn needs_row_from_status(status: &ainb_hangar_proto::agent_status::AgentStatusRo
     use ainb_fleet_core::fleet::read::needs::{NeedsContext, WaitContext};
 
     let session = Session {
+        provider_session_id: None,
         id: status.session_key.clone(),
         cwd: status.cwd.clone(),
         pid: None,
@@ -579,6 +584,7 @@ mod census_tests {
 
     fn probe_only_session() -> Session {
         Session {
+            provider_session_id: None,
             id: "probe-session".to_string(),
             cwd: "/tmp/probe".to_string(),
             pid: None,
