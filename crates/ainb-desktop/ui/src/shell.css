@@ -806,7 +806,11 @@ body {
   display: grid;
   grid-template-columns: minmax(160px, 220px) 1fr;
   gap: 12px;
-  min-height: 0;
+  /* A flex item in the page's column, which scrolls as a whole. `min-height:
+     0` here let the grid shrink to nothing when the page overflowed, and its
+     rows then drew over the daemons and setup panels below, where the pointer
+     landed on the panel rather than on the field (#46). */
+  flex: none;
 }
 
 .settings-search {
@@ -896,6 +900,10 @@ body {
 .settings-page .empty,
 .readonly-note {
   margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* The review tab: the changed files beside the diff body. Laid out like the
    board, because it has the same job: fill the work area and let its own
    panes scroll, rather than clipping what does not fit. */
@@ -933,6 +941,10 @@ body {
 }
 
 .daemons-panel th {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .review-withheld {
   border-color: var(--red);
   color: var(--text);
@@ -1061,6 +1073,8 @@ body {
   grid-template-columns: 120px 1fr;
   gap: 8px;
   align-items: center;
+}
+
 .review-body {
   min-height: 0;
   border: 1px solid var(--border);
