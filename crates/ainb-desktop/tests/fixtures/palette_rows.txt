@@ -354,6 +354,7 @@ session_list.logs_pane.toggle_auto_scroll|session_list.logs_pane|space|false
 session_list.logs_pane.top|session_list.logs_pane|home|false
 session_list.logs_pane.up|session_list.logs_pane|up|false
 session_list.menu_bar|session_list|M|true
+session_list.metadata|session_list|v|true
 session_list.new_session|session_list|n|true
 session_list.next|session_list|down|true
 session_list.preview_down|session_list|shift+down|true

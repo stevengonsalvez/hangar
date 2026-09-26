@@ -38,7 +38,7 @@
 //! sources never receive writes.
 //!
 //! [`NoOp`]: SyncDirection::NoOp
-//! [`SyncEngine`]: https://github.com/stevengonsalvez/agents-in-a-box
+//! [`SyncEngine`]: https://github.com/stevengonsalvez/hangar
 
 use std::fs;
 use std::path::{Path, PathBuf};

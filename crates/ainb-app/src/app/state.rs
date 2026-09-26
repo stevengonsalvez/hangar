@@ -73,7 +73,8 @@ pub enum SessionContextAction {
 /// Fleet-only metadata for one local session row.
 ///
 /// Absent fields mean Hangar has never observed them. The UI must omit those
-/// fields, never replace them with a guessed provider default.
+/// fields, never replace them with a guessed provider default. The Session
+/// List can temporarily use model/effort as its one-line title.
 #[derive(serde::Serialize, Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 pub struct SessionFleetMetadata {
@@ -85,6 +86,8 @@ pub struct SessionFleetMetadata {
     pub provider_session_id: Option<String>,
     /// Exact Fleet lifecycle, omitted when Fleet has no observation.
     pub lifecycle: Option<ainb_hangar_proto::fleet::LifecycleState>,
+    /// Timestamp paired with `lifecycle`, used to reject an older snapshot.
+    pub lifecycle_updated_at: i64,
 }
 
 /// Ephemeral state for the keyboard-accessible right-click context menu.
@@ -7038,6 +7041,11 @@ impl AppState {
         self.sessions.expand_all_workspaces = !self.sessions.expand_all_workspaces;
     }
 
+    /// Toggle compact model/effort titles for this TUI process only.
+    pub fn toggle_session_metadata(&mut self) {
+        self.sessions.show_session_metadata = !self.sessions.show_session_metadata;
+    }
+
     /// Hide/show the Sessions bottom keymap legend (⇧M) and persist the choice.
     pub fn toggle_session_menu_bar(&mut self) {
         let show = !self.config.app_config.ui_preferences.show_session_menu_bar;
@@ -10351,6 +10359,14 @@ impl AppState {
                     true, // resume_requested — Enter/r on a Stopped session
                     metadata.headroom_enabled,
                     codex_remote.as_ref(),
+                    // The id the record holds, kept across the resume: named
+                    // exactly when Claude holds a transcript under it.
+                    metadata.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&metadata.worktree_path, id),
+                        }
+                    }),
                 )
                 .await?;
 
@@ -10479,8 +10495,64 @@ impl AppState {
     /// Returns `None` when the project directory is missing or contains no
     /// transcripts.
     pub fn find_latest_transcript(worktree_path: &std::path::Path) -> Option<std::path::PathBuf> {
-        let home = dirs::home_dir()?;
-        Self::find_latest_transcript_in(&home, worktree_path)
+        Self::find_latest_transcript_under(&Self::claude_projects_dir()?, worktree_path)
+    }
+
+    /// Where Claude keeps its transcripts: `$CLAUDE_CONFIG_DIR/projects` when
+    /// that variable is set, as `models::usage` reads it, else
+    /// `~/.claude/projects`. A resume that read the default while Claude
+    /// wrote elsewhere would relaunch under an id Claude already holds, and
+    /// the pane would die on "already in use".
+    fn claude_projects_dir() -> Option<std::path::PathBuf> {
+        Self::claude_projects_dir_from(
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// Pure half of [`Self::claude_projects_dir`]: `config_dir` is the
+    /// `CLAUDE_CONFIG_DIR` value, `home` the home directory.
+    pub(crate) fn claude_projects_dir_from(
+        config_dir: Option<&std::ffi::OsStr>,
+        home: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        config_dir
+            .map(|dir| std::path::PathBuf::from(dir).join("projects"))
+            .or_else(|| home.map(|home| home.join(".claude").join("projects")))
+    }
+
+    /// Whether Claude holds a transcript for `session_id` in `worktree_path`'s
+    /// project directory, which is what a `--resume <session_id>` needs: the
+    /// transcript is named by the session id.
+    pub fn claude_transcript_exists(worktree_path: &std::path::Path, session_id: &str) -> bool {
+        Self::claude_projects_dir().is_some_and(|projects| {
+            Self::claude_transcript_exists_under(&projects, worktree_path, session_id)
+        })
+    }
+
+    /// Test-friendly variant of [`Self::claude_transcript_exists`]: `home` is
+    /// the home directory whose `.claude/projects` is read.
+    pub(crate) fn claude_transcript_exists_in(
+        home: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        Self::claude_transcript_exists_under(
+            &home.join(".claude").join("projects"),
+            worktree_path,
+            session_id,
+        )
+    }
+
+    pub(crate) fn claude_transcript_exists_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+        session_id: &str,
+    ) -> bool {
+        projects
+            .join(Self::claude_project_dir_name(worktree_path))
+            .join(format!("{session_id}.jsonl"))
+            .is_file()
     }
 
     /// Test-friendly variant: caller supplies the home directory so unit tests
@@ -10494,10 +10566,14 @@ impl AppState {
         home: &std::path::Path,
         worktree_path: &std::path::Path,
     ) -> Option<std::path::PathBuf> {
-        let project_dir = home
-            .join(".claude")
-            .join("projects")
-            .join(Self::claude_project_dir_name(worktree_path));
+        Self::find_latest_transcript_under(&home.join(".claude").join("projects"), worktree_path)
+    }
+
+    pub(crate) fn find_latest_transcript_under(
+        projects: &std::path::Path,
+        worktree_path: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
+        let project_dir = projects.join(Self::claude_project_dir_name(worktree_path));
 
         let read = std::fs::read_dir(&project_dir).ok()?;
         let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -11818,9 +11894,10 @@ impl AppState {
     /// `recent` MUST be newest-first (as [`Store::recent_since`] returns
     /// it). The marker is the kind implied by the newest user-facing
     /// event for this session's `(cwd, agent)` whose `ts` is strictly
-    /// newer than `baseline_ms` — unless the agent is currently
-    /// `generating` (suppressed; the `●` busy dot covers it) or the only
-    /// match is a terminal lifecycle event. Returns `None`
+    /// newer than `baseline_ms`, unless the only match is a terminal lifecycle
+    /// event. A hook notification is explicit evidence and is deliberately
+    /// not suppressed by tmux discovery's coarse `generating` observation.
+    /// Returns `None`
     /// (blank — no marker) when nothing qualifies, which is the common
     /// case for an idle session with no pending hook event.
     /// The one-line message a hook payload carried, if it carried one.
@@ -11909,15 +11986,18 @@ impl AppState {
         cwd_fallback_requires_unidentified_id: bool,
         generating: bool,
         baseline_ms: i64,
-        now_ms: i64,
+        _now_ms: i64,
         recent: &[ainb_plugin_notifyd::NotificationRecord],
     ) -> Option<SessionAttention> {
         use ainb_plugin_notifyd::{AlertKind, classify_attention};
-        if generating {
-            return None;
-        }
+        // A hook notification is explicit evidence, not the old quiet-pane
+        // heuristic. In particular, a session can retain its tmux process
+        // while Claude is blocked at an idle/permission prompt. Suppressing
+        // that WAIT because discovery initially called the process `Running`
+        // made every attachable quiet session look like active work.
+        let _ = generating;
         let agent = agent?;
-        let cwd = session_cwd.trim_end_matches('/');
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(session_cwd);
 
         for rec in recent {
             // `recent` is newest-first and `ts`-sorted globally, so the
@@ -11925,7 +12005,7 @@ impl AppState {
             if rec.ts <= baseline_ms {
                 break;
             }
-            if rec.agent != agent || rec.cwd.trim_end_matches('/') != cwd {
+            if rec.agent != agent || !ainb_fleet_core::read::jsonl_tail::same_dir(&rec.cwd, &cwd) {
                 continue;
             }
             if let Some(provider_session_id) = provider_session_id {
@@ -12026,6 +12106,7 @@ impl AppState {
             baseline_ms,
             recent,
         )
+        .map(|(status, _)| status)
     }
 
     /// Identity-safe terminal lifecycle lookup; mirrors attention lookup.
@@ -12037,13 +12118,13 @@ impl AppState {
         cwd_fallback_requires_unidentified_id: bool,
         baseline_ms: i64,
         recent: &[ainb_plugin_notifyd::NotificationRecord],
-    ) -> Option<crate::models::SessionStatus> {
+    ) -> Option<(crate::models::SessionStatus, i64)> {
         let agent = agent?;
-        let cwd = session_cwd.trim_end_matches('/');
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(session_cwd);
         let newest = recent.iter().find(|record| {
             if record.ts <= baseline_ms
                 || record.agent != agent
-                || record.cwd.trim_end_matches('/') != cwd
+                || !ainb_fleet_core::read::jsonl_tail::same_dir(&record.cwd, &cwd)
             {
                 return false;
             }
@@ -12053,9 +12134,9 @@ impl AppState {
             )
         })?;
         match newest.raw_event.as_str() {
-            "SessionEnd" => Some(crate::models::SessionStatus::Stopped),
+            "SessionEnd" => Some((crate::models::SessionStatus::Stopped, newest.ts)),
             "Stop" | "agentStop" | "agent-turn-complete" | "task_complete" => {
-                Some(crate::models::SessionStatus::Idle)
+                Some((crate::models::SessionStatus::Idle, newest.ts))
             }
             _ => None,
         }
@@ -12392,10 +12473,10 @@ impl AppState {
         });
         let first_tmux = tmux_rows.next();
         let by_unique_tmux = first_tmux.filter(|_| tmux_rows.next().is_none());
-        let cwd = session.workspace_path.trim_end_matches('/');
-        let mut by_cwd = snapshot
-            .iter()
-            .filter(|row| row.provider == provider && row.cwd.trim_end_matches('/') == cwd);
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(&session.workspace_path);
+        let mut by_cwd = snapshot.iter().filter(|row| {
+            row.provider == provider && ainb_fleet_core::read::jsonl_tail::same_dir(&row.cwd, &cwd)
+        });
         let first = by_cwd.next();
         let by_unique_cwd = first.filter(|_| by_cwd.next().is_none());
         // Tmux and cwd can recover *display metadata* but never hook identity:
@@ -12419,6 +12500,7 @@ impl AppState {
                 provider_session_id,
                 lifecycle: (row.lifecycle != ainb_hangar_proto::fleet::LifecycleState::Unknown)
                     .then_some(row.lifecycle),
+                lifecycle_updated_at: row.lifecycle_updated_at,
             })
     }
 
@@ -12448,17 +12530,34 @@ impl AppState {
             || matches!(projected, crate::models::SessionStatus::Stopped)
     }
 
-    /// A local `SessionEnd` is a terminal fact. Fleet can briefly retain an
-    /// older live lifecycle after the pane is gone, so let only this explicit
-    /// local stop beat Fleet's otherwise-preferred lifecycle projection.
+    /// A daemon heartbeat proves transport only. Lifecycle remains authoritative
+    /// only while its own transition evidence is fresh. `0` is an explicit
+    /// no-expiry override for operators who require it.
+    #[must_use]
+    pub fn fleet_lifecycle_is_fresh_at(
+        lifecycle_updated_at: i64,
+        now_ms: i64,
+        stale_after_ms: i64,
+    ) -> bool {
+        stale_after_ms == 0
+            || (lifecycle_updated_at > 0
+                && now_ms.saturating_sub(lifecycle_updated_at) <= stale_after_ms)
+    }
+
+    /// A hook is the session's own latest lifecycle fact. Fleet is useful when
+    /// hooks have not observed the session, but must not turn a just-stopped
+    /// agent back into `RUN`: a live tmux server is attachability, not work.
     fn projected_session_status(
-        fleet: Option<crate::models::SessionStatus>,
-        local: Option<crate::models::SessionStatus>,
+        fleet: Option<(crate::models::SessionStatus, i64)>,
+        local: Option<(crate::models::SessionStatus, i64)>,
     ) -> Option<crate::models::SessionStatus> {
-        if matches!(local, Some(crate::models::SessionStatus::Stopped)) {
-            local
-        } else {
-            fleet.or(local)
+        match (fleet, local) {
+            (Some((fleet, fleet_at)), Some((local, local_at))) => {
+                Some(if local_at >= fleet_at { local } else { fleet })
+            }
+            (Some((fleet, _)), None) => Some(fleet),
+            (None, Some((local, _))) => Some(local),
+            (None, None) => None,
         }
     }
 
@@ -12832,10 +12931,20 @@ impl AppState {
                 let fleet_status = daemon
                     .reachable
                     .then(|| {
-                        fleet_metadata
-                            .get(&s.id)
-                            .and_then(|metadata| metadata.lifecycle)
-                            .and_then(Self::session_status_for_fleet_lifecycle)
+                        fleet_metadata.get(&s.id).and_then(|metadata| {
+                            Self::fleet_lifecycle_is_fresh_at(
+                                metadata.lifecycle_updated_at,
+                                now_ms,
+                                self.config.app_config.fleet.healthy_state_stale_ms,
+                            )
+                            .then(|| {
+                                metadata
+                                    .lifecycle
+                                    .and_then(Self::session_status_for_fleet_lifecycle)
+                                    .map(|status| (status, metadata.lifecycle_updated_at))
+                            })
+                            .flatten()
+                        })
                     })
                     .flatten();
                 // Persisted identity is authoritative. Older local rows have
@@ -13131,14 +13240,14 @@ impl AppState {
             // the only place the host learns it — the session tree carries
             // ainb's own UUID, which the hook never sees.
             let hook_session = self.find_session(id).and_then(|session| {
-                let cwd = session.workspace_path.trim_end_matches('/');
+                let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(&session.workspace_path);
                 let agent = Self::agent_hook_name(session.agent_type)?;
                 if let Some(known) = provider_session_id.as_deref() {
                     recent
                         .iter()
                         .find(|row| {
                             row.agent == agent
-                                && row.cwd.trim_end_matches('/') == cwd
+                                && ainb_fleet_core::read::jsonl_tail::same_dir(&row.cwd, &cwd)
                                 && row.session_id == known
                         })
                         .map(|row| row.session_id.clone())
@@ -13503,6 +13612,14 @@ impl AppState {
                 true,
                 headroom_enabled,
                 codex_remote.as_ref(),
+                metadata.and_then(|m| {
+                    m.claude_session_id.as_deref().map(|id| {
+                        crate::interactive::session_manager::ClaudeSession {
+                            id,
+                            resumable: Self::claude_transcript_exists(&m.worktree_path, id),
+                        }
+                    })
+                }),
             )
             .await?;
 
@@ -13595,7 +13712,7 @@ impl AppState {
         // held here. The write is the `Persist::SessionHeadroom` effect below,
         // a compare-and-set the resolver runs under its own lock, so a value
         // that moved between this read and that write is never overwritten.
-        let (skip_permissions, model, has_history) = {
+        let (skip_permissions, model, has_history, claude_session_id) = {
             let store = match crate::cli::util::load_session_store_async().await {
                 Ok(store) => store,
                 Err(e) => {
@@ -13623,6 +13740,13 @@ impl AppState {
                     meta.launch_model().or(session_model),
                     agent_type == SessionAgentType::Claude
                         && Self::find_latest_transcript(&meta.worktree_path).is_some(),
+                    // The id the record holds, kept across the respawn: a
+                    // resume names it exactly when Claude holds a transcript
+                    // under it, so the daemon's rows for it still land here.
+                    meta.claude_session_id.clone().map(|id| {
+                        let resumable = Self::claude_transcript_exists(&meta.worktree_path, &id);
+                        (id, resumable)
+                    }),
                 ),
             };
 
@@ -13651,6 +13775,12 @@ impl AppState {
                 model.as_deref(),
                 true,
                 has_history,
+                claude_session_id.as_ref().map(|(id, resumable)| {
+                    crate::interactive::session_manager::ClaudeSession {
+                        id,
+                        resumable: *resumable,
+                    }
+                }),
             );
         let cli_cmd = cmd_parts
             .iter()
@@ -15173,6 +15303,7 @@ mod codex_degrade_notice_tests {
             headroom_enabled: false,
             rtk_enabled: false,
             codex_thread_id: None,
+            claude_session_id: None,
             codex_degrade: degrade,
         }
     }

@@ -54,7 +54,10 @@ pub const UNAUTHORIZED: i32 = -32000;
 /// `{ token }` frame a pre-W0-wire client sends still decodes: it is read as
 /// [`ProtocolRange::legacy`] with no declared capabilities, which is exactly
 /// what that build is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` redacts [`Self::token`]: a hello is exactly the frame a connection
+/// error or a test failure prints.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
     /// The plaintext daemon token (`mdt_…`).
     pub token: String,
@@ -108,6 +111,29 @@ pub struct HelloParams {
     pub host: Option<crate::connections::SurfaceHost>,
 }
 
+impl std::fmt::Debug for HelloParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            token: _,
+            surface,
+            protocol,
+            capabilities,
+            device,
+            transient,
+            host,
+        } = self;
+        f.debug_struct("HelloParams")
+            .field("token", &crate::Redacted)
+            .field("surface", surface)
+            .field("protocol", protocol)
+            .field("capabilities", capabilities)
+            .field("device", device)
+            .field("transient", transient)
+            .field("host", host)
+            .finish()
+    }
+}
+
 /// The paired device presenting a per-device token (D13 / R1).
 ///
 /// Carried in hello rather than derived from the token so a daemon can log and
@@ -154,6 +180,18 @@ pub struct HelloResult {
     /// its rows name `local`, and a client reads the host as `local` too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,
+    /// The scope of the paired device this connection authenticated as (R1).
+    ///
+    /// Only on the peer leg, under the dark capability
+    /// [`crate::protocol::CAP_SCOPES`]; always absent on the unix leg, so a
+    /// v1.29.0 client sees the same reply it always did. Additive to the
+    /// result, not to `HelloParams` (D17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::devices::DeviceScope>,
+    /// Unix milliseconds the device token expires unless a hello slides it.
+    /// Present exactly when [`Self::scope`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_expires_at_ms: Option<i64>,
 }
 
 impl HelloResult {
@@ -295,12 +333,30 @@ mod tests {
             capabilities: crate::protocol::catalogue_strings(),
             daemon_version: Some("0.1.0".to_string()),
             host_id: Some("01K5A0000000000000000FIRST".to_string()),
+            scope: Some(crate::devices::DeviceScope::MOBILE),
+            device_expires_at_ms: Some(1),
         })
         .unwrap();
         // The pre-W0-wire client deserialized the ack as an empty struct.
         #[derive(Deserialize)]
         struct LegacyAck {}
         assert!(serde_json::from_value::<LegacyAck>(reply).is_ok());
+    }
+
+    /// T14: the device members are absent unless set, so the unix-leg reply a
+    /// v1.29.0 client reads is byte-identical, and they decode when present.
+    #[test]
+    fn the_device_members_are_absent_on_the_local_leg() {
+        let local = serde_json::to_value(HelloResult::default()).unwrap();
+        assert!(local.get("scope").is_none(), "{local}");
+        assert!(local.get("device_expires_at_ms").is_none(), "{local}");
+        let peer: HelloResult = serde_json::from_value(serde_json::json!({
+            "scope": {"base": "mobile+type", "admin": false},
+            "device_expires_at_ms": 42,
+        }))
+        .unwrap();
+        assert_eq!(peer.scope, Some(crate::devices::DeviceScope::MOBILE_TYPE));
+        assert_eq!(peer.device_expires_at_ms, Some(42));
     }
 
     /// The token file lives at `{home}/hangar/daemon.token`.

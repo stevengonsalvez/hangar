@@ -4,14 +4,14 @@
 ╭  Workspaces (2)F [all│  ↓            Next session                                           │────────────────────────
 │    ▼  api (3)        │  ↑            Previous session                                       │                       │
 │▶ 1 ☐ ├─ ainb/feat-logi│  Home/End     Top / bottom                                           │                       │
-│         ✻             │  Shift+↑/↓    Scroll the selected session's output                   │e active.              │
-│  2 ☐ ├─ ainb/fix-cache│                                                                      │                       │
-│         ✻             │Session Actions:                                                      │                       │
-│  3 ☐ └─ ainb/docs-read│  n            New session (local or remote)                          │                       │
-│         ✻             │  a            Attach — full-screen takeover (Ctrl+B then D to leave) │                       │
-│    ▼  web (1)        │  →            Pane attach (keeps the session list visible)           │                       │
-│  4 ☐ └─ ainb/spike-ssr│  1-9          Quick-attach to numbered session                       │                       │
-│         ✻             │  Enter        Resume (stopped) / attach (running)                    │                       │
+│  2 ☐ ├─ ainb/fix-cache│  Shift+↑/↓    Scroll the selected session's output                   │e active.              │
+│  3 ☐ └─ ainb/docs-read│                                                                      │                       │
+│    ▼  web (1)        │Session Actions:                                                      │                       │
+│  4 ☐ └─ ainb/spike-ssr│  n            New session (local or remote)                          │                       │
+│                       │  a            Attach — full-screen takeover (Ctrl+B then D to leave) │                       │
+│                       │  →            Pane attach (keeps the session list visible)           │                       │
+│                       │  1-9          Quick-attach to numbered session                       │                       │
+│                       │  Enter        Resume (stopped) / attach (running)                    │                       │
 │                       │  r            Resume stopped session (tmux)                          │                       │
 │                       │  Space        Select / deselect session                              │                       │
 │                       │  d            Delete session                                         │                       │
@@ -32,5 +32,5 @@
 │    new  attach  → Pane│  c            Toggle Claude chat                                     │w witr                 │
 │            r resume  d│                                                                      │ t abtop               │
 │          o editor  $ s│Panels (closing returns here):                                        │pand                   │
-│             f refresh └──────────────────────────────────────────────────────────────────────┘  ?/H help  q home     │
+│         f refresh  ⇧F └──────────────────────────────────────────────────────────────────────┘  ?/H help  q home     │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -169,9 +169,9 @@ fn applying_no_scroll_leaves_the_layout_and_the_repaint_flag_alone() {
 }
 
 /// The hit test resolves a click through the row heights the RENDER recorded,
-/// because a session row is two terminal lines and a header is one. Painting
-/// the real component is the only way to get a map that matches what the user
-/// clicked on.
+/// so a row that grows or shrinks can never desynchronise the map from what
+/// the user clicked on. Painting the real component is the only way to get
+/// heights that match the frame.
 #[test]
 fn mouse_hit_test_resolves_a_click_through_the_painted_row_map() {
     let mut state = AppState::new();
@@ -196,7 +196,7 @@ fn mouse_hit_test_resolves_a_click_through_the_painted_row_map() {
         .draw(|frame| list.render(frame, SESSIONS_RECT, &state, &mut ui))
         .expect("draw sessions panel");
 
-    // Row 0 is the workspace header (one line); every session below it is two.
+    // Row 0 is the workspace header; every session below it is one line.
     assert_eq!(
         ui.sessions_pane.row_index_at(8, SESSIONS_RECT.y + 1),
         Some(0)
@@ -207,11 +207,11 @@ fn mouse_hit_test_resolves_a_click_through_the_painted_row_map() {
     );
     assert_eq!(
         ui.sessions_pane.row_index_at(8, SESSIONS_RECT.y + 3),
-        Some(1)
+        Some(2)
     );
     assert_eq!(
         ui.sessions_pane.row_index_at(8, SESSIONS_RECT.y + 4),
-        Some(2)
+        Some(3)
     );
 
     // A point outside the pane is nobody's row.
@@ -228,7 +228,7 @@ fn mouse_hit_test_resolves_a_click_through_the_painted_row_map() {
         .session_list_row_at_mouse(&ui.sessions_pane, 8, SESSIONS_RECT.y + 3)
         .expect("a session row");
     state.select_session_list_row(target);
-    assert_eq!(state.sessions.selected_session_index, Some(0));
+    assert_eq!(state.sessions.selected_session_index, Some(1));
 }
 
 /// The seal itself: no `Rect` survives in `AppState`. A geometry field there is

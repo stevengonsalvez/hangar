@@ -79,7 +79,10 @@ pub const REASON_ALREADY_ANSWERED_BY: &str = "already_answered_by";
 pub const REASON_TURN_ADVANCED: &str = "turn_advanced";
 /// Reason: a different process now owns the session name.
 pub const REASON_INCARNATION_MISMATCH: &str = "incarnation_mismatch";
-/// Reason: a concurrent admin edit moved the registry version.
+/// Reason: the version the client read has moved on. A concurrent admin
+/// edit moved the device registry version (`registry_version` fence), or
+/// the fleet session's `version` is no longer the `expected_version` a
+/// `fleet/action` named. Re-read and resend under the same op id.
 pub const REASON_CONFLICT: &str = "conflict";
 /// Reason: the daemon died between `writing` and the reply, so the bytes may
 /// or may not have reached the PTY.
@@ -105,6 +108,25 @@ pub const REASON_NO_TARGET: &str = "no_target";
 /// ambiguous means "do not retry, go and look", while this means "nothing
 /// happened, retrying is safe".
 pub const REASON_NOT_DELIVERED: &str = "not_delivered";
+/// Reason: another stream holds the terminal input floor (R2).
+///
+/// A [`MUTATION_REJECTED`] reason, not a new error code: the spec already
+/// calls it "rejected with `floor_denied`". The error data also carries the
+/// current `holder` and `floor_gen` ([`crate::terminal::FloorDeniedData`]).
+pub const REASON_FLOOR_DENIED: &str = "floor_denied";
+/// Reason: no live hook hold, and the answer did not originate on this
+/// machine, so the local keys fallback is refused (hooks-and-answers).
+///
+/// Typed keys into a pane are a local-only fallback. An answer from a paired
+/// device, from ainb-web, or relayed by the phone bridge gets this instead of
+/// keystrokes; the operator answers at the machine.
+pub const REASON_LOCAL_ONLY: &str = "local_only";
+/// Reason: the caller's scope does not allow this answer for this row's kind.
+///
+/// `attention/answer` is allowed in every scope column, but an approval, or an
+/// ask that resolves a live hook hold, takes the same column verdict as
+/// `fleet/action` Approve. A phone scope, interrupt-only there, gets this.
+pub const REASON_SCOPE: &str = "scope";
 
 /// The reserved key under which the daemon attaches a [`MutationAck`] to an
 /// object-shaped mutation result.
@@ -548,27 +570,25 @@ pub static MUTATING_METHODS: &[MutatingMethod] = &[
         r#"{"attention_id":"att-sample","answer":"yes","answered_by":"harness"}"#
     ),
     // ── fleet control plane ──────────────────────────────────────────────
-    // FenceKind::None, not SessionIncarnation, and the difference is honesty:
-    // the verified send lives in `fleet.rs`, which another lane owns, so no
-    // handler reads an incarnation fence today. Declaring one here would tell a
-    // client reading the contract that it holds a stale-kill guard it does not
-    // have. The row flips to `SessionIncarnation` in the change that enforces
-    // it, and `receipt_tier_mutations_are_all_fenced` is the test that has to
-    // be relaxed to allow this, deliberately, so the gap is visible.
+    // Fenced on the session incarnation (F-1): the daemon refuses an action
+    // whose fence names another process with `incarnation_mismatch`, before
+    // the `writing` receipt, and `FleetSession.session_incarnation` carries
+    // the value a client fences on.
     mutating_method!(
         m::FLEET_ACTION,
         f::FleetActionParams,
         Receipt,
-        Fk::None,
+        Fk::SessionIncarnation,
         r#"{"session_key":"fleet-sample","expected_version":1,"request_id":"op-fleet-action","action":{"action":"kill"}}"#
     ),
-    // FenceKind::None for the same reason as `fleet/action` above: the
-    // lifecycle fence is specified and unenforced, so it is not claimed.
+    // Fenced on the lifecycle clock (F-1): a single-target send whose fence
+    // is older than `FleetSession.lifecycle_updated_at` is refused
+    // `turn_advanced` and nothing is typed.
     mutating_method!(
         m::FLEET_MESSAGE_SEND,
         f::FleetMessageSendParams,
         Receipt,
-        Fk::None,
+        Fk::LifecycleUpdatedAt,
         r#"{"targets":["fleet-sample"],"text":"hello","request_id":"op-fleet-message"}"#
     ),
     mutating_method!(
@@ -1308,11 +1328,12 @@ mod tests {
     /// A declared fence must be an ENFORCED fence.
     ///
     /// The earlier shape of this test asserted that every tier-2 mutation names
-    /// a fence, which the table satisfied by naming two that no handler reads.
+    /// a fence, which the table satisfied by naming two that no handler read.
     /// That is the worse failure: a client that reads the contract and sends a
-    /// lifecycle fence believes it holds a stale-send guard that does not
-    /// exist. So the list of fenced methods is pinned exactly, and adding a row
-    /// to it means adding the enforcement in the same change.
+    /// fence believes it holds a guard that does not exist. So the list of
+    /// fenced methods is pinned exactly, and adding a row to it means adding
+    /// the enforcement in the same change (F-1 enforces the two fleet rows in
+    /// the daemon's `enforce_session_fence`).
     #[test]
     fn only_enforced_fences_are_declared() {
         let fenced: Vec<(&str, FenceKind)> = MUTATING_METHODS
@@ -1322,14 +1343,20 @@ mod tests {
             .collect();
         assert_eq!(
             fenced,
-            vec![(
-                crate::methods::ATTENTION_ANSWER,
-                FenceKind::AttentionVersion
-            )],
-            "`fleet/action` (session_incarnation) and `fleet/message_send` \
-             (lifecycle_updated_at) are specified in D18 and enforced nowhere: \
-             their executor lives in a file another lane owns. Flip the registry \
-             row in the change that reads the fence, not before."
+            vec![
+                (
+                    crate::methods::ATTENTION_ANSWER,
+                    FenceKind::AttentionVersion
+                ),
+                (crate::methods::FLEET_ACTION, FenceKind::SessionIncarnation),
+                (
+                    crate::methods::FLEET_MESSAGE_SEND,
+                    FenceKind::LifecycleUpdatedAt
+                ),
+            ],
+            "exactly the fences a handler enforces: attention/answer (version), \
+             fleet/action (session_incarnation) and fleet/message_send \
+             (lifecycle_updated_at)"
         );
     }
 
@@ -1425,6 +1452,82 @@ mod tests {
             json,
             serde_json::json!({"status":"unknown","reason":"effects_ambiguous","receipt":"unknown"})
         );
+    }
+
+    /// PR-0 freezes the v2-next params and dispatches none of them, so no new
+    /// method joins the registry yet: `mutation_dedupe` replays every entry
+    /// as the operator, where `device/redeem` is refused by design and the
+    /// rest have no handler. Each handler PR appends its row here.
+    #[test]
+    fn the_v2_next_methods_are_not_registered_yet() {
+        for method in [
+            crate::methods::DEVICE_REDEEM,
+            crate::methods::DEVICE_INVITE_CREATE,
+            crate::methods::DEVICE_LIST,
+            crate::methods::DEVICE_REVOKE,
+            crate::methods::DEVICE_RESCOPE,
+            crate::methods::TERMINAL_ATTACH,
+            crate::methods::TERMINAL_DETACH,
+            crate::methods::TERMINAL_ACK,
+            crate::methods::TERMINAL_SCROLLBACK,
+            crate::methods::TERMINAL_INPUT,
+            crate::methods::TERMINAL_FLOOR,
+            crate::methods::TERMINAL_RESIZE,
+        ] {
+            assert!(
+                !is_mutating(method),
+                "{method} registered before its handler"
+            );
+        }
+    }
+
+    /// The W0 rule for the v2-next mutations: `op_id` and `fence` sit at the
+    /// TOP level of the params object, never under a named `envelope` member.
+    #[test]
+    fn every_v2_next_mutating_params_struct_flattens_the_envelope() {
+        use crate::devices::{
+            DeviceInviteCreateParams, DeviceRescopeParams, DeviceRevokeParams, DeviceScope,
+        };
+        use crate::terminal::{FloorAction, TerminalFloorParams, TerminalInputParams};
+
+        let op = OpId::from_bytes([0xcd; 16]);
+        let envelope = MutationEnvelope::fenced(op.clone(), Fence::RegistryVersion { version: 5 });
+        let encoded = [
+            serde_json::to_value(DeviceInviteCreateParams {
+                scope: DeviceScope::MOBILE,
+                display_name: None,
+                ttl_s: None,
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(DeviceRevokeParams {
+                device_id: "d".to_string(),
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(DeviceRescopeParams {
+                device_id: "d".to_string(),
+                scope: DeviceScope::MOBILE,
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(TerminalInputParams {
+                stream_id: 1,
+                floor_gen: None,
+                data: String::new(),
+                mutation: envelope.clone(),
+            }),
+            serde_json::to_value(TerminalFloorParams {
+                stream_id: 1,
+                action: FloorAction::Acquire,
+                mutation: envelope,
+            }),
+        ];
+        for value in encoded {
+            let value = value.unwrap();
+            assert_eq!(value["op_id"], op.as_str(), "{value}");
+            assert_eq!(value["fence"]["kind"], "registry_version", "{value}");
+            for nested in ["envelope", "mutation"] {
+                assert!(value.get(nested).is_none(), "{value}");
+            }
+        }
     }
 
     /// The two mutation codes sit in the server-error range and collide with

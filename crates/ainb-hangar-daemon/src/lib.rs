@@ -136,6 +136,14 @@ mod fsm;
 pub mod health_stats;
 /// The minted host identity's boot-time adoption of `local` fleet events (#1066).
 pub mod host_identity;
+/// The host's Noise static key for the peer leg (R1-02): minted once, kept in
+/// the keychain or a `0600` file, made only when the peer leg is switched on.
+mod host_key;
+/// Where the peer leg's `0600` host key file lives inside a Hangar home.
+/// Re-exported alone, for tests that seed the key before the daemon boots;
+/// the rest of the key custody stays private.
+#[doc(hidden)]
+pub use host_key::key_file_in as host_key_file_in;
 /// The inbox aggregator: the writer that turns the live event stream into the
 /// durable notification inbox (e38.14).
 ///
@@ -206,6 +214,9 @@ pub mod pal;
 /// tier-5 discovery scan, binds when exactly one pane matches, and leaves the
 /// row `pane_unbound` when zero or two do rather than guessing.
 pub mod pane_binding;
+/// The off-box peer listener (R1-06), bound only when
+/// [`peer_listener::LISTEN_ENV`] is set at boot. Nothing binds in this tree.
+pub mod peer_listener;
 /// `gh`-backed PR status fetch behind an injectable seam (e38.34).
 ///
 /// Fetches a captured PR's CI rollup + mergeability + merge state by shelling out
@@ -365,6 +376,9 @@ pub mod task_executor;
 /// a hard [`templates::TemplateUseError::SkillNotImported`] with a sync hint and
 /// nothing is written. Idempotent by agent name within the workspace.
 pub mod templates;
+/// Terminal streams (R2), served only when [`term::STREAM_ENV`] is set at boot
+/// in a build with the `terminal-stream` feature. Nothing serves in this tree.
+pub mod term;
 /// Danger-full-access warning emission at provider invocation (P5.6).
 pub mod warnings;
 /// The local HTTP webhook ingress for webhook-triggered autopilots (e38.18).
@@ -769,6 +783,48 @@ fn spawn_parent_watchdog() {
     });
 }
 
+/// Bind the peer leg (R1-06a) once its host key is loaded: only with a
+/// minted host id and an address [`peer_listener::listen_config`] accepts.
+/// Every failure is logged and leaves the leg unbound; the daemon runs on.
+async fn start_peer_leg(
+    pool: &sqlx::SqlitePool,
+    loaded: &crate::host_key::Loaded,
+    shutdown: crate::shutdown::Handle,
+) -> Option<peer_listener::PeerLeg> {
+    let host_id =
+        match ainb_hangar_store::repo::daemon_identity::DaemonIdentityRepo::read(pool).await {
+            Ok(Some(identity)) => identity.host_id,
+            Ok(None) => {
+                tracing::error!("peer leg not bound: this daemon has no minted host id");
+                return None;
+            }
+            Err(error) => {
+                tracing::error!(%error, "peer leg not bound: the host id could not be read");
+                return None;
+            }
+        };
+    let Ok(host_id) = ainb_hangar_proto::hosts::HostId::parse_minted(&host_id) else {
+        tracing::error!("peer leg not bound: the host id is not a minted id");
+        return None;
+    };
+    let value = std::env::var(peer_listener::LISTEN_ENV).unwrap_or_default();
+    let config = match peer_listener::listen_config(&value) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "peer leg not bound");
+            return None;
+        }
+    };
+    let host = peer_listener::PeerHost::new(host_id, loaded.key.secret());
+    match peer_listener::start(config, host, shutdown).await {
+        Ok(leg) => Some(leg),
+        Err(error) => {
+            tracing::error!(%error, addr = %config.addr, "peer leg bind failed");
+            None
+        }
+    }
+}
+
 /// Boot the daemon: open the persistence layer and run the claim loop.
 ///
 /// Resolves the database directory the same way every Hangar consumer does
@@ -863,6 +919,14 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
     // orphaning the shutdown path exists to prevent.
     let (running_tx, running_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // The peer leg's listener task, kept OUTSIDE the boot future so it is
+    // drained on every exit, including a shutdown mid-boot that drops that
+    // future: draining is what lets every open peer socket close 4503 before
+    // the process exits.
+    let peer_leg: std::sync::Arc<std::sync::Mutex<Option<peer_listener::PeerLeg>>> =
+        std::sync::Arc::default();
+    let peer_leg_slot = std::sync::Arc::clone(&peer_leg);
+
     // The rest of boot, raced against that seam. Dropping this future on a
     // shutdown unwinds the partially built daemon; `_ownership` lives OUTSIDE it,
     // so the lock is released either way.
@@ -905,6 +969,32 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
                 );
             }
             Err(error) => tracing::error!(%error, "could not mint the daemon identity"),
+        }
+
+        // R1-02: the peer leg's Noise static key, right after the identity it
+        // is recorded on, and only when the leg is switched on. Off, which is
+        // the default, no keychain item is read or written and the column
+        // stays NULL. Non-fatal: a key that cannot be loaded leaves the peer
+        // leg without a key for this boot, never the daemon down.
+        if crate::peer_listener::switched_on() {
+            let secrets = crate::claude_cred::default_backend();
+            match crate::host_key::ensure(store.pool(), secrets, &dir).await {
+                Ok(loaded) => {
+                    tracing::info!(
+                        custody = ?loaded.custody,
+                        minted = loaded.minted,
+                        "peer leg host key"
+                    );
+                    if let Some(leg) = start_peer_leg(store.pool(), &loaded, shutdown.clone()).await
+                    {
+                        *peer_leg_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(leg);
+                    }
+                }
+                // No key, no bind: the leg never listens without the key
+                // devices pin.
+                Err(error) => tracing::error!(%error, "could not load the peer leg host key"),
+            }
         }
 
         // D14 boot order, step one: every row that survived the restart is a
@@ -1466,7 +1556,7 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         run(store.pool().clone(), cfg, stats, broker.sink(), shutdown).await
     };
 
-    tokio::select! {
+    let result = tokio::select! {
         result = booted => result,
         cause = async move {
             let raced = tokio::select! {
@@ -1486,7 +1576,15 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
             );
             Ok(())
         }
+    };
+    // Drained on every exit: a signal already cancelled it, and a one-shot
+    // boot or a boot error cancels it here, so its 4503 closes are sent before
+    // the process exits either way.
+    let leg = peer_leg.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    if let Some(leg) = leg {
+        leg.drain().await;
     }
+    result
 }
 
 #[cfg(test)]

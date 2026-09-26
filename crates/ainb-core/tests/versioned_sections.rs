@@ -62,6 +62,7 @@ fn an_event_bumps_the_sections_it_touches_and_no_others() {
         (AppEvent::GoToHomeScreen, vec![SectionId::Shell]),
         (AppEvent::SessionTabNext, vec![SectionId::Shell]),
         (AppEvent::ToggleExpandAll, vec![SectionId::Sessions]),
+        (AppEvent::ToggleSessionMetadata, vec![SectionId::Sessions]),
         (
             AppEvent::QuickCommitCancel,
             vec![SectionId::GitView, SectionId::Shell],

@@ -242,6 +242,21 @@ describe("reviewing from the window", () => {
       const key = await row.getAttribute("data-key");
       assert.ok(key, "a settings row was drawn with no key of the reducer's");
     }
+    // The settings body holds its tree and its rows, and the daemons panel
+    // starts below it (#46): the body was shrinking to nothing once the page
+    // overflowed, so its controls drew over the daemons and setup panels,
+    // where the pointer landed on the panel and never on the field.
+    const spill = await browser.execute(() => {
+      const box = (element) => element.getBoundingClientRect();
+      const body = box(document.querySelector(".settings-body"));
+      const daemons = box(document.querySelector(".daemons-panel"));
+      const outside = [...document.querySelectorAll(".settings-node, .settings-row")]
+        .filter((element) => box(element).bottom > body.bottom + 1)
+        .map((element) => `${element.dataset.node ?? element.dataset.key} ends at ${Math.round(box(element).bottom)}`);
+      return { bodyBottom: Math.round(body.bottom), daemonsTop: Math.round(daemons.top), outside };
+    });
+    assert.deepEqual(spill.outside, [], `settings controls spill out of the body (${spill.bodyBottom}px): ${spill.outside.join("; ")}`);
+    assert.ok(spill.daemonsTop >= spill.bodyBottom, `the daemons panel (top ${spill.daemonsTop}px) overlaps the settings body (bottom ${spill.bodyBottom}px)`);
     const categories = [];
     for (const node of await $$(".settings-node")) categories.push(await node.getAttribute("data-node"));
     const selected = await selectedNode();

@@ -76,6 +76,7 @@ fn seed(tmux: &str, home: &std::path::Path) {
         model_source: ModelSource::LegacyTyped,
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     store.save().expect("seed sessions.json");
 }
@@ -167,5 +168,52 @@ fn a_worker_that_is_gone_is_replaced_rather_than_failing_every_write() {
     assert!(
         reports.is_empty(),
         "the write after the loss was reported as failed: {reports:?}"
+    );
+}
+
+/// The quit's other race (P6e): a write that fails after the loop stopped
+/// reading reports and before the quit starts waiting. Its report sits on a
+/// queue no screen reads any more, so the quit has to count it as not
+/// written, however early it failed.
+#[test]
+fn a_write_that_failed_before_the_quit_waited_is_counted_as_not_written() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let home = scratch_home();
+    let tmux = "tmux_p6e-unread-failure";
+    seed(tmux, home);
+    let mut terminal = terminal();
+    let _ = effect_host::take_deferred_reports();
+
+    // Refused: the switch is on and this write expects it off.
+    queue(&rt, &mut terminal, tmux, false, true);
+    // Lands, and only once the refused write is done: the queue runs in order.
+    queue(&rt, &mut terminal, tmux, true, false);
+    let deadline = std::time::Instant::now() + SESSION_STORE_FLUSH_BOUND;
+    while SessionStore::load().sessions[tmux].headroom_enabled {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second write never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Both writes are done, one of them failed, and nothing read its report.
+    let dropped = effect_host::finish_session_store_writes(SESSION_STORE_FLUSH_BOUND);
+    assert_eq!(
+        dropped, 1,
+        "a write whose failure no screen reported was counted as written"
+    );
+    // Counted once: the quit took the report, so a second finish (the desktop
+    // flushes on several exit paths) does not count the same write again.
+    assert_eq!(
+        effect_host::finish_session_store_writes(SESSION_STORE_FLUSH_BOUND),
+        0,
+        "a second finish counted the same failed write again"
+    );
+    let reports = effect_host::take_deferred_reports();
+    assert!(
+        reports.is_empty(),
+        "the counted report was left on the queue: {reports:?}"
     );
 }

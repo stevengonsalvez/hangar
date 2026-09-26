@@ -2434,6 +2434,12 @@ export type FleetRowFrame = {
 	discovered_at: number,
 	last_observed_at: number,
 	lifecycle_updated_at: number,
+	/**
+	 *  The `fleet/action` fence value (F-1), like `lifecycle_updated_at` is
+	 *  the `fleet/message_send` one: a surface that acts through the mirror
+	 *  needs what it read.
+	 */
+	session_incarnation: string | null,
 	attention_updated_at: number,
 	model: string | null,
 	reasoning_effort: string | null,
@@ -4225,7 +4231,8 @@ export type SessionFilter = "all" | "active_only" | "stopped_only";
  *  Fleet-only metadata for one local session row.
  * 
  *  Absent fields mean Hangar has never observed them. The UI must omit those
- *  fields, never replace them with a guessed provider default.
+ *  fields, never replace them with a guessed provider default. The Session
+ *  List can temporarily use model/effort as its one-line title.
  */
 export type SessionFleetMetadata = {
 	model: string | null,
@@ -4238,6 +4245,8 @@ export type SessionFleetMetadata = {
 	provider_session_id: string | null,
 	/**  Exact Fleet lifecycle, omitted when Fleet has no observation. */
 	lifecycle: LifecycleState | null,
+	/**  Timestamp paired with `lifecycle`, used to reject an older snapshot. */
+	lifecycle_updated_at: number,
 };
 
 /**
@@ -4377,8 +4386,9 @@ export type Session_Serialize = {
 	 * 
 	 *  A row can carry MORE THAN ONE: an ASK arriving while an ERR is still
 	 *  open shows both, and only the ASK is counted in the header badge (see
-	 *  [`crate::fleet::attention::needs_you_count`]). Empty while the agent is
-	 *  actively generating, when nothing is waiting on a human.
+	 *  [`crate::fleet::attention::needs_you_count`]). Explicit hook evidence
+	 *  remains visible even while tmux discovery sees a live process;
+	 *  `Running` there means attachability, not proof of work.
 	 * 
 	 *  Transient: never persisted; set in `AppState::refresh_attention`. A
 	 *  mirror frame carries it as `attention`, each chip's kind and scrubbed

@@ -105,6 +105,8 @@ pub fn listen(home: &Path, hello: Hello) -> Listener {
                                 capabilities: Vec::new(),
                                 daemon_version: daemon_version.clone(),
                                 host_id: None,
+                                scope: None,
+                                device_expires_at_ms: None,
                             })
                             .expect("data");
                             format!(

@@ -19,6 +19,64 @@ fn unique_session_name(prefix: &str) -> String {
     )
 }
 
+/// How long a pane gets to show what a test waits for.
+const PANE_WAIT: Duration = Duration::from_secs(10);
+
+/// Capture with `capture` until the text holds `needle` or [`PANE_WAIT`]
+/// passes, and return the last capture either way, so a miss still reports
+/// what the pane held. A loaded runner runs a shell's echo late; a single
+/// capture after a guessed sleep reads that as missing output.
+async fn capture_until<F, Fut>(needle: &str, mut capture: F) -> Result<String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let deadline = tokio::time::Instant::now() + PANE_WAIT;
+    loop {
+        let text = capture().await?;
+        if text.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return Ok(text);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// `tmux capture-pane` over the whole history of `live`'s window. `-S -`
+/// mirrors capture_failed_launch_pane: without it the dead-pane marker
+/// overwrites the viewport and the program's own output is lost.
+async fn capture_history(live: &str) -> Result<String> {
+    let out = tokio::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-S", "-", "-t", &format!("={live}:")])
+        .output()
+        .await?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Wait for `live`'s pane to read as dead, up to [`PANE_WAIT`], and return
+/// whether it did.
+async fn wait_for_dead_pane(live: &str) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + PANE_WAIT;
+    loop {
+        let panes = tokio::process::Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                &format!("={live}:"),
+                "-F",
+                "#{pane_dead}",
+            ])
+            .output()
+            .await?;
+        if String::from_utf8_lossy(&panes.stdout).contains('1') {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Test that tmux sessions can be created and cleaned up properly
 #[tokio::test]
 async fn test_tmux_session_create_and_cleanup() -> Result<()> {
@@ -127,11 +185,10 @@ async fn test_tmux_session_capture_pane_content() -> Result<()> {
     send_tmux_keys(session.name(), "echo 'CAPTURE_TEST_OUTPUT_12345'")?;
     send_tmux_keys(session.name(), "Enter")?;
 
-    // Wait for command to execute
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Capture the pane content
-    let content = session.capture_pane_content().await?;
+    let content = capture_until("CAPTURE_TEST_OUTPUT_12345", || {
+        session.capture_pane_content()
+    })
+    .await?;
 
     // Verify our output is in the captured content
     assert!(
@@ -286,8 +343,8 @@ async fn test_tmux_capture_options_visible_vs_full_history() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Wait for commands to complete
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The last line in history, so every line before it is there too.
+    let full_content = capture_until("HISTORY_LINE_5", || session.capture_full_history()).await?;
 
     // Test visible capture options
     let visible_opts = CaptureOptions::visible();
@@ -323,9 +380,6 @@ async fn test_tmux_capture_options_visible_vs_full_history() -> Result<()> {
 
     // Capture visible content
     let visible_content = session.capture_pane_content().await?;
-
-    // Capture full history
-    let full_content = session.capture_full_history().await?;
 
     // Both should contain our test output
     assert!(
@@ -435,8 +489,16 @@ async fn test_keeping_dead_pane_launches_program_and_holds_the_pane() -> Result<
 
 /// A program that exits immediately leaves a DEAD pane, not a vanished session.
 ///
-/// The payoff the option exists for: the pane, and whatever the program wrote
-/// to it, survive long enough to be read.
+/// The exit is instant on purpose: `keeping_dead_pane` exists for a CLI that
+/// dies before a `remain-on-exit` set after `new-session` could land, and only
+/// an instant exit catches that ordering coming back.
+///
+/// What the program wrote is NOT asserted here. On a child's exit tmux 3.4
+/// closes the pane's pty straight away (`server_child_exited` then
+/// `server_destroy_pane`, which frees the read event and closes the fd), so
+/// output its event loop had not read yet is dropped for good. A loaded runner
+/// hit that once (#33): ten seconds of polling saw only the dead-pane marker.
+/// The output half is the next test, with a program that outlives the read.
 #[tokio::test]
 async fn test_keeping_dead_pane_survives_an_immediate_exit() -> Result<()> {
     require_tmux!();
@@ -451,60 +513,46 @@ async fn test_keeping_dead_pane_survives_an_immediate_exit() -> Result<()> {
     session.start(temp_dir.path()).await?;
     let live = session.name().to_string();
 
-    // Poll for the program's own output, do not sleep a guessed interval. The
-    // echo and the exit are two separate events, and a loaded runner can put
-    // the capture between them: the dead-pane marker is drawn while the line is
-    // not readable yet. The sibling assertion in `session_manager` went red on
-    // ubuntu that way while macOS passed the same commit.
-    //
-    // On timeout, fall through and let the assertions below report what the
-    // pane actually held.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let seen = tokio::process::Command::new("tmux")
-            .args(["capture-pane", "-p", "-S", "-", "-t", &format!("={live}:")])
-            .output()
-            .await?;
-        if String::from_utf8_lossy(&seen.stdout).contains("codex-startup-failed")
-            || tokio::time::Instant::now() >= deadline
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
+    let dead = wait_for_dead_pane(&live).await?;
     assert!(
         tmux_session_exists(&live),
         "an exited program must NOT take its session with it"
     );
+    assert!(dead, "the pane must read as dead");
 
-    let panes = tokio::process::Command::new("tmux")
-        .args([
-            "list-panes",
-            "-t",
-            &format!("={live}:"),
-            "-F",
-            "#{pane_dead}",
-        ])
-        .output()
-        .await?;
+    cleanup_tmux_session(&live);
+    Ok(())
+}
+
+/// A dead pane keeps what its program wrote, which is the payoff the option
+/// exists for: a startup failure stays readable after the program is gone.
+///
+/// The program lives a second past its output, so tmux has read the output
+/// before the exit closes the pty (see the test above for why an instant exit
+/// cannot promise that).
+#[tokio::test]
+async fn test_a_dead_pane_keeps_what_its_program_wrote() -> Result<()> {
+    require_tmux!();
+
+    let session_name = unique_session_name("deadoutput");
+    let temp_dir = tempfile::tempdir()?;
+    let mut session = TmuxSession::new(
+        session_name.clone(),
+        "sh -c 'echo codex-startup-failed; sleep 1; exit 1'".to_string(),
+    )
+    .keeping_dead_pane(true);
+    session.start(temp_dir.path()).await?;
+    let live = session.name().to_string();
+
     assert!(
-        String::from_utf8_lossy(&panes.stdout).contains('1'),
-        "the pane must read as dead, got: {:?}",
-        String::from_utf8_lossy(&panes.stdout)
+        wait_for_dead_pane(&live).await?,
+        "the pane must read as dead"
     );
-
-    // And its output is still readable -- the entire point.
-    let captured = tokio::process::Command::new("tmux")
-        // `-S -` mirrors capture_failed_launch_pane: without it the dead-pane
-        // marker overwrites the viewport and the program's own output is lost.
-        .args(["capture-pane", "-p", "-S", "-", "-t", &format!("={live}:")])
-        .output()
-        .await?;
+    // Read after the death, which is when a caller reads a failed launch.
+    let captured = capture_until("codex-startup-failed", || capture_history(&live)).await?;
     assert!(
-        String::from_utf8_lossy(&captured.stdout).contains("codex-startup-failed"),
-        "the failed program's output must still be capturable, got: {:?}",
-        String::from_utf8_lossy(&captured.stdout)
+        captured.contains("codex-startup-failed"),
+        "the failed program's output must still be capturable, got: {captured:?}"
     );
 
     cleanup_tmux_session(&live);

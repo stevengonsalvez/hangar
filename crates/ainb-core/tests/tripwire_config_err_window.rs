@@ -146,7 +146,9 @@ fn kill(session: &str) {
 fn rendered_row(capture: &str, key: &str) -> Option<String> {
     let line = capture.lines().find(|line| line.contains(key))?;
     let start = line.find(key)?;
-    let segment = line[start..].trim_end_matches(['\u{2502}', ' ']);
+    // Stop at the first box-drawing character: past the value the same row
+    // carries the pane border, or a toast drawn over the pane's right end.
+    let segment = line[start..].split(|c| ('\u{2500}'..='\u{257f}').contains(&c)).next()?;
     Some(segment.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 

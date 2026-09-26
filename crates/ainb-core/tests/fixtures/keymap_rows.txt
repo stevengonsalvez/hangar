@@ -324,6 +324,7 @@
     {"context":"session_list","chord":"E","action":"App(ToggleExpandAll)"},
     {"context":"session_list","chord":"B","action":"Ui(ToggleSessionsSidebar)"},
     {"context":"session_list","chord":"M","action":"App(ToggleSessionMenuBar)"},
+    {"context":"session_list","chord":"v","action":"App(ToggleSessionMetadata)"},
     {"context":"session_list","chord":"i","action":"App(GoToStats)"},
     {"context":"session_list","chord":"b","action":"App(GoToInbox)"},
     {"context":"session_list","chord":"w","action":"App(GoToWitr)"},

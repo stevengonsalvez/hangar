@@ -524,6 +524,60 @@ mod tests {
         assert!(result.is_some(), "dotted worktree transcript must resolve");
     }
 
+    /// With `CLAUDE_CONFIG_DIR` set, Claude keeps its transcripts under that
+    /// directory, and both probes read it there: a resume that read the
+    /// default would relaunch under an id Claude already holds, and the pane
+    /// would die on "already in use".
+    #[test]
+    fn transcript_probes_honour_claude_config_dir() {
+        use std::ffi::OsStr;
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        // The variable wins over the home directory, and the default stands
+        // without it.
+        assert_eq!(
+            AppState::claude_projects_dir_from(
+                Some(OsStr::new("/cfg")),
+                Some(Path::new("/home/x"))
+            ),
+            Some(PathBuf::from("/cfg/projects"))
+        );
+        assert_eq!(
+            AppState::claude_projects_dir_from(None, Some(Path::new("/home/x"))),
+            Some(PathBuf::from("/home/x/.claude/projects"))
+        );
+        assert_eq!(AppState::claude_projects_dir_from(None, None), None);
+
+        // Both probes read the projects directory they are given.
+        let config_dir = tempfile::tempdir().unwrap();
+        let projects =
+            AppState::claude_projects_dir_from(Some(config_dir.path().as_os_str()), None).unwrap();
+        let worktree = PathBuf::from("/work/repo--cfg");
+        let project_dir = projects.join("-work-repo--cfg");
+        fs::create_dir_all(&project_dir).unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        fs::write(project_dir.join(format!("{id}.jsonl")), "x").unwrap();
+
+        assert!(
+            AppState::claude_transcript_exists_under(&projects, &worktree, id),
+            "the transcript under CLAUDE_CONFIG_DIR is found"
+        );
+        assert!(
+            !AppState::claude_transcript_exists_under(
+                &projects,
+                &worktree,
+                "22222222-2222-4333-8444-555555555555"
+            ),
+            "and only for its own id"
+        );
+        assert_eq!(
+            AppState::find_latest_transcript_under(&projects, &worktree).as_deref(),
+            Some(project_dir.join(format!("{id}.jsonl")).as_path()),
+            "the history probe reads the same directory"
+        );
+    }
+
     /// The probe canonicalizes the worktree path before encoding: a symlinked
     /// path component (e.g. macOS `/tmp` → `/private/tmp`) must still resolve
     /// to the project dir of the PHYSICAL path, because that is what Claude
@@ -651,6 +705,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -694,6 +749,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -733,6 +789,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -823,6 +880,7 @@ mod tests {
                 true,
                 false,
                 Some(&remote),
+                None,
             )
             .await
             .expect("respawn remote Codex pane");
@@ -2505,8 +2563,8 @@ mod tests {
         ));
 
         let projected = AppState::projected_session_status(
-            Some(SessionStatus::Idle),
-            Some(SessionStatus::Stopped),
+            Some((SessionStatus::Idle, 100)),
+            Some((SessionStatus::Stopped, 200)),
         );
         assert_eq!(projected, Some(SessionStatus::Stopped));
 
@@ -2521,12 +2579,85 @@ mod tests {
     }
 
     #[test]
-    fn attention_suppressed_while_generating() {
+    fn fresh_local_hook_beats_stale_fleet_lifecycle() {
+        use crate::models::SessionStatus;
+
+        assert_eq!(
+            AppState::projected_session_status(
+                Some((SessionStatus::Running, 1_000)),
+                Some((SessionStatus::Idle, 2_000)),
+            ),
+            Some(SessionStatus::Idle),
+            "a Stop hook must not be repainted RUN by a retained Fleet row"
+        );
+    }
+
+    #[test]
+    fn fresh_fleet_lifecycle_beats_an_older_local_hook() {
+        use crate::models::SessionStatus;
+
+        assert_eq!(
+            AppState::projected_session_status(
+                Some((SessionStatus::Running, 2_000)),
+                Some((SessionStatus::Idle, 1_000)),
+            ),
+            Some(SessionStatus::Running),
+            "a new Fleet observation may replace an older terminal hook"
+        );
+    }
+
+    #[test]
+    fn fleet_lifecycle_freshness_expires_on_its_own_transition_clock() {
+        const STALE_AFTER: i64 = 5 * 60_000;
+        assert!(AppState::fleet_lifecycle_is_fresh_at(
+            NOW - STALE_AFTER,
+            NOW,
+            STALE_AFTER
+        ));
+        assert!(
+            !AppState::fleet_lifecycle_is_fresh_at(NOW - STALE_AFTER - 1, NOW, STALE_AFTER),
+            "one millisecond past the window is stale"
+        );
+        assert!(
+            !AppState::fleet_lifecycle_is_fresh_at(0, NOW, STALE_AFTER),
+            "a row that never recorded a transition carries no fresh evidence"
+        );
+        assert!(
+            AppState::fleet_lifecycle_is_fresh_at(1, NOW, 0),
+            "zero is the explicit no-expiry override"
+        );
+    }
+
+    #[test]
+    fn attention_survives_tmux_generating_observation() {
+        use crate::fleet::attention::AttentionKind;
         let recent = vec![rec("claude", CWD, "PermissionRequest", NOW - 1000)];
         assert_eq!(
             kind_of(CWD, Some("claude"), true, 0, NOW, &recent),
+            Some(AttentionKind::Approve),
+            "an explicit hook prompt beats tmux discovery's coarse busy observation",
+        );
+    }
+
+    #[test]
+    fn unidentified_codex_hook_never_binds_by_cwd() {
+        let mut event = rec("codex", CWD, "PermissionRequest", NOW - 100);
+        event.session_id = "unbound-codex-thread".into();
+        assert_eq!(
+            AppState::attention_for_session_identity(
+                CWD,
+                Some("codex"),
+                None,
+                true,
+                true,
+                false,
+                0,
+                NOW,
+                &[event],
+            )
+            .map(|chip| chip.kind),
             None,
-            "a generating session shows the busy dot, not an attention chip",
+            "a legacy row without an exact thread id stays unknown, never guessed by cwd"
         );
     }
 
@@ -2671,6 +2802,7 @@ mod tests {
             discovered_at: NOW - 2_000,
             last_observed_at: NOW - 1_000,
             lifecycle_updated_at: NOW - 1_000,
+            session_incarnation: None,
             attention_updated_at: NOW - 1_000,
             model: None,
             reasoning_effort: None,
@@ -3215,6 +3347,90 @@ mod tests {
             state.find_session(child_id).unwrap().live_attention.is_empty(),
             "a shared cwd must not copy parent attention onto a child"
         );
+    }
+
+    /// A Claude session runs under the id ainb minted for it, which its
+    /// record holds as its provider session id, and the daemon files every
+    /// request its hooks raise under that id: the row takes them exactly.
+    #[test]
+    fn a_claude_row_takes_the_hook_request_raised_under_its_minted_session_id() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/claude-minted";
+        let mut state = state_with_session_at(cwd, Some("tmux_claude"));
+        let id = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].provider_session_id =
+            Some("11111111-2222-4333-8444-555555555555".into());
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-hook".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert(
+            "11111111-2222-4333-8444-555555555555".into(),
+            vec![chip.clone()],
+        );
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-hook".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        let chips = &state.find_session(id).unwrap().live_attention;
+        assert_eq!(
+            chips.len(),
+            1,
+            "the request lands on the session that raised it"
+        );
+        assert_eq!(chips[0].kind, AttentionKind::Ask);
+        assert_eq!(state.fleet.attention_elsewhere, 0);
+    }
+
+    /// A request raised under an id no record holds, a `claude` started by
+    /// hand in the worktree or a question left from an earlier conversation,
+    /// is placed on no row even when the worktree names one session: an
+    /// answer sent there would reach the wrong agent's pane. It is counted
+    /// elsewhere instead.
+    #[test]
+    fn a_request_under_an_unknown_session_id_never_lands_by_worktree() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/claude-stranger";
+        let mut state = state_with_session_at(cwd, Some("tmux_claude"));
+        let id = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].provider_session_id =
+            Some("11111111-2222-4333-8444-555555555555".into());
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-stranger".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert("some-other-claude".into(), vec![chip.clone()]);
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-stranger".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        assert!(
+            state.find_session(id).unwrap().live_attention.is_empty(),
+            "a request under another agent's id is not this session's"
+        );
+        assert_eq!(state.fleet.attention_elsewhere, 1);
+
+        // The same, for a record with no minted id at all: nothing is guessed.
+        state.sessions.workspaces[0].sessions[0].provider_session_id = None;
+        state.merge_attention(3_000);
+        assert!(state.find_session(id).unwrap().live_attention.is_empty());
+        assert_eq!(state.fleet.attention_elsewhere, 1);
     }
 
     #[test]

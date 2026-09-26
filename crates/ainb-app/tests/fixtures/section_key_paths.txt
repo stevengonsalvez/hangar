@@ -281,6 +281,7 @@ fleet.daemon_attention.reachable
 fleet.daemon_attention_seen
 fleet.fleet_metadata{}.direct_child_count
 fleet.fleet_metadata{}.lifecycle
+fleet.fleet_metadata{}.lifecycle_updated_at
 fleet.fleet_metadata{}.model
 fleet.fleet_metadata{}.provider_session_id
 fleet.fleet_metadata{}.reasoning_effort
@@ -319,6 +320,7 @@ fleet.fleet_snapshot[].provenance
 fleet.fleet_snapshot[].provider
 fleet.fleet_snapshot[].provider_session_id
 fleet.fleet_snapshot[].reasoning_effort
+fleet.fleet_snapshot[].session_incarnation
 fleet.fleet_snapshot[].session_key
 fleet.fleet_snapshot[].tmux_target
 fleet.fleet_snapshot[].transport_health

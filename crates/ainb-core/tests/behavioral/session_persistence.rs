@@ -28,6 +28,7 @@ fn create_session_metadata(
         model_source: Default::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
@@ -52,6 +53,7 @@ fn create_session_metadata_with_id(
         model_source: Default::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 

@@ -677,8 +677,9 @@ pub struct Session {
     ///
     /// A row can carry MORE THAN ONE: an ASK arriving while an ERR is still
     /// open shows both, and only the ASK is counted in the header badge (see
-    /// [`crate::fleet::attention::needs_you_count`]). Empty while the agent is
-    /// actively generating, when nothing is waiting on a human.
+    /// [`crate::fleet::attention::needs_you_count`]). Explicit hook evidence
+    /// remains visible even while tmux discovery sees a live process;
+    /// `Running` there means attachability, not proof of work.
     ///
     /// Transient: never persisted; set in `AppState::refresh_attention`. A
     /// mirror frame carries it as `attention`, each chip's kind and scrubbed
@@ -716,10 +717,11 @@ pub struct Session {
     /// Not ainb's `id` and not the tmux name: this is the identity the daemon
     /// and the approve broker file everything under, so it is what a
     /// `session:<key>` chat scope and a parked permission waiter are addressed
-    /// by. Only a Codex session learns it today, from its app-server thread id
-    /// (`interactive::session_manager`). Nothing sets it for a Claude session,
-    /// whose hooks do carry one, so a Claude row has none and the surfaces
-    /// that need it say so rather than guessing (#1049).
+    /// by. A Codex session learns it from its app-server thread id, and a
+    /// Claude session from the id ainb minted for its launch and handed to
+    /// `claude --session-id` (`interactive::session_manager`), so the id its
+    /// hooks report is this one exactly. A session launched before that has
+    /// none, and the surfaces that need it say so rather than guessing.
     ///
     /// Transient: never persisted.
     #[serde(skip)]

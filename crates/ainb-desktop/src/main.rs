@@ -94,7 +94,7 @@ fn flush_session_store_writes(handle: &tauri::AppHandle) {
         Some(0) => {}
         Some(dropped) => tracing::warn!(
             dropped,
-            "session-store writes were still queued when the app went"
+            "session-store writes were not written when the app went"
         ),
         None => tracing::warn!(
             "the shell was busy for the whole bound; queued session-store writes were not drained"
@@ -199,6 +199,14 @@ fn clipboard_read(app: tauri::AppHandle, window: tauri::State<'_, Window>, key: 
 #[tauri::command]
 fn palette(window: tauri::State<'_, Window>) -> Vec<ainb_desktop::host::PaletteEntry> {
     window.shell.palette()
+}
+
+/// Put the reducer on the session list before the answer banner sends its
+/// rows (#121): they are the session list's, and a page the reducer is on
+/// would refuse them. Decided by the reducer's own screen.
+#[tauri::command]
+fn answer_home(window: tauri::State<'_, Window>) {
+    window.shell.answer_home();
 }
 
 /// The tab strip, for the webview's first paint.
@@ -845,6 +853,7 @@ fn main() {
             clipboard_read,
             clipboard_write,
             terminal_tabs,
+            answer_home,
             terminal_output,
             terminal_ack,
             terminal_input,

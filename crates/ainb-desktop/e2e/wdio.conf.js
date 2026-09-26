@@ -25,6 +25,7 @@ export const config = {
     "./specs/review.e2e.js",
     "./specs/inbox.e2e.js",
     "./specs/commits.e2e.js",
+    "./specs/palette.e2e.js",
   ],
   maxInstances: 1,
   framework: "mocha",
@@ -32,7 +33,10 @@ export const config = {
   logLevel: "warn",
   // One journey, driving a real daemon and real tmux sessions end to end:
   // every leg waits on the product, and creating a session is real work.
-  mochaOpts: { ui: "bdd", timeout: 600_000 },
+  // `window.hooks.js` holds the preconditions a spec must not run without
+  // (the macOS window on screen): wdio logs and ignores an error thrown from
+  // a config hook, while a mocha root hook that throws fails the spec file.
+  mochaOpts: { ui: "bdd", timeout: 600_000, require: ["./window.hooks.js"] },
 
   capabilities: [
     {

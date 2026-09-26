@@ -1,0 +1,154 @@
+{
+  "version": 1,
+  "header": [
+    {
+      "opcode": "Rpc",
+      "fin": true,
+      "stream_id": 0,
+      "seq": "1",
+      "hex": "74011401000000000000000001000000"
+    },
+    {
+      "opcode": "Rpc",
+      "fin": false,
+      "stream_id": 0,
+      "seq": "4294967298",
+      "hex": "74011400000000000100000002000000"
+    },
+    {
+      "opcode": "Ping",
+      "fin": true,
+      "stream_id": 0,
+      "seq": "42",
+      "hex": "7401160100000000000000002a000000"
+    },
+    {
+      "opcode": "Pong",
+      "fin": true,
+      "stream_id": 0,
+      "seq": "42",
+      "hex": "7401170100000000000000002a000000"
+    },
+    {
+      "opcode": "StreamEnd",
+      "fin": true,
+      "stream_id": 7,
+      "seq": "18446744073709551615",
+      "hex": "7401150107000000ffffffffffffffff"
+    }
+  ],
+  "prologue": [
+    {
+      "transport": "tailnet",
+      "host_id": "01K5A0000000000000000ABCDE",
+      "hex": "000870726f746f636f6c000c61696e622d706565722d777300076672616d696e67000131000d7061796c6f61645f6b696e6473000662696e6172790009696e69746961746f720006636c69656e740009726573706f6e6465720004686f737400097472616e73706f727400077461696c6e65740007686f73745f6964001a30314b3541303030303030303030303030303030304142434445"
+    },
+    {
+      "transport": "lan",
+      "host_id": "01K5A0000000000000000ABCDE",
+      "hex": "000870726f746f636f6c000c61696e622d706565722d777300076672616d696e67000131000d7061796c6f61645f6b696e6473000662696e6172790009696e69746961746f720006636c69656e740009726573706f6e6465720004686f737400097472616e73706f727400036c616e0007686f73745f6964001a30314b3541303030303030303030303030303030304142434445"
+    },
+    {
+      "transport": "ssh-l",
+      "host_id": "01K5A0000000000000000ABCDE",
+      "hex": "000870726f746f636f6c000c61696e622d706565722d777300076672616d696e67000131000d7061796c6f61645f6b696e6473000662696e6172790009696e69746961746f720006636c69656e740009726573706f6e6465720004686f737400097472616e73706f727400057373682d6c0007686f73745f6964001a30314b3541303030303030303030303030303030304142434445"
+    }
+  ],
+  "offer": {
+    "json": {
+      "v": 1,
+      "host_id": "01K5A0000000000000000ABCDE",
+      "host_static_pubkey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+      "endpoints": [
+        {
+          "carrier": "tailnet",
+          "url": "ws://100.64.0.1:47300/peer"
+        },
+        {
+          "carrier": "ssh-l",
+          "url": "ws://127.0.0.1:47300/peer"
+        }
+      ],
+      "invite_id": "01K5A0000000000000000QRSTV",
+      "invite_secret": "__79_Pv6-fj39vX08_Lx8O_u7ezr6uno5-bl5OPi4eA",
+      "expires_at_ms": 1758800000000
+    },
+    "uri": "ainb://pair#eyJ2IjoxLCJob3N0X2lkIjoiMDFLNUEwMDAwMDAwMDAwMDAwMDAwQUJDREUiLCJob3N0X3N0YXRpY19wdWJrZXkiOiJBQUVDQXdRRkJnY0lDUW9MREEwT0R4QVJFaE1VRlJZWEdCa2FHeHdkSGg4IiwiZW5kcG9pbnRzIjpbeyJjYXJyaWVyIjoidGFpbG5ldCIsInVybCI6IndzOi8vMTAwLjY0LjAuMTo0NzMwMC9wZWVyIn0seyJjYXJyaWVyIjoic3NoLWwiLCJ1cmwiOiJ3czovLzEyNy4wLjAuMTo0NzMwMC9wZWVyIn1dLCJpbnZpdGVfaWQiOiIwMUs1QTAwMDAwMDAwMDAwMDAwMDBRUlNUViIsImludml0ZV9zZWNyZXQiOiJfXzc5X1B2Ni1majM5dlgwOF9MeDhPX3U3ZXpyNnVubzUtYmw1T1BpNGVBIiwiZXhwaXJlc19hdF9tcyI6MTc1ODgwMDAwMDAwMH0"
+  },
+  "opcodes": [
+    {
+      "number": 1,
+      "name": "Output",
+      "in_use": false
+    },
+    {
+      "number": 2,
+      "name": "SnapshotStart",
+      "in_use": false
+    },
+    {
+      "number": 3,
+      "name": "SnapshotChunk",
+      "in_use": false
+    },
+    {
+      "number": 4,
+      "name": "SnapshotEnd",
+      "in_use": false
+    },
+    {
+      "number": 5,
+      "name": "DataGap",
+      "in_use": false
+    },
+    {
+      "number": 6,
+      "name": "Resize",
+      "in_use": false
+    },
+    {
+      "number": 8,
+      "name": "Floor",
+      "in_use": false
+    },
+    {
+      "number": 10,
+      "name": "Presence",
+      "in_use": false
+    },
+    {
+      "number": 11,
+      "name": "Closed",
+      "in_use": false
+    },
+    {
+      "number": 13,
+      "name": "Ack",
+      "in_use": false
+    },
+    {
+      "number": 20,
+      "name": "Rpc",
+      "in_use": true
+    },
+    {
+      "number": 21,
+      "name": "StreamEnd",
+      "in_use": true
+    },
+    {
+      "number": 22,
+      "name": "Ping",
+      "in_use": true
+    },
+    {
+      "number": 23,
+      "name": "Pong",
+      "in_use": true
+    }
+  ],
+  "retired_opcodes": [
+    7,
+    9
+  ]
+}

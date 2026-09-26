@@ -395,11 +395,12 @@ pub enum AppEvent {
     GitReviewExpandAllFolders, // e — expand all folders
     GitReviewCollapseAllFolders, // E — collapse all folders
     // Tmux integration events
-    AttachTmuxSession,    // Attach to tmux session (full-screen)
-    EnterInteractivePane, // Attach in-place: interactive embedded tmux pane
-    DetachTmuxSession,    // Detach from tmux session
-    ToggleExpandAll,      // Toggle expand/collapse all workspaces
-    ToggleSessionMenuBar, // Hide/show the Sessions bottom keymap legend (⇧M)
+    AttachTmuxSession,     // Attach to tmux session (full-screen)
+    EnterInteractivePane,  // Attach in-place: interactive embedded tmux pane
+    DetachTmuxSession,     // Detach from tmux session
+    ToggleExpandAll,       // Toggle expand/collapse all workspaces
+    ToggleSessionMenuBar,  // Hide/show the Sessions bottom keymap legend (⇧M)
+    ToggleSessionMetadata, // Toggle compact model/effort titles (v)
     // Other tmux rename events
     OtherTmuxStartRename, // Start rename mode for selected "Other tmux" session
     OtherTmuxRenameChar(char), // Character input for rename
@@ -1606,44 +1607,21 @@ impl EventHandler {
         match intent {
             Intent::Key(chord) => Self::handle_key_event_with_keymap(chord, state, keymap, host),
             Intent::Command(id, args) => {
-                let Some(binding) = keymap.command(&id) else {
-                    tracing::warn!("command `{id}` is unknown");
-                    return None;
+                // One judgement for every surface that names a row
+                // (`judge_command`): a host asks it before dispatching, so a
+                // name that will not run is refused where it was sent from,
+                // not dropped here in silence (#121).
+                let action = match crate::app::keymap::judge_command(state, keymap, &id, &args) {
+                    Ok(action) => action,
+                    Err(crate::app::keymap::CommandRefusal::Payload(fields)) => {
+                        tracing::warn!("command `{id}` rejected arguments with fields {fields:?}");
+                        return None;
+                    }
+                    Err(refusal) => {
+                        tracing::warn!("command `{id}` not run: {}", refusal.reason());
+                        return None;
+                    }
                 };
-                // Host-authored rows (a host's reports, a plugin action naming
-                // its plugin) run from any screen. A row that writes outside
-                // ainb runs only from its key, so no other surface can fire it
-                // by name. Every other row passes the gate a key passes: it
-                // runs only while its context is active and no overlay covers
-                // it, so a click resolved on one screen cannot act after the
-                // user has left it or opened a dialog over it.
-                if binding.key_only() {
-                    tracing::warn!("command `{id}` runs only from its key");
-                    return None;
-                }
-                let Some(action) = binding.action.with_args(&args) else {
-                    // Field names only: a payload can carry a pairing code, a
-                    // path or typed text, none of which belongs in a log.
-                    let fields: Vec<&String> =
-                        args.as_object().map(|object| object.keys().collect()).unwrap_or_default();
-                    tracing::warn!("command `{id}` rejected arguments with fields {fields:?}");
-                    return None;
-                };
-                // Judged with its payload: a pointer row's action is what the
-                // arguments name (the settings row a `config.set_row` edits,
-                // #1224), not the placeholder the table wrote.
-                if let Some(why) = state.remote_command_refusal(&action) {
-                    tracing::warn!("command `{id}` refused: {why}");
-                    return None;
-                }
-                let host_authored = crate::app::reports::ids::ALL.contains(&id.as_str())
-                    || crate::app::plugin_action::ids::ALL.contains(&id.as_str());
-                if !host_authored
-                    && !crate::app::keymap::command_contexts(state).contains(&binding.ctx)
-                {
-                    tracing::warn!("command `{id}` is not active on this screen");
-                    return None;
-                }
                 Self::apply_key_action(action, state, host)
             }
             // A press resolves to what was under it; a host answering a press
@@ -2036,23 +2014,18 @@ impl EventHandler {
         state: &mut AppState,
         chip: &crate::fleet::attention::SessionAttention,
     ) {
-        // The row's own identity for the verified send: the provider session
-        // id is not knowable here, so the tmux name is the identity the send
-        // path correlates on, with the worktree as the cwd its ambiguity
-        // guard checks.
-        let (session_id, cwd) = state.get_selected_session().map_or_else(
-            || (String::new(), String::new()),
-            |session| {
-                (
-                    session.tmux_session_name.clone().unwrap_or_default(),
-                    session.workspace_path.clone(),
-                )
-            },
-        );
+        // The row's own identity for the verified send: the id its agent runs
+        // under (the Claude id ainb minted, a Codex thread), which the send
+        // path matches exactly. A row with none delivers nowhere; the cwd is
+        // no fallback (#132).
+        let session_id = state
+            .get_selected_session()
+            .and_then(|session| session.provider_session_id.clone())
+            .unwrap_or_default();
         // Read before the send borrows the Fleet section: the answer is
         // recorded under the surface this process is, whichever that is.
         let surface = state.host.surface;
-        if let Err(refusal) = state.fleet.ask_state.send(chip, &session_id, &cwd, surface) {
+        if let Err(refusal) = state.fleet.ask_state.send(chip, &session_id, surface) {
             // Refusals are shown, never swallowed: a send that silently does
             // nothing is the failure mode this screen exists to remove.
             state.add_info_notification(refusal);
@@ -2686,6 +2659,7 @@ impl EventHandler {
             AppEvent::ToggleClaudeChat => state.toggle_claude_chat(),
             AppEvent::ToggleExpandAll => state.toggle_expand_all_workspaces(),
             AppEvent::ToggleSessionMenuBar => state.toggle_session_menu_bar(),
+            AppEvent::ToggleSessionMetadata => state.toggle_session_metadata(),
             // Applied in the main loop: the sidebar's collapsed flag is
             // renderer state (`UiState::sessions_pane`), which the reducer does
             // not hold. Same path the [-]/[+] mouse glyph takes.
@@ -7972,6 +7946,19 @@ mod session_list_key_tests {
         EventHandler::handle_key_event(Chord::new(Char('x'), Mods::CTRL), state)
     }
 
+    /// `m` and ⇧M are occupied. A persistent toggle works in terminals that
+    /// cannot report a held key's release event.
+    #[test]
+    fn session_list_v_key_toggles_compact_model_metadata() {
+        let mut state = session_list_state();
+        let event = key(&mut state, 'v').expect("v on the session list dispatches metadata toggle");
+        assert!(matches!(event, AppEvent::ToggleSessionMetadata));
+        EventHandler::process_event(event, &mut state);
+        assert!(state.sessions.show_session_metadata);
+        EventHandler::process_event(AppEvent::ToggleSessionMetadata, &mut state);
+        assert!(!state.sessions.show_session_metadata);
+    }
+
     /// The chord is claimed only while a notice is showing; an empty corner
     /// leaves it doing whatever the screen already did with it.
     ///
@@ -9835,6 +9822,7 @@ mod open_transcript_tests {
             discovered_at: 1,
             last_observed_at: 1,
             lifecycle_updated_at: 1,
+            session_incarnation: None,
             attention_updated_at: 1,
             model: None,
             reasoning_effort: None,

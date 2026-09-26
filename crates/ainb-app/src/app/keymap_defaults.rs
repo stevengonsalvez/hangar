@@ -945,6 +945,9 @@ pub fn defaults() -> Vec<Binding> {
     );
     append_app_rows!(rows, Context::screen("session_list"),
         menu_bar: "M" => AppEvent::ToggleSessionMenuBar,
+        // `m` and ⇧M are occupied. A persistent toggle works in terminals
+        // that cannot report a held key's release event.
+        metadata: "v" => AppEvent::ToggleSessionMetadata,
         stats: "i" => AppEvent::GoToStats,
         inbox: "b" => AppEvent::GoToInbox,
         witr: "w" => AppEvent::GoToWitr,

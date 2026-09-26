@@ -486,6 +486,8 @@ pub struct SessionsSection {
     pub selected_sessions: HashSet<Uuid>, // Multi-selected session IDs for bulk operations
     pub expand_all_workspaces: bool, // When true, show all sessions across all workspaces
     pub session_filter: SessionFilter, // View filter for Interactive sessions (Shift+F to cycle)
+    /// Session List alternate title mode; never persisted across TUI launches.
+    pub show_session_metadata: bool,
     // Track attached terminal state
     pub attached_session_id: Option<Uuid>,
     /// Cache of workspace paths that are currently favorited (starred).
@@ -507,6 +509,7 @@ impl Default for SessionsSection {
             expand_all_workspaces: true, // Default to expanded view
             // AppState::default overwrites this from the loaded config.
             session_filter: crate::app::state::SessionFilter::default(),
+            show_session_metadata: false,
             attached_session_id: None,
             favorite_workspace_paths: HashSet::new(),
         }
@@ -1423,6 +1426,7 @@ mod agent_status_section_tests {
             discovered_at: 1,
             last_observed_at: heartbeat,
             lifecycle_updated_at: 5,
+            session_incarnation: None,
             attention_updated_at: 7,
             model: None,
             reasoning_effort: None,

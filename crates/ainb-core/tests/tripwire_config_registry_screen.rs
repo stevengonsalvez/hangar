@@ -174,7 +174,9 @@ fn rendered_row(capture: &str, key: &str) -> Option<String> {
     // Start AT the key: the same terminal row also carries the left pane's tree
     // and both panes' borders, none of which belong to this assertion.
     let start = line.find(key)?;
-    let segment = line[start..].trim_end_matches(['│', ' ']);
+    // Stop at the first box-drawing character: past the value the same row
+    // carries the pane border, or a toast drawn over the pane's right end.
+    let segment = line[start..].split(|c| ('\u{2500}'..='\u{257f}').contains(&c)).next()?;
     Some(segment.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
