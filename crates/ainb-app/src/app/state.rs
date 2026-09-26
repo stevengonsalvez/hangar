@@ -10504,10 +10504,21 @@ impl AppState {
     /// wrote elsewhere would relaunch under an id Claude already holds, and
     /// the pane would die on "already in use".
     fn claude_projects_dir() -> Option<std::path::PathBuf> {
-        std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(std::path::PathBuf::from)
-            .map(|dir| dir.join("projects"))
-            .or_else(|| dirs::home_dir().map(|home| home.join(".claude").join("projects")))
+        Self::claude_projects_dir_from(
+            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// Pure half of [`Self::claude_projects_dir`]: `config_dir` is the
+    /// `CLAUDE_CONFIG_DIR` value, `home` the home directory.
+    pub(crate) fn claude_projects_dir_from(
+        config_dir: Option<&std::ffi::OsStr>,
+        home: Option<&std::path::Path>,
+    ) -> Option<std::path::PathBuf> {
+        config_dir
+            .map(|dir| std::path::PathBuf::from(dir).join("projects"))
+            .or_else(|| home.map(|home| home.join(".claude").join("projects")))
     }
 
     /// Whether Claude holds a transcript for `session_id` in `worktree_path`'s
@@ -10533,7 +10544,7 @@ impl AppState {
         )
     }
 
-    fn claude_transcript_exists_under(
+    pub(crate) fn claude_transcript_exists_under(
         projects: &std::path::Path,
         worktree_path: &std::path::Path,
         session_id: &str,
@@ -10558,7 +10569,7 @@ impl AppState {
         Self::find_latest_transcript_under(&home.join(".claude").join("projects"), worktree_path)
     }
 
-    fn find_latest_transcript_under(
+    pub(crate) fn find_latest_transcript_under(
         projects: &std::path::Path,
         worktree_path: &std::path::Path,
     ) -> Option<std::path::PathBuf> {
