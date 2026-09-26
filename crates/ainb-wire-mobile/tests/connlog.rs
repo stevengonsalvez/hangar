@@ -1,5 +1,7 @@
 //! M1-07: the persisted connection log holds identifiers and digests only.
 
+#![allow(clippy::too_many_lines)]
+
 mod common;
 
 use ainb_wire_mobile::api::{ConnectParams, backoff_delay_ms, connect_host, read_connection_log};
@@ -32,7 +34,8 @@ async fn a_real_run_logs_events_with_digests_and_never_a_secret() {
         admin: false,
         expires_at_ms: 1_800_000_000_000,
         paired_at_ms: 1,
-        repair: false,
+        repair: None,
+        notice: None,
     };
     let params = ConnectParams {
         host_id: HOST_ID.into(),
