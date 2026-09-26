@@ -127,6 +127,73 @@ fn a_send_to_an_exact_pane_lands_there_and_not_in_the_active_pane() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let (targeted, other) = (capture(&first_id), capture(&active_id));
+
+    // The resolver (#132 follow-up): the fingerprint's pane id wins and is
+    // checked to be in this session; an index target resolves to the id it
+    // names now; with nothing recorded, two panes refuse and one pane is
+    // typed into. After the first pane closes the second is renumbered, so
+    // its old index names nothing while its id still does.
+    use ainb_fleet_core::send::{PaneHint, resolve_send_target};
+    let resolve = |hint: PaneHint| runtime.block_on(resolve_send_target(&name, &hint));
+    let fingerprint = |id: &str| Some(format!("pane={id};pid=0;session_started=0"));
+    assert_eq!(
+        resolve(PaneHint {
+            target: Some(target.clone()),
+            fingerprint: fingerprint(&active_id)
+        }),
+        Ok(active_id.clone()),
+        "the fingerprint's id outranks the index target"
+    );
+    assert_eq!(
+        resolve(PaneHint {
+            target: Some(target.clone()),
+            fingerprint: None
+        }),
+        Ok(first_id.clone()),
+        "an index target resolves to the pane it names now"
+    );
+    assert!(
+        resolve(PaneHint::default()).unwrap_err().contains("2 panes"),
+        "two panes and nothing recorded: refused"
+    );
+    assert!(
+        resolve(PaneHint {
+            target: None,
+            fingerprint: fingerprint("%999")
+        })
+        .unwrap_err()
+        .contains("gone"),
+        "a pane id nothing runs under"
+    );
+    let second_index_before = active.clone();
+    assert!(
+        tmux(&["kill-pane", "-t", &first_id]).is_some(),
+        "the first pane closes"
+    );
+    let second_index_after = tmux(&["display-message", "-p", "-t", &active_id, "#{pane_index}"])
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(
+        second_index_after, second_index_before,
+        "tmux renumbered the surviving pane"
+    );
+    assert_eq!(
+        resolve(PaneHint {
+            target: Some(format!("{name}:{window}.{second_index_before}")),
+            fingerprint: fingerprint(&active_id)
+        }),
+        Ok(active_id.clone()),
+        "the fingerprint still names the surviving pane after the renumbering"
+    );
+    // The stale index alone is whatever tmux makes of a renumbered position:
+    // not the pane the row meant. The fingerprint above is what is trusted.
+    assert_eq!(
+        resolve(PaneHint::default()),
+        Ok(active_id.clone()),
+        "one pane left: typed into"
+    );
+
     eprintln!("killing tmux session {name} on {dir_shown}");
     let _ = tmux(&["kill-session", "-t", &session]);
     assert!(
