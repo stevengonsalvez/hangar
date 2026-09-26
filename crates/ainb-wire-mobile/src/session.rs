@@ -29,6 +29,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::connlog::{ConnLog, Event, digest};
 use crate::records::{WireError, error_reason};
 
 /// The AEAD tag Noise appends to every transport message.
@@ -63,6 +64,8 @@ pub struct ConnectConfig {
     pub heartbeat: Option<Duration>,
     /// How long a request waits for its reply.
     pub rpc_timeout: Duration,
+    /// The connection log, when the app keeps one.
+    pub log: Option<Arc<ConnLog>>,
 }
 
 impl ConnectConfig {
@@ -83,6 +86,7 @@ impl ConnectConfig {
             device_private_key,
             heartbeat: Some(HEARTBEAT),
             rpc_timeout: RPC_TIMEOUT,
+            log: None,
         }
     }
 }
@@ -227,6 +231,7 @@ pub struct Session {
     last_rtt_us: AtomicU64,
     ping_seq: AtomicU64,
     rpc_timeout: Duration,
+    log: Option<Arc<ConnLog>>,
 }
 
 fn lsp_encode(body: &[u8]) -> Vec<u8> {
@@ -317,8 +322,38 @@ impl Session {
     /// Must run inside a tokio runtime. A peer that closes at message 1 or
     /// answers with a static key other than the pinned one is
     /// [`WireError::PeerChanged`].
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub async fn connect(config: ConnectConfig) -> Result<Arc<Self>, WireError> {
+        let log = config.log.clone();
+        let note = |event: Event| {
+            if let Some(log) = &log {
+                log.log(event);
+            }
+        };
+        note(Event::Connect {
+            url: config.url.clone(),
+            carrier: config.carrier.as_str().to_owned(),
+            host_id: config.host_id.as_str().to_owned(),
+        });
+        let session = Self::connect_inner(&config).await;
+        match &session {
+            Ok(s) => note(Event::Handshake {
+                host_key_digest: digest(&config.host_static_pubkey),
+                ws_connect_ms: s.ws_connect_ms as u64,
+                noise_handshake_ms: s.noise_handshake_ms as u64,
+            }),
+            Err(WireError::Connect { message }) => note(Event::ConnectFailed {
+                detail: message.clone(),
+            }),
+            Err(e) => note(Event::HandshakeFailed {
+                detail: e.to_string(),
+            }),
+        }
+        session
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn connect_inner(config: &ConnectConfig) -> Result<Arc<Self>, WireError> {
         let t0 = Instant::now();
         let (ws, _) = tokio_tungstenite::connect_async(config.url.as_str()).await.map_err(|e| {
             WireError::Connect {
@@ -378,6 +413,7 @@ impl Session {
             last_rtt_us: AtomicU64::new(0),
             ping_seq: AtomicU64::new(0),
             rpc_timeout: config.rpc_timeout,
+            log: config.log.clone(),
         });
 
         let writer = Arc::clone(&session);
@@ -476,11 +512,30 @@ impl Session {
 
     fn mark_closed(&self, code: Option<u16>, reason: String) {
         let mut closed = self.closed.lock().unwrap();
-        if closed.is_none() {
-            *closed = Some(Closed { code, reason });
+        let first = closed.is_none();
+        if first {
+            *closed = Some(Closed {
+                code,
+                reason: reason.clone(),
+            });
         }
         drop(closed);
+        if first {
+            if let Some(log) = &self.log {
+                log.log(Event::Close {
+                    code,
+                    reason,
+                    pings_sent: self.pings_sent.load(Ordering::SeqCst),
+                    pongs_received: self.pongs_received.load(Ordering::SeqCst),
+                });
+            }
+        }
         self.pending.lock().unwrap().clear();
+    }
+
+    /// The connection log, when the app keeps one.
+    pub fn log(&self) -> Option<&Arc<ConnLog>> {
+        self.log.as_ref()
     }
 
     /// Whether the session is closed.
