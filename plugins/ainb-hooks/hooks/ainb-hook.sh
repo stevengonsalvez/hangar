@@ -11,13 +11,20 @@
 #   call, so a pane that outlives a daemon restart reaches the new daemon.
 # - The endpoint file is PARSED line by line against an allowlist. It is never
 #   sourced, so a corrupted file cannot run as shell code.
-# - The token reaches curl only as `-H @<file>`. It never appears in argv.
+# - Before sending anything the script checks the daemon is really there and
+#   really ours: the pid it published answers `kill -0`, and both files are
+#   owned by this user. A stale file left by a crash, or a port another user
+#   squats on, gets nothing (and no hold).
+# - The token reaches curl only as `-H @<file>`, and only from a file named
+#   `hook-headers`. It never appears in argv.
 # - Status events print `{}` and return within ~1.5s whatever the daemon does.
-# - Blocking events (Claude PermissionRequest, and PreToolUse on
-#   AskUserQuestion) wait for the daemon's answer and print it. On any failure
-#   they print `{}`, so the agent shows its own prompt and the keyboard decides.
-# - When the daemon cannot be reached, non-tool events are appended to a spool
-#   the daemon drains at its next start.
+# - Claude PermissionRequest and PreToolUse go to the hold route; the daemon
+#   decides which of them wait for a human (AskUserQuestion) and answers the
+#   rest at once. The script prints the daemon's answer, or `{}` on any failure
+#   so the agent shows its own prompt and the keyboard decides.
+# - When the daemon cannot be reached, status events are appended to a spool
+#   the daemon drains at its next start. Tool events and holds never spool: a
+#   replayed approval would be a phantom.
 # - Always exits 0.
 
 if [ "$#" -gt 0 ]; then
@@ -27,7 +34,10 @@ else
 fi
 
 agent=${AINB_AGENT:-claude}
-home=${AINB_HANGAR_HOME:-${AINB_HOME:-$HOME/.agents-in-a-box}}
+# The same resolution as the daemon's hangar home: AINB_HANGAR_HOME, else the
+# default. Nothing else, so the script never reads files the daemon did not
+# write.
+home=${AINB_HANGAR_HOME:-$HOME/.agents-in-a-box}
 endpoint="$home/hangar/hook-endpoint.env"
 
 # A Claude background job worker is not a session anyone watches.
@@ -50,16 +60,17 @@ safe() {
   printf '%s' "$1" | tr -c 'A-Za-z0-9:_%-' '_' | cut -c1-96
 }
 
+# Route on the event name only. Which PreToolUse holds is the daemon's call.
 blocking=0
 if [ "$agent" = claude ]; then
   case "$event" in
-    PermissionRequest) blocking=1 ;;
-    PreToolUse) [ "$(json_field tool_name)" = AskUserQuestion ] && blocking=1 ;;
+    PermissionRequest | PreToolUse) blocking=1 ;;
   esac
 fi
 
 port=
 headers=
+pid=
 if [ -r "$endpoint" ]; then
   while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
@@ -69,10 +80,16 @@ if [ -r "$endpoint" ]; then
           *) port=$value ;;
         esac
         ;;
+      AINB_HOOK_PID)
+        case "$value" in
+          '' | *[!0-9]*) pid= ;;
+          *) pid=$value ;;
+        esac
+        ;;
       AINB_HOOK_HEADERS)
         case "$value" in
           /*[!A-Za-z0-9/._-]* | *..*) headers= ;;
-          /*) headers=$value ;;
+          /*/hook-headers) headers=$value ;;
           *) headers= ;;
         esac
         ;;
@@ -122,8 +139,17 @@ post() {
     --data-binary @- 2>/dev/null
 }
 
+# Only a live daemon that this user owns: the published pid answers kill -0
+# (which also fails for another user's process), and both files are ours.
+# `test -O` is outside POSIX but in every sh this runs under (dash, bash,
+# the macOS sh).
 reachable=0
-[ -n "$port" ] && [ -n "$headers" ] && [ -r "$headers" ] && command -v curl >/dev/null 2>&1 && reachable=1
+# shellcheck disable=SC3067
+if [ -n "$port" ] && [ -n "$headers" ] && [ -n "$pid" ] &&
+  [ -O "$endpoint" ] && [ -O "$headers" ] && [ -r "$headers" ] &&
+  kill -0 "$pid" 2>/dev/null && command -v curl >/dev/null 2>&1; then
+  reachable=1
+fi
 
 if [ "$blocking" = 1 ] || [ "$event" = Stop ]; then
   # The daemon's body is the agent's answer: a human decision for a hold, or
@@ -141,7 +167,8 @@ if [ "$blocking" = 1 ] || [ "$event" = Stop ]; then
     printf '{}\n'
     exit 0
   fi
-  spool
+  # A hold is never spooled; Stop is status and is.
+  [ "$blocking" = 1 ] || spool
   printf '{}\n'
   exit 0
 fi
