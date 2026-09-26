@@ -168,9 +168,12 @@ pub fn public_key(private: &[u8; KEY_LEN]) -> Result<[u8; KEY_LEN], NoiseError> 
     key(dh.pubkey())
 }
 
-/// Whether `public` is a low-order X25519 point: one whose Diffie-Hellman
-/// output is all zero whatever the other side's key, so a session keyed on it
-/// is not secret. The host refuses such a device key at redeem (R1-07).
+/// Whether `public` is a low-order X25519 point.
+///
+/// Such a point's Diffie-Hellman output is all zero whatever the other side's
+/// key, so a session keyed on it is not secret. The host refuses one at
+/// message 1 (the responder calls this). Redeem does not call it yet: R1-07
+/// (lane r1-daemon) is to refuse such a device key there too.
 ///
 /// The check multiplies `public` by a clamped scalar, which is a multiple of
 /// the cofactor 8, so the product is zero exactly when `public` lies in the

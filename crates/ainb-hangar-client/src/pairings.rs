@@ -168,6 +168,15 @@ impl std::fmt::Debug for PairingStore {
     }
 }
 
+// `Option` because a platform with neither backend gets `None`; on macOS and
+// Linux it is always `Some`, which is what the lint sees.
+#[cfg_attr(
+    any(target_os = "macos", target_os = "linux"),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "always Some on macOS and Linux; None on a platform with no backend"
+    )
+)]
 fn platform_backend() -> Option<Box<dyn SecretBackend + Send + Sync>> {
     #[cfg(target_os = "macos")]
     {
