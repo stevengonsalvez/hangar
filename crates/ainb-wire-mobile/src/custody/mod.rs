@@ -1,20 +1,21 @@
-//! Device key custody: the Noise static keypair never leaves this crate.
+//! Device secrets custody: the Noise static keypair and every device token
+//! never leave this crate.
 //!
-//! The app gets a fingerprint and nothing else. One entry point,
-//! [`DeviceKey::load_or_create`], picks the backend for the target:
+//! The app gets a fingerprint and nothing else. One backend per target holds
+//! named secrets ([`store_secret`], [`load_secret`], [`delete_secret`]):
 //!
 //! | target  | backend                                              | degraded |
 //! |---------|------------------------------------------------------|----------|
 //! | iOS     | Keychain, `AfterFirstUnlockThisDeviceOnly`, ungated | no       |
-//! | Android | app-private `0600` file (Keystore via JNI pending)   | yes      |
-//! | other   | app-private `0600` file (tests, desktop)             | no       |
+//! | Android | app-private `0600` files (Keystore via JNI pending)  | yes      |
+//! | other   | app-private `0600` files (tests, desktop)            | no       |
 //!
-//! `degraded` means the key is at rest in the app sandbox rather than in
+//! `degraded` means the secret is at rest in the app sandbox rather than in
 //! hardware-backed storage; the app shows it on the Log screen so the owner
-//! knows which phones carry a file key.
+//! knows which phones carry file secrets.
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ainb_hangar_noise::NOISE_PATTERN;
 
@@ -23,15 +24,17 @@ use crate::records::WireError;
 #[cfg(target_os = "ios")]
 mod ios;
 
-/// The bytes a backend stores: private key then public key.
-pub type KeyBytes = Vec<u8>;
+/// The secret name of the device keypair (private key then public key).
+pub const KEY_FILE: &str = "device.key";
+const PRIVATE_LEN: usize = 32;
+const PUBLIC_LEN: usize = 32;
 
-/// Which backend holds the key on this target, for the Log screen.
+/// Which backend holds the secrets on this target, for the Log screen.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CustodyReport {
     /// `keychain` or `file`.
     pub backend: String,
-    /// Whether the key is at rest in the app sandbox rather than in
+    /// Whether secrets are at rest in the app sandbox rather than in
     /// hardware-backed storage.
     pub degraded: bool,
     /// Why, when degraded.
@@ -53,7 +56,8 @@ impl CustodyReport {
                 backend: "file".to_owned(),
                 degraded: true,
                 detail: Some(
-                    "android keystore backend pending; key in an app-private 0600 file".to_owned(),
+                    "android keystore backend pending; secrets in app-private 0600 files"
+                        .to_owned(),
                 ),
             }
         } else {
@@ -66,10 +70,105 @@ impl CustodyReport {
     }
 }
 
-/// The file the file backend keeps the keypair in, under the custody dir.
-pub const KEY_FILE: &str = "device.key";
-const PRIVATE_LEN: usize = 32;
-const PUBLIC_LEN: usize = 32;
+pub(crate) fn custody_error(e: impl std::fmt::Display) -> WireError {
+    WireError::Custody {
+        message: e.to_string(),
+    }
+}
+
+/// A secret name: one path component, so it cannot escape the custody dir.
+fn checked(name: &str) -> Result<&str, WireError> {
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    {
+        return Err(custody_error(format!("bad secret name {name:?}")));
+    }
+    Ok(name)
+}
+
+/// Store `bytes` under `name`, replacing any previous value.
+pub fn store_secret(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), WireError> {
+    let name = checked(name)?;
+    #[cfg(target_os = "ios")]
+    {
+        let _ = dir;
+        ios::store(name, bytes)
+    }
+    #[cfg(not(target_os = "ios"))]
+    file::store(dir, name, bytes)
+}
+
+/// The secret under `name`, when one exists.
+pub fn load_secret(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, WireError> {
+    let name = checked(name)?;
+    #[cfg(target_os = "ios")]
+    {
+        let _ = dir;
+        ios::load(name)
+    }
+    #[cfg(not(target_os = "ios"))]
+    file::load(dir, name)
+}
+
+/// Forget the secret under `name`; absent is not an error.
+pub fn delete_secret(dir: &Path, name: &str) -> Result<(), WireError> {
+    let name = checked(name)?;
+    #[cfg(target_os = "ios")]
+    {
+        let _ = dir;
+        ios::delete(name)
+    }
+    #[cfg(not(target_os = "ios"))]
+    file::delete(dir, name)
+}
+
+/// The file backend: `<dir>/<name>`, owner-only, written whole through a
+/// rename so a kill mid-write leaves the old value, never a torn one.
+#[cfg(not(target_os = "ios"))]
+mod file {
+    use std::io::Write as _;
+    use std::path::Path;
+
+    use super::custody_error;
+    use crate::records::WireError;
+
+    pub fn store(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), WireError> {
+        std::fs::create_dir_all(dir).map_err(custody_error)?;
+        let path = dir.join(name);
+        let tmp = dir.join(format!("{name}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(custody_error)
+    }
+
+    pub fn load(dir: &Path, name: &str) -> Result<Option<Vec<u8>>, WireError> {
+        match std::fs::read(dir.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(custody_error(e)),
+        }
+    }
+
+    pub fn delete(dir: &Path, name: &str) -> Result<(), WireError> {
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(custody_error(e)),
+        }
+    }
+}
 
 /// This device's Noise static keypair.
 #[derive(Clone)]
@@ -86,12 +185,6 @@ impl std::fmt::Debug for DeviceKey {
     }
 }
 
-pub(crate) fn custody_error(e: impl std::fmt::Display) -> WireError {
-    WireError::Custody {
-        message: e.to_string(),
-    }
-}
-
 impl DeviceKey {
     /// Mint a fresh keypair.
     pub fn generate() -> Result<Self, WireError> {
@@ -104,44 +197,18 @@ impl DeviceKey {
         })
     }
 
-    /// The keypair for this device, minted on first use: the Keychain on iOS,
-    /// the `0600` file under `dir` elsewhere.
+    /// The keypair for this device, minted on first use and kept as the
+    /// secret [`KEY_FILE`] in this target's backend.
     pub fn load_or_create(dir: &Path) -> Result<Self, WireError> {
-        #[cfg(target_os = "ios")]
-        {
-            let _ = dir;
-            if let Some(bytes) = ios::load()? {
-                return Self::from_file_bytes(&bytes);
-            }
-            let key = Self::generate()?;
-            ios::store(&key.bytes())?;
-            return Ok(key);
+        if let Some(bytes) = load_secret(dir, KEY_FILE)? {
+            return Self::from_bytes(&bytes);
         }
-        #[cfg(not(target_os = "ios"))]
-        Self::load_or_create_file(dir)
+        let key = Self::generate()?;
+        store_secret(dir, KEY_FILE, &key.bytes())?;
+        Ok(key)
     }
 
-    fn bytes(&self) -> KeyBytes {
-        let mut bytes = self.private.clone();
-        bytes.extend_from_slice(&self.public);
-        bytes
-    }
-
-    /// The file backend: `<dir>/device.key`, created `0600`.
-    pub fn load_or_create_file(dir: &Path) -> Result<Self, WireError> {
-        let path = dir.join(KEY_FILE);
-        match std::fs::read(&path) {
-            Ok(bytes) => Self::from_file_bytes(&bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = Self::generate()?;
-                key.write(&path)?;
-                Ok(key)
-            }
-            Err(e) => Err(custody_error(e)),
-        }
-    }
-
-    fn from_file_bytes(bytes: &[u8]) -> Result<Self, WireError> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, WireError> {
         if bytes.len() != PRIVATE_LEN + PUBLIC_LEN {
             return Err(custody_error(format!(
                 "{KEY_FILE} holds {} bytes, expected {}",
@@ -155,22 +222,10 @@ impl DeviceKey {
         })
     }
 
-    fn write(&self, path: &PathBuf) -> Result<(), WireError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(custody_error)?;
-        }
-        let bytes = self.bytes();
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        options
-            .open(path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
-            .map_err(custody_error)
+    fn bytes(&self) -> Vec<u8> {
+        let mut bytes = self.private.clone();
+        bytes.extend_from_slice(&self.public);
+        bytes
     }
 
     /// The private key, for the Noise builder. Never crosses the uniffi
@@ -220,6 +275,25 @@ mod tests {
         assert!(!format!("{first:?}").contains("private"));
         let other = DeviceKey::load_or_create(&dir.path().join("other")).unwrap();
         assert_ne!(other.public(), first.public());
+    }
+
+    #[test]
+    fn secrets_replace_delete_and_refuse_path_names() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_secret(dir.path(), "token-h1").unwrap(), None);
+        store_secret(dir.path(), "token-h1", b"one").unwrap();
+        store_secret(dir.path(), "token-h1", b"two").unwrap();
+        assert_eq!(
+            load_secret(dir.path(), "token-h1").unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
+        assert!(!dir.path().join("token-h1.tmp").exists());
+        delete_secret(dir.path(), "token-h1").unwrap();
+        delete_secret(dir.path(), "token-h1").unwrap();
+        assert_eq!(load_secret(dir.path(), "token-h1").unwrap(), None);
+        assert!(store_secret(dir.path(), "../escape", b"x").is_err());
+        assert!(store_secret(dir.path(), "a/b", b"x").is_err());
+        assert!(load_secret(dir.path(), "").is_err());
     }
 
     #[test]
