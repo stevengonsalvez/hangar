@@ -4,19 +4,19 @@
 //! listener only when `AINB_HANGAR_HOOK_LISTEN` is set at boot; a hook script
 //! finds it through two files under `<hangar_home>/hangar/`:
 //!
-//! - [`ENDPOINT_FILE_NAME`]: port, protocol version, daemon pid and the path of
-//!   the headers file. No secret. The script PARSES it line by line with
-//!   [`HookEndpoint::parse_env_file`]'s rules and never sources it, so a
-//!   corrupted file cannot become shell code.
+//! - [`ENDPOINT_FILE_NAME`]: port, protocol version and daemon pid. No secret.
+//!   The script PARSES it line by line with [`HookEndpoint::parse_env_file`]'s
+//!   rules and never sources it, so a corrupted file cannot become shell code.
 //! - [`HEADERS_FILE_NAME`]: the one line `X-Ainb-Hook-Token: <token>`, mode
-//!   0600. The script hands it to curl as `-H @<file>`, so the token never
-//!   appears in any process argv (on macOS `ps` shows every user's argv).
+//!   0600, always at this fixed name beside the endpoint file. The endpoint
+//!   file does not name it, so it cannot redirect the script to another file.
+//!   The script hands it to curl as `-H @<file>`, so the token never appears
+//!   in any process argv (on macOS `ps` shows every user's argv).
 //!
 //! Both are re-read on every hook call, so a pane that outlives a daemon
 //! restart reaches the new port and the new token.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -233,27 +233,14 @@ pub fn spool_stem(raw: &str) -> String {
 }
 
 /// The contents of [`ENDPOINT_FILE_NAME`].
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookEndpoint {
     /// The loopback port the listener bound.
     pub port: u16,
     /// [`HOOK_ENDPOINT_VERSION`] at write time.
     pub version: u32,
-    /// The daemon pid, for diagnostics only.
+    /// The daemon pid. The script requires it to answer `kill -0`.
     pub pid: u32,
-    /// Absolute path of [`HEADERS_FILE_NAME`].
-    pub headers_path: PathBuf,
-}
-
-impl fmt::Debug for HookEndpoint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HookEndpoint")
-            .field("port", &self.port)
-            .field("version", &self.version)
-            .field("pid", &self.pid)
-            .field("headers_path", &self.headers_path)
-            .finish()
-    }
 }
 
 /// Why an endpoint file was refused.
@@ -287,17 +274,16 @@ impl HookEndpoint {
     #[must_use]
     pub fn render_env_file(&self) -> String {
         format!(
-            "AINB_HOOK_PORT={}\nAINB_HOOK_VERSION={}\nAINB_HOOK_PID={}\nAINB_HOOK_HEADERS={}\n",
-            self.port,
-            self.version,
-            self.pid,
-            self.headers_path.display()
+            "AINB_HOOK_PORT={}\nAINB_HOOK_VERSION={}\nAINB_HOOK_PID={}\n",
+            self.port, self.version, self.pid
         )
     }
 
     /// Parse the file with the same rules the hook script applies: only the
-    /// four allowlisted keys, digits for the numbers, and an absolute headers
-    /// path made of `[A-Za-z0-9/._-]` whose file name is [`HEADERS_FILE_NAME`].
+    /// allowlisted keys, digits for the numbers, a pid above 1. An
+    /// `AINB_HOOK_HEADERS` line (written by earlier builds) is accepted and
+    /// ignored: the headers file is always [`HEADERS_FILE_NAME`] beside this
+    /// one.
     ///
     /// # Errors
     /// [`EndpointParseError`] on any other shape.
@@ -305,7 +291,6 @@ impl HookEndpoint {
         let mut port = None;
         let mut version = None;
         let mut pid = None;
-        let mut headers = None;
         for line in text.lines() {
             if line.is_empty() {
                 continue;
@@ -338,12 +323,7 @@ impl HookEndpoint {
                             .ok_or(EndpointParseError::BadValue("AINB_HOOK_PID"))?,
                     );
                 }
-                "AINB_HOOK_HEADERS" => {
-                    headers = Some(
-                        safe_headers_path(value)
-                            .ok_or(EndpointParseError::BadValue("AINB_HOOK_HEADERS"))?,
-                    );
-                }
+                "AINB_HOOK_HEADERS" => {}
                 other => return Err(EndpointParseError::UnknownKey(other.to_owned())),
             }
         }
@@ -351,7 +331,6 @@ impl HookEndpoint {
             port: port.ok_or(EndpointParseError::Missing("AINB_HOOK_PORT"))?,
             version: version.ok_or(EndpointParseError::Missing("AINB_HOOK_VERSION"))?,
             pid: pid.ok_or(EndpointParseError::Missing("AINB_HOOK_PID"))?,
-            headers_path: headers.ok_or(EndpointParseError::Missing("AINB_HOOK_HEADERS"))?,
         })
     }
 }
@@ -359,17 +338,6 @@ impl HookEndpoint {
 fn digits(value: &str) -> Option<&str> {
     (!value.is_empty() && value.len() <= 10 && value.bytes().all(|b| b.is_ascii_digit()))
         .then_some(value)
-}
-
-fn safe_headers_path(value: &str) -> Option<PathBuf> {
-    let path = Path::new(value);
-    let charset_ok = !value.is_empty()
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'));
-    let named_ok = path.file_name().is_some_and(|n| n == HEADERS_FILE_NAME);
-    let no_parent = !path.components().any(|c| matches!(c, std::path::Component::ParentDir));
-    (charset_ok && path.is_absolute() && named_ok && no_parent).then(|| path.to_path_buf())
 }
 
 /// Render [`HEADERS_FILE_NAME`]: the token header line, nothing else.
@@ -387,7 +355,6 @@ mod tests {
             port: 41234,
             version: HOOK_ENDPOINT_VERSION,
             pid: 77,
-            headers_path: PathBuf::from("/home/u/.agents-in-a-box/hangar/hook-headers"),
         }
     }
 
@@ -409,8 +376,6 @@ mod tests {
             "AINB_HOOK_PORT=1; touch pwned",
             "AINB_HOOK_PORT=$(touch pwned)",
             "AINB_HOOK_PORT=`id`",
-            "AINB_HOOK_HEADERS=/tmp/x/hook-headers;id",
-            "AINB_HOOK_HEADERS=/tmp/$(id)/hook-headers",
         ] {
             assert!(
                 HookEndpoint::parse_env_file(bad).is_err(),
@@ -429,25 +394,23 @@ mod tests {
     }
 
     #[test]
-    fn headers_path_must_be_absolute_and_named() {
-        for bad in [
-            "relative/hook-headers",
-            "/tmp/other-file",
-            "/tmp/../etc/hook-headers",
-        ] {
-            let text = format!(
-                "AINB_HOOK_PORT=1\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID=1\nAINB_HOOK_HEADERS={bad}\n"
-            );
-            assert!(HookEndpoint::parse_env_file(&text).is_err(), "{bad}");
-        }
+    fn an_old_headers_line_is_ignored_and_never_rendered() {
+        let text = "AINB_HOOK_PORT=9\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID=42\nAINB_HOOK_HEADERS=/anything at all\n";
+        assert_eq!(
+            HookEndpoint::parse_env_file(text),
+            Ok(HookEndpoint {
+                port: 9,
+                version: 1,
+                pid: 42
+            })
+        );
+        assert!(!endpoint().render_env_file().contains("HEADERS"));
     }
 
     #[test]
     fn pid_zero_and_one_are_refused() {
         for pid in ["0", "1"] {
-            let text = format!(
-                "AINB_HOOK_PORT=5\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID={pid}\nAINB_HOOK_HEADERS=/h/hook-headers\n"
-            );
+            let text = format!("AINB_HOOK_PORT=5\nAINB_HOOK_VERSION=1\nAINB_HOOK_PID={pid}\n");
             assert_eq!(
                 HookEndpoint::parse_env_file(&text),
                 Err(EndpointParseError::BadValue("AINB_HOOK_PID")),
