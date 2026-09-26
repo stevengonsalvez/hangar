@@ -154,29 +154,40 @@ test("a failed redial is rescheduled with growing backoff until one succeeds", a
   expect(log.filter((l) => l.event === "hello")).toHaveLength(2);
 });
 
-test("a close with retry-after waits that long, not the backoff", async () => {
+test("retry-after is a floor under the backoff, on the first redial and every one after", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
   await screen.findByTestId("banner-att-1");
+  fake.failNextConnect = 1;
   await act(async () => fake.dropConnection(FAKE_HOST_A, 4429, "retry-after=5"));
   await act(async () => {
     jest.advanceTimersByTime(3000);
   });
-  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // not yet: 1 s backoff would have fired
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // not yet: the 1 s backoff is under the 5 s floor
   await act(async () => {
-    jest.advanceTimersByTime(2500);
+    jest.advanceTimersByTime(2500); // 5 s: first redial, fails
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await act(async () => {
+    jest.advanceTimersByTime(3000); // 2 s backoff would have fired here; the floor still holds
+  });
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
+  await act(async () => {
+    jest.advanceTimersByTime(2500); // second redial at +5 s
   });
   await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
+  expect((await fake.connectionLog()).filter((l) => l.event === "dial-failed")).toHaveLength(1);
 });
 
-test("a socket whose connect succeeded but whose subscribe failed is still closed on background", async () => {
+test("a connect whose subscribe fails closes the socket at once and rethrows", async () => {
   const screen = renderRouter("./app", { initialUrl: "/" });
   await screen.findByTestId("banner-att-1");
   await act(() => onAppState(fake, "background"));
   fake.failNextSubscribe = 1;
-  await act(() => onAppState(fake, "active"));
-  expect(fake.isConnected(FAKE_HOST_A)).toBe(true); // dialled, then the subscribe threw
-  await act(() => onAppState(fake, "background"));
-  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // tracked from the connect, so closed
+  await expect(connectHost(fake, FAKE_HOST_A)).rejects.toThrow("subscribe failed");
+  expect(fake.isConnected(FAKE_HOST_A)).toBe(false); // dialled, subscribe threw, closed before the caller heard
+  expect(liveHosts().get(FAKE_HOST_A)?.connected).toBe(false);
+  const log = await fake.connectionLog();
+  expect(log.slice(-2).map((l) => l.event)).toEqual(["hello", "close"]);
 });
 
 test("a 4403 through either fake close hook latches the host", async () => {
