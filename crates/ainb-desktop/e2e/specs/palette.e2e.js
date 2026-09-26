@@ -6,7 +6,7 @@
 
 import assert from "node:assert/strict";
 import { click, intentsSent, setPaletteQuery } from "../support.js";
-import { hook, paneText, seeded } from "../world.js";
+import { paneText, raiseHook, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
 const MOD = process.platform === "darwin" ? ["Meta"] : ["Control", "Shift"];
@@ -32,20 +32,20 @@ async function focusState() {
   }));
 }
 
-/** The question the agent in `session`'s row is blocked on, as the Claude hook announces it. */
-const askLine = (session) => ({
-  event_id: `e2e-palette-ask-${Date.now()}`,
-  ts: Date.now(),
-  session_id: "",
-  cwd: session.cwd,
-  event_type: "PreToolUse",
+/**
+ * The AskUserQuestion call, as Claude hands it to its PreToolUse hook. Raised
+ * under the session's own id (the one ainb minted for it), which is what
+ * places the question on the row since #101; a line with no id places
+ * nothing.
+ */
+const ASK = {
+  event: "PreToolUse",
   matcher: "AskUserQuestion",
-  agent: "claude",
   payload: {
     tool_name: "AskUserQuestion",
     tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
   },
-});
+};
 
 /**
  * The request id of the banner over the selected row once it shows a
@@ -259,9 +259,7 @@ describe("the palette over a terminal", () => {
     // the pane's.
     const session = seeded()[0];
     await ready(session);
-    // Raised with no session id, matched to the row by its worktree: the
-    // banner over the row's terminal is what this case needs, not the id.
-    hook(askLine(session));
+    raiseHook(session, ASK);
     await focusTerminal(session);
     await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
@@ -318,7 +316,7 @@ describe("the palette over a terminal", () => {
     // to the agent's pane (#47).
     const session = seeded()[0];
     await ready(session);
-    hook(askLine(session));
+    raiseHook(session, ASK);
     await focusTerminal(session);
     await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
