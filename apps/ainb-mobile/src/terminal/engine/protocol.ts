@@ -12,7 +12,9 @@ export type ToEngine =
 export type FromEngine =
   | { t: "ready" }
   | { t: "fit"; cols: number; rows: number }
-  | { t: "input"; data: string };
+  | { t: "input"; data: string }
+  /** An OSC 8 link was activated in the pane; the engine opened nothing. */
+  | { t: "link"; uri: string };
 
 export function encode(msg: ToEngine | FromEngine): string {
   return JSON.stringify(msg);
@@ -24,6 +26,7 @@ export function decodeFromEngine(raw: string): FromEngine | undefined {
     if (v.t === "ready") return { t: "ready" };
     if (v.t === "fit" && typeof v.cols === "number" && typeof v.rows === "number") return { t: "fit", cols: v.cols, rows: v.rows };
     if (v.t === "input" && typeof v.data === "string") return { t: "input", data: v.data };
+    if (v.t === "link" && typeof v.uri === "string") return { t: "link", uri: v.uri.slice(0, 512) };
   } catch {
     // not ours
   }
