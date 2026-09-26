@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
+use ainb_hangar_core::actor::{ActorKind, ActorRef};
 use ainb_hangar_core::clock::{HangarClock, SystemClock};
 use ainb_hangar_core::token::{TokenKind, mint, sha256_hex};
 use ainb_hangar_proto::auth::{DeviceInfo, HelloParams, HelloResult, UNAUTHORIZED};
@@ -262,6 +263,50 @@ impl Caller {
         }
     }
 
+    /// The actor a write from this caller is authored as: the one stamp for
+    /// every author, creator and acting-actor field a caller could otherwise
+    /// fill in itself (security review follow-up A).
+    ///
+    /// - The operator: `claimed`, else the local member. Unchanged, because
+    ///   the operator token is shared by the local surfaces and by the agents
+    ///   the operator runs, which author as themselves.
+    /// - A device: `member:device:<device_id>`, whatever it claimed. Pinned,
+    ///   not validated, like its `fleet/message_send.actor`, so a phone never
+    ///   comments as the operator or as an agent.
+    /// - Pal: `agent:<PAL_ACTOR>`. Pal reaches none of these methods today
+    ///   ([`PAL_METHODS`]); this is the safe answer if one is ever added.
+    #[must_use]
+    pub fn stamp(&self, claimed: Option<ActorRef>) -> ActorRef {
+        match self {
+            Self::Operator => claimed.unwrap_or_else(ainb_hangar_core::actor::local_member),
+            Self::Device { device_id, .. } => {
+                ActorRef::new(ActorKind::Member, format!("device:{device_id}"))
+                    .expect("a device id is never empty")
+            }
+            Self::Pal { .. } => ActorRef::new(ActorKind::Agent, crate::pal::PAL_ACTOR)
+                .expect("PAL_ACTOR is a non-empty constant"),
+        }
+    }
+
+    /// Whether `actor` is this caller's own device stamp. A device's stamp has
+    /// no `member` row, and it is the daemon's own value, so the workspace
+    /// membership gate for caller-named actors does not apply to it.
+    #[must_use]
+    pub fn is_own_device_stamp(&self, actor: &ActorRef) -> bool {
+        matches!(self, Self::Device { .. }) && *actor == self.stamp(None)
+    }
+
+    /// The same identity as a chat-bus sender: `operator`, `device:<id>`, or
+    /// Pal's actor.
+    #[must_use]
+    pub fn sender(&self) -> String {
+        match self {
+            Self::Operator => "operator".to_string(),
+            Self::Device { device_id, .. } => format!("device:{device_id}"),
+            Self::Pal { .. } => crate::pal::PAL_ACTOR.to_string(),
+        }
+    }
+
     /// The paired device this connection is, if any.
     #[must_use]
     pub fn device_id(&self) -> Option<&str> {
@@ -270,6 +315,26 @@ impl Caller {
             Self::Device { device_id, .. } => Some(device_id),
         }
     }
+}
+
+tokio::task_local! {
+    /// The caller of the request this task is serving, for the few effects
+    /// that run frames below the handler (the ACP prompt path) and so cannot
+    /// take the caller as an argument without threading it through every
+    /// shared executor.
+    static CURRENT: Caller;
+}
+
+/// Run `request` with `caller` as [`current_sender`]'s answer.
+pub async fn serving<F: std::future::Future>(caller: Caller, request: F) -> F::Output {
+    CURRENT.scope(caller, request).await
+}
+
+/// The sender stamp of the request this task is serving, or `None` outside a
+/// request (a daemon-internal effect, which keeps its own attribution).
+#[must_use]
+pub fn current_sender() -> Option<String> {
+    CURRENT.try_with(Caller::sender).ok()
 }
 
 /// Live Pal credentials: `sha256(plaintext) -> scope_key`.
@@ -1155,5 +1220,32 @@ mod tests {
             crate::answer::answered_by_caller(&authenticated.caller, None),
             None
         );
+    }
+
+    /// Review follow-up A: the stamp. The operator keeps its claim or the
+    /// local member; a device is always itself; the sender string matches.
+    #[tokio::test]
+    async fn the_stamp_pins_a_device_and_leaves_the_operator_alone() {
+        let agent: ActorRef = "agent:agent-1".parse().unwrap();
+        assert_eq!(Caller::Operator.stamp(Some(agent.clone())), agent);
+        assert_eq!(
+            Caller::Operator.stamp(None),
+            ainb_hangar_core::actor::local_member()
+        );
+        let laptop = device(DeviceScope::DESKTOP);
+        assert_eq!(
+            laptop.stamp(Some(agent)).to_string(),
+            "member:device:01J0DEVICE0000000000000000"
+        );
+        assert!(laptop.is_own_device_stamp(&laptop.stamp(None)));
+        assert!(!Caller::Operator.is_own_device_stamp(&Caller::Operator.stamp(None)));
+        assert_eq!(laptop.sender(), "device:01J0DEVICE0000000000000000");
+        assert_eq!(Caller::Operator.sender(), "operator");
+
+        // What the ACP SendPrompt path reads: the serving request's caller,
+        // and nothing outside a request.
+        assert_eq!(current_sender(), None);
+        let inside = serving(laptop.clone(), async { current_sender() }).await;
+        assert_eq!(inside.as_deref(), Some("device:01J0DEVICE0000000000000000"));
     }
 }
