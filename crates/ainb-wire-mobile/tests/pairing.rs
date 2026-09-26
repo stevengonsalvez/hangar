@@ -366,7 +366,8 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
     .unwrap_err();
     assert_eq!(err, WireError::PeerChanged);
     assert_eq!(
-        list_pairings(dir_s.clone()).unwrap()[0].repair, None,
+        list_pairings(dir_s.clone()).unwrap()[0].repair,
+        None,
         "an offer's dial never latches"
     );
 
@@ -409,6 +410,65 @@ async fn peer_changed_sets_the_repair_latch_on_connect_and_on_repair() {
         (None, None)
     );
     assert_eq!(list_pairings(dir_s).unwrap()[0].repair, None);
+}
+
+#[tokio::test]
+async fn a_refused_hello_answered_with_an_error_before_the_close_still_latches_on_the_code() {
+    // The daemon's shape: the JSON-RPC error reply, then the 4401 close.
+    let peer = spawn(
+        issuing_host(Arc::new(AtomicBool::new(false)), None),
+        PeerOpts::default(),
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let dir_s = dir.path().to_string_lossy().into_owned();
+    pair(
+        offer_for(&peer, peer.host_pubkey, vec![live(&peer)]),
+        "my phone".into(),
+        dir_s.clone(),
+        dir_s.clone(),
+    )
+    .await
+    .unwrap();
+    let refusing = spawn(
+        Arc::new(|method: &str, _| {
+            assert_eq!(method, "auth/hello");
+            Reply::ErrorThenClose {
+                code: -32000,
+                message: "unauthorized".into(),
+                close: 4401,
+                reason: "token expired".into(),
+            }
+        }),
+        PeerOpts::default(),
+    )
+    .await;
+    let mut record = list_pairings(dir_s.clone()).unwrap().remove(0);
+    record.endpoints[0].url = refusing.url.clone();
+    record.host_static_pubkey = refusing.host_pubkey.to_vec();
+    ainb_wire_mobile::pairing::save(dir.path(), record, TOKEN).unwrap();
+    let err = connect_host(ConnectParams {
+        host_id: HOST_ID.into(),
+        custody_dir: dir_s.clone(),
+        log_dir: dir_s.clone(),
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WireError::Closed {
+                code: Some(4401),
+                retryable: false,
+                ..
+            }
+        ),
+        "the close, not the raced Rpc error: {err:?}"
+    );
+    assert_eq!(
+        list_pairings(dir_s).unwrap().remove(0).repair.as_deref(),
+        Some("unauthenticated")
+    );
 }
 
 #[tokio::test]
