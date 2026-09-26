@@ -664,30 +664,39 @@ desktop_ready() {
 }
 
 # start_desktop: the window in a harness pane, under a headless X server,
-# waited on until its renderer has applied a batch.
+# waited on until its renderer has applied a batch and the daemon its sidecar
+# starts answers with a token on disk. Every way the boot can fail is recorded
+# here as a failed check naming its own bound, and the function then returns 1,
+# so a caller only has to stop: `start_desktop || return`.
 start_desktop() {
   DESKTOP_LOG="$AINB_HANGAR_HOME/desktop.log"
   ptmux new-session -d -s desktop -x "$PROOF_COLS" -y "$PROOF_ROWS" \
     "env -u TMUX -u TMUX_PANE AINB_DESKTOP_DAEMON_BIN='$DESKTOP_DAEMON_BIN' \
        xvfb-run -a '$DESKTOP_BIN' 2>>'$PROOF_WORLD/desktop.stderr'"
-  wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null || return 1
+  if ! wait_for 90 grep -q "renderer applied" "$DESKTOP_LOG" 2>/dev/null; then
+    check "the desktop window applied a frame batch within 90 s" false
+    [[ -s "$PROOF_WORLD/desktop.stderr" ]] && observe "window stderr: $(tail -3 "$PROOF_WORLD/desktop.stderr")"
+    return 1
+  fi
   # The first batch is applied from the reducer before the window's sidecar
   # has a daemon: the socket binds and the token is written a few seconds
   # after that line on a slower box. A scenario whose first daemon read
   # follows this return would race that boot (d3p-inbox did: its issue_create
-  # found no token file), so the wait lives here, as it does in start_tui, and
-  # every desktop node's first read finds a daemon. A daemon that never comes
-  # fails the node here, against the boot, rather than against the read.
-  # Each wait is named with its own bound and the time actually waited, so a
-  # failure says which half of the boot never happened.
+  # found no token file), so both waits live here and every desktop node's
+  # first read finds a daemon. (start_tui waits for the daemon's socket only,
+  # not its token.) A daemon that never comes fails the node here, against the
+  # boot, rather than against the read. Each wait is named with its own bound
+  # and the time actually waited, so a failure says which half of the boot
+  # never happened.
   local booted=$SECONDS
   if ! wait_for 60 daemon_running; then
     check "the daemon the window starts answers on its socket within 60 s of the first batch (waited $((SECONDS - booted)) s; status: $("$AINB_BIN" hangar daemon status 2>&1 | head -1))" false
-  else
-    local answered=$SECONDS
-    if ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
-      check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - answered)) s since it answered)" false
-    fi
+    return 1
+  fi
+  local answered=$SECONDS
+  if ! wait_for 30 test -f "$AINB_HANGAR_HOME/hangar/daemon.token"; then
+    check "the daemon writes hangar/daemon.token within 30 s of answering on its socket (waited $((SECONDS - answered)) s since it answered, $((SECONDS - booted)) s since the first batch)" false
+    return 1
   fi
 }
 
