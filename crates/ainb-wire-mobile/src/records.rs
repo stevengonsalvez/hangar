@@ -59,40 +59,25 @@ pub enum WireError {
         /// The method that timed out.
         method: String,
     },
-    /// The session is closed.
-    #[error("session closed: {reason}")]
+    /// The session is closed, or the host refused the connection with a
+    /// WebSocket close. `code` is what the host sent (4401 unauthenticated,
+    /// 4403 revoked, 4409 protocol incompatible, 4429 rate limited, 1013 over
+    /// capacity, 4503 draining, or another code), absent for a network loss.
+    /// `retryable` and `retry_after_ms` are the crate's classification, so
+    /// the app never rebuilds the close-code table: a network loss and 4429,
+    /// 1013, 4503 are retryable; 4401, 4403, 4409 and a code this build does
+    /// not know are not.
+    #[error("session closed ({}): {reason}", code.map_or("no code".to_owned(), |c| c.to_string()))]
     Closed {
-        /// The WebSocket close code, when the peer sent one.
+        /// The WebSocket close code, when the host sent one.
         code: Option<u16>,
-        /// Why.
+        /// The host's reason, or the transport's words.
         reason: String,
-    },
-    /// The device token is refused: 4401. The app re-pairs after expiry.
-    #[error("unauthenticated (4401)")]
-    Unauthenticated,
-    /// The device was revoked: 4403. The app latches to "re-pair".
-    #[error("revoked (4403)")]
-    Revoked,
-    /// The protocol ranges do not overlap: 4409. Not retryable until one
-    /// side is updated.
-    #[error("protocol incompatible (4409)")]
-    Incompatible,
-    /// Rate limited: 4429. Retry after the delay the host named.
-    #[error("rate limited (4429)")]
-    RateLimited {
+        /// Whether a reconnect can succeed without a person acting.
+        retryable: bool,
         /// The host's `retry-after`, in milliseconds, when it named one.
         retry_after_ms: Option<u64>,
     },
-    /// The host is over capacity: 1013. Retry after the delay it named.
-    #[error("host over capacity (1013)")]
-    OverCapacity {
-        /// The host's `retry-after`, in milliseconds, when it named one.
-        retry_after_ms: Option<u64>,
-    },
-    /// The host is draining, or this device was rescoped and must hello
-    /// again: 4503. Reconnect.
-    #[error("host draining (4503)")]
-    Draining,
     /// A pairing offer did not parse.
     #[error("bad offer: {message}")]
     Offer {
@@ -119,15 +104,11 @@ impl WireError {
     /// revocation or an incompatible protocol is not.
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            Self::Connect { .. }
-                | Self::Timeout { .. }
-                | Self::Closed { .. }
-                | Self::RateLimited { .. }
-                | Self::OverCapacity { .. }
-                | Self::Draining
-        )
+        match self {
+            Self::Connect { .. } | Self::Timeout { .. } => true,
+            Self::Closed { retryable, .. } => *retryable,
+            _ => false,
+        }
     }
 
     pub(crate) fn protocol(e: impl std::fmt::Display) -> Self {
@@ -642,12 +623,18 @@ pub enum WireEvent {
         /// How many were dropped.
         dropped: u64,
     },
-    /// The session closed; no event follows.
+    /// The session closed; no event follows. `retryable` and
+    /// `retry_after_ms` are the crate's reading of `code`, the same one
+    /// [`WireError::Closed`] carries, so the app redials on the crate's word.
     Closed {
-        /// The WebSocket close code, when the peer sent one.
+        /// The WebSocket close code, when the host sent one.
         code: Option<u16>,
         /// Why.
         reason: String,
+        /// Whether a reconnect can succeed without a person acting.
+        retryable: bool,
+        /// The host's `retry-after`, in milliseconds, when it named one.
+        retry_after_ms: Option<u64>,
     },
     /// One frame of an attached terminal stream, bytes already decoded.
     TerminalFrame {
