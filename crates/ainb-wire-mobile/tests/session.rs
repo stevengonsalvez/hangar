@@ -73,6 +73,7 @@ fn params_for(peer: &FakePeer, dir: &std::path::Path) -> ConnectParams {
         host_id: HOST_ID.into(),
         host_static_pubkey: peer.host_pubkey.to_vec(),
         custody_dir: dir.to_string_lossy().into_owned(),
+        log_dir: dir.to_string_lossy().into_owned(),
         device_token: "mdd_test".into(),
         device_id: "01K5A0000000000000000DEV01".into(),
         display_name: "test phone".into(),
