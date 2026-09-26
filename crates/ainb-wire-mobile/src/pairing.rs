@@ -223,14 +223,26 @@ pub(crate) async fn pair(
         })
         .collect();
     let key = DeviceKey::load_or_create(custody_dir)?;
-    let session = dial(
+    let session = match dial(
         &endpoints,
         &offer.host_id,
         offer.host_static_pubkey,
         &key,
         log,
     )
-    .await?;
+    .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            // Re-pairing an already paired host with an offer whose key the
+            // host refuses: the existing record latches; a first pair has
+            // no record and nothing to latch.
+            if matches!(e, WireError::PeerChanged) {
+                mark_repair(custody_dir, offer.host_id.as_str(), true)?;
+            }
+            return Err(e);
+        }
+    };
     let redeemed = match redeem(&session, &offer, display_name).await {
         Ok(redeemed) => redeemed,
         Err(e) => {
