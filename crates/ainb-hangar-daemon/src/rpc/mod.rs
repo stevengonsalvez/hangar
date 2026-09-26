@@ -14739,31 +14739,49 @@ mod tests {
 
         let home = tempfile::tempdir().expect("home");
         let store = Store::open_in(home.path()).await.expect("store");
-        let watch = serde_json::json!({
-            "stream_id": 1,
-            "session": {"host_id": "local", "session_key": "s1"},
-            "want_input": false,
-        });
-        let typing = serde_json::json!({
-            "stream_id": 1,
-            "session": {"host_id": "local", "session_key": "s1"},
-            "want_input": true,
-        });
+        // Each method gets its own real params shape, checked against its
+        // typed struct below, so the gate is exercised with what a client
+        // sends and a stricter parser later cannot fail it for the wrong
+        // reason.
+        let session = serde_json::json!({"host_id": "local", "session_key": "s1"});
+        let watch = serde_json::json!({"session": session, "want_input": false});
+        let typing = serde_json::json!({"session": session, "want_input": true});
+        let detach = serde_json::json!({"stream_id": 1});
+        let ack = serde_json::json!({"stream_id": 1, "consumed": 0});
+        let scrollback = serde_json::json!({"stream_id": 1, "before_row": 0, "rows": 10});
+        let input = serde_json::json!({"stream_id": 1, "data": "ls\n"});
+        let floor = serde_json::json!({"stream_id": 1, "action": "acquire"});
+        let resize = serde_json::json!({"stream_id": 1, "cols": 80, "rows": 24});
+        {
+            use ainb_hangar_proto::terminal::{
+                TerminalAckParams, TerminalAttachParams, TerminalDetachParams, TerminalFloorParams,
+                TerminalInputParams, TerminalResizeParams, TerminalScrollbackParams,
+            };
+            serde_json::from_value::<TerminalAttachParams>(watch.clone()).expect("attach");
+            serde_json::from_value::<TerminalAttachParams>(typing.clone()).expect("attach");
+            serde_json::from_value::<TerminalDetachParams>(detach.clone()).expect("detach");
+            serde_json::from_value::<TerminalAckParams>(ack.clone()).expect("ack");
+            serde_json::from_value::<TerminalScrollbackParams>(scrollback.clone())
+                .expect("scrollback");
+            serde_json::from_value::<TerminalInputParams>(input.clone()).expect("input");
+            serde_json::from_value::<TerminalFloorParams>(floor.clone()).expect("floor");
+            serde_json::from_value::<TerminalResizeParams>(resize.clone()).expect("resize");
+        }
         // (method, params, which scopes the table lets through)
         let cases: [(&str, &serde_json::Value, [bool; 4]); 8] = [
             // [mobile, mobile+type, desktop, desktop+admin]
             (methods::TERMINAL_ATTACH, &watch, [true, true, true, true]),
             (methods::TERMINAL_ATTACH, &typing, [false, true, true, true]),
-            (methods::TERMINAL_DETACH, &watch, [true, true, true, true]),
-            (methods::TERMINAL_ACK, &watch, [true, true, true, true]),
+            (methods::TERMINAL_DETACH, &detach, [true, true, true, true]),
+            (methods::TERMINAL_ACK, &ack, [true, true, true, true]),
             (
                 methods::TERMINAL_SCROLLBACK,
-                &watch,
+                &scrollback,
                 [true, true, true, true],
             ),
-            (methods::TERMINAL_INPUT, &watch, [false, true, true, true]),
-            (methods::TERMINAL_FLOOR, &watch, [false, true, true, true]),
-            (methods::TERMINAL_RESIZE, &watch, [false, true, true, true]),
+            (methods::TERMINAL_INPUT, &input, [false, true, true, true]),
+            (methods::TERMINAL_FLOOR, &floor, [false, true, true, true]),
+            (methods::TERMINAL_RESIZE, &resize, [false, true, true, true]),
         ];
         let scopes = [
             DeviceScope::MOBILE,
