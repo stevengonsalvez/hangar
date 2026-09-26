@@ -189,15 +189,10 @@ async fn a_redeemed_invite_whose_hello_fails_leaves_the_pairing_to_retry() {
     )
     .await
     .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            WireError::Closed {
-                code: Some(4503),
-                ..
-            }
-        ),
-        "{err:?}"
+    assert_eq!(
+        err,
+        WireError::Draining,
+        "4503 at hello is the host draining"
     );
     assert!(redeemed.load(Ordering::SeqCst), "the invite was consumed");
     let saved = list_pairings(dir_s.clone()).unwrap();
