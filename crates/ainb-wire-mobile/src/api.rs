@@ -36,8 +36,7 @@ use crate::custody::{CustodyReport, DeviceKey};
 use crate::pairing::{self, EndpointRecord, PairingRecord};
 use crate::records::{
     AnswerReply, AttentionRecord, FleetSubscribeSummary, HelloSummary, InterruptReply,
-    MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptDecoder, TranscriptPage, WireError,
-    WireEvent,
+    MutationReceipt, RosterSnapshot, SendPromptReply, TranscriptPage, WireError, WireEvent,
 };
 use crate::session::{Session, SessionEvent, SessionStats, backoff_delay, classify_close};
 use crate::terminal::{
@@ -292,9 +291,6 @@ pub struct MobileHost {
     streams: Arc<Streams>,
     custody_dir: std::path::PathBuf,
     host_id: String,
-    /// The daemon's transcript classifier, one per host (it remembers tool
-    /// calls across rows).
-    transcript: std::sync::Mutex<TranscriptDecoder>,
 }
 
 /// A refusal from the host goes on the pairing record: `repair` for an
@@ -304,12 +300,6 @@ pub struct MobileHost {
 /// stays the app's only source of truth for a redial.
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
     let _ = pairing::mark_refusal(custody_dir, host_id, err);
-}
-
-impl MobileHost {
-    fn transcript(&self) -> std::sync::MutexGuard<'_, TranscriptDecoder> {
-        self.transcript.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 impl std::fmt::Debug for MobileHost {
@@ -383,7 +373,6 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             streams: Arc::new(Streams::default()),
             custody_dir: custody_dir.to_path_buf(),
             host_id: params.host_id.clone(),
-            transcript: std::sync::Mutex::new(TranscriptDecoder::default()),
         }))
     })
     .await
@@ -618,7 +607,7 @@ impl MobileHost {
                     },
                 )
                 .await?;
-            Ok(self.transcript().page(result))
+            Ok(result.into())
         })
         .await
         .map_err(WireError::protocol)?
@@ -672,9 +661,7 @@ impl MobileHost {
                         },
                     }
                 }
-                SessionEvent::Notification(n) => {
-                    WireEvent::from_notification(&n.method, n.params, &mut self.transcript())
-                }
+                SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
                 SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
                 SessionEvent::Closed { code, reason } => {
                     // The session's own record says whether this side closed
