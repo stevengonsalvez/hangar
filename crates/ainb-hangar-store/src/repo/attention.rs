@@ -844,40 +844,6 @@ impl AttentionRepo {
             .fetch_optional(pool)
             .await
     }
-
-    /// Superseded by [`Self::record_pane_fingerprint`]; kept until the daemon
-    /// has moved.
-    ///
-    /// # Errors
-    ///
-    /// Returns the sqlx error if the write fails.
-    pub async fn record_pane_key(
-        pool: &SqlitePool,
-        attention_id: &str,
-        pane_key: &str,
-    ) -> Result<(), sqlx::Error> {
-        Self::record_pane_fingerprint(pool, attention_id, &format!("pane={pane_key}")).await
-    }
-
-    /// Superseded by [`Self::pane_fingerprint`]; kept until the daemon has
-    /// moved.
-    ///
-    /// # Errors
-    ///
-    /// Returns the sqlx error if the read fails.
-    pub async fn pane_key(
-        pool: &SqlitePool,
-        attention_id: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        Ok(
-            Self::pane_fingerprint(pool, attention_id).await?.and_then(|fingerprint| {
-                fingerprint
-                    .split(';')
-                    .find_map(|part| part.strip_prefix("pane="))
-                    .map(str::to_string)
-            }),
-        )
-    }
 }
 
 fn row_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<Option<AttentionRow>, sqlx::Error> {
@@ -1421,7 +1387,7 @@ mod tests {
     /// The pane key rides beside the row by its id: recorded, replaced,
     /// absent for a row that never carried one, and gone with the row.
     #[tokio::test]
-    async fn the_pane_key_is_kept_beside_the_row() {
+    async fn the_pane_fingerprint_is_kept_beside_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in(dir.path()).await.unwrap();
         let pool = store.pool();
@@ -1445,25 +1411,21 @@ mod tests {
         };
         AttentionRepo::insert(pool, &row).await.unwrap();
         assert_eq!(
-            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
             None
         );
-        AttentionRepo::record_pane_key(pool, "att-pane", "%4").await.unwrap();
+        AttentionRepo::record_pane_fingerprint(
+            pool,
+            "att-pane",
+            "pane=%4;pid=41;session_started=9",
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
-            Some("%4".to_string())
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
+            Some("pane=%4;pid=41;session_started=9".to_string())
         );
-        AttentionRepo::record_pane_key(pool, "att-pane", "%5").await.unwrap();
-        assert_eq!(
-            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
-            Some("%5".to_string())
-        );
-        assert_eq!(
-            AttentionRepo::pane_key(pool, "att-none").await.unwrap(),
-            None
-        );
-        // The whole fingerprint rides beside the row, and a later line
-        // replaces it.
+        // A later line for the same row replaces it.
         AttentionRepo::record_pane_fingerprint(
             pool,
             "att-pane",
@@ -1474,10 +1436,6 @@ mod tests {
         assert_eq!(
             AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
             Some("pane=%6;pid=4242;session_started=9".to_string())
-        );
-        assert_eq!(
-            AttentionRepo::pane_key(pool, "att-pane").await.unwrap(),
-            Some("%6".to_string())
         );
         assert_eq!(
             AttentionRepo::pane_fingerprint(pool, "att-none").await.unwrap(),
