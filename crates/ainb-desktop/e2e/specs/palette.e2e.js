@@ -32,9 +32,6 @@ async function focusState() {
   }));
 }
 
-/** How many lines the agent in `session`'s pane has read so far. */
-const linesRead = (session) => (paneText(session.tmux).match(/agent read:/g) ?? []).length;
-
 /**
  * Give `session`'s terminal the keyboard the way a person does: choose its
  * row, then click its pane. The shell also focuses a tab it has just opened,
@@ -56,10 +53,24 @@ async function focusTerminal(session) {
   // line the agent read, and the last failure says where the keyboard was.
   for (let attempt = 1; attempt <= 6; attempt += 1) {
     await click(`${tab} .xterm`);
-    await browser.execute((selector) => document.querySelector(`${selector} .xterm-helper-textarea`)?.focus(), tab);
-    const before = linesRead(session);
+    // A token through the terminal's own input event, and Enter through the
+    // driver, exactly as the journey spec types on both runners: the token
+    // read back from the pane is the keyboard, proven.
+    const token = `focus-${Date.now()}-${attempt}`;
+    await browser.execute(
+      (selector, text) => {
+        const area = document.querySelector(`${selector} .xterm-helper-textarea`);
+        area.focus();
+        area.value = text;
+        area.dispatchEvent(new InputEvent("input", { data: text, inputType: "insertText", bubbles: true }));
+      },
+      tab,
+      token,
+    );
     await browser.keys(["Enter"]);
-    const read = await browser.waitUntil(() => linesRead(session) > before, { timeout: 5_000 }).then(() => true, () => false);
+    const read = await browser
+      .waitUntil(() => paneText(session.tmux).includes(`agent read: ${token}`), { timeout: 5_000 })
+      .then(() => true, () => false);
     if (read) return;
     if (attempt === 6) assert.fail(`the terminal never took the keyboard: ${JSON.stringify(await focusState())}`);
   }
