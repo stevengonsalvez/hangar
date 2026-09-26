@@ -25,6 +25,12 @@ export interface TerminalState {
 
 /** Keystrokes inside one frame go out as one receipt-tier mutation (M1-plan R8). */
 const INPUT_BATCH_MS = 16;
+/** Early frames held before the attach reply: one snapshot window's worth (T15 chunks are 48 KiB). */
+const EARLY_BUFFER_BYTES = 256 * 1024;
+
+function frameBytes(frame: TerminalFrame): number {
+  return frame.kind === "snapshot_chunk" || frame.kind === "output" ? frame.data.length : 0;
+}
 
 export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey | undefined) {
   const wire = useWire();
@@ -34,8 +40,17 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
   const lastFit = useRef<{ cols: number; rows: number } | undefined>(undefined);
   const snapshotSeq = useRef(0);
   const pendingInput = useRef<string>("");
-  /** Frames for a stream we are attaching to but have not recorded yet (they can beat the attach reply). */
-  const early = useRef<Map<number, { seq: number; frame: TerminalFrame }[]>>(new Map());
+  /**
+   * Frames for a stream we are attaching to but have not recorded yet (they
+   * can beat the attach reply), capped by payload bytes. Dropping the oldest
+   * would lose the snapshot head, so an overflow discards the lot and asks for
+   * a fresh snapshot by re-attaching once the pending attach settles.
+   */
+  const early = useRef<{ frames: { streamId: number; seq: number; frame: TerminalFrame }[]; bytes: number; overflowed: boolean }>({
+    frames: [],
+    bytes: 0,
+    overflowed: false,
+  });
   const inputTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const [state, setState] = useState<TerminalState>({ canType: false, typing: false, floor: { floorGen: 0 }, nativeClients: 0 });
   const stateRef = useRef(state);
@@ -103,21 +118,45 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
     [resizeIfHolder],
   );
 
-  const attach = useCallback(async () => {
+  const resetEarly = () => {
+    early.current = { frames: [], bytes: 0, overflowed: false };
+  };
+  /** One fresh snapshot per overflow; a second overflow in a row is reported, not retried forever. */
+  const overflowRetried = useRef(false);
+
+  const attach = useCallback(async (): Promise<void> => {
     if (!hostId || !sessionKey || stream.current !== undefined) return;
-    const info: HostInfo = await wire.hostInfo(hostId).catch(() => ({ capabilities: [] }));
-    const canType =
-      info.scope?.base === "mobile+type" && info.capabilities.includes("terminal.stream") && info.capabilities.includes("terminal.input");
-    const wantInput = canType && stateRef.current.typing;
-    const at = await wire.terminalAttach({ hostId, sessionKey, ...lastFit.current, wantInput });
-    stream.current = at.streamId;
-    snapshotSeq.current = at.snapshotSeq;
-    patch({ streamId: at.streamId, canType, floor: at.floor, nativeClients: at.nativeClients, cols: at.cols, rows: at.rows, closed: undefined, denied: undefined });
-    const queued = early.current.get(at.streamId) ?? [];
-    early.current.clear();
-    for (const q of queued) onFrame(q.seq, q.frame);
+    resetEarly();
+    let at;
+    try {
+      const info: HostInfo = await wire.hostInfo(hostId).catch(() => ({ capabilities: [] }));
+      const canType =
+        info.scope?.base === "mobile+type" && info.capabilities.includes("terminal.stream") && info.capabilities.includes("terminal.input");
+      const wantInput = canType && stateRef.current.typing;
+      at = await wire.terminalAttach({ hostId, sessionKey, ...lastFit.current, wantInput });
+      stream.current = at.streamId;
+      snapshotSeq.current = at.snapshotSeq;
+      patch({ streamId: at.streamId, canType, floor: at.floor, nativeClients: at.nativeClients, cols: at.cols, rows: at.rows, closed: undefined, denied: undefined });
+    } catch (e) {
+      resetEarly(); // nothing held for a stream that never came
+      throw e;
+    }
+    const held = early.current;
+    resetEarly();
+    if (held.overflowed) {
+      // The head of the snapshot is gone: start over with a fresh one, once.
+      await detach();
+      if (overflowRetried.current) {
+        patch({ closed: "snapshot too large for the phone, reopen the terminal" });
+        return;
+      }
+      overflowRetried.current = true;
+      return attach();
+    }
+    overflowRetried.current = false;
+    for (const q of held.frames) if (q.streamId === at.streamId) onFrame(q.seq, q.frame);
     await resizeIfHolder(at.floor);
-  }, [wire, hostId, sessionKey, resizeIfHolder]);
+  }, [wire, hostId, sessionKey, resizeIfHolder, detach]);
 
   useEffect(() => {
     void attach().catch((e: unknown) => patch({ closed: String(e instanceof Error ? e.message : e) }));
@@ -137,9 +176,15 @@ export function useTerminal(hostId: HostId | undefined, sessionKey: SessionKey |
         if (ev.streamId === stream.current) onFrame(ev.seq, ev.frame);
         else if (stream.current === undefined) {
           // Attach in flight: keep the frame until the reply names our stream.
-          const list = early.current.get(ev.streamId) ?? [];
-          list.push({ seq: ev.seq, frame: ev.frame });
-          early.current.set(ev.streamId, list.slice(-64));
+          const e = early.current;
+          if (e.overflowed) return;
+          e.bytes += frameBytes(ev.frame);
+          if (e.bytes > EARLY_BUFFER_BYTES) {
+            e.frames = [];
+            e.overflowed = true; // the attach continuation re-attaches for a fresh snapshot
+            return;
+          }
+          e.frames.push({ streamId: ev.streamId, seq: ev.seq, frame: ev.frame });
         }
       },
       [hostId, onFrame],
