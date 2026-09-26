@@ -205,6 +205,10 @@ pub mod observability;
 /// parking, the expiry, the activity feed and Pal's authorship live
 /// here, because only the daemon owns the store and the event broker.
 pub mod pal;
+/// Agent hooks over loopback HTTP (hooks-and-answers), bound only when
+/// [`hook_ingress::LISTEN_ENV`] is set at boot. Token in a 0600 headers file,
+/// never in argv; `Host`, `Origin`, size, rate and connection count bounded.
+pub mod hook_ingress;
 /// Daemon-side pane binding for hook-sourced Fleet rows (D14, issue #916).
 ///
 /// A provider whose hooks run from a long-lived shared daemon (Codex 0.154)
@@ -1448,6 +1452,27 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
                 }
             }
         }
+
+        // hooks-and-answers: the agent hook listener. OFF unless
+        // `$AINB_HANGAR_HOOK_LISTEN` is set at boot (DV16: phase switches are
+        // boot env, never daemon_config). 127.0.0.1 only, a fresh token per
+        // start, published through the 0600 headers file. Held until the run
+        // loop returns, so a clean shutdown removes the endpoint files. A bind
+        // failure is logged, never fatal.
+        let _hook_ingress = if crate::hook_ingress::enabled_from_env() {
+            match crate::hook_ingress::start(&dir, std::sync::Arc::new(crate::hook_ingress::DiscardSink)).await {
+                Ok(running) => {
+                    tracing::info!(port = running.port(), "hangar hook ingress listening (127.0.0.1 only)");
+                    Some(running)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "hangar hook ingress failed to start");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         tracing::info!(idle = true, "ainb-hangar-daemon ready idle=true");
         if once {
