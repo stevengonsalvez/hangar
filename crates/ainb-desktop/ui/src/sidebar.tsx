@@ -14,7 +14,8 @@ import {
   type SidebarStorage,
   type WorktreeCard,
 } from "./sidebar_model.ts";
-import { statusForSession, statusKey, statusLabel } from "./status.ts";
+import { statusForSession } from "./status.ts";
+import { StatusGlyph } from "./status_glyph.tsx";
 
 interface Props {
   sessions: SessionsView_Serialize | undefined;
@@ -212,11 +213,7 @@ function Card(props: {
                       aria-current={selected() ? "true" : undefined}
                       onClick={() => props.onOpen(session().id)}
                     >
-                      <span
-                        class="ring"
-                        data-status={status() ? statusKey(status()!) : undefined}
-                        title={status() ? statusLabel(status()!) : undefined}
-                      />
+                      <StatusGlyph status={status()} />
                       <span class="agent-type">{agentLabel(session().agent_type)}</span>
                       <span class="name">{label(session().name)}</span>
                     </button>
