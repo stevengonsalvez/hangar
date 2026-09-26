@@ -2,7 +2,8 @@ import { render } from "solid-js/web";
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
+import type { AgentState, FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
+import { ackTurn, readAcks, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
 import {
@@ -31,9 +32,9 @@ import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
 import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
-import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
 import { createComposerFlow } from "./composer.ts";
+import { cardForSession, statusForTarget, statusKey } from "./status.ts";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { Titlebar } from "./titlebar.tsx";
@@ -78,6 +79,34 @@ const ATTENTION_SELECTORS = [
 const TOAST_MS = 5000;
 
 const MAC = navigator.userAgent.includes("Mac");
+
+/**
+ * How many cards the agent status frame carries per raw `AgentState`, for
+ * the `renderer_applied` proof line only. Deliberately NOT the board's own
+ * bucket counts: that Tauri command's `board` argument is typed
+ * `Vec<(AgentState, usize)>` on the Rust side, and the board now draws by the
+ * operator's four words (needs/working/done/idle), which that enum cannot
+ * parse. The wire contract stays what it was; the UI's bucketing lives in
+ * `board.ts`.
+ */
+function agentStateCounts(cards: readonly { state: AgentState }[]): [AgentState, number][] {
+  const counts = new Map<AgentState, number>();
+  for (const card of cards) counts.set(card.state, (counts.get(card.state) ?? 0) + 1);
+  return [...counts.entries()];
+}
+
+/**
+ * `window.localStorage`, or `undefined` when it is missing, throws (a
+ * private window, blocked site data), or this module evaluates with no
+ * `window` at all: the same guard `sidebar.tsx` and `theme.ts` use.
+ */
+function safeStorage(): AckStorage | undefined {
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
 
 function Shell() {
   const store = createFrameStore(SUBSCRIBED);
@@ -165,6 +194,29 @@ function Shell() {
         focusers.get(key)?.();
       }
     });
+  // Done-until-ack, per viewer: one map, read once from this window's own
+  // storage, shared by the sidebar row, the tab chip and the board card, so
+  // the three surfaces can never disagree about which turn was opened.
+  const [acks, setAcks] = createSignal<AckMap>(readAcks(safeStorage()));
+  const ackSession = (sessionKey: string, turnMarker: number) => {
+    setAcks((current) => {
+      const next = ackTurn(current, sessionKey, turnMarker);
+      if (next !== current) writeAcks(safeStorage(), next);
+      return next;
+    });
+  };
+  /** `key`'s own card, when it names a session with one: the join `status.ts`
+   * uses, so opening a tab acks the exact turn its glyph shows. */
+  const cardForTabKey = (key: string) => {
+    const tab = tabs().find((candidate) => candidate.key === key);
+    const target = tab?.target;
+    if (target === undefined || target.kind !== "session") return undefined;
+    const session = allSessions(sessions()).find((row) => row.id === target.id);
+    return session === undefined
+      ? undefined
+      : cardForSession(session, agentStatus()?.view?.cards ?? [], fleet()?.fleet_metadata);
+  };
+
   /**
    * Show `key`'s terminal. `byHost` says who asked: the host, answering a
    * tab open on its own schedule, or a person, by a chord or a click. Every
@@ -178,6 +230,9 @@ function Shell() {
       closeTranscript();
       closeSettings();
       focusTab(key, byHost);
+      // Opening a session acks the Done its card shows, on every surface.
+      const card = cardForTabKey(key);
+      if (card !== undefined) ackSession(card.session_key, card.evidence_observed_at);
     }
   };
   /**
@@ -399,11 +454,7 @@ function Shell() {
         void invoke("renderer_applied", {
           sections: applied,
           sessions: allSessions(store.section(host, "sessions")).length,
-          board: boardColumns(
-            store.section(host, "agent_status"),
-            store.section(host, "fleet"),
-            store.section(host, "sessions"),
-          ).map((column) => [column.state, column.cards.length]),
+          board: agentStateCounts(store.section(host, "agent_status")?.view?.cards ?? []),
           inbox: inboxCounts(store.section(host, "inbox")),
         });
       }
@@ -477,6 +528,12 @@ function Shell() {
     ),
   );
 
+  /** The glyph a session tab shows before its title: `null` for a bare tmux
+   * tab, or a session this window has not listed yet, the same answer the
+   * sidebar row and the board card read for the very same agent. */
+  const tabStatus = (tab: Tab) =>
+    statusForTarget(tab.target, allSessions(sessions()), agentStatus()?.view?.cards ?? [], fleet()?.fleet_metadata, acks());
+
   /** A tab's title: its session's name when the sidebar knows it. */
   const title = (tab: Tab) => {
     const target = tab.target;
@@ -542,6 +599,9 @@ function Shell() {
             stale={sessionsStale()}
             loading={loading()}
             pending={composer.pending()}
+            cards={agentStatus()?.view?.cards ?? []}
+            fleetMetadata={fleet()?.fleet_metadata}
+            acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
             ref={(element) => (sidebar = element)}
@@ -623,30 +683,37 @@ function Shell() {
                 )}
               </Show>
               <For each={tabs()}>
-                {(tab) => (
-                  <span
-                    class="tab"
-                    classList={{ active: showing("terminal") && tab.key === active() }}
-                    data-state={tab.state}
-                  >
-                    <button
-                      type="button"
-                      class="tab-title"
-                      aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
-                      onClick={() => choose(tab)}
+                {(tab) => {
+                  const status = () => tabStatus(tab);
+                  return (
+                    <span
+                      class="tab"
+                      classList={{ active: showing("terminal") && tab.key === active() }}
+                      data-state={tab.state}
+                      data-status={status() ? statusKey(status()!) : undefined}
                     >
-                      {title(tab)}
-                    </button>
-                    <button
-                      type="button"
-                      class="tab-close"
-                      aria-label={`Close ${title(tab)}`}
-                      onClick={() => void invoke("terminal_close", { key: tab.key })}
-                    >
-                      ×
-                    </button>
-                  </span>
-                )}
+                      <button
+                        type="button"
+                        class="tab-title"
+                        aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
+                        onClick={() => choose(tab)}
+                      >
+                        <Show when={status() !== null}>
+                          <span class="tab-glyph" aria-hidden="true" />
+                        </Show>
+                        {title(tab)}
+                      </button>
+                      <button
+                        type="button"
+                        class="tab-close"
+                        aria-label={`Close ${title(tab)}`}
+                        onClick={() => void invoke("terminal_close", { key: tab.key })}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                }}
               </For>
             </nav>
             {/* One banner per open request, latched for a short grace across
@@ -705,6 +772,8 @@ function Shell() {
                 fleet={fleet()}
                 sessions={sessions()}
                 elsewhere={elsewhere()}
+                acks={acks()}
+                onAck={ackSession}
                 onChoose={dispatch}
                 onOpenTranscript={openTranscript}
               />
