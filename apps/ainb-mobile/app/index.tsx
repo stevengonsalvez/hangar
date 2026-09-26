@@ -20,7 +20,11 @@ export default function Hosts() {
               <Text style={item.reachability === "reachable" ? styles.up : styles.down}>
                 {item.reachability === "reachable"
                   ? "reachable"
-                  : `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`}
+                  : item.reachability === "stale"
+                    ? `stale since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                    : item.reachability === "unreachable"
+                      ? `unreachable since ${new Date(item.sinceMs ?? 0).toLocaleTimeString()}`
+                      : "unknown"}
               </Text>
             </Pressable>
           </Link>
