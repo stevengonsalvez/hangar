@@ -138,7 +138,7 @@ pub mod health_stats;
 pub mod host_identity;
 /// The host's Noise static key for the peer leg (R1-02): minted once, kept in
 /// the keychain or a `0600` file, made only when the peer leg is switched on.
-mod host_key;
+pub mod host_key;
 /// The inbox aggregator: the writer that turns the live event stream into the
 /// durable notification inbox (e38.14).
 ///
