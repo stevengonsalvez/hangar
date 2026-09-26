@@ -47,13 +47,16 @@ const linesRead = (session) => (paneText(session.tmux).match(/agent read:/g) ?? 
  */
 async function focusTerminal(session) {
   await click(`.session-row[data-session="${session.id}"]`);
-  await $(".terminal[data-tab]").waitForExist({ timeout: 60_000 });
+  // This session's own tab, by its key: another spec in the world may have
+  // left its tab mounted, hidden, ahead of this one in the document.
+  const tab = `.terminal[data-tab="${session.tmux}"]`;
+  await $(tab).waitForExist({ timeout: 60_000 });
   // The click and the focus behind it take a few tries on the Linux runner,
   // whose driver hands the page its keys unevenly; each try is proven by a
   // line the agent read, and the last failure says where the keyboard was.
   for (let attempt = 1; attempt <= 6; attempt += 1) {
-    await click(".terminal[data-tab] .xterm");
-    await browser.execute(() => document.querySelector(".xterm-helper-textarea")?.focus());
+    await click(`${tab} .xterm`);
+    await browser.execute((selector) => document.querySelector(`${selector} .xterm-helper-textarea`)?.focus(), tab);
     const before = linesRead(session);
     await browser.keys(["Enter"]);
     const read = await browser.waitUntil(() => linesRead(session) > before, { timeout: 5_000 }).then(() => true, () => false);
