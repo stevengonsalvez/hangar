@@ -15,6 +15,8 @@ appId: com.stevengonsalvez.ainb.mobile
     id: "tab-terminal"
 - assertVisible:
     id: "terminal-webview"
+- assertVisible:
+    text: "engine ready"
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-before
@@ -27,9 +29,13 @@ appId: com.stevengonsalvez.ainb.mobile
 - waitForAnimationToEnd:
     timeout: 2000
 - takeScreenshot: terminal-osc8-after
+# the tap reached the link: the engine reported it and the host shows the
+# ignored host name; the terminal is still on screen, no page opened
+- assertVisible:
+    id: "link-ignored"
+- assertVisible:
+    text: "link ignored: example.invalid"
 - assertVisible:
     id: "terminal-webview"
 - assertVisible:
     id: "terminal-size"
-- assertNotVisible:
-    text: "example.invalid"
