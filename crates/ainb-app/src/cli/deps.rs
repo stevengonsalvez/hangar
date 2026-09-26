@@ -275,15 +275,18 @@ pub fn catalog() -> &'static [DepSpec] {
     ]
 }
 
-/// The lowest tmux the terminal stream (R2) can drive. The daemon's feed
-/// client runs every watched pane under `refresh-client -f pause-after`, which
-/// arrived in tmux 3.2, and asserts it at boot; below this floor the daemon
-/// never advertises `terminal.stream`.
+/// The lowest tmux the terminal stream (R2, dark until its flip) will drive.
+/// Its feed client will run every watched pane under
+/// `refresh-client -f pause-after`, which arrived in tmux 3.2, and the daemon
+/// will refuse to advertise `terminal.stream` below it. Until that flip a
+/// lower tmux runs every shipped feature, so the floor is reported as a
+/// detail, never as a missing dependency.
 pub const TMUX_MIN_VERSION: (u32, u32) = (3, 2);
 
-/// `(major, minor)` from a `tmux -V` line: `tmux 3.6a`, `tmux 3.2`,
-/// `tmux next-3.7` and `tmux 3.3a-openbsd` all parse. `None` when the line
-/// carries no dotted number, which a build from a bare git checkout can print.
+/// `(major, minor)` from a `tmux -V` line: `tmux 3.6a`, `tmux 3.2` and
+/// `tmux next-3.7` all parse. `None` when the line carries no dotted number
+/// (a build from a bare git checkout, or a vendor string), which counts as
+/// present.
 pub fn parse_tmux_version(line: &str) -> Option<(u32, u32)> {
     let rest = line.trim().strip_prefix("tmux")?.trim_start();
     let rest = rest.strip_prefix("next-").unwrap_or(rest);
@@ -295,21 +298,23 @@ pub fn parse_tmux_version(line: &str) -> Option<(u32, u32)> {
 /// Probe a single dependency's state on the given host.
 fn detect_one(spec: &DepSpec, env: &dyn Env) -> DepState {
     match spec.name {
-        // tmux: any version runs a session today, but the terminal stream (R2)
-        // needs `refresh-client -f pause-after`, so the floor is reported here,
-        // where an operator looks first. An unparseable `-V` line counts as
-        // present: refusing a working tmux over its version string would be
-        // worse than a missing detail.
+        // tmux: any version runs a session today, so the row stays satisfied
+        // on every version. The terminal stream (R2) will need
+        // `refresh-client -f pause-after`, so a tmux below that floor says so
+        // in its detail, here, where an operator looks first; it becomes a
+        // blocking check only when the daemon gates on it. An unparseable
+        // `-V` line counts as present: refusing a working tmux over its
+        // version string would be worse than a missing detail.
         "tmux" => {
             if !env.which("tmux") {
                 return DepState::Missing;
             }
             match env.run("tmux", &["-V"]) {
                 Some(line) => match parse_tmux_version(&line) {
-                    Some(version) if version < TMUX_MIN_VERSION => DepState::TooOld(format!(
-                        "{line} (need >={}.{} for terminal streams: refresh-client -f pause-after)",
+                    Some(version) if version < TMUX_MIN_VERSION => DepState::Ok(Some(format!(
+                        "{line}; terminal streams will need >={}.{} (refresh-client -f pause-after), upgrade before enabling them",
                         TMUX_MIN_VERSION.0, TMUX_MIN_VERSION.1
-                    )),
+                    ))),
                     _ => DepState::Ok(Some(line)),
                 },
                 None => DepState::Ok(None),
@@ -531,7 +536,6 @@ mod tests {
     fn tmux_version_line_parses_release_patch_and_next_builds() {
         assert_eq!(parse_tmux_version("tmux 3.6a"), Some((3, 6)));
         assert_eq!(parse_tmux_version("tmux 3.2"), Some((3, 2)));
-        assert_eq!(parse_tmux_version("tmux 3.3a-openbsd"), Some((3, 3)));
         assert_eq!(parse_tmux_version("tmux next-3.7"), Some((3, 7)));
         assert_eq!(parse_tmux_version("tmux 2.9a"), Some((2, 9)));
         assert_eq!(parse_tmux_version("tmux master"), None);
@@ -539,7 +543,10 @@ mod tests {
     }
 
     #[test]
-    fn tmux_below_3_2_reports_too_old_and_names_pause_after() {
+    fn tmux_below_3_2_stays_satisfied_and_names_the_coming_floor() {
+        // Every shipped feature runs on it, so it never blocks; the detail
+        // says what the terminal stream will need and that the fix is an
+        // upgrade, not an install.
         let env = MockEnv {
             present: vec!["tmux"],
             runs: HashMap::from([("tmux -V".to_string(), "tmux 3.1c".to_string())]),
@@ -547,13 +554,16 @@ mod tests {
         let reports = detect(&env);
         let tmux = find(&reports, "tmux");
         match &tmux.state {
-            DepState::TooOld(detail) => {
-                assert!(detail.contains("tmux 3.1c"), "{detail}");
+            DepState::Ok(Some(detail)) => {
+                assert!(detail.starts_with("tmux 3.1c"), "{detail}");
+                assert!(detail.contains(">=3.2"), "{detail}");
                 assert!(detail.contains("pause-after"), "{detail}");
+                assert!(detail.contains("upgrade"), "{detail}");
             }
-            other => panic!("expected TooOld, got {other:?}"),
+            other => panic!("expected Ok with a detail, got {other:?}"),
         }
-        assert!(tmux.is_blocking());
+        assert!(tmux.satisfied);
+        assert!(!tmux.is_blocking());
     }
 
     #[test]
