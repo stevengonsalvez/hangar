@@ -129,6 +129,12 @@ pub fn listen_config(value: &str) -> Result<ListenConfig, String> {
 /// (100.64.0.0/10, fd7a:115c:a1e0::/48) are `tailnet`, anything else is a
 /// LAN. `None` for an unspecified address.
 fn carrier_of(ip: IpAddr) -> Option<CarrierKind> {
+    // `[::ffff:127.0.0.1]` is 127.0.0.1: judge an IPv4-mapped address as its
+    // IPv4, or a loopback bind reads as LAN and every prologue mismatches.
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    };
     if ip.is_unspecified() {
         return None;
     }
@@ -265,7 +271,13 @@ async fn run(
         let (stream, source) = match accepted {
             Ok(accepted) => accepted,
             Err(error) => {
+                // A persistent fault (EMFILE, ENFILE) fails every accept at
+                // once; pause so the loop does not spin while it lasts.
                 tracing::warn!(%error, "peer leg accept failed");
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(ACCEPT_ERROR_PAUSE) => {}
+                }
                 continue;
             }
         };
@@ -274,7 +286,12 @@ async fn run(
         let admission = match Limits::admit(&limits, source.ip(), Instant::now()) {
             Admission::Admitted(source_slot) => match Arc::clone(&slots).try_acquire_owned() {
                 Ok(global) => Admission::Admitted(source_slot.holding(global)),
-                Err(_) => Admission::OverCapacity,
+                // Full because of other sources: this attempt was never
+                // served, so it does not count against its source's rate.
+                Err(_) => {
+                    source_slot.refund_handshake();
+                    Admission::OverCapacity
+                }
             },
             refused => refused,
         };
@@ -377,9 +394,14 @@ where
         // Text, ping, anything that is not a binary Noise message, or silence.
         Ok(Some(Ok(_))) | Err(_) => return UNAUTHENTICATED,
     };
+    // `start` built a responder from the same inputs before binding, so this
+    // cannot fail short of a regression; if it does, the fault is the host's
+    // and permanent. 1011 tells the device not to redial into it, where
+    // 4503 (draining) would have it retry forever.
     let Ok(mut handshake) = ainb_hangar_noise::responder(&host.secret, carrier, &host.host_id)
     else {
-        return Ending::Close(peer_close::DRAINING, "draining");
+        tracing::error!("peer leg: the Noise responder could not be built");
+        return Ending::Close(INTERNAL_ERROR, "internal error");
     };
     // A wrong carrier, a wrong host id, or a key the device did not pin all
     // fail here, before any Rpc frame is read.
@@ -488,7 +510,28 @@ where
     };
     let _ = send(ws, Message::Close(Some(frame))).await;
     let _ = tokio::time::timeout(WRITE_DEADLINE, ws.close(None)).await;
+    // Linger: read and discard until the peer's own close (or the bound), so
+    // unread input still in our receive buffer does not make the kernel
+    // answer with a reset that destroys the close frame on the peer's side.
+    let _ = tokio::time::timeout(CLOSE_LINGER, async {
+        while let Some(Ok(message)) = ws.next().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
+
+/// How long a closed socket keeps reading for the peer's close reply.
+const CLOSE_LINGER: Duration = Duration::from_secs(1);
+
+/// The WebSocket close code for a server fault (RFC 6455 1011): not a code a
+/// device redials on.
+const INTERNAL_ERROR: u16 = 1011;
+
+/// How long the accept loop pauses after an accept error.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(100);
 
 /// Per-source accounting.
 #[derive(Debug, Default)]
@@ -534,6 +577,15 @@ impl SourceSlot {
     fn holding(mut self, global: tokio::sync::OwnedSemaphorePermit) -> Self {
         self.global = Some(global);
         self
+    }
+
+    /// Give back the rate-limit entry `admit` took, for an attempt refused
+    /// only for the global cap; the counters go back when the slot drops.
+    fn refund_handshake(self) {
+        let mut limits = self.limits.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(source) = limits.sources.get_mut(&self.ip) {
+            source.handshakes.pop_back();
+        }
     }
 }
 
@@ -644,6 +696,12 @@ mod tests {
         );
         assert!(carrier("[::]:47300").is_err());
         assert!(carrier("not an address").is_err());
+        assert_eq!(
+            carrier("[::ffff:127.0.0.1]:47300"),
+            Ok(CarrierKind::SshL),
+            "an IPv4-mapped loopback is loopback"
+        );
+        assert_eq!(carrier("[::ffff:100.64.1.2]:1"), Ok(CarrierKind::Tailnet));
         assert_eq!(
             listen_config("127.0.0.1").map(|c| c.addr.port()),
             Ok(ainb_hangar_noise::DEFAULT_PORT),
@@ -985,6 +1043,27 @@ mod tests {
             close_code(&mut ninth).await,
             Some(peer_close::OVER_CAPACITY)
         );
+    }
+
+    /// #138 review: an attempt refused only because the global slots were
+    /// full (other sources' sockets) gives back its rate-limit entry, so a
+    /// device redialling on the 1013 hint is not later refused 4429 for
+    /// attempts that were never served.
+    #[test]
+    fn a_global_refusal_does_not_spend_the_source_rate() {
+        let limits = Arc::new(Mutex::new(Limits::default()));
+        let ip: IpAddr = "127.0.0.9".parse().expect("ip");
+        let now = Instant::now();
+        for _ in 0..HANDSHAKES_PER_WINDOW * 2 {
+            let Admission::Admitted(slot) = Limits::admit(&limits, ip, now) else {
+                panic!("a refunded attempt must not count toward the rate");
+            };
+            slot.refund_handshake();
+        }
+        let guard = limits.lock().unwrap_or_else(PoisonError::into_inner);
+        let source = guard.sources.get(&source_key(ip)).expect("source tracked");
+        assert!(source.handshakes.is_empty(), "{source:?}");
+        assert_eq!((source.unauthenticated, source.sockets), (0, 0));
     }
 
     /// Thirty handshakes a minute from one source; the thirty-first closes
