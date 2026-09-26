@@ -30,9 +30,10 @@
 # harness pane it would otherwise inherit that server as "its" tmux and list
 # the harness panes instead of the fixture sessions.
 #
-# Nothing here is killed by pattern. Sessions are killed by exact name, and a
-# process is only signalled when its environment carries this world's
-# AINB_HANGAR_HOME, which no process outside the world can have.
+# Nothing here is killed by pattern. Each tmux server is ended whole with
+# `kill-server` on its own socket path in the world, and a process is only
+# signalled when its environment carries this world's AINB_HANGAR_HOME, which
+# no process outside the world can have.
 
 # shellcheck disable=SC2034  # several globals are read by the scenarios
 
@@ -372,8 +373,11 @@ fixture_session() {
   FIXTURE_ID="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
   FIXTURE_TMUX="$(jq -r '.tmux_session_name // empty' <<<"$line" 2>/dev/null)"
   FIXTURE_CWD="$(jq -r '.worktree_path // empty' <<<"$line" 2>/dev/null)"
-  if [[ -z "$FIXTURE_TMUX" ]]; then
-    say "ainb run did not create a session: $out"
+  # All three are used later (the id by the daemon reads, the worktree by the
+  # hook's cwd and the diff scenarios), so a line missing any of them is a
+  # session the harness cannot drive.
+  if [[ -z "$FIXTURE_ID" || -z "$FIXTURE_TMUX" || -z "$FIXTURE_CWD" ]]; then
+    say "ainb run gave no usable session (id '${FIXTURE_ID}', tmux '${FIXTURE_TMUX}', worktree '${FIXTURE_CWD}'): $out"
     return 1
   fi
   wait_for 15 fixture_says "agent tick"
