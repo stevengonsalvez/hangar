@@ -186,15 +186,12 @@ impl ResyncGate {
             );
             receiver
         };
-        match receiver.await {
-            Ok(permit) => permit,
-            // The gate is shared by `Arc`, so a sender outlives this wait
-            // unless the gate itself is gone; there is then no budget to keep.
-            Err(_) => ResyncPermit {
-                gate: None,
-                host_id: HostId::local(),
-            },
-        }
+        // The gate is shared by `Arc`, so a sender outlives this wait unless
+        // the gate itself is gone; there is then no budget to keep.
+        receiver.await.unwrap_or_else(|_| ResyncPermit {
+            gate: None,
+            host_id: HostId::local(),
+        })
     }
 
     /// Resyncs holding a slot now.
@@ -210,6 +207,9 @@ impl ResyncGate {
     }
 
     /// A slot came free: hand it to the best waiter still listening.
+    // The lock is held for the whole hand-out on purpose: releasing it
+    // between waiters would let a new `acquire` jump the queue.
+    #[allow(clippy::significant_drop_tightening)]
     fn release(&self) {
         let mut state = self.lock();
         state.running = state.running.saturating_sub(1);
