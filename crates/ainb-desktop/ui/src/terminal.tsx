@@ -6,7 +6,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
 import { tauriTransport } from "./transport.ts";
-import { terminalColors } from "./theme/theme.ts";
+import { TERMINAL_COLORS } from "./theme/theme.ts";
 
 interface Props {
   tab: Tab;
@@ -38,7 +38,7 @@ export function TerminalView(props: Props) {
       fontFamily: '"SF Mono", Menlo, "JetBrains Mono", ui-monospace, monospace',
       fontSize: 13,
       scrollback: 5000,
-      theme: terminalColors((token) => getComputedStyle(document.documentElement).getPropertyValue(token)),
+      theme: TERMINAL_COLORS,
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
