@@ -3,11 +3,18 @@ import { StatusBar } from "expo-status-bar";
 
 import { Banner } from "../src/attention/Banner";
 import { colors } from "../src/theme";
-import { WireProvider } from "../src/wire/context";
+import { useLifecycle } from "../src/lifecycle";
+import { WireProvider, useWire } from "../src/wire/context";
+
+function Lifecycle() {
+  useLifecycle(useWire());
+  return null;
+}
 
 export default function RootLayout() {
   return (
     <WireProvider>
+      <Lifecycle />
       <StatusBar style="light" />
       <Stack
         screenOptions={{
