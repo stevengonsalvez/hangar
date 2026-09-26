@@ -216,11 +216,22 @@ export class FakeWire implements WireClient {
     return !!st && this.floors.get(st.sessionKey)?.holder?.streamId === streamId;
   }
 
-  /** The socket dropped (network, or a peer close with `code`). */
+  /** The socket dropped (network, or a peer close with `code`); latching codes latch here too. */
   dropConnection(hostId: HostId, code?: number, reason?: string) {
+    if (code !== undefined) return this.closedBy(hostId, code, reason);
     this.host(hostId).connected = false;
-    this.record(hostId, "close", code === undefined ? "network" : String(code));
+    this.record(hostId, "close", "network");
     this.emit({ kind: "closed", hostId, code, reason });
+  }
+
+  /** When set, the next N `connect` calls fail (the redials that must be rescheduled). */
+  failNextConnect = 0;
+  /** When set, the next N `subscribeFleet` calls fail after a successful connect. */
+  failNextSubscribe = 0;
+  /** Deterministic backoff for tests: no jitter. */
+  backoffDelayMs(attempt: number, retryAfterSecs?: number): number {
+    if (retryAfterSecs !== undefined) return Math.min(60_000, retryAfterSecs * 1000);
+    return Math.min(60_000, 1000 * 2 ** Math.min(attempt, 6));
   }
 
   /** The daemon asks the phone to start over from a snapshot. */
@@ -267,7 +278,7 @@ export class FakeWire implements WireClient {
   }
 
   /** The host closed us with a peer close code (T9); 4403 and 4401 latch re-pair, 4409 and unknown codes park the row. */
-  closedBy(hostId: HostId, code: number) {
+  closedBy(hostId: HostId, code: number, reason?: string) {
     const host = this.host(hostId);
     host.connected = false;
     if (code === 4403) host.row.repair = "revoked";
@@ -275,7 +286,7 @@ export class FakeWire implements WireClient {
     else if (code === 4409) host.row.notice = "update_required";
     else if (![1013, 4429, 4503].includes(code)) host.row.notice = "unknown_close";
     this.record(hostId, "close", String(code));
-    this.emit({ kind: "closed", hostId, code });
+    this.emit({ kind: "closed", hostId, code, reason });
   }
 
   async forget(hostId: HostId) {
@@ -285,6 +296,11 @@ export class FakeWire implements WireClient {
   async connect(hostId: HostId) {
     const host = this.host(hostId);
     if (host.row.reachability === "unreachable") throw new Error("unreachable");
+    if (this.failNextConnect > 0) {
+      this.failNextConnect -= 1;
+      this.record(hostId, "dial-failed");
+      throw new Error("dial failed");
+    }
     host.connected = true;
     this.record(hostId, "hello", "scope=mobile");
   }
@@ -369,6 +385,10 @@ export class FakeWire implements WireClient {
 
   async subscribeFleet(hostId: HostId, afterRevision?: number): Promise<FleetCursor> {
     const host = this.connected(hostId);
+    if (this.failNextSubscribe > 0) {
+      this.failNextSubscribe -= 1;
+      throw new Error("subscribe failed");
+    }
     if (afterRevision === undefined) return { revision: host.revision, replayState: "complete" };
     return { revision: host.revision, replayState: afterRevision <= host.revision ? "complete" : "snapshot_reset" };
   }
