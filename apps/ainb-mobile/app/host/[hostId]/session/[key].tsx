@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { connectHost } from "../../../../src/lifecycle";
-import { FixtureTerminal } from "../../../../src/terminal/FixtureTerminal";
+import { WireTerminal } from "../../../../src/terminal/WireTerminal";
 import { colors } from "../../../../src/theme";
 import { useWire, useWireQuery } from "../../../../src/wire/context";
 import type { TranscriptEntry } from "../../../../src/wire/types";
@@ -106,8 +106,7 @@ export default function Session() {
           </View>
         </>
       ) : (
-        // Fixture bytes until the stream arrives over the wire (M1-13).
-        <FixtureTerminal />
+        <WireTerminal hostId={hostId} sessionKey={key} />
       )}
     </View>
   );

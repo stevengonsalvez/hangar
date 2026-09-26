@@ -116,12 +116,62 @@ export interface LogLine {
   detail?: string;
 }
 
+// Terminal stream (RECONCILED T15 to T17, M5 to M11). Frame `data` arrives
+// already base64-decoded by the crate.
+export interface FloorHolder {
+  principal: string;
+  label: string;
+  streamId: number;
+}
+export interface FloorState {
+  holder?: FloorHolder;
+  floorGen: number;
+}
+export interface TerminalAttached {
+  streamId: number;
+  epoch: number;
+  snapshotSeq: number;
+  cols: number;
+  rows: number;
+  floor: FloorState;
+  nativeClients: number;
+}
+export type DataGapReason = "paused" | "feed_lost" | "dropped" | "session_gone" | "unknown";
+export type TerminalFrame =
+  | { kind: "snapshot_start"; cols: number; rows: number; epoch: number; chunks: number }
+  | { kind: "snapshot_chunk"; data: Uint8Array }
+  | { kind: "snapshot_end" }
+  | { kind: "output"; data: Uint8Array }
+  | { kind: "resize"; cols: number; rows: number }
+  | { kind: "data_gap"; reason: DataGapReason; droppedBytes?: number }
+  | { kind: "floor"; holder?: FloorHolder; floorGen: number }
+  | { kind: "presence"; nativeClients: number }
+  | { kind: "closed"; reason: string }
+  | { kind: "unknown" };
+/** `MUTATION_REJECTED` with `reason: floor_denied` (M11). */
+export interface FloorDenied {
+  kind: "floor_denied";
+  holder?: FloorHolder;
+  floorGen: number;
+}
+export type TerminalResizeOutcome =
+  | { outcome: "applied"; cols: number; rows: number }
+  | { outcome: "not_applicable"; windowSize: string }
+  | { outcome: "unknown" };
+
+/** What hello told us about this host: gates the type toggle (C-R2-8). */
+export interface HostInfo {
+  scope?: DeviceScope;
+  capabilities: string[];
+}
+
 export type WireEvent =
   | { kind: "attention_raised"; row: AttentionRow }
   | { kind: "attention_answered"; hostId: HostId; attentionId: string; by: string }
   | { kind: "fleet_revision"; hostId: HostId; revision: number }
   | { kind: "reachability"; hostId: HostId; reachability: Reachability; sinceMs?: number }
   | { kind: "transcript_line"; hostId: HostId; sessionKey: SessionKey; entry: TranscriptEntry }
+  | { kind: "terminal_frame"; hostId: HostId; streamId: number; seq: number; frame: TerminalFrame }
   /** The socket closed; `code` is the peer close code when there was one (T9). */
   | { kind: "closed"; hostId: HostId; code?: number; reason?: string }
   /** The event stream fell behind: resubscribe from the cursor. */
@@ -139,6 +189,7 @@ export interface WireClient {
 
   connect(hostId: HostId): Promise<void>;
   close(hostId: HostId): Promise<void>;
+  hostInfo(hostId: HostId): Promise<HostInfo>;
 
   rosterStatus(hostId: HostId): Promise<SessionRow[]>;
   /** No `afterRevision` asks for a snapshot; with one, the daemon replays from it. */
@@ -180,6 +231,23 @@ export interface WireClient {
   transcriptPage(hostId: HostId, sessionKey: SessionKey, beforeSeq?: number): Promise<TranscriptEntry[]>;
   /** `fleet/transcript_subscribe`: live lines for one session until unsubscribed. */
   subscribeTranscript(hostId: HostId, sessionKey: SessionKey, cb: (entry: TranscriptEntry) => void): Unsubscribe;
+
+  /**
+   * Terminal stream. `terminal/ack` is the crate's job (it counts the decoded
+   * bytes), so it has no facade method. Input and floor calls answer the
+   * floor refusal as a value, not a throw.
+   */
+  terminalAttach(req: {
+    hostId: HostId;
+    sessionKey: SessionKey;
+    cols?: number;
+    rows?: number;
+    wantInput?: boolean;
+  }): Promise<TerminalAttached>;
+  terminalDetach(hostId: HostId, streamId: number): Promise<void>;
+  terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string }): Promise<{ floorGen: number } | FloorDenied>;
+  terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome>;
+  terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied>;
 
   connectionLog(): Promise<LogLine[]>;
   deviceKeyFingerprint(): Promise<string>;

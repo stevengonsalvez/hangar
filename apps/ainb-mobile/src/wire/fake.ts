@@ -1,11 +1,17 @@
 // In-memory transport for development and tests (`EXPO_PUBLIC_FAKE_WIRE=1`).
 // Same interface as the native binding; nothing here touches a socket.
 
+import { fromBase64 } from "../terminal/engine/protocol";
+import { FIXTURES } from "../terminal/fixtures";
 import type {
   AnswerOutcome,
   AttentionRow,
   FleetCursor,
+  FloorDenied,
+  FloorHolder,
+  FloorState,
   HostId,
+  HostInfo,
   HostRow,
   LogLine,
   MutationAck,
@@ -13,11 +19,23 @@ import type {
   PairingOffer,
   SessionKey,
   SessionRow,
+  TerminalAttached,
+  TerminalFrame,
+  TerminalResizeOutcome,
   TranscriptEntry,
   Unsubscribe,
   WireClient,
   WireEvent,
 } from "./types";
+
+interface FakeStream {
+  hostId: HostId;
+  sessionKey: SessionKey;
+  cols: number;
+  rows: number;
+  seq: number;
+  epoch: number;
+}
 
 interface FakeHost {
   row: HostRow;
@@ -53,6 +71,15 @@ export class FakeWire implements WireClient {
   readonly answers: { opId: string; attentionId: string; answer: string; version: number }[] = [];
   /** When set, the next `answer` is APPLIED and then its reply is lost (throws). */
   dropNextAnswer = false;
+  /** Scope and capabilities hello would report; tests flip these. */
+  info: HostInfo = { scope: { base: "mobile", admin: false }, capabilities: ["terminal.stream", "terminal.input"] };
+  /** Every `terminal/input` call, for tests. */
+  readonly inputs: { streamId: number; floorGen?: number; data: string }[] = [];
+  readonly detached: number[] = [];
+  private streams = new Map<number, FakeStream>();
+  private nextStream = 1;
+  /** The floor per session key: who holds it and its generation. */
+  private floors = new Map<SessionKey, FloorState>();
   /** The op-id ledger: a retry under a known id replays the stored reply. */
   private ledger = new Map<string, { outcome: AnswerOutcome; ack: MutationAck }>();
   /** Dedupe ledger for prompts and interrupts. */
@@ -143,6 +170,47 @@ export class FakeWire implements WireClient {
     return this.host(hostId).connected;
   }
 
+  /** A desktop takes the floor for this session out from under the phone. */
+  floorTakenBy(sessionKey: SessionKey, label: string) {
+    const prev = this.floors.get(sessionKey) ?? { floorGen: 0 };
+    const next: FloorState = { holder: { principal: `local:${label}`, label, streamId: 0 }, floorGen: prev.floorGen + 1 };
+    this.floors.set(sessionKey, next);
+    for (const [id, st] of this.streams) if (st.sessionKey === sessionKey) this.frame(id, { kind: "floor", holder: next.holder, floorGen: next.floorGen });
+  }
+
+  /** Emit one frame on a stream, as the daemon would. */
+  frame(streamId: number, frame: TerminalFrame) {
+    const st = this.streams.get(streamId);
+    if (!st) return;
+    st.seq += frame.kind === "output" || frame.kind === "snapshot_chunk" ? frame.data.length : 0;
+    this.emit({ kind: "terminal_frame", hostId: st.hostId, streamId, seq: st.seq, frame });
+  }
+
+  /** Feed lost: a gap then a fresh snapshot, as the contract promises (C-R2-6). */
+  dropFeed(streamId: number) {
+    this.frame(streamId, { kind: "data_gap", reason: "feed_lost" });
+    this.snapshot(streamId);
+  }
+
+  private snapshot(streamId: number) {
+    const st = this.streams.get(streamId);
+    if (!st) return;
+    st.epoch += 1;
+    this.frame(streamId, { kind: "snapshot_start", cols: st.cols, rows: st.rows, epoch: st.epoch, chunks: 1 });
+    this.frame(streamId, { kind: "snapshot_chunk", data: fromBase64(FIXTURES["f1-altscreen"]) });
+    this.frame(streamId, { kind: "snapshot_end" });
+  }
+
+  private denied(sessionKey: SessionKey): FloorDenied {
+    const f = this.floors.get(sessionKey) ?? { floorGen: 0 };
+    return { kind: "floor_denied", holder: f.holder, floorGen: f.floorGen };
+  }
+
+  private holdsFloor(streamId: number): boolean {
+    const st = this.streams.get(streamId);
+    return !!st && this.floors.get(st.sessionKey)?.holder?.streamId === streamId;
+  }
+
   /** The socket dropped (network, or a peer close with `code`). */
   dropConnection(hostId: HostId, code?: number, reason?: string) {
     this.host(hostId).connected = false;
@@ -196,6 +264,74 @@ export class FakeWire implements WireClient {
     const host = this.host(hostId);
     host.connected = false;
     this.record(hostId, "close", "1000");
+  }
+
+  async hostInfo(hostId: HostId): Promise<HostInfo> {
+    this.host(hostId);
+    return this.info;
+  }
+
+  async terminalAttach(req: { hostId: HostId; sessionKey: SessionKey; cols?: number; rows?: number; wantInput?: boolean }): Promise<TerminalAttached> {
+    this.connected(req.hostId);
+    const streamId = this.nextStream++;
+    const st: FakeStream = { hostId: req.hostId, sessionKey: req.sessionKey, cols: req.cols ?? 80, rows: req.rows ?? 24, seq: 0, epoch: 0 };
+    this.streams.set(streamId, st);
+    let floor = this.floors.get(req.sessionKey) ?? { floorGen: 0 };
+    if (req.wantInput && !floor.holder) {
+      floor = { holder: { principal: "device:fake", label: "phone", streamId }, floorGen: floor.floorGen + 1 };
+      this.floors.set(req.sessionKey, floor);
+    }
+    queueMicrotask(() => this.snapshot(streamId));
+    return { streamId, epoch: st.epoch, snapshotSeq: 0, cols: st.cols, rows: st.rows, floor, nativeClients: 1 };
+  }
+
+  async terminalDetach(hostId: HostId, streamId: number) {
+    this.host(hostId);
+    const st = this.streams.get(streamId);
+    if (!st) return;
+    this.detached.push(streamId);
+    if (this.holdsFloor(streamId)) {
+      const f = this.floors.get(st.sessionKey)!;
+      this.floors.set(st.sessionKey, { floorGen: f.floorGen + 1 });
+    }
+    this.streams.delete(streamId);
+  }
+
+  async terminalInput(req: { hostId: HostId; streamId: number; floorGen?: number; data: string }) {
+    const st = this.streams.get(req.streamId);
+    if (!st) throw new Error("unknown stream");
+    this.inputs.push({ streamId: req.streamId, floorGen: req.floorGen, data: req.data });
+    let floor = this.floors.get(st.sessionKey) ?? { floorGen: 0 };
+    if (!floor.holder && req.floorGen === undefined) {
+      floor = { holder: { principal: "device:fake", label: "phone", streamId: req.streamId }, floorGen: floor.floorGen + 1 };
+      this.floors.set(st.sessionKey, floor);
+    }
+    if (floor.holder?.streamId !== req.streamId || (req.floorGen !== undefined && req.floorGen !== floor.floorGen)) return this.denied(st.sessionKey);
+    this.frame(req.streamId, { kind: "output", data: new TextEncoder().encode(req.data) }); // echo
+    return { floorGen: floor.floorGen };
+  }
+
+  async terminalResize(req: { hostId: HostId; streamId: number; cols: number; rows: number }): Promise<TerminalResizeOutcome> {
+    const st = this.streams.get(req.streamId);
+    if (!st || !this.holdsFloor(req.streamId)) return { outcome: "not_applicable", windowSize: "latest" };
+    st.cols = req.cols;
+    st.rows = req.rows;
+    this.frame(req.streamId, { kind: "resize", cols: req.cols, rows: req.rows });
+    return { outcome: "applied", cols: req.cols, rows: req.rows };
+  }
+
+  async terminalFloor(req: { hostId: HostId; streamId: number; action: "acquire" | "release" | "take" }): Promise<FloorState | FloorDenied> {
+    const st = this.streams.get(req.streamId);
+    if (!st) throw new Error("unknown stream");
+    const cur = this.floors.get(st.sessionKey) ?? { floorGen: 0 };
+    const mine: FloorHolder = { principal: "device:fake", label: "phone", streamId: req.streamId };
+    let next: FloorState;
+    if (req.action === "release") next = { floorGen: cur.floorGen + 1 };
+    else if (req.action === "take" || !cur.holder || cur.holder.streamId === req.streamId) next = { holder: mine, floorGen: cur.floorGen + 1 };
+    else return this.denied(st.sessionKey);
+    this.floors.set(st.sessionKey, next);
+    for (const [id, s] of this.streams) if (s.sessionKey === st.sessionKey) this.frame(id, { kind: "floor", holder: next.holder, floorGen: next.floorGen });
+    return next;
   }
 
   async rosterStatus(hostId: HostId) {
