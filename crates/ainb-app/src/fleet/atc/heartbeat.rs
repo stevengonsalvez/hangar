@@ -289,6 +289,7 @@ mod tests {
 
     fn session(id: &str, tmux: &str) -> Session {
         Session {
+            provider_session_id: None,
             id: id.into(),
             cwd: format!("/tmp/{id}"),
             pid: None,
