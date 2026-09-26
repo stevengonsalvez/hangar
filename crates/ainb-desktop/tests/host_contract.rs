@@ -787,6 +787,7 @@ mod transcript {
             .collect();
         TranscriptOutcome::Page(FleetTranscriptListResult {
             next_after_order: chunks.last().map(|chunk| chunk.ingest_order),
+            next_before_order: None,
             chunks,
             truncated: false,
         })
