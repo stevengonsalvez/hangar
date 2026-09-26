@@ -210,6 +210,17 @@ fn with_ack(mut value: Value, ack: &MutationAck) -> Value {
     value
 }
 
+/// A D18 refusal: [`MUTATION_REJECTED`](ainb_hangar_proto::mutation::MUTATION_REJECTED)
+/// with a rejected ack carrying `reason`, the shape every mutation refusal
+/// takes so a client branches on the reason, never on the message text.
+pub(crate) fn rejected(reason: &str, message: String) -> RpcError {
+    ack_error(
+        ainb_hangar_proto::mutation::MUTATION_REJECTED,
+        message,
+        &MutationAck::rejected(reason),
+    )
+}
+
 /// An error envelope carrying the ack in `data`.
 fn ack_error(code: i32, message: String, ack: &MutationAck) -> RpcError {
     with_error_ack(
@@ -592,11 +603,14 @@ where
         }
         Err(error) => {
             let encoded = stored::encode_err(error);
+            // A handler that refused with a D18 reason (a fence) keeps it; any
+            // other refusal is named by its code, as before.
+            let reason = handler_reason(error).unwrap_or_else(|| error.code.to_string());
             MutationLedgerRepo::record_reply(
                 pool,
                 &key,
                 ainb_hangar_store::repo::mutation_ledger::STATUS_REJECTED,
-                Some(&error.code.to_string()),
+                Some(&reason),
                 Some(&encoded),
                 settled_ms,
             )
@@ -610,12 +624,24 @@ where
                 &MutationAck {
                     outcome: Some(ainb_hangar_proto::mutation::MutationOutcome::Created),
                     status: MutationStatus::Rejected,
-                    reason: Some(error.code.to_string()),
+                    reason: Some(reason),
                     receipt: None,
                 },
             ))
         }
     }
+}
+
+/// The D18 reason a handler already put on its refusal through [`rejected`],
+/// so the ledger's ack does not overwrite `turn_advanced` with `-32008`.
+fn handler_reason(error: &RpcError) -> Option<String> {
+    error
+        .data
+        .as_ref()?
+        .get(ACK_KEY)?
+        .get("reason")?
+        .as_str()
+        .map(ToString::to_string)
 }
 
 #[cfg(test)]
