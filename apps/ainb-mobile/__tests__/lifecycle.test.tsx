@@ -2,7 +2,7 @@ import { act, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { reset } from "../src/attention/store";
-import { connectHost, liveHosts, mayRedial, onAppState, resetLifecycle, retryAfterSecs } from "../src/lifecycle";
+import { connectHost, liveHosts, mayRedial, onAppState, resetLifecycle } from "../src/lifecycle";
 import { PeerCloseError } from "../src/wire/types";
 import { FakeWire, FAKE_HOST_A, FAKE_HOST_B } from "../src/wire/fake";
 import { setWire } from "../src/wire";
@@ -124,14 +124,6 @@ test("a retryable close redials with backoff; a latching close does not", async 
   });
   expect(fake.isConnected(FAKE_HOST_A)).toBe(false);
   expect(await hellos()).toBe(2);
-});
-
-test("retry-after is read from the close reason", () => {
-  expect(retryAfterSecs("retry-after=7")).toBe(7);
-  expect(retryAfterSecs("over capacity; retry-after=30")).toBe(30);
-  expect(retryAfterSecs("draining")).toBeUndefined();
-  expect(retryAfterSecs(undefined)).toBeUndefined();
-  expect(retryAfterSecs("retry-after=-1")).toBeUndefined();
 });
 
 test("a failed redial is rescheduled with growing backoff until one succeeds", async () => {
@@ -269,19 +261,22 @@ test("a redial refused with 4429 and retry-after keeps dialling after that floor
   await waitFor(() => expect(fake.isConnected(FAKE_HOST_A)).toBe(true), { timeout: 5000 });
 });
 
-test("mayRedial is fail-closed: only a network error or a retryable close code", () => {
-  expect(mayRedial(PeerCloseError.network("dns"))).toBe(true);
-  for (const code of [1013, 4429, 4503]) expect(mayRedial(PeerCloseError.closed(code))).toBe(true);
-  for (const code of [4401, 4403, 4409, 4999, 1000]) expect(mayRedial(PeerCloseError.closed(code))).toBe(false);
-  for (const kind of ["peer_changed", "not_paired", "custody", "protocol", "offer"] as const) expect(mayRedial(new PeerCloseError(kind))).toBe(false);
+test("mayRedial is fail-closed and reads the crate's verdict, not a code table of its own", () => {
+  // the crate's Connect and Timeout are retryable by default; Closed carries its own flag
+  expect(mayRedial(new PeerCloseError("connect", { reason: "dns" }))).toBe(true);
+  expect(mayRedial(new PeerCloseError("timeout", { reason: "hello" }))).toBe(true);
+  expect(mayRedial(new PeerCloseError("closed", { reason: "network loss", retryable: true }))).toBe(true); // code None, retryable
+  expect(mayRedial(new PeerCloseError("closed", { code: 4503, reason: "draining", retryable: true }))).toBe(true);
+  expect(mayRedial(new PeerCloseError("closed", { code: 4403, reason: "revoked", retryable: false }))).toBe(false);
+  expect(mayRedial(new PeerCloseError("closed", { code: 1013, reason: "but the phone closed it", retryable: false }))).toBe(false);
+  for (const kind of ["peer_changed", "not_paired", "custody", "protocol", "offer", "handshake", "rpc"] as const)
+    expect(mayRedial(new PeerCloseError(kind))).toBe(false);
   expect(mayRedial(new Error("anything"))).toBe(false);
   expect(mayRedial("string")).toBe(false);
   expect(mayRedial(undefined)).toBe(false);
-  // a copy of the class from another bundle is recognised by name
-  const foreign = Object.assign(new Error("x"), { name: "PeerCloseError", kind: "network" });
-  expect(mayRedial(foreign)).toBe(true);
-  const foreignStop = Object.assign(new Error("x"), { name: "PeerCloseError", kind: "custody" });
-  expect(mayRedial(foreignStop)).toBe(false);
+  // a copy of the class from another bundle is recognised by name, and still needs the flag
+  expect(mayRedial(Object.assign(new Error("x"), { name: "PeerCloseError", kind: "connect", retryable: true }))).toBe(true);
+  expect(mayRedial(Object.assign(new Error("x"), { name: "PeerCloseError", kind: "connect" }))).toBe(false);
 });
 
 test("a host whose key changed latches re-pair and is never redialled", async () => {
