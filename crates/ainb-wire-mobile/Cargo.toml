@@ -18,6 +18,8 @@ name = "ainb_wire_mobile"
 crate-type = ["lib", "staticlib", "cdylib"]
 
 [dependencies]
+# Private key bytes are zeroed when dropped (already in the lock via snow).
+zeroize = "1"
 # The frozen wire (PR-0): frame header, opcodes, prologue, offer codec.
 ainb-hangar-noise = { path = "../ainb-hangar-noise" }
 # The real RPC types: the crate stops compiling the moment a contract moves.
