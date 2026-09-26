@@ -5,39 +5,47 @@ import { colors } from "../theme";
 import { useWire } from "../wire/context";
 import type { AttentionRow } from "../wire/types";
 import { outcomeCopy } from "./outcome";
-import { retire } from "./store";
+import { markSent, retire, sentFor } from "./store";
 
 /**
  * The second tap. Options answer with their 1-based number (the picker and
- * bridge contract); anything without options takes free text. The op id is
- * minted by the crate on the first send and reused on every retry, so a lost
- * reply never becomes a second answer.
+ * bridge contract); anything without options takes free text. The first send
+ * pins `{op id, answer}` for this row in the store, so a retry from any later
+ * sheet resends that answer under that id and nothing else (D18).
  */
 export function AnswerSheet({ row, onClose }: { row: AttentionRow; onClose: () => void }) {
   const wire = useWire();
-  const opId = useRef<string | undefined>(undefined);
+  const inFlight = useRef(false);
   const [text, setText] = useState("");
-  const [status, setStatus] = useState<{ text: string; final: boolean; lost?: string }>();
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{ text: string; final: boolean; lost?: boolean }>();
+  const [, bump] = useState(0);
+  const sent = sentFor(row.hostId, row.id);
 
   const send = async (answer: string) => {
-    if (busy) return;
-    setBusy(true);
+    if (inFlight.current) return;
+    inFlight.current = true;
     try {
-      opId.current ??= await wire.mintOpId();
-      const reply = await wire.answer({ hostId: row.hostId, attentionId: row.id, answer, version: row.version, opId: opId.current });
+      let pinned = sentFor(row.hostId, row.id);
+      if (pinned && pinned.answer !== answer) return; // only the pinned answer may go out
+      if (!pinned) {
+        pinned = { opId: await wire.mintOpId(), answer };
+        markSent(row.hostId, row.id, pinned);
+        bump((n) => n + 1);
+      }
+      const reply = await wire.answer({ hostId: row.hostId, attentionId: row.id, answer: pinned.answer, version: row.version, opId: pinned.opId });
       const copy = outcomeCopy(reply.outcome, reply.ack);
       setStatus(copy);
-      if (copy.final) retire(row.id);
+      if (copy.retire) retire(row.hostId, row.id);
     } catch (e) {
-      // Reply lost; the same op id goes back out on retry.
-      setStatus({ text: `No reply (${e instanceof Error ? e.message : String(e)})`, final: false, lost: answer });
+      // Reply lost; the pinned answer goes back out under the pinned op id.
+      setStatus({ text: `No reply (${e instanceof Error ? e.message : String(e)})`, final: false, lost: true });
     } finally {
-      setBusy(false);
+      inFlight.current = false;
     }
   };
 
   const options = row.payload.options ?? [];
+  const pinnedLabel = sent ? (options[Number(sent.answer) - 1] ?? sent.answer) : undefined;
   return (
     <Modal transparent animationType="slide" onRequestClose={onClose}>
       <View style={styles.backdrop}>
@@ -53,10 +61,18 @@ export function AnswerSheet({ row, onClose }: { row: AttentionRow; onClose: () =
             <Pressable testID="answer-done" onPress={onClose} style={styles.cta}>
               <Text style={styles.ctaText}>Done</Text>
             </Pressable>
-          ) : status?.lost !== undefined ? (
-            <Pressable testID="answer-retry" onPress={() => send(status.lost!)} style={styles.cta}>
-              <Text style={styles.ctaText}>Retry</Text>
-            </Pressable>
+          ) : sent ? (
+            <>
+              <Text style={styles.status} testID="answer-pinned">
+                Sent: {pinnedLabel}
+              </Text>
+              <Pressable testID="answer-retry" onPress={() => send(sent.answer)} style={styles.cta}>
+                <Text style={styles.ctaText}>{status?.lost ? "Retry" : "Check again"}</Text>
+              </Pressable>
+              <Pressable testID="answer-cancel" onPress={onClose}>
+                <Text style={styles.muted}>Not now</Text>
+              </Pressable>
+            </>
           ) : (
             <>
               {options.map((label, i) => (

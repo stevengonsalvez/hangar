@@ -2,6 +2,7 @@ import { useRouter } from "expo-router";
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
+import { connectHost } from "../src/lifecycle";
 import { colors } from "../src/theme";
 import { useWire } from "../src/wire/context";
 
@@ -19,6 +20,7 @@ export default function Pair() {
       const parsed = await wire.parseOffer(offer.trim());
       const paired = await wire.pair(parsed, name.trim() || "phone");
       setStatus(`paired as ${paired.deviceId} (${paired.scope.base})`);
+      void connectHost(wire, paired.hostId).catch(() => undefined);
       if (router.canGoBack()) router.back();
       else router.replace("/");
     } catch (e) {
