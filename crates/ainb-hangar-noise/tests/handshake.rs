@@ -380,3 +380,98 @@ fn a_key_pair_is_fresh_and_its_private_half_never_prints() {
     assert!(!shown.contains(&format!("{:?}", a.private)));
     assert!(!shown.contains(&private_hex));
 }
+
+/// F2 end to end: snow forges message 1 with a static public key of 1 when
+/// its resolver reports one (the review's proof), and the host refuses that
+/// message with `LowOrderKey` and answers nothing.
+#[test]
+fn a_forged_low_order_static_is_refused_at_message_one() {
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+    use snow::types::{Cipher, Dh, Hash, Random};
+
+    /// X25519 whose reported public key is the low-order point 1, and whose
+    /// static DH is the all-zero output that point gives.
+    struct ForgedDh {
+        inner: Box<dyn Dh>,
+        public: [u8; KEY_LEN],
+    }
+    impl Dh for ForgedDh {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn pub_len(&self) -> usize {
+            self.inner.pub_len()
+        }
+        fn priv_len(&self) -> usize {
+            self.inner.priv_len()
+        }
+        fn set(&mut self, privkey: &[u8]) {
+            self.inner.set(privkey);
+        }
+        fn generate(&mut self, rng: &mut dyn Random) {
+            self.inner.generate(rng);
+        }
+        fn pubkey(&self) -> &[u8] {
+            &self.public
+        }
+        fn privkey(&self) -> &[u8] {
+            self.inner.privkey()
+        }
+        // With a public key of 1, the host's `ss` is DH(host, 1) = 0. The
+        // forger matches it, so message 1 authenticates and only the key
+        // check can stop it.
+        fn dh(&self, _pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+            out[..KEY_LEN].fill(0);
+            Ok(())
+        }
+    }
+
+    /// The default resolver, except the local static reports public key 1.
+    /// The ephemeral key stays honest (snow resolves one `Dh` per key; the
+    /// first call is the static, the second the ephemeral).
+    struct ForgedResolver(std::sync::atomic::AtomicUsize);
+    impl CryptoResolver for ForgedResolver {
+        fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+            DefaultResolver.resolve_rng()
+        }
+        fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn Dh>> {
+            let inner = DefaultResolver.resolve_dh(choice)?;
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut public = [0u8; KEY_LEN];
+                public[0] = 1;
+                Some(Box::new(ForgedDh { inner, public }))
+            } else {
+                Some(inner)
+            }
+        }
+        fn resolve_hash(&self, choice: &snow::params::HashChoice) -> Option<Box<dyn Hash>> {
+            DefaultResolver.resolve_hash(choice)
+        }
+        fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn Cipher>> {
+            DefaultResolver.resolve_cipher(choice)
+        }
+    }
+
+    let k = keys();
+    let id = host_id(HOST);
+    let prologue = ainb_hangar_noise::prologue(CarrierKind::Tailnet, &id).unwrap();
+    let mut forger = snow::Builder::with_resolver(
+        ainb_hangar_noise::NOISE_PATTERN.parse().unwrap(),
+        Box::new(ForgedResolver(std::sync::atomic::AtomicUsize::new(0))),
+    )
+    .local_private_key(&k.device.private)
+    .remote_public_key(&k.host.public)
+    .prologue(&prologue)
+    .build_initiator()
+    .unwrap();
+    let mut msg1 = vec![0u8; 1024];
+    let len = forger.write_message(&[], &mut msg1).unwrap();
+
+    let mut host = responder(&k.host.private, CarrierKind::Tailnet, &id).unwrap();
+    assert_eq!(
+        host.read_message(&msg1[..len]),
+        Err(NoiseError::LowOrderKey)
+    );
+    assert!(host.write_message().is_err(), "the host answers nothing");
+    assert!(host.into_session().is_err());
+}
