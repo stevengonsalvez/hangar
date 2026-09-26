@@ -1,8 +1,17 @@
-//! Driver floor: who may type into, and size, one pane (D16, spec R2 row).
+//! Driver floor: who may type into, and size, one attached session target
+//! (D16, spec R2 row).
+//!
+//! Granularity: one floor per session target a stream attaches to, not per
+//! pane. The sizer resizes a tmux client, which sizes the whole window, so
+//! two panes of one window can never have two resize owners; the daemon
+//! keys its `Floor` map by the same target it keys the feed by.
 //!
 //! The floor is keyed per STREAM, not per principal (RECONCILED T17): two
 //! browser tabs share one operator principal and still arbitrate. Exactly
-//! one stream holds it or nobody does. Every change of holder bumps
+//! one stream holds it or nobody does. A [`StreamId`] is therefore
+//! daemon-wide unique and never reused within a daemon lifetime (WP9a mints
+//! it from one global counter); two connections must never both hold
+//! stream 1, or one could type into the other's turn. Every change of holder bumps
 //! `floor_gen`, so a client that types with the generation it last saw is
 //! refused the moment the floor moved (RECONCILED M8, M9, M11). The resize
 //! owner is always the holder: the sizer control client lives and dies with
@@ -21,8 +30,20 @@
 //! [`Floor::release`]. Native tmux clients are not arbitrated here at all
 //! (spec :258): presence only reports them.
 
-/// A stream id, unique per connection while attached.
-pub type StreamId = u64;
+/// A stream id: DAEMON-WIDE unique, never reused within a daemon lifetime.
+///
+/// Not per connection. The floor compares holders by this id alone, so a
+/// per-connection numbering would make stream 1 on connection A and stream
+/// 1 on connection B the same holder and let B type mid-run. WP9a mints it
+/// from one global `AtomicU64` and puts it on the wire as `stream_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(pub u64);
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Who holds the floor. Mirrors the frozen wire `FloorHolder`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +68,7 @@ pub struct Denied {
     pub floor_gen: u64,
 }
 
-/// The floor of one pane.
+/// The floor of one attached session target.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Floor {
     holder: Option<Holder>,
@@ -150,9 +171,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn who(stream_id: StreamId) -> Holder {
+    fn who(stream_id: u64) -> Holder {
         Holder {
-            stream_id,
+            stream_id: StreamId(stream_id),
             principal: if stream_id.is_multiple_of(2) {
                 "local".to_string()
             } else {
@@ -173,16 +194,19 @@ mod tests {
             Ok(1),
             "re-acquire by the holder: no bump"
         );
-        assert_eq!(f.resize_owner(), Some(1));
+        assert_eq!(f.resize_owner(), Some(StreamId(1)));
         let denied = f.acquire(who(2)).unwrap_err();
-        assert_eq!(denied.holder.as_ref().map(|h| h.stream_id), Some(1));
+        assert_eq!(
+            denied.holder.as_ref().map(|h| h.stream_id),
+            Some(StreamId(1))
+        );
         assert_eq!(denied.floor_gen, 1);
-        assert!(!f.release(2), "a non-holder cannot release");
+        assert!(!f.release(StreamId(2)), "a non-holder cannot release");
         assert_eq!(f.floor_gen(), 1);
         assert_eq!(f.take(who(2)), 2);
         assert_eq!(f.take(who(2)), 2, "take by the holder: no bump");
-        assert!(f.is_holder(2));
-        assert!(f.release(2));
+        assert!(f.is_holder(StreamId(2)));
+        assert!(f.release(StreamId(2)));
         assert_eq!(f.floor_gen(), 3);
         assert_eq!(f.holder(), None);
         assert_eq!(f.take(who(1)), 4, "take on a free floor acquires");
@@ -214,7 +238,7 @@ mod tests {
         assert_eq!(f.input(who(2), Some(2)), Ok(2));
         assert!(f.input(who(1), Some(2)).is_err());
         // Released: a stale gen on a free floor is refused with no holder.
-        assert!(f.release(2));
+        assert!(f.release(StreamId(2)));
         assert_eq!(
             f.input(who(2), Some(2)),
             Err(Denied {
@@ -269,8 +293,8 @@ mod tests {
                         (v, true)
                     }
                     Op::Release(v) | Op::Detach(v) => {
-                        f.release(u64::from(v));
-                        prop_assert!(!f.is_holder(u64::from(v)), "released stream is never the holder");
+                        f.release(StreamId(u64::from(v)));
+                        prop_assert!(!f.is_holder(StreamId(u64::from(v))), "released stream is never the holder");
                         (v, false)
                     }
                     Op::InputSeen(v) => {
@@ -285,12 +309,12 @@ mod tests {
                 };
                 // Accepted input or floor comes only from the holder.
                 if accepted {
-                    prop_assert!(f.is_holder(u64::from(viewer)), "accepted for a non-holder");
+                    prop_assert!(f.is_holder(StreamId(u64::from(viewer))), "accepted for a non-holder");
                 }
                 // Input with a generation is accepted only when nobody took
                 // the floor in between: the holder is unchanged.
                 if matches!(o, Op::InputSeen(_)) && accepted {
-                    prop_assert_eq!(holder_before, Some(u64::from(viewer)));
+                    prop_assert_eq!(holder_before, Some(StreamId(u64::from(viewer))));
                 }
                 // The generation is monotonic and moves exactly with the holder.
                 let g = f.floor_gen();
