@@ -28,7 +28,11 @@
 //! the same kind (the latest state is all the client needs), so at most
 //! four control frames plus one `closed` ever wait. The replacement is
 //! done in place, so a `data_gap` keeps its position ahead of whatever
-//! followed it. The same holds for
+//! followed it; two gaps add their `dropped_bytes` and keep the later
+//! reason. An updated `resize` therefore also sits AHEAD of output that
+//! was queued at the old size: clients rely on the repaint the pane does
+//! after a resize (every full-screen app repaints on SIGWINCH), and do not
+//! reinterpret already-queued bytes. The same holds for
 //! snapshots: only `output` bytes count against the pending cap, and a new
 //! snapshot replaces any unsent one, so a viewer that never acks holds at
 //! most one snapshot, one cap of output and the control frames. When the
@@ -438,6 +442,25 @@ impl ViewerQueue {
                 self.pending.iter_mut().find(|s| s.frame.coalesce_key() == Some(key))
             {
                 slot.seq = seq;
+                // Two gaps merge: the bytes dropped add up, the reason is
+                // the later one.
+                if let (
+                    Frame::DataGap {
+                        dropped_bytes: Some(earlier),
+                        ..
+                    },
+                    Frame::DataGap {
+                        reason,
+                        dropped_bytes,
+                    },
+                ) = (&slot.frame, &frame)
+                {
+                    slot.frame = Frame::DataGap {
+                        reason: *reason,
+                        dropped_bytes: Some(earlier + dropped_bytes.unwrap_or(0)),
+                    };
+                    return;
+                }
                 slot.frame = frame;
                 return;
             }
@@ -1127,5 +1150,60 @@ mod tests {
             "the floor stays last"
         );
         assert!(matches!(last_two[1], Frame::Presence { native_clients: 2 }));
+    }
+
+    #[test]
+    fn two_gaps_add_their_dropped_bytes_and_keep_the_later_reason() {
+        let mut q = attached(small());
+        let opening = q.take_ready(usize::MAX);
+        q.ack(sent_payload(&opening));
+        q.push_output(0, &[b'a'; 8 * KIB]);
+        q.take_ready(usize::MAX);
+        // Trip the cap: a dropped gap with a byte count.
+        q.push_output(8 * KIB as u64, &[b'b'; 9 * KIB]);
+        assert!(q.in_gap());
+        let first = q
+            .pending
+            .iter()
+            .find_map(|s| match &s.frame {
+                Frame::DataGap { dropped_bytes, .. } => Some(*dropped_bytes),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(first, Some(9 * KIB as u64));
+        // A feed gap before it is sent: bytes add up (a feed gap carries
+        // none of its own), the reason becomes the later one.
+        q.gap(17 * KIB as u64, GapReason::FeedLost);
+        let gaps: Vec<(GapReason, Option<u64>)> = q
+            .pending
+            .iter()
+            .filter_map(|s| match &s.frame {
+                Frame::DataGap {
+                    reason,
+                    dropped_bytes,
+                } => Some((*reason, *dropped_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gaps, vec![(GapReason::FeedLost, Some(9 * KIB as u64))]);
+        // A snapshot, then a torn replacement's dropped gap on top of an
+        // unsent feed gap: counted bytes survive, none plus none stays none.
+        q.push_snapshot(17 * KIB as u64, 40, 20, 1, &[b's'; 2 * KIB]);
+        q.ack(u64::MAX);
+        q.take_ready(usize::MAX);
+        q.gap(20 * KIB as u64, GapReason::Paused);
+        q.gap(20 * KIB as u64, GapReason::FeedLost);
+        let gaps: Vec<(GapReason, Option<u64>)> = q
+            .pending
+            .iter()
+            .filter_map(|s| match &s.frame {
+                Frame::DataGap {
+                    reason,
+                    dropped_bytes,
+                } => Some((*reason, *dropped_bytes)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gaps, vec![(GapReason::FeedLost, None)]);
     }
 }
