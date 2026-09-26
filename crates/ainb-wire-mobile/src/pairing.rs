@@ -268,7 +268,16 @@ pub(crate) async fn pair(
             // The pairing stays saved to retry; a 4401 or 4403 on the very
             // first hello is still the host refusing this device, so the
             // re-pair latch is set exactly as it would be on a later connect.
-            if matches!(e, WireError::Unauthenticated | WireError::Revoked) {
+            if matches!(
+                e,
+                WireError::Closed {
+                    code: Some(
+                        ainb_hangar_proto::peer_close::UNAUTHENTICATED
+                            | ainb_hangar_proto::peer_close::REVOKED
+                    ),
+                    ..
+                }
+            ) {
                 mark_repair(custody_dir, &record.host_id, true)?;
             }
             Err(e)
