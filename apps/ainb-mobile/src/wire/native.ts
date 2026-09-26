@@ -522,9 +522,14 @@ export class NativeWire implements WireClient {
     }
   }
 
+  /**
+   * A call on a host with no live socket is `not_connected`, its own kind:
+   * the cure is `connect`, never a re-pair, so it is retryable and it is
+   * not `not_paired` (which the crate answers when no record exists).
+   */
   private hostOf(hostId: HostId): NativeMobileHost {
     const l = this.live.get(hostId);
-    if (!l || l.host.isClosed()) throw new PeerCloseError("not_paired", { reason: `${hostId} is not connected` });
+    if (!l || l.host.isClosed()) throw new PeerCloseError("not_connected", { reason: `${hostId} is not connected`, retryable: true });
     return l.host;
   }
 
