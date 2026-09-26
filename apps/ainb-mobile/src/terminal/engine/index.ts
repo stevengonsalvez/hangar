@@ -42,8 +42,13 @@ term.onData((data) => {
   if (!readonly) post({ t: "input", data });
 });
 
+let bytesWritten = 0;
 const writes = makeCoalescer<Uint8Array>(
-  (batch) => term.write(concat(batch)),
+  (batch) => {
+    const data = concat(batch);
+    bytesWritten += data.length;
+    term.write(data, () => post({ t: "stats", bytes: bytesWritten, cols: term.cols, rows: term.rows }));
+  },
   (cb) => requestAnimationFrame(cb),
 );
 
