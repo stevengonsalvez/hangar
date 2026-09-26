@@ -34,6 +34,8 @@ import { Review } from "./review.tsx";
 import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
 import { Sidebar } from "./sidebar.tsx";
+import { Titlebar } from "./titlebar.tsx";
+import { Statusbar } from "./statusbar.tsx";
 import { SettingsPage } from "./settings.tsx";
 import { CLOSE_SETTINGS, OPEN_SETTINGS } from "./settings.ts";
 import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar.ts";
@@ -60,12 +62,13 @@ import { startTheme } from "./theme/theme.ts";
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
-/** The header's counts, in the order it draws them. */
-const HEADER_COUNTS = [
-  [ROOT_SELECTORS.askCount, "ASK"],
-  [ROOT_SELECTORS.approveCount, "APPROVE"],
-  [ROOT_SELECTORS.waitCount, "WAIT"],
-  [ROOT_SELECTORS.errCount, "ERR"],
+/** The selectors summed into the status bar's one "N need you" count, in the
+ * order the old header drew them as separate badges (D2). */
+const ATTENTION_SELECTORS = [
+  ROOT_SELECTORS.askCount,
+  ROOT_SELECTORS.approveCount,
+  ROOT_SELECTORS.waitCount,
+  ROOT_SELECTORS.errCount,
 ] as const;
 
 /** How long a toast stays up. */
@@ -264,6 +267,13 @@ function Shell() {
     if (tab.state === "detached") openRow(rowOf(tab.target));
     activate(tab.key);
   };
+  /** Open the palette, or close it the way Esc does: the titlebar's search
+   * button and the Cmd/Ctrl+Shift+K accelerator both send exactly this, so
+   * there is one place that decides which way a press or a click goes. */
+  const togglePalette = () => {
+    if (palette()) closePalette();
+    else setPalette(true);
+  };
   const onAccelerator = (shell: Accelerator) => {
     switch (shell.kind) {
       case "tab": {
@@ -290,10 +300,7 @@ function Shell() {
       case "paste":
         return;
       case "palette":
-        // The second press closes it the way Esc does, so focus goes back to
-        // the pane or the sidebar rather than to the body.
-        if (palette()) closePalette();
-        else setPalette(true);
+        togglePalette();
         return;
     }
   };
@@ -376,10 +383,11 @@ function Shell() {
   const gitView = () => shellGitView(store, host());
   const usage = () => shellUsage(store, host());
   const usageStale = createMemo(() => ROOT_SELECTORS.usageStale(store, host()));
-  const counts = HEADER_COUNTS.map(([select, label]) => ({
-    label,
-    count: createMemo(() => select(store, host())),
-  }));
+  /** ASK + APPROVE + WAIT + ERR: the status bar's one "N need you" amber
+   * count. Each selector is its own memo first, so a drain that only moves
+   * one of the four still wakes just that one before the sum recomputes. */
+  const attentionCounts = ATTENTION_SELECTORS.map((select) => createMemo(() => select(store, host())));
+  const needsYou = createMemo(() => attentionCounts.reduce((sum, count) => sum + count(), 0));
   const idle = createMemo(() => ROOT_SELECTORS.idleCount(store, host()));
   const sessionsStale = createMemo(() => ROOT_SELECTORS.sessionsStale(store, host()));
   const gitViewStale = createMemo(() => ROOT_SELECTORS.gitViewStale(store, host()));
@@ -437,50 +445,16 @@ function Shell() {
 
   return (
     <main class="shell">
-      <header class="header">
-        <span class="host" title="Host">
-          host: {host() ?? "none"}
-        </span>
-        <span class="counts" aria-label="Attention">
-          <For each={counts}>
-            {(entry) => (
-              <Show when={entry.count() > 0}>
-                <span class="count attention">
-                  {entry.count()} {entry.label}
-                </span>
-              </Show>
-            )}
-          </For>
-          <span class="count">{idle()} IDLE</span>
-          {/* A development build shows frames the store refused (#1132). */}
-          <Show when={import.meta.env.DEV && store.framesIgnored() > 0}>
-            <span class="count ignored" title="Frames the store ignored">
-              {store.framesIgnored()} ignored
-            </span>
-          </Show>
-        </span>
-        <button
-          type="button"
-          class="inbox-button"
-          title="Inbox"
-          aria-pressed={inboxOpen()}
-          onClick={() => (inboxOpen() ? closeInbox() : openInbox())}
-        >
-          Inbox
-          <Show when={inboxUnread() > 0}>
-            <span class="inbox-unread">{inboxUnread()}</span>
-          </Show>
-        </button>
-        <button
-          type="button"
-          class="settings"
-          title="Settings"
-          aria-pressed={settings()}
-          onClick={() => (settings() ? closeSettings() : openSettings())}
-        >
-          ⚙
-        </button>
-      </header>
+      <Titlebar
+        mac={MAC}
+        searchOpen={palette()}
+        onSearch={togglePalette}
+        inboxOpen={inboxOpen()}
+        inboxUnread={inboxUnread()}
+        onInbox={() => (inboxOpen() ? closeInbox() : openInbox())}
+        settingsOpen={settings()}
+        onSettings={() => (settings() ? closeSettings() : openSettings())}
+      />
       <Show when={sidecar().state !== "connected"}>
         <div class={`banner ${sidecar().state}`} role="status">
           <span>{banner()}</span>
@@ -707,6 +681,14 @@ function Shell() {
           </For>
         </section>
       </div>
+      <Statusbar
+        host={host()}
+        sidecar={sidecar()}
+        needsYou={needsYou()}
+        idle={idle()}
+        // A development build shows frames the store refused (#1132).
+        framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
+      />
       <Show when={palette()}>
         <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
       </Show>
