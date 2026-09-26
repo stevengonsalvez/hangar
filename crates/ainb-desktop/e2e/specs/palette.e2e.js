@@ -5,7 +5,7 @@
 // keystroke is caught where it does damage rather than where it was typed.
 
 import assert from "node:assert/strict";
-import { click, intentsSent, setPaletteQuery } from "../support.js";
+import { click, setPaletteQuery } from "../support.js";
 import { paneText, raiseHook, seeded } from "../world.js";
 
 /** The shell accelerator, as this platform spells it. */
@@ -259,7 +259,18 @@ describe("the palette over a terminal", () => {
     // the pane's.
     const session = seeded()[0];
     await ready(session);
-    raiseHook(session, ASK);
+    // Raised through the real hook under the id ainb minted for this launch,
+    // as the session's own agent raises it. A row that holds a minted id
+    // takes only requests filed under that id (#101): one raised with no id
+    // is never placed on it by worktree, so the banner would never appear.
+    raiseHook(session, {
+      event: "PreToolUse",
+      matcher: "AskUserQuestion",
+      payload: {
+        tool_name: "AskUserQuestion",
+        tool_input: { questions: [{ question: "Which environment?", options: [{ label: "staging" }, { label: "prod" }] }] },
+      },
+    });
     await focusTerminal(session);
     await bannerUp();
     await $(".answer-banner .answer-composer input").waitForExist({ timeout: 60_000 });
