@@ -67,6 +67,7 @@ pub fn session_at(worktree: &Path, tmux: &str) -> SessionMetadata {
         model_source: ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     }
 }
 
