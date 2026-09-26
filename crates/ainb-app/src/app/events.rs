@@ -2045,10 +2045,28 @@ impl EventHandler {
             .get_selected_session()
             .and_then(|session| session.provider_session_id.clone())
             .unwrap_or_default();
+        // The agent's pane as the fleet snapshot has it for this id: its index
+        // target and its fingerprint, so the send goes to that pane's stable
+        // id, not to whichever pane of the session is active.
+        let pane = state
+            .fleet
+            .fleet_snapshot
+            .lock()
+            .map(|rows| {
+                rows.iter()
+                    .find(|row| row.provider_session_id.as_deref() == Some(session_id.as_str()))
+                    .map(|row| crate::fleet::send::PaneHint {
+                        target: row.tmux_target.clone(),
+                        fingerprint: row.process_start_fingerprint.clone(),
+                    })
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         // Read before the send borrows the Fleet section: the answer is
         // recorded under the surface this process is, whichever that is.
         let surface = state.host.surface;
-        if let Err(refusal) = state.fleet.ask_state.send(chip, &session_id, surface) {
+        if let Err(refusal) = state.fleet.ask_state.send_to(chip, &session_id, pane, surface) {
             // Refusals are shown, never swallowed: a send that silently does
             // nothing is the failure mode this screen exists to remove.
             state.add_info_notification(refusal);
