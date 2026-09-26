@@ -18,7 +18,6 @@ fn base() -> WorktreeCreateParams {
         model: None,
         prompt: None,
         skip_permissions: false,
-        name: None,
         mutation: MutationEnvelope::default(),
     }
 }
@@ -38,7 +37,6 @@ fn every_shared_case_matches_the_daemon_validator() {
         match field {
             "branch" => params.branch = Some(value.clone()),
             "base" => params.base = Some(value.clone()),
-            "name" => params.name = Some(value.clone()),
             "model" => params.model = Some(value.clone()),
             "prompt" => params.prompt = Some(value.clone()),
             "repo_path" => params.repo_path = value.clone(),
