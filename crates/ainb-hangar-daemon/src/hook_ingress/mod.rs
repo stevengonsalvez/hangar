@@ -27,13 +27,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ainb_hangar_proto::hooks::{
-    HookSource, PaneKey, PANE_KEY_HEADER, PARENT_HEADER, TMUX_PANE_HEADER,
+    HookSource, PANE_KEY_HEADER, PARENT_HEADER, PaneKey, TMUX_PANE_HEADER,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 pub use endpoint::EndpointFiles;
-pub use guard::{Judge, Refusal, Route, MAX_BODY, MAX_CONNECTIONS, MAX_HEAD};
+pub use guard::{Judge, MAX_BODY, MAX_CONNECTIONS, MAX_HEAD, Refusal, Route};
 
 use crate::local_http::{read_body, read_head, write_response};
 
@@ -48,8 +48,7 @@ pub const BODY_DEADLINE: Duration = Duration::from_secs(5);
 /// Whether the switch is on in this process's environment.
 #[must_use]
 pub fn enabled_from_env() -> bool {
-    std::env::var(LISTEN_ENV)
-        .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+    std::env::var(LISTEN_ENV).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
 }
 
 /// One hook call, as the listener hands it on.
