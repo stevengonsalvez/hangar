@@ -11,7 +11,7 @@ import type {
   Tier,
   WaitKind,
 } from "../../../ainb-app/bindings/AppState";
-import { ackTurn, NO_ACKS } from "./acks.ts";
+import { ackTurn, NO_ACKS, pruneAcks, rowAckKey } from "./acks.ts";
 import {
   deriveStatus,
   elicitationDetail,
@@ -39,11 +39,11 @@ function input(state: AgentState, waitKind: WaitKind | null, turnComplete: boole
  * alone, and the loop checks both `turn_complete` values against the same
  * expectation for every state except `idle`.
  */
-const EXPECTED: Record<AgentState, UiStatus | null> = {
+const EXPECTED: Record<AgentState, UiStatus> = {
   working: { kind: "working" },
   waiting: { kind: "needs", need: "wait" }, // overridden per wait_kind below
   idle: { kind: "idle" }, // overridden per turn_complete below
-  exited: null,
+  exited: { kind: "exited" },
   unverifiable: { kind: "unverifiable" },
 };
 
@@ -63,10 +63,10 @@ test("every AgentState x WaitKind x turn_complete combination", () => {
         const key = waitKind ?? "null";
         // `wait_kind: "error"` needs a human on every state that reaches the
         // check (not just `waiting`, which already maps it through
-        // `WAITING_NEED`): `exited` still hides the card outright.
+        // `WAITING_NEED`): `exited` reads exited whatever else it carries.
         const expected =
           state === "exited"
-            ? null
+            ? { kind: "exited" as const }
             : state === "waiting"
               ? WAITING_NEED[key]
               : waitKind === "error"
@@ -86,9 +86,25 @@ test("every AgentState x WaitKind x turn_complete combination", () => {
   }
 });
 
-test("exited hides the card whatever else the frame says", () => {
-  assert.equal(deriveStatus(input("exited", "ask", true)), null);
-  assert.equal(deriveStatus(input("exited", "error", false), { attention: ["Err"] }), null);
+test("exited reads exited whatever else the frame says", () => {
+  assert.deepEqual(deriveStatus(input("exited", "ask", true)), { kind: "exited" });
+  assert.deepEqual(deriveStatus(input("exited", "error", false), { attention: ["Err"] }), { kind: "exited" });
+});
+
+test("a stopped row with no card is exited, not idle", () => {
+  const stopped = session("u-9", { status: "Stopped" });
+  assert.deepEqual(statusForSession(stopped, [], {}, NO_ACKS), { kind: "exited" });
+  assert.equal(statusLabel({ kind: "exited" }), "Exited");
+});
+
+test("a chip-only Done is acked by row and shows again once pruned", () => {
+  const done = session("u-8", { attention: [{ kind: "Done", detail: null, request: "r", options: [], route: "Pane" }] });
+  assert.deepEqual(statusForSession(done, [], {}, NO_ACKS), { kind: "done" });
+  const acked = ackTurn(NO_ACKS, rowAckKey("u-8"), 0);
+  assert.deepEqual(statusForSession(done, [], {}, acked), { kind: "idle" });
+  // The chip cleared: the row key is no longer live and is pruned.
+  const pruned = pruneAcks(acked, new Set());
+  assert.deepEqual(statusForSession(done, [], {}, pruned), { kind: "done" });
 });
 
 test("an Err attention chip needs a human even off a card the host has not called waiting", () => {
