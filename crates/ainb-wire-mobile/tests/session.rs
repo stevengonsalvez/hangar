@@ -428,7 +428,13 @@ async fn an_overflowing_event_queue_reports_lag_once() {
             tokio::task::yield_now().await;
         }
     }
-    // A round trip orders every pushed notification before this reply.
+    // The peer interleaves its forwarding with request handling, so wait
+    // for the overflow itself rather than assuming an order.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while session.stats().events_dropped == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no overflow in 5 s");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     session.request("ping", json!({})).await.unwrap();
     let first = session.next_event().await;
     let SessionEvent::Lagged(dropped) = first else {
