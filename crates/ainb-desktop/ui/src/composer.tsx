@@ -77,19 +77,66 @@ export function Composer(props: Props) {
   // newline. Every single-line field submits on a plain Enter for free: the
   // platform's own form submission, not reimplemented here.
   const onPromptKeyDown = (event: KeyboardEvent) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submit(event);
+    // Not while an input method is composing: its Enter confirms a candidate.
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !event.isComposing) submit(event);
+  };
+
+  // A click closes only when it both started and ended on the scrim: a drag
+  // that selects text in a field and is released outside it must not throw
+  // the form away.
+  let downOnScrim = false;
+  const onScrimDown = (event: MouseEvent) => {
+    downOnScrim = event.target === event.currentTarget;
+  };
+  const onScrimClick = (event: MouseEvent) => {
+    if (downOnScrim && event.target === event.currentTarget) props.onClose();
+    downOnScrim = false;
+  };
+
+  // Esc closes wherever the keyboard is, even after focus left every field:
+  // a window listener, live only while this is mounted (open). Not while an
+  // input method is composing: its Esc cancels the candidate.
+  const onWindowKey = (event: KeyboardEvent) => {
+    if (event.key === "Escape" && !event.isComposing && !event.defaultPrevented) {
+      event.preventDefault();
+      props.onClose();
+    }
+  };
+  window.addEventListener("keydown", onWindowKey);
+  onCleanup(() => window.removeEventListener("keydown", onWindowKey));
+
+  // Tab and Shift+Tab cycle inside the dialog. The shell behind it is inert,
+  // but a webview can still hand focus to <body> past the last field.
+  let form!: HTMLFormElement;
+  const onFormKeyDown = (event: KeyboardEvent) => {
+    if (event.key !== "Tab") return;
+    const focusable = [
+      ...form.querySelectorAll<HTMLElement>(
+        "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary",
+      ),
+    ];
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   };
 
   return (
-    // Esc bubbles here from any field; a click on the scrim (not the panel,
-    // which stops it) closes the same way, matching the palette's overlay.
-    <div class="composer-backdrop" onClick={props.onClose} onKeyDown={(event) => event.key === "Escape" && props.onClose()}>
+    // Esc is the window's (`main.tsx`), so it works wherever the keyboard is.
+    <div class="composer-backdrop" onMouseDown={onScrimDown} onClick={onScrimClick}>
       <form
+        ref={form}
         class="composer"
         role="dialog"
         aria-modal="true"
         aria-label="New worktree"
-        onClick={(event) => event.stopPropagation()}
+        onKeyDown={onFormKeyDown}
         onSubmit={submit}
       >
         <h2 class="composer-title">New worktree</h2>
