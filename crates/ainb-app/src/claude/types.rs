@@ -206,12 +206,30 @@ impl ClaudeChatSession {
     }
 }
 
-// Authentication configuration
-#[derive(Debug, Clone)]
+// Authentication configuration. `Debug` redacts both credentials: a `{:?}`
+// of the auth reaches logs and error chains.
+#[derive(Clone)]
 pub struct ClaudeAuth {
     pub api_key: Option<String>,
     pub oauth_token: Option<String>,
     pub base_url: String,
+}
+
+impl std::fmt::Debug for ClaudeAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ainb_hangar_proto::Redacted;
+        let Self {
+            api_key,
+            oauth_token,
+            base_url,
+        } = self;
+        f.debug_struct("ClaudeAuth")
+            .field("api_key", &api_key.as_ref().map(|_| Redacted))
+            .field("oauth_token", &oauth_token.as_ref().map(|_| Redacted))
+            // A proxy or gateway URL can carry `user:password@`.
+            .field("base_url", &ainb_hangar_core::redact::scrub(base_url))
+            .finish()
+    }
 }
 
 impl Default for ClaudeAuth {
@@ -253,5 +271,39 @@ impl ClaudeAuth {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_redaction_tests {
+    use super::ClaudeAuth;
+
+    /// Neither credential prints under `Debug`; the base URL still does.
+    #[test]
+    fn claude_auth_debug_hides_the_api_key_and_oauth_token() {
+        let auth = ClaudeAuth {
+            api_key: Some("sk-ant-s3cr3tApiKey".to_string()),
+            oauth_token: Some("s3cr3tOauthToken".to_string()),
+            base_url: "https://base-visible.example".to_string(),
+        };
+        for rendered in [format!("{auth:?}"), format!("{auth:#?}")] {
+            assert!(!rendered.contains("s3cr3tApiKey"), "{rendered}");
+            assert!(!rendered.contains("s3cr3tOauthToken"), "{rendered}");
+            assert!(rendered.contains("<redacted>"), "{rendered}");
+            assert!(rendered.contains("base-visible"), "{rendered}");
+        }
+    }
+
+    /// A base URL with credentials in its userinfo prints without them.
+    #[test]
+    fn claude_auth_debug_hides_base_url_userinfo() {
+        let auth = ClaudeAuth {
+            api_key: None,
+            oauth_token: None,
+            base_url: "https://proxyuser:s3cr3tProxyPass@gateway-visible.example".to_string(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("s3cr3tProxyPass"), "{rendered}");
+        assert!(rendered.contains("gateway-visible.example"), "{rendered}");
     }
 }
