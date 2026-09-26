@@ -111,6 +111,7 @@ ainb-core/src/cli/presets.rs | serde_json::to_string_pretty(&wrapper)
 ainb-core/src/cli/presets.rs | toml::to_string_pretty(preset)
 ainb-core/src/cli/recover.rs | serde_json::to_string_pretty(&orphans)
 ainb-core/src/cli/reflect.rs | serde_json::to_string_pretty(&reports)
+ainb-core/src/cli/run.rs | serde_json::to_string(&created)
 ainb-core/src/cli/status.rs | serde_json::to_string_pretty(&output)
 ainb-core/src/cli/usage.rs | serde_json::to_string_pretty(&json!({
 ainb-core/src/cli/usage.rs | serde_json::to_string_pretty(&json!({"cleared": true}))
