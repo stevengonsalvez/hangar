@@ -15,16 +15,17 @@
 #   really ours: the pid it published answers `kill -0`, and both files are
 #   owned by this user. A stale file left by a crash, or a port another user
 #   squats on, gets nothing (and no hold).
-# - The token reaches curl only as `-H @<file>`, and only from a file named
-#   `hook-headers`. It never appears in argv.
+# - The token reaches curl only as `-H @<home>/hangar/hook-headers`, a fixed
+#   path that must be a regular file this user owns. It never appears in argv.
 # - Status events print `{}` and return within ~1.5s whatever the daemon does.
 # - Claude PermissionRequest and PreToolUse go to the hold route; the daemon
 #   decides which of them wait for a human (AskUserQuestion) and answers the
 #   rest at once. The script prints the daemon's answer, or `{}` on any failure
 #   so the agent shows its own prompt and the keyboard decides.
-# - When the daemon cannot be reached, status events are appended to a spool
-#   the daemon drains at its next start. Tool events and holds never spool: a
-#   replayed approval would be a phantom.
+# - When the daemon certainly did not record a status event (unreachable,
+#   nothing listening, or it answered 429/503), the event is appended to a
+#   spool the daemon drains at its next start. Tool events and holds never
+#   spool: a replayed approval would be a phantom.
 # - Always exits 0.
 
 if [ "$#" -gt 0 ]; then
@@ -61,16 +62,21 @@ safe() {
 }
 
 # Route on the event name only. Which PreToolUse holds is the daemon's call.
+# Only the managed entry's own AINB_HOOK_EVENT may open a hold; a name read
+# from the payload never does.
 blocking=0
-if [ "$agent" = claude ]; then
-  case "$event" in
+if [ "$agent" = claude ] && [ -n "${AINB_HOOK_EVENT:-}" ]; then
+  case "$AINB_HOOK_EVENT" in
     PermissionRequest | PreToolUse) blocking=1 ;;
   esac
 fi
 
+# The headers file is never taken from the endpoint file: it is always this
+# fixed name in the hangar home, and must be a regular file, not a symlink.
+headers="$home/hangar/hook-headers"
 port=
-headers=
 pid=
+version=
 if [ -r "$endpoint" ]; then
   while IFS='=' read -r key value || [ -n "$key" ]; do
     case "$key" in
@@ -81,17 +87,14 @@ if [ -r "$endpoint" ]; then
         esac
         ;;
       AINB_HOOK_PID)
+        # 0 and 1 are refused: `kill -0 0` always succeeds, and 1 is init.
         case "$value" in
-          '' | *[!0-9]*) pid= ;;
+          '' | *[!0-9]* | 0* | 1) pid= ;;
           *) pid=$value ;;
         esac
         ;;
-      AINB_HOOK_HEADERS)
-        case "$value" in
-          /*[!A-Za-z0-9/._-]* | *..*) headers= ;;
-          /*/hook-headers) headers=$value ;;
-          *) headers= ;;
-        esac
+      AINB_HOOK_VERSION)
+        version=$value
         ;;
     esac
   done <"$endpoint"
@@ -126,6 +129,7 @@ spool() {
 }
 
 # post <path> <max-time>: prints the body, then a last line with the status.
+# Returns curl's own exit status (7: nothing listening).
 post() {
   printf '%s' "$payload" | curl -sS -X POST "http://127.0.0.1:${port}$1" \
     --connect-timeout 0.5 --max-time "$2" --noproxy 127.0.0.1 \
@@ -145,40 +149,52 @@ post() {
 # the macOS sh).
 reachable=0
 # shellcheck disable=SC3067
-if [ -n "$port" ] && [ -n "$headers" ] && [ -n "$pid" ] &&
-  [ -O "$endpoint" ] && [ -O "$headers" ] && [ -r "$headers" ] &&
+if [ -n "$port" ] && [ -n "$pid" ] && [ "$version" = 1 ] &&
+  [ -O "$endpoint" ] && [ -f "$headers" ] && [ ! -L "$headers" ] &&
+  [ -O "$headers" ] && [ -r "$headers" ] &&
   kill -0 "$pid" 2>/dev/null && command -v curl >/dev/null 2>&1; then
   reachable=1
 fi
+
+# Spool only what the daemon certainly did not record: nothing reachable,
+# nothing listening (curl 7), or the daemon said so (429, 503). A timeout
+# may have been recorded, so it is never replayed.
+should_spool() {
+  [ "$reachable" = 0 ] && return 0
+  [ "$1" = 7 ] && return 0
+  case "$2" in 429 | 503) return 0 ;; esac
+  return 1
+}
 
 if [ "$blocking" = 1 ] || [ "$event" = Stop ]; then
   # The daemon's body is the agent's answer: a human decision for a hold, or
   # an immediate inbox decision on Stop.
   if [ "$blocking" = 1 ]; then route="/hook/$agent/hold" budget=610; else route="/hook/$agent" budget=1.5; fi
-  if [ "$reachable" = 1 ] && resp=$(post "$route" "$budget"); then
+  rc=0 code=
+  if [ "$reachable" = 1 ]; then
+    resp=$(post "$route" "$budget") || rc=$?
     code=${resp##*
 }
     body=${resp%
 *}
-    if [ "$code" = 200 ] && [ -n "$body" ]; then
+    if [ "$rc" = 0 ] && [ "$code" = 200 ] && [ -n "$body" ]; then
       printf '%s\n' "$body"
       exit 0
     fi
-    printf '{}\n'
-    exit 0
   fi
-  # A hold is never spooled; Stop is status and is.
-  [ "$blocking" = 1 ] || spool
+  # A hold is never spooled: a replayed approval would be a phantom. Stop is
+  # status and is.
+  if [ "$blocking" = 0 ] && should_spool "$rc" "$code"; then spool; fi
   printf '{}\n'
   exit 0
 fi
 
 printf '{}\n'
-if [ "$reachable" = 1 ] && resp=$(post "/hook/$agent" 1.5); then
-  case "${resp##*
-}" in
-    2??) exit 0 ;;
-  esac
+rc=0 code=
+if [ "$reachable" = 1 ]; then
+  resp=$(post "/hook/$agent" 1.5) || rc=$?
+  code=${resp##*
+}
 fi
-spool
+if should_spool "$rc" "$code"; then spool; fi
 exit 0
