@@ -7,6 +7,7 @@ import type { SessionsView_Serialize, Session_Serialize, Workspace_Serialize } f
 import {
   branchPreview,
   BRANCH_PREFIX,
+  createComposerFlow,
   defaultProjectPath,
   effectiveBranch,
   initialFields,
@@ -17,6 +18,7 @@ import {
   toArgs,
   validate,
   type ComposerFields,
+  type CreatedWorktree,
 } from "./composer.ts";
 
 function session(id: string, over: Partial<Session_Serialize> = {}): Session_Serialize {
@@ -177,4 +179,72 @@ test("toArgs keeps the prompt exactly as typed, only blank becomes null", () => 
   const args = toArgs(fields({ prompt: "  fix the thing  " }));
   assert.equal(args.prompt, "  fix the thing  ");
   assert.equal(toArgs(fields({ prompt: "   " })).prompt, null);
+});
+
+test("refs are checked per component, as the daemon does", () => {
+  const withBase = (base: string) => validate({ ...initialFields(undefined), projectPath: "/repo", base });
+  for (const bad of ["feat/.hidden", "feat/x.lock/y", "@", "a//b", "/a", "a/", ".a", "a.lock"]) {
+    assert.equal(withBase(bad).some((error) => error.field === "base"), true, bad);
+  }
+  for (const good of ["feat/login", "origin/main", "v1.2.3", "release/2026-09"]) {
+    assert.equal(withBase(good).some((error) => error.field === "base"), false, good);
+  }
+});
+
+function flowWith(create: (args: unknown) => Promise<CreatedWorktree>) {
+  const effects = { toasts: [] as string[], restored: 0 };
+  const flow = createComposerFlow({
+    create: create as never,
+    toast: (message) => effects.toasts.push(message),
+    restoreFocus: () => {
+      effects.restored += 1;
+    },
+  });
+  return { flow, effects };
+}
+
+const valid = (): ComposerFields => ({ ...initialFields(undefined), projectPath: "/repo", name: "Fix login" });
+const created: CreatedWorktree = { session_id: "u", tmux_session_name: "t", worktree_path: "/w", branch: "ainb/fix-login" };
+
+test("the flow never sends what the daemon would refuse", () => {
+  let calls = 0;
+  const { flow } = flowWith(() => {
+    calls += 1;
+    return Promise.resolve(created);
+  });
+  flow.openComposer();
+  flow.submit({ ...valid(), base: "-rf" });
+  assert.equal(calls, 0);
+  assert.equal(flow.state().kind, "idle");
+});
+
+test("a success clears the pending card, closes the view and restores focus", async () => {
+  const { flow, effects } = flowWith(() => Promise.resolve(created));
+  flow.openComposer();
+  flow.submit(valid());
+  assert.equal(flow.state().kind, "creating");
+  assert.deepEqual(flow.pending(), { projectPath: "/repo", name: "Fix login" });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(flow.state().kind, "done");
+  assert.equal(flow.pending(), null);
+  assert.equal(flow.open(), false);
+  assert.equal(effects.restored, 1);
+});
+
+test("a failure keeps the view open when shown, and toasts when it was closed", async () => {
+  const shown = flowWith(() => Promise.reject("branch exists"));
+  shown.flow.openComposer();
+  shown.flow.submit(valid());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(shown.flow.state(), { kind: "failed", message: "branch exists" });
+  assert.equal(shown.flow.open(), true);
+  assert.deepEqual(shown.effects.toasts, []);
+
+  const closed = flowWith(() => Promise.reject("branch exists"));
+  closed.flow.openComposer();
+  closed.flow.submit(valid());
+  closed.flow.closeComposer();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(closed.effects.toasts, ["branch exists"]);
 });
