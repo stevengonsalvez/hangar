@@ -135,7 +135,7 @@ pub fn save(custody_dir: &Path, record: PairingRecord, token: &str) -> Result<()
 pub fn forget(custody_dir: &Path, host_id: &str) -> Result<(), WireError> {
     delete_secret(custody_dir, &token_secret(host_id))?;
     with_index(custody_dir, |records| {
-        records.retain(|r| r.host_id != host_id)
+        records.retain(|r| r.host_id != host_id);
     })
 }
 
