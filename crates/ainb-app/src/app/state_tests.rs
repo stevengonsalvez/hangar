@@ -651,6 +651,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -694,6 +695,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -733,6 +735,7 @@ mod tests {
             model_source: Default::default(),
             codex_model: None,
             codex_thread_id: None,
+            claude_session_id: None,
         };
 
         let session = AppState::stopped_session_from_metadata(
@@ -823,6 +826,7 @@ mod tests {
                 true,
                 false,
                 Some(&remote),
+                None,
             )
             .await
             .expect("respawn remote Codex pane");
@@ -3288,6 +3292,90 @@ mod tests {
             state.find_session(child_id).unwrap().live_attention.is_empty(),
             "a shared cwd must not copy parent attention onto a child"
         );
+    }
+
+    /// A Claude session runs under the id ainb minted for it, which its
+    /// record holds as its provider session id, and the daemon files every
+    /// request its hooks raise under that id: the row takes them exactly.
+    #[test]
+    fn a_claude_row_takes_the_hook_request_raised_under_its_minted_session_id() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/claude-minted";
+        let mut state = state_with_session_at(cwd, Some("tmux_claude"));
+        let id = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].provider_session_id =
+            Some("11111111-2222-4333-8444-555555555555".into());
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-hook".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert(
+            "11111111-2222-4333-8444-555555555555".into(),
+            vec![chip.clone()],
+        );
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-hook".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        let chips = &state.find_session(id).unwrap().live_attention;
+        assert_eq!(
+            chips.len(),
+            1,
+            "the request lands on the session that raised it"
+        );
+        assert_eq!(chips[0].kind, AttentionKind::Ask);
+        assert_eq!(state.fleet.attention_elsewhere, 0);
+    }
+
+    /// A request raised under an id no record holds, a `claude` started by
+    /// hand in the worktree or a question left from an earlier conversation,
+    /// is placed on no row even when the worktree names one session: an
+    /// answer sent there would reach the wrong agent's pane. It is counted
+    /// elsewhere instead.
+    #[test]
+    fn a_request_under_an_unknown_session_id_never_lands_by_worktree() {
+        use crate::fleet::attention::{AttentionKind, DaemonAttention, SessionAttention};
+
+        let cwd = "/work/claude-stranger";
+        let mut state = state_with_session_at(cwd, Some("tmux_claude"));
+        let id = state.sessions.workspaces[0].sessions[0].id;
+        state.sessions.workspaces[0].sessions[0].provider_session_id =
+            Some("11111111-2222-4333-8444-555555555555".into());
+        let chip = SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-stranger".into());
+        let mut by_session_id = std::collections::HashMap::new();
+        by_session_id.insert("some-other-claude".into(), vec![chip.clone()]);
+        let mut by_cwd = std::collections::HashMap::new();
+        by_cwd.insert(cwd.into(), vec![chip.clone()]);
+        let mut all = std::collections::HashMap::new();
+        all.insert("att-stranger".into(), chip);
+        *state.fleet.daemon_attention.lock().unwrap() = DaemonAttention::up_indexed(
+            by_session_id,
+            by_cwd,
+            std::collections::HashMap::new(),
+            all,
+        );
+
+        state.merge_attention(2_000);
+
+        assert!(
+            state.find_session(id).unwrap().live_attention.is_empty(),
+            "a request under another agent's id is not this session's"
+        );
+        assert_eq!(state.fleet.attention_elsewhere, 1);
+
+        // The same, for a record with no minted id at all: nothing is guessed.
+        state.sessions.workspaces[0].sessions[0].provider_session_id = None;
+        state.merge_attention(3_000);
+        assert!(state.find_session(id).unwrap().live_attention.is_empty());
+        assert_eq!(state.fleet.attention_elsewhere, 1);
     }
 
     #[test]
