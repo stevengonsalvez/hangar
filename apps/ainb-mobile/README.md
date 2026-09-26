@@ -5,8 +5,13 @@ transcript, prompt send, banner answers and (later) a terminal over the peer
 socket.
 
 Nothing here is linked by `ainb` or the daemon and the directory is outside
-the Cargo workspace, so v1.29.0 behaviour is untouched. The native binding
-(`ainb-wire-mobile`, lane E) is not linked yet: run with the fake transport.
+the Cargo workspace, so v1.29.0 behaviour is untouched. `src/wire/index.ts`
+selects the transport: `EXPO_PUBLIC_FAKE_WIRE=1` is the in-memory FakeWire;
+without it the app loads lane E's adapter (`src/wire/native.ts`, `NativeWire`
+over the ubrn-linked `ainb-wire-mobile` crate) with the custody and log
+directories from `wirePaths()` (expo-file-system, under the app's document
+directory). A missing or malformed adapter refuses to start; the app never
+falls back to the fake silently.
 
 ```sh
 npm ci
