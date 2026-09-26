@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ainb_hangar_proto::terminal::ACK_EVERY_BYTES;
-use ainb_wire_mobile::api::{ConnectParams, connect_host};
+use ainb_wire_mobile::api::{ConnectParams, connect_host, mint_op_id};
 use ainb_wire_mobile::pairing::{self, EndpointRecord, PairingRecord};
 use ainb_wire_mobile::records::{WireError, WireEvent};
 use ainb_wire_mobile::terminal::{
@@ -283,7 +283,7 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
 
     // Typing under the wrong generation is a value, not an error.
     let denied = Arc::clone(&host)
-        .terminal_input(7, b"ls\n".to_vec(), Some(3), None)
+        .terminal_input(7, b"ls\n".to_vec(), Some(3), mint_op_id())
         .await
         .unwrap();
     assert_eq!(
@@ -297,7 +297,10 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
             floor_gen: 3
         }
     );
-    let acquire = Arc::clone(&host).terminal_floor(7, "acquire".into(), None).await.unwrap();
+    let acquire = Arc::clone(&host)
+        .terminal_floor(7, "acquire".into(), mint_op_id())
+        .await
+        .unwrap();
     assert!(
         matches!(
             acquire,
@@ -307,14 +310,15 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
     );
 
     // Take the floor, then type under the new generation.
-    let taken = Arc::clone(&host).terminal_floor(7, "take".into(), None).await.unwrap();
+    let taken = Arc::clone(&host).terminal_floor(7, "take".into(), mint_op_id()).await.unwrap();
     let TerminalFloorOutcome::Floor { floor, op_id, .. } = taken else {
         panic!("{taken:?}")
     };
     assert_eq!(floor.floor_gen, 5);
     assert_eq!(op_id.len(), 32);
+    let minted = mint_op_id();
     let typed = Arc::clone(&host)
-        .terminal_input(7, b"ls\n".to_vec(), Some(5), None)
+        .terminal_input(7, b"ls\n".to_vec(), Some(5), minted.clone())
         .await
         .unwrap();
     let TerminalInputOutcome::Typed {
@@ -326,6 +330,7 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
         panic!("{typed:?}")
     };
     assert_eq!(floor_gen, 5);
+    assert_eq!(op_id, minted);
     assert_eq!(ack.unwrap().receipt.as_deref(), Some("delivered"));
     let wire = peer.params_of("terminal/input");
     assert_eq!(
@@ -335,7 +340,7 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
     );
     assert_eq!(wire.last().unwrap()["data"], b64(b"ls\n"));
     let retry = Arc::clone(&host)
-        .terminal_input(7, b"ls\n".to_vec(), Some(5), Some(op_id.clone()))
+        .terminal_input(7, b"ls\n".to_vec(), Some(5), minted.clone())
         .await
         .unwrap();
     assert!(
@@ -365,7 +370,7 @@ async fn attach_frames_decode_acks_flow_and_the_floor_is_a_value() {
         Arc::clone(&host).next_event().await,
         WireEvent::TerminalFrame { .. }
     ));
-    assert!(Arc::clone(&host).terminal_floor(7, "steal".into(), None).await.is_err());
+    assert!(Arc::clone(&host).terminal_floor(7, "steal".into(), mint_op_id()).await.is_err());
     host.close();
 }
 
@@ -404,6 +409,14 @@ async fn a_refused_ack_still_delivers_the_frame_and_is_logged_separately() {
             if *frame == TerminalFrameRecord::Output { data: chunk.clone() }),
         "the frame that triggered the refused ack is still delivered: {got:?}"
     );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while host.terminal_acks_failed() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no ack failure within 5 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(host.terminal_acks_failed(), 1);
     let log = host.connection_log(50);
     let failed = log.iter().find(|e| e.event == "ack_failed").expect("ack_failed logged");
