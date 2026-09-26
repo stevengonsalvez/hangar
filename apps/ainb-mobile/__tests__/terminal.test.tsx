@@ -50,14 +50,14 @@ test("ctrl turns a letter into its control byte", () => {
   expect(withCtrl("\x1b[A")).toBe("\x1b[A");
 });
 
-test("bytes written before ready are injected once the engine is up, and keys reach onInput", async () => {
+test("the sink exists from mount, bytes written before ready are injected once the engine is up, and keys reach onInput", async () => {
   const input: string[] = [];
   let sink: TerminalSink | undefined;
-  const screen = render(<TerminalView onReady={(s) => (sink = s)} onInput={(d) => input.push(d)} onFit={() => undefined} />);
-  expect(sink).toBeUndefined();
-  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
+  const screen = render(<TerminalView onSink={(s) => (sink = s)} onInput={(d) => input.push(d)} onFit={() => undefined} />);
   expect(sink).toBeDefined();
   sink!.write(new Uint8Array([104, 105]));
+  expect(injectedWrites()).toEqual([]);
+  await act(async () => bridge.engineMessage!(encode({ t: "ready" })));
   expect(injectedWrites()).toEqual([toBase64(new Uint8Array([104, 105]))]);
 
   fireEvent.press(screen.getByTestId("key-ctrl"));
@@ -68,14 +68,14 @@ test("bytes written before ready are injected once the engine is up, and keys re
 });
 
 test("a read-only terminal has no key bar", () => {
-  const screen = render(<TerminalView onReady={() => undefined} />);
+  const screen = render(<TerminalView onSink={() => undefined} />);
   expect(screen.queryByTestId("key-bar")).toBeNull();
   expect(screen.getByTestId("terminal-webview")).toBeTruthy();
 });
 
 test("the webview is locked to the inline document and ignores a foreign page's messages", async () => {
   const input: string[] = [];
-  render(<TerminalView onReady={() => undefined} onInput={(d) => input.push(d)} />);
+  render(<TerminalView onSink={() => undefined} onInput={(d) => input.push(d)} />);
   const p = bridge.props!;
   expect(p.originWhitelist).toEqual([ENGINE_URL]);
   expect((p.onShouldStartLoadWithRequest as (r: { url: string }) => boolean)({ url: "https://evil.example/" })).toBe(false);
