@@ -290,10 +290,11 @@ pub struct MobileHost {
 fn latch_repair(custody_dir: &Path, host_id: &str, err: &WireError) {
     if matches!(
         err,
-        WireError::Closed {
-            code: Some(peer_close::UNAUTHENTICATED | peer_close::REVOKED),
-            ..
-        }
+        WireError::PeerChanged
+            | WireError::Closed {
+                code: Some(peer_close::UNAUTHENTICATED | peer_close::REVOKED),
+                ..
+            }
     ) {
         let _ = pairing::mark_repair(custody_dir, host_id, true);
     }
@@ -333,14 +334,23 @@ pub async fn connect_host(params: ConnectParams) -> Result<Arc<MobileHost>, Wire
             })?;
         let key = DeviceKey::load_or_create(custody_dir)?;
         let log = open_log(&params.log_dir)?;
-        let session = pairing::dial(
+        let session = match pairing::dial(
             &record.endpoints,
             &host_id,
             host_static_pubkey,
             &key,
             Some(log),
         )
-        .await?;
+        .await
+        {
+            Ok(session) => session,
+            Err(e) => {
+                // A wrong pinned host key, or 4401 before message 2, is the
+                // host refusing this device's identity: latch re-pair.
+                latch_repair(custody_dir, &params.host_id, &e);
+                return Err(e);
+            }
+        };
         let hello = match hello(&session, &token, &record.device_id, &record.display_name).await {
             Ok(hello) => hello,
             Err(e) => {
@@ -646,10 +656,23 @@ impl MobileHost {
                 SessionEvent::Notification(n) => WireEvent::from_notification(&n.method, n.params),
                 SessionEvent::Lagged(dropped) => WireEvent::Lagged { dropped },
                 SessionEvent::Closed { code, reason } => {
-                    if let Some(closed) = self.session.closed() {
-                        latch_repair(&self.custody_dir, &self.host_id, &closed.error());
-                    }
-                    let (retryable, retry_after_ms) = classify_close(code, &reason);
+                    // The session's own record says whether this side closed
+                    // on purpose (never retryable) or the host did.
+                    let (retryable, retry_after_ms) = match self.session.closed() {
+                        Some(closed) => {
+                            let err = closed.error();
+                            latch_repair(&self.custody_dir, &self.host_id, &err);
+                            match err {
+                                WireError::Closed {
+                                    retryable,
+                                    retry_after_ms,
+                                    ..
+                                } => (retryable, retry_after_ms),
+                                _ => classify_close(code, &reason),
+                            }
+                        }
+                        None => classify_close(code, &reason),
+                    };
                     WireEvent::Closed {
                         code,
                         reason,
