@@ -235,15 +235,14 @@ fn group_rows(rows: &[WireRow]) -> GroupedRows {
                 .or_default()
                 .push(chip.clone());
         }
-        let cwd = row.cwd.trim_end_matches('/');
+        // Keyed by the directory's one spelling, as `rows_for` looks it up:
+        // the daemon holds the cwd as the agent reported it, canonical, and
+        // the row on screen holds the path ainb was given (#132).
+        let cwd = ainb_fleet_core::read::jsonl_tail::canonical_dir(&row.cwd);
         if !cwd.is_empty() {
-            grouped.by_cwd.entry(cwd.to_string()).or_default().push(chip.clone());
+            grouped.by_cwd.entry(cwd.clone()).or_default().push(chip.clone());
             if row.session_id.is_empty() {
-                grouped
-                    .by_cwd_without_session_id
-                    .entry(cwd.to_string())
-                    .or_default()
-                    .push(chip.clone());
+                grouped.by_cwd_without_session_id.entry(cwd).or_default().push(chip.clone());
             }
         }
         grouped.all.insert(row.id.clone(), chip);

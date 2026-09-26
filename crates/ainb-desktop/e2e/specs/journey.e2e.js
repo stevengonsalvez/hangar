@@ -10,7 +10,7 @@ import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { click, setPaletteQuery } from "../support.js";
-import { env, paneText, run, seed, seeded } from "../world.js";
+import { env, paneText, run, seed, seeded, tmux } from "../world.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MIB = 1024 * 1024;
@@ -164,7 +164,7 @@ describe("the desktop shell", () => {
     // read runs in the pane the tab is already showing.
     const before = await paintedBy(key);
     const started = Date.now();
-    run("tmux", ["send-keys", "-t", `=${first.tmux}:`, `bulk ${path}`, "Enter"]);
+    tmux(["send-keys", "-t", `=${first.tmux}:`, `bulk ${path}`, "Enter"]);
 
     let finished = false;
     try {

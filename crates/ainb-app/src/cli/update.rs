@@ -1150,19 +1150,27 @@ pub fn ensure_schedule_with(
     installed: impl FnOnce() -> bool,
     install: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    if let Some(home) = home {
-        if crate::cli::hangar::is_under_temp_dir(home) {
-            anyhow::bail!(
-                "{} is a temporary home; the daily release checker registers with the real \
-                 user's service manager, so it is not installed from here",
-                home.display()
-            );
-        }
-    }
+    refuse_temp_home(home, "installed")?;
     if installed() {
         return Ok(());
     }
     install()
+}
+
+/// Refuse a home under the system temp dir: installing or removing the
+/// release checker goes through the user's service manager, which such a home
+/// does not scope. `what` is the verb for the message.
+fn refuse_temp_home(home: Option<&std::path::Path>, what: &str) -> Result<()> {
+    if let Some(home) = home {
+        if crate::cli::hangar::is_under_temp_dir(home) {
+            anyhow::bail!(
+                "{} is a temporary home; the daily release checker registers with the real \
+                 user's service manager, so it is not {what} from here",
+                home.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn install_schedule() -> Result<()> {
@@ -1205,7 +1213,25 @@ fn enable_schedule() -> Result<()> {
 }
 
 /// Remove the daily release checker and its OS registration.
+///
+/// Refused for a home under the system temp dir, as [`ensure_schedule`] is:
+/// `systemctl --user disable --now` and `launchctl unload` would stop the real
+/// user's checker, whatever `HOME` says.
 pub fn disable_schedule() -> Result<()> {
+    disable_schedule_with(dirs::home_dir().as_deref(), remove_schedule)
+}
+
+/// [`disable_schedule`] with the home and the removal passed in, so the
+/// refusal is proven on the removal itself.
+pub fn disable_schedule_with(
+    home: Option<&std::path::Path>,
+    remove: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    refuse_temp_home(home, "removed")?;
+    remove()
+}
+
+fn remove_schedule() -> Result<()> {
     if cfg!(target_os = "macos") {
         if let Some(path) = launchd_path().filter(|path| path.exists()) {
             let _ =
@@ -1258,6 +1284,32 @@ mod tests {
             "a temp home must be refused, not skipped in silence"
         );
         assert!(!installed, "the install ran for a temp home");
+    }
+
+    #[test]
+    fn a_temp_home_never_disables_the_real_checker() {
+        let home = tempfile::tempdir().expect("temp home");
+        let mut removed = false;
+        let result = super::disable_schedule_with(Some(home.path()), || {
+            removed = true;
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "a temp home must be refused, not skipped in silence"
+        );
+        assert!(!removed, "the removal ran for a temp home");
+    }
+
+    #[test]
+    fn a_real_home_disables_the_checker() {
+        let mut removed = false;
+        super::disable_schedule_with(Some(std::path::Path::new("/home/someone")), || {
+            removed = true;
+            Ok(())
+        })
+        .expect("a real home is not refused");
+        assert!(removed, "the removal did not run for a real home");
     }
 
     #[test]

@@ -41,7 +41,60 @@ struct App {
     pty: Pty,
     screen: ScreenCapture,
     // Dropped last: the app is gone before its home is deleted.
-    _root: tempfile::TempDir,
+    root: IsolatedRoot,
+}
+
+/// The directory an app runs under, whose `tmux/` holds its own tmux server
+/// (and `tmux-visual/` the visual-debug copy's).
+///
+/// Dropping it kills every session on that server, each by its exact name,
+/// while the socket directory still exists, and only then deletes the
+/// directory: a server whose socket is gone can no longer be reached, and it
+/// and a test's `sleep 600` would linger. The last session takes the server
+/// with it. Held from before the app is spawned, so a failed spawn is covered
+/// too.
+struct IsolatedRoot(tempfile::TempDir);
+
+impl IsolatedRoot {
+    fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for IsolatedRoot {
+    fn drop(&mut self) {
+        // The hangar daemon the TUI brought up in this home. It stops by
+        // itself once its TUI is gone, but a moment later, when this
+        // directory may already be deleted under it: `stop` signals the exact
+        // pid it recorded, and returns once it has.
+        if self.path().join("hangar/hangar/daemon.pid").exists() {
+            let _ = Command::new(helpers::visual_debug::ainb_bin())
+                .args(["hangar", "daemon", "stop"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", self.path().join("home"))
+                .env("AINB_HOME", self.path().join("home"))
+                .env("AINB_HANGAR_HOME", self.path().join("hangar"))
+                .output();
+        }
+        // `tmux-visual` is the visual-debug Terminal.app copy's own server.
+        for server in ["tmux", "tmux-visual"] {
+            let dir = self.path().join(server);
+            let tmux = |args: &[&str]| {
+                Command::new("tmux")
+                    .args(args)
+                    .env("TMUX_TMPDIR", &dir)
+                    .env_remove("TMUX")
+                    .output()
+            };
+            let Ok(listed) = tmux(&["list-sessions", "-F", "#{session_name}"]) else {
+                continue;
+            };
+            for name in String::from_utf8_lossy(&listed.stdout).lines() {
+                let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
+            }
+        }
+    }
 }
 
 impl App {
@@ -50,10 +103,11 @@ impl App {
     }
 
     fn start_in(root: tempfile::TempDir) -> Self {
+        let root = IsolatedRoot(root);
         let mut app = Self {
             pty: spawn_app(root.path()),
             screen: ScreenCapture::new(ROWS, COLS),
-            _root: root,
+            root,
         };
         app.wait_until("the home screen on the alternate screen", |s| {
             s.screen().alternate_screen() && s.has_text(HOME)
@@ -335,4 +389,32 @@ mod vt100_tests {
         drop(victim);
         app.quit();
     }
+}
+
+/// The hangar daemon the TUI brings up in its test home is stopped before
+/// that home is deleted, not left to notice its TUI is gone a moment later.
+#[test]
+#[ignore]
+fn test_e2e_hangar_daemon_is_stopped_with_its_home() {
+    let app = App::start();
+    let pid_file = app.root.path().join("hangar/hangar/daemon.pid");
+    let deadline = Instant::now() + WAIT;
+    let pid = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+        {
+            break pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the TUI never started its hangar daemon"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    drop(app);
+    let alive = Command::new("kill").args(["-0", &pid]).status().is_ok_and(|s| s.success());
+    assert!(!alive, "hangar daemon {pid} outlived its test home");
 }
