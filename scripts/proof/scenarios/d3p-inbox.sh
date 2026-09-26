@@ -49,11 +49,8 @@ scenario() {
 
   fixture_session || { check "the CLI seeded a session before the window opened" false; return; }
 
-  if ! start_desktop; then
-    check "the desktop window applied a frame batch within 90 s" false
-    [[ -s "$PROOF_WORLD/desktop.stderr" ]] && observe "window stderr: $(tail -3 "$PROOF_WORLD/desktop.stderr")"
-    return
-  fi
+  # A failed boot is recorded by start_desktop itself.
+  start_desktop || return
   observe "sections in the first batch the renderer applied: $(applied_sections)"
   check "the window subscribes to the inbox section from its first batch" \
     grep -q '"inbox"' <<<"$(applied_sections)"
