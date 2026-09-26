@@ -2781,11 +2781,14 @@ fn install_http_hooks() -> anyhow::Result<()> {
             endpoint.display()
         )
     })?;
-    let parsed = ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
+    ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
         .map_err(|e| anyhow::anyhow!("unreadable hook endpoint {}: {e}", endpoint.display()))?;
     anyhow::ensure!(
-        parsed.headers_path.exists(),
-        "the hook endpoint names a headers file that does not exist"
+        hangar_home
+            .join("hangar")
+            .join(ainb_hangar_proto::hooks::HEADERS_FILE_NAME)
+            .is_file(),
+        "the hangar daemon has no hook headers file beside its endpoint"
     );
     let paths = ainb_plugin_notifyd::paths::Paths::under(hangar_home.clone());
     let script = ainb_plugin_notifyd::install::extract_http_hook_script(&paths)?;
