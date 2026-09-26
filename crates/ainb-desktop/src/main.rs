@@ -286,6 +286,7 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
 /// its next scan. A refusal comes back as the sentence the composer shows.
 #[tauri::command]
 async fn worktree_create(
+    app: tauri::AppHandle,
     window: tauri::State<'_, Window>,
     args: CreateWorktreeArgs,
 ) -> Result<CreatedWorktree, String> {
@@ -295,16 +296,38 @@ async fn worktree_create(
     .map_err(|error| ainb_desktop::create::refusal_text(&error))?;
     let created = ainb_desktop::create::request(&client, args).await?;
     tracing::info!(session = %created.session_id, "window created a worktree session");
-    if let (Some(terminals), Ok(id)) = (
+    // The session exists either way; a tab that cannot open is said out loud
+    // rather than leaving the person with a closed composer and nothing new.
+    let attach_problem = match (
         &window.terminals,
         uuid::Uuid::parse_str(&created.session_id),
     ) {
-        let target = TabTarget::Session {
-            id,
-            tmux: created.tmux_session_name.clone(),
-        };
-        if let Some(report) = terminals.open(target) {
-            window.shell.dispatch(report);
+        (None, _) => Some("no tmux was found".to_string()),
+        (Some(_), Err(error)) => Some(format!(
+            "the daemon named session {:?}: {error}",
+            created.session_id
+        )),
+        (Some(terminals), Ok(id)) => {
+            let target = TabTarget::Session {
+                id,
+                tmux: created.tmux_session_name.clone(),
+            };
+            // A report back is the tab failing to attach; the reducer shows it
+            // in its own words, so this does not repeat it.
+            if let Some(report) = terminals.open(target) {
+                window.shell.dispatch(report);
+            }
+            None
+        }
+    };
+    if let Some(problem) = attach_problem {
+        let message = intent::toast_text(&format!(
+            "Created {} but could not open its tab: {problem}",
+            created.branch
+        ));
+        tracing::warn!(%message, "worktree created without a tab");
+        if let Err(error) = app.emit("toast", &message) {
+            tracing::warn!(%error, "toast not delivered to the webview");
         }
     }
     Ok(created)
