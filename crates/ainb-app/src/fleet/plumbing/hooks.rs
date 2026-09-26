@@ -227,7 +227,9 @@ pub fn merge_http_into(settings: Value, hook_script: &str) -> Value {
         if !arr.is_array() {
             *arr = Value::Array(Vec::new());
         }
-        arr.as_array_mut().expect("ensured array").push(http_managed_entry(event, hook_script));
+        arr.as_array_mut()
+            .expect("ensured array")
+            .push(http_managed_entry(event, hook_script));
     }
     settings
 }
@@ -613,7 +615,12 @@ mod tests {
         assert!(events.iter().any(|e| e == "Notification"));
         assert!(events.iter().any(|e| e == "Elicitation"));
         // No legacy entry survives, and nothing of ours on a dropped event.
-        for event in ["Setup", "PreCompact", "PermissionDenied", "ElicitationResult"] {
+        for event in [
+            "Setup",
+            "PreCompact",
+            "PermissionDenied",
+            "ElicitationResult",
+        ] {
             assert!(
                 commands_for(&http, event).iter().all(|c| !c.contains("AINB_MANAGED")),
                 "{event}"
@@ -621,7 +628,11 @@ mod tests {
         }
         assert!(!http["hooks"].as_object().unwrap().contains_key("Setup"));
         // Reflect and notifyd hooks are untouched.
-        assert!(commands_for(&http, "PreCompact").iter().any(|c| c.contains("precompact_reflect.py")));
+        assert!(
+            commands_for(&http, "PreCompact")
+                .iter()
+                .any(|c| c.contains("precompact_reflect.py"))
+        );
         let stop = commands_for(&http, "Stop");
         assert!(stop.iter().any(|c| c.contains("stop_reflect.py")));
         assert!(stop.iter().any(|c| c == "AINB_AGENT=claude /x/notify.sh"));
@@ -634,12 +645,18 @@ mod tests {
         let http = merge_http_into(json!({}), "/x/ainb-hook.sh");
         for event in ainb_hangar_proto::hooks::CLAUDE_HOOK_EVENTS {
             let entry = &http["hooks"][event][0];
-            let want = if matches!(event, "PermissionRequest" | "PreToolUse") { 660 } else { 10 };
+            let want = if matches!(event, "PermissionRequest" | "PreToolUse") {
+                660
+            } else {
+                10
+            };
             assert_eq!(entry["hooks"][0]["timeout"], want, "{event}");
             let cmd = entry["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(
                 cmd,
-                format!("AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc '/x/ainb-hook.sh'")
+                format!(
+                    "AINB_AGENT=claude AINB_HOOK_EVENT={event} AINB_MANAGED=atc '/x/ainb-hook.sh'"
+                )
             );
         }
     }
