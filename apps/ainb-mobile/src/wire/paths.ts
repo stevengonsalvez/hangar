@@ -1,10 +1,12 @@
 // The two app-data directories the native adapter hands the crate: where
-// it keeps secrets (the device key, pairing tokens, the pairing index) and
-// where the connection log lives. Both are under the app's private document
-// directory (`expo-file-system`), so they survive updates, are excluded
-// from nothing the platform backs up privately, and are removed with the
-// app. On iOS the device key itself lives in the keychain (the crate's
-// custody backend); the directory holds the index and file-backed secrets.
+// it keeps the pairing index, pairing tokens and the file-backed device key,
+// and where the connection log lives. Both sit under the app's private
+// Documents directory (`expo-file-system`'s `Paths.document`): private to the
+// app, kept across updates, removed with the app. On iOS the device key is
+// in the keychain (the crate's custody backend) and the pairing index is a
+// file in Documents; Documents is in the iCloud/iTunes backup unless the
+// app marks it excluded, which the switch to the adapter must do for the
+// custody directory.
 //
 // `expo-file-system` is a dependency of the switch to the adapter: add
 // `"expo-file-system": "~57.0.7"` (`npx expo install expo-file-system`,
