@@ -2744,6 +2744,7 @@ mod tests {
             discovered_at: NOW - 2_000,
             last_observed_at: NOW - 1_000,
             lifecycle_updated_at: NOW - 1_000,
+            session_incarnation: None,
             attention_updated_at: NOW - 1_000,
             model: None,
             reasoning_effort: None,
