@@ -826,6 +826,20 @@ impl DaemonClient {
         self.call_typed(methods::WORKSPACE_SESSION_LIST, &params).await
     }
 
+    /// Create a worktree with one agent session in it (`worktree/create`).
+    ///
+    /// The daemon runs the CLI's own create path, which waits up to 30s for
+    /// the agent's input box before sending the first prompt and bounds the
+    /// whole run at 120s, so this call waits longer than the default. A daemon
+    /// without the spawn switch answers `METHOD_NOT_FOUND`.
+    pub async fn worktree_create(
+        &self,
+        params: &ainb_hangar_proto::spawn::WorktreeCreateParams,
+    ) -> Result<ainb_hangar_proto::spawn::WorktreeCreateResult, DaemonError> {
+        self.call_typed_within(methods::WORKTREE_CREATE, params, Duration::from_secs(150))
+            .await
+    }
+
     /// Upsert one workspace session into the daemon store.
     pub async fn workspace_session_upsert(
         &self,
