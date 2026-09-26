@@ -279,6 +279,10 @@ struct FleetRowFrame<'a> {
     discovered_at: i64,
     last_observed_at: i64,
     lifecycle_updated_at: i64,
+    /// The `fleet/action` fence value (F-1), like `lifecycle_updated_at` is
+    /// the `fleet/message_send` one: a surface that acts through the mirror
+    /// needs what it read.
+    session_incarnation: Option<String>,
     attention_updated_at: i64,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -314,6 +318,7 @@ impl<'a> FleetRowFrame<'a> {
             discovered_at,
             last_observed_at,
             lifecycle_updated_at,
+            session_incarnation,
             attention_updated_at,
             model,
             reasoning_effort,
@@ -341,6 +346,7 @@ impl<'a> FleetRowFrame<'a> {
             discovered_at: *discovered_at,
             last_observed_at: *last_observed_at,
             lifecycle_updated_at: *lifecycle_updated_at,
+            session_incarnation: session_incarnation.clone(),
             attention_updated_at: *attention_updated_at,
             model: model.clone(),
             reasoning_effort: reasoning_effort.clone(),

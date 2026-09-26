@@ -78,6 +78,7 @@ fn seed(store: &mut SessionStore, tmux_name: &str, worktree: &Path, name: &str) 
         model_source: ModelSource::default(),
         codex_model: None,
         codex_thread_id: None,
+        claude_session_id: None,
     });
     id
 }

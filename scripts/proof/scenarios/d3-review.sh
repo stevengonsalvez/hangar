@@ -60,11 +60,8 @@ scenario() {
   check "a separate process wrote $DIFF_FILES changed files into the worktree" \
     test "$(changed_files)" = "$DIFF_FILES"
 
-  if ! start_desktop; then
-    check "the desktop window applied a frame batch within 90 s" false
-    [[ -s "$PROOF_WORLD/desktop.stderr" ]] && observe "window stderr: $(tail -3 "$PROOF_WORLD/desktop.stderr")"
-    return
-  fi
+  # A failed boot is recorded by start_desktop itself.
+  start_desktop || return
   observe "sections in the first batch the renderer applied: $(applied_sections)"
 
   # The subscription is the thing a review tab cannot work without: a section

@@ -531,6 +531,7 @@ mod tests {
 
     fn mk_session(cwd: &str) -> Session {
         Session {
+            provider_session_id: None,
             id: "sid".to_string(),
             cwd: cwd.to_string(),
             pid: None,

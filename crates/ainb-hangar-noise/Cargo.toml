@@ -27,6 +27,8 @@ serde_json = { workspace = true }
 # set spike 5/6 built for the phone targets. Declared here, not in the root
 # `[workspace.dependencies]`, so no other lane's file changes.
 snow = "0.9"
+# Zeroes a static key pair when it drops. Pure Rust, like the rest.
+zeroize = { version = "1", features = ["derive"] }
 
 # Local lint config, mirroring ainb-hangar-proto (the workspace-level lint
 # groups share a priority with specific lints, which rustc rejects).
