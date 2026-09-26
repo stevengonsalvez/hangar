@@ -1,0 +1,42 @@
+# M1-09 / M1-14: the two-tap banner answer.
+#
+# FakeWire build: launch with EXPO_PUBLIC_FAKE_WIRE=1; the seeded ASK
+# "Which runner do you mean?" is open on host mbp, so no pairing step runs.
+# Real daemon (M1-14): scripts/proof/scenarios/m1-phone-answer.sh installs the
+# build, mints the invite and passes the offer as OFFER; the pair step below
+# then runs and the ASK is the fixture the scenario raised.
+appId: com.stevengonsalvez.ainb.mobile
+env:
+  OFFER: ""
+---
+- launchApp:
+    clearState: true
+- runFlow:
+    when:
+      true: ${OFFER != ""}
+    commands:
+      - tapOn:
+          id: "pair"
+      - tapOn:
+          id: "offer"
+      - inputText: ${OFFER}
+      - tapOn:
+          id: "pair-submit"
+      - assertVisible:
+          text: "reachable"
+- assertVisible:
+    text: "Which runner do you mean?"
+# tap 1: the banner
+- tapOn:
+    id: "banner-att-1"
+- assertVisible:
+    id: "answer-sheet"
+# tap 2: the option
+- tapOn:
+    id: "option-2"
+- assertVisible:
+    text: "Delivered"
+- tapOn:
+    id: "answer-done"
+- assertNotVisible:
+    id: "banner-att-1"
