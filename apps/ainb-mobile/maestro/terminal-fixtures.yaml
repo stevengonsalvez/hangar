@@ -1,0 +1,25 @@
+# M1-11: the terminal renders the recorded fixture at phone size.
+# The FakeWire stream snapshots f1-altscreen on attach; the screenshot is the
+# artifact the compare reads (framed panel, log lines, status row).
+#   HOST_ID, SESSION_KEY: see README.md
+appId: com.stevengonsalvez.ainb.mobile
+---
+- launchApp:
+    clearState: true
+- tapOn:
+    id: "host-${HOST_ID}"
+- tapOn:
+    id: "session-${SESSION_KEY}"
+- tapOn:
+    id: "tab-terminal"
+- assertVisible:
+    id: "terminal"
+- assertVisible:
+    id: "terminal-size"
+# painted, not merely up: the engine row counts the bytes xterm has written,
+# and a blank terminal reads "engine ready, 0 B" or shows no count at all
+- assertVisible:
+    text: "engine ready, [1-9][0-9]* B.*"
+- waitForAnimationToEnd:
+    timeout: 2000
+- takeScreenshot: terminal-f1-altscreen
