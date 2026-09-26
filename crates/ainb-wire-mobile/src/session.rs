@@ -50,7 +50,11 @@ pub const BACKOFF_MIN: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_mins(1);
 
 /// What a session dials.
-#[derive(Debug, Clone)]
+///
+/// `Debug` never prints the device private key: it is rendered as
+/// `<redacted>`, and the pinned host key as its SHA-256 digest, so a config
+/// that reaches a log line or a panic message carries no key bytes.
+#[derive(Clone)]
 pub struct ConnectConfig {
     /// `ws://host:port/peer`.
     pub url: String,
@@ -93,6 +97,24 @@ impl ConnectConfig {
             connect_timeout: CONNECT_TIMEOUT,
             log: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ConnectConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectConfig")
+            .field("url", &self.url)
+            .field("carrier", &self.carrier)
+            .field("host_id", &self.host_id)
+            .field(
+                "host_static_pubkey_digest",
+                &digest(&self.host_static_pubkey),
+            )
+            .field("device_private_key", &"<redacted>")
+            .field("heartbeat", &self.heartbeat)
+            .field("rpc_timeout", &self.rpc_timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .finish_non_exhaustive()
     }
 }
 
@@ -832,6 +854,34 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_of_a_config_carries_no_key_bytes() {
+        let private: Vec<u8> = (1..=32).collect();
+        let host_key = [0xABu8; 32];
+        let config = ConnectConfig::new(
+            "ws://127.0.0.1:1/peer",
+            CarrierKind::Lan,
+            HostId::parse("01K5A0000000000000000ABCDE").unwrap(),
+            host_key,
+            private.clone(),
+        );
+        let text = format!("{config:?}");
+        let alt = format!("{config:#?}");
+        for rendered in [
+            format!("{private:?}"),
+            format!("{:?}", &private[..4]),
+            "1, 2, 3, 4".to_owned(),
+            format!("{host_key:?}"),
+            "171, 171".to_owned(),
+        ] {
+            assert!(!text.contains(&rendered), "{text}");
+            assert!(!alt.contains(&rendered), "{alt}");
+        }
+        assert!(text.contains("<redacted>"));
+        assert!(text.contains(&digest(&host_key)));
+        assert!(text.contains("ws://127.0.0.1:1/peer"));
+    }
 
     #[test]
     fn two_unanswered_pings_are_dead_and_a_pong_resets() {
