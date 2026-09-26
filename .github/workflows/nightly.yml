@@ -262,6 +262,20 @@ jobs:
             echo "::error::expected both keeping_dead_pane tests to run; filter may have stopped matching"
             exit 1
           fi
+      # R2 WP8: the terminal feed actor against a real tmux server (seed
+      # ordering, pause/continue re-seed, feed loss, session gone). Behind the
+      # `terminal-stream` feature, which release builds never enable; the
+      # suite self-skips without tmux, so the SKIP grep is the guard.
+      - name: Terminal feed against a real tmux server
+        run: |
+          set -o pipefail
+          cargo test -p ainb-hangar-daemon --features terminal-stream \
+            --test term_feed --no-fail-fast -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/term-feed.log"
+          if grep -q '^SKIP:' "$RUNNER_TEMP/term-feed.log"; then
+            echo "::error::term_feed suite SKIPped, so the feed was never exercised on this runner"
+            exit 1
+          fi
 
   # ──────────────────────────────────────────────────────────────────────────
   # The full macOS nextest leg, dropped from the required set because its
