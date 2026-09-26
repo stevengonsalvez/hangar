@@ -2,12 +2,14 @@ import { fireEvent, waitFor } from "@testing-library/react-native";
 import { renderRouter } from "expo-router/testing-library";
 
 import { reset } from "../src/attention/store";
+import { resetLifecycle } from "../src/lifecycle";
 import { FakeWire, FAKE_HOST_A } from "../src/wire/fake";
 import { setWire } from "../src/wire";
 
 let fake: FakeWire;
 beforeEach(() => {
   reset();
+  resetLifecycle();
   fake = new FakeWire();
   setWire(fake);
 });
