@@ -1,7 +1,7 @@
-//! `worktree/create` and `worktree/agent_add` ship dark: with
+//! `worktree/create`, `worktree/agent_add` and `shell/create` ship dark: with
 //! `AINB_HANGAR_SPAWN` unset at boot the daemon answers `METHOD_NOT_FOUND`,
-//! exactly as a v1.29.0 daemon does, and neither method is in the mutation
-//! registry yet.
+//! exactly as a v1.29.0 daemon does, and none is in the mutation registry
+//! yet.
 //!
 //! Its own test binary: the switch is read once per process, so the enabled
 //! path lives in `spawn_verbs.rs`, a separate process that sets it.
@@ -38,6 +38,15 @@ async fn worktree_agent_add_is_method_not_found_by_default() {
     assert_method_not_found(
         m::WORKTREE_AGENT_ADD,
         serde_json::json!({"worktree_path": "/tmp", "agent": "claude"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shell_create_is_method_not_found_by_default() {
+    assert_method_not_found(
+        m::SHELL_CREATE,
+        serde_json::json!({"worktree_path": "/tmp"}),
     )
     .await;
 }
@@ -87,6 +96,11 @@ fn worktree_agent_add_is_not_in_the_mutation_registry_while_dark() {
     assert!(!ainb_hangar_proto::mutation::is_mutating(
         m::WORKTREE_AGENT_ADD
     ));
+}
+
+#[test]
+fn shell_create_is_not_in_the_mutation_registry_while_dark() {
+    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
 }
 
 #[test]
