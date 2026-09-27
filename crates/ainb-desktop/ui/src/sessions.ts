@@ -80,6 +80,20 @@ export function providerId(sessionKey: string): string {
 }
 
 /**
+ * What a card is called when no session row names it. A legacy card's key is
+ * `legacy:<provider>:<tmux target>:<fingerprint>` (`SessionKey::legacy`): its
+ * name is the tmux target, the thing a person would recognise. Any other key
+ * is `<provider>:<session id>`: the provider and the id's first 8 characters.
+ * Never the raw key, which is an identifier and not a name.
+ */
+export function keyLabel(sessionKey: string): string {
+  const legacy = /^legacy:[^:]+:(.+):[^:]*$/.exec(sessionKey);
+  if (legacy) return legacy[1];
+  const at = sessionKey.indexOf(":");
+  return at < 0 ? sessionKey : `${sessionKey.slice(0, at)} ${sessionKey.slice(at + 1, at + 9)}`;
+}
+
+/**
  * Whether `sessionId` is the session list's selected row.
  *
  * The frame carries only the rows the filter shows, and the selection by id
@@ -95,7 +109,13 @@ export function ringCount(view: SessionsView_Serialize | undefined, kind: Attent
   return allSessions(view).filter((session) => ringFor(session) === kind).length;
 }
 
-/** How many rows are idle, the header's last count. */
+/**
+ * How many rows are idle, the footer's last count. A row that rings is
+ * waiting on a person, whatever its lifecycle says: an agent blocked on a
+ * question sits at an idle prompt, so its status reads `Idle` too. Counting
+ * it here as well as in "need you" showed one waiting session as
+ * "1 need you 1 idle"; a row lands in exactly one of the two counts.
+ */
 export function idleCount(view: SessionsView_Serialize | undefined): number {
-  return allSessions(view).filter((session) => session.status === "Idle").length;
+  return allSessions(view).filter((session) => session.status === "Idle" && ringFor(session) === null).length;
 }
