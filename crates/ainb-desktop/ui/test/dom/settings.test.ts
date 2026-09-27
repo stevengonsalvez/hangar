@@ -263,7 +263,7 @@ test("the settings page draws Appearance > Theme when it is given a setter", asy
   await settle();
   const panel = container.querySelector('section[aria-label="Appearance"]');
   assert.ok(panel, "an Appearance panel");
-  assert.equal(panel.querySelector('[data-theme-choice="dark"]')?.getAttribute("aria-checked"), "true");
-  panel.querySelector<HTMLButtonElement>('[data-theme-choice="light"]')!.click();
+  assert.equal(panel.querySelector<HTMLInputElement>('[data-theme-choice="dark"] input')?.checked, true);
+  panel.querySelector<HTMLInputElement>('[data-theme-choice="light"] input')!.click();
   assert.deepEqual(picked, ["light"]);
 });
