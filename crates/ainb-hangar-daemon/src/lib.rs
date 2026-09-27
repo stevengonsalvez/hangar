@@ -56,6 +56,10 @@ pub mod atc;
 /// qualifying session event and raises an answerable row + an `AttentionRaised`
 /// nudge. The producer half of the answerable-inbox pipeline.
 pub mod attention_ingest;
+/// Wakes every `fleet/subscribe` reader when a human closes or reopens an
+/// attention row, so the agent-status read is re-taken at once rather than
+/// on the agent's next hook.
+pub mod attention_wake;
 /// [`beads_adapter::BdClient`] is the sync layer's gateway to Stevie's existing
 /// issue tracker: `create` / `close` / `list` / `show`, each passing `BEADS_DIR`
 /// explicitly and serialised by an O_EXCL pidfile lock.
