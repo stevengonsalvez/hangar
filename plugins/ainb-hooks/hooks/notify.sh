@@ -21,19 +21,6 @@ else
   AINB_INPUT_SOURCE="stdin"
 fi
 
-# ----- 1b. HTTP transport handover --------------------------------------------
-# `ainb fleet atc setup --hooks=http` hands the managed hooks to ainb-hook.sh,
-# which posts to the hangar daemon, and writes `http` to hooks/transport. This
-# script may still be registered by the ainb-hooks Claude plugin; delivering a
-# second copy then would put a second waiter on every PermissionRequest beside
-# the daemon's hold. Stand down with an empty decision instead.
-AINB_TRANSPORT_FILE="${AINB_HANGAR_HOME:-${AINB_HOME:-${HOME}/.agents-in-a-box}}/hooks/transport"
-if [ -r "${AINB_TRANSPORT_FILE}" ] \
-  && [ "$(head -c 16 "${AINB_TRANSPORT_FILE}" 2>/dev/null | tr -d '[:space:]')" = "http" ]; then
-  printf '{}\n'
-  exit 0
-fi
-
 # An empty input is a noop — exit cleanly.
 if [ -z "${AINB_INPUT}" ]; then
   exit 0
@@ -48,6 +35,21 @@ if [ -z "${AINB_AGENT:-}" ]; then
     stdin)  AINB_AGENT="claude" ;;
     *)      AINB_AGENT="unknown" ;;
   esac
+fi
+
+# ----- 2b. HTTP transport handover (Claude only) -----------------------------
+# `ainb fleet atc setup --hooks=http` hands the managed CLAUDE hooks to
+# ainb-hook.sh, which posts to the hangar daemon, and writes `http` to
+# hooks/transport. This script may still be registered for Claude by the
+# ainb-hooks plugin; delivering a second copy then would put a second waiter on
+# every PermissionRequest beside the daemon's hold, so a Claude event stands
+# down with an empty decision. Codex, Copilot and Antigravity still come
+# through here and are delivered as before.
+AINB_TRANSPORT_FILE="${AINB_HANGAR_HOME:-${AINB_HOME:-${HOME}/.agents-in-a-box}}/hooks/transport"
+if [ "${AINB_AGENT}" = "claude" ] && [ -r "${AINB_TRANSPORT_FILE}" ] \
+  && [ "$(head -c 16 "${AINB_TRANSPORT_FILE}" 2>/dev/null | tr -d '[:space:]')" = "http" ]; then
+  printf '{}\n'
+  exit 0
 fi
 
 # ----- 3. Extract event + session via jq when available ----------------------

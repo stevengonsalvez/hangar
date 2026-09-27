@@ -2805,6 +2805,16 @@ fn build_atc_command() -> Command {
                         ),
                 )
                 .arg(
+                    // hooks-and-answers: hidden until the hooks flip, so help
+                    // and man/cli.md stay as v1.29.0 shipped them.
+                    clap::Arg::new("hooks")
+                        .long("hooks")
+                        .value_parser(["legacy", "http"])
+                        .default_value("legacy")
+                        .hide(true)
+                        .help("Hook transport: legacy (notify.sh) or http (ainb-hook.sh to the daemon listener)"),
+                )
+                .arg(
                     clap::Arg::new("provider")
                         .long("provider")
                         .help("Full-mode brain (claude | codex; default claude)"),
