@@ -6350,13 +6350,15 @@ async fn close_session_ask_attention(
         }
     };
     let now_ms = SystemClock.now_ms();
+    let mut first_closed: Option<String> = None;
     for id in ids {
         match AttentionRepo::mark_answered_if_open(pool, &id, answered_by, answer, now_ms).await {
             Ok(1) => {
                 events.emit_attention(ainb_hangar_proto::events::HangarEvent::AttentionAnswered {
-                    attention_id: id,
+                    attention_id: id.clone(),
                     by: answered_by.to_string(),
-                })
+                });
+                first_closed.get_or_insert(id);
             }
             // Another surface won the race; it already owns the close.
             Ok(_) => {}
@@ -6364,6 +6366,19 @@ async fn close_session_ask_attention(
                 tracing::warn!(error = %error, "fleet interview: attention close failed");
             }
         }
+    }
+    // One wake for the whole close, however many rows it closed: a reader
+    // re-reads the whole status once per revision either way.
+    if let Some(id) = first_closed {
+        crate::attention_wake::wake_for_provider_session(
+            pool,
+            events,
+            session_id,
+            &id,
+            crate::attention_wake::AttentionChange::Closed,
+            now_ms,
+        )
+        .await;
     }
 }
 

@@ -48,6 +48,7 @@ use sqlx::SqlitePool;
 use std::time::{Duration, Instant};
 
 use crate::acp_pool::{PermissionAnswer, PermissionDecision};
+use crate::attention_wake::AttentionChange;
 use crate::events::EventSink;
 
 /// Daemon-owned provenance for an answer made through a live RPC connection.
@@ -264,12 +265,14 @@ pub async fn answer(
                     mark_receipt(pool, params, ReceiptState::Delivered, Some(&via), now_ms).await;
                     stall_after_delivery().await;
                     emit_answered(events, params);
+                    wake_readers(pool, events, &row, AttentionChange::Closed, now_ms).await;
                     Ok(AnswerResult::Delivered { via })
                 }
                 Ok(SendOutcome::Broker { peer_id }) => {
                     let via = format!("broker ({peer_id})");
                     mark_receipt(pool, params, ReceiptState::Delivered, Some(&via), now_ms).await;
                     emit_answered(events, params);
+                    wake_readers(pool, events, &row, AttentionChange::Closed, now_ms).await;
                     Ok(AnswerResult::Delivered { via })
                 }
                 Ok(SendOutcome::Failed { reason }) => {
@@ -1012,6 +1015,27 @@ fn picker_probe(label: &str) -> &str {
     &label[..end]
 }
 
+/// Wake every fleet reader for `row`'s session: the answer changed what the
+/// agent-status read says, and nothing else writes a fleet revision for it
+/// ([`crate::attention_wake`]).
+async fn wake_readers(
+    pool: &SqlitePool,
+    events: &EventSink,
+    row: &AttentionRow,
+    change: AttentionChange,
+    now_ms: i64,
+) {
+    crate::attention_wake::wake_for_provider_session(
+        pool,
+        events,
+        &row.session_id,
+        &row.id,
+        change,
+        now_ms,
+    )
+    .await;
+}
+
 /// Emit the `AttentionAnswered` nudge on the fleet-wide attention stream.
 fn emit_answered(events: &EventSink, params: &AnswerParams) {
     events.emit_attention(HangarEvent::AttentionAnswered {
@@ -1049,6 +1073,7 @@ async fn reopen_on_failed_delivery(
             // fixed at first raise.
             channels: row.channels,
         });
+        wake_readers(pool, events, row, AttentionChange::Reopened, now_ms).await;
     }
     Ok(())
 }

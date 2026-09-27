@@ -876,6 +876,66 @@ async fn structured_answer_closes_the_open_attention_row() {
 }
 
 #[tokio::test]
+async fn structured_answer_wakes_fleet_subscribers_for_the_closed_card() {
+    // Closing the card changes what the agent-status read says, but a reader
+    // re-reads only on a fleet revision: without one it kept the answered
+    // question on screen until the agent's next hook.
+    let fixture = InterviewFixture::open("wake").await;
+    // A subscriber of its own: `call` on the same connection would read past
+    // the notifications while it waits for its reply.
+    let mut subscriber = fixture.client().await;
+    let ack = subscriber
+        .call(
+            methods::FLEET_SUBSCRIBE,
+            serde_json::json!({ "after_revision": 0 }),
+        )
+        .await;
+    let head = ack["result"]["snapshot"]["head_revision"].as_i64().unwrap();
+
+    let mut client = fixture.client().await;
+    let version = fixture.session_version(&mut client).await;
+    let response = client
+        .call(
+            methods::FLEET_ACTION,
+            serde_json::json!({
+                "session_key": format!("claude:{}", InterviewFixture::SESSION_ID),
+                "expected_version": version,
+                "request_id": "answer-wakes-readers",
+                "action": {
+                    "action": "structured_answer",
+                    "request_fingerprint": fixture.fingerprint,
+                    "answers": [{"question_id": "q-1", "selected_options": ["yes"]}]
+                }
+            }),
+        )
+        .await;
+    assert_eq!(
+        response["result"]["receipt"]["status"], "DELIVERED",
+        "{response}"
+    );
+    let attention_id = fixture.attention_row().await.id;
+
+    // The action may write events of its own first; the wake is among the
+    // next few, named for the row it closed.
+    let mut seen = Vec::new();
+    let wake = loop {
+        let event = subscriber.next_fleet_event().await;
+        let id = event["event_id"].as_str().unwrap_or_default().to_string();
+        seen.push(id.clone());
+        if id.starts_with(&format!("attention_closed:{attention_id}:")) {
+            break event;
+        }
+        assert!(
+            seen.len() < 10,
+            "no attention_closed revision among {seen:?}"
+        );
+    };
+    assert!(wake["revision"].as_i64().unwrap() > head, "{wake}");
+
+    fixture.finish();
+}
+
+#[tokio::test]
 async fn release_to_native_picker_closes_the_attention_row_as_native_claude() {
     // Releasing hands the waiter back to Claude's own picker, so the control
     // centre can no longer deliver an answer to it. Leaving the card open would
