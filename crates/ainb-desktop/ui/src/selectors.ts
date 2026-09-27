@@ -11,16 +11,17 @@ import type { FrameStore } from "./store.ts";
 
 type RootSelector = (store: FrameStore, host: HostId | undefined) => number | boolean;
 
-const ring =
+/** How many rows ring `kind`, as a root selector. */
+export const ringSelector =
   (kind: AttentionKind) =>
   (store: FrameStore, host: HostId | undefined): number =>
   host === undefined ? 0 : ringCount(store.section(host, "sessions"), kind);
 
 export const ROOT_SELECTORS = {
-  askCount: ring("Ask"),
-  approveCount: ring("Approve"),
-  waitCount: ring("Wait"),
-  errCount: ring("Err"),
+  askCount: ringSelector("Ask"),
+  approveCount: ringSelector("Approve"),
+  waitCount: ringSelector("Wait"),
+  errCount: ringSelector("Err"),
   idleCount: (store, host) => (host === undefined ? 0 : idleCount(store.section(host, "sessions"))),
   sessionsStale: (store, host) => host !== undefined && store.state.stale[host]?.sessions === true,
   /** The git view was withheld for being over the frame ceiling, so the review

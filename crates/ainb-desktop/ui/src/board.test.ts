@@ -9,6 +9,7 @@ import type {
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
+import { cardForSession, statusForSession } from "./status.ts";
 import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
@@ -173,7 +174,7 @@ test("a card takes its row's name and the fleet's model, and one with no row sti
   const stray = working.cards.find((c) => c.key === "claude:p-9");
   assert.ok(stray, "an agent the sidebar has not listed is still on the board");
   assert.equal(stray.sessionId, null);
-  assert.equal(stray.title, "claude:p-9");
+  assert.equal(stray.title, "claude p-9", "named by provider and id, not the raw key");
 });
 
 test("an agent with something open floats to the top of its column", () => {
@@ -262,4 +263,46 @@ test("the proof line lists every agent state, zero included", () => {
     ["unverifiable", 0],
     ["exited", 0],
   ], "a state this build does not know is left off, since the host could not parse it back");
+});
+
+test("a legacy card joins its session row by tmux session, and without one is titled by its target", () => {
+  // The fingerprint the daemon really writes (`fleet-core` `discover/tmux.rs`
+  // `process_start_fingerprint`): the pane id, pid and session start.
+  const key = (target: string) => `legacy:claude:${target}:pane=%3;pid=41;session_started=1790000000`;
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  (sessions.workspaces[0].sessions[0] as { tmux_session_name: string | null }).tmux_session_name = "api-7f3a";
+  const columns = boardColumns(
+    status(card(key("api-7f3a:0.1"), { state: "waiting" }), card(key("orphan:1.0"), { state: "waiting" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  const cards = columns.flatMap((column) => column.cards);
+  const joined = cards.find((c) => c.key === key("api-7f3a:0.1"))!;
+  assert.equal(joined.title, "api", "named by its session row");
+  assert.equal(joined.sessionId, "u-1", "and opens it");
+  const orphan = cards.find((c) => c.key === key("orphan:1.0"))!;
+  assert.equal(orphan.title, "orphan:1.0");
+  assert.equal(orphan.sessionId, null);
+});
+
+test("the board, the sidebar row and the tab ack share one join, a legacy card included", () => {
+  // Before: the board joined a legacy card by tmux session while the row and
+  // the tab joined by provider id only, so the board said Working, the row
+  // said unverifiable, and opening the tab never acked the board's Done.
+  const key = "legacy:claude:api-7f3a:0.1:pane=%3;pid=41;session_started=1790000000";
+  const { sessions, fleet } = world(["u-1", "api", "p-other"]);
+  const row = sessions.workspaces[0].sessions[0] as { tmux_session_name: string | null };
+  row.tmux_session_name = "api-7f3a";
+  const legacy = card(key, { state: "working" });
+  const [onBoard] = boardColumns(status(legacy), fleet, sessions, NO_ACKS).flatMap((column) => column.cards);
+  assert.equal(onBoard.sessionId, "u-1");
+  assert.deepEqual(onBoard.status, { kind: "working" });
+  const session = sessions.workspaces[0].sessions[0];
+  assert.equal(cardForSession(session, [legacy], fleet.fleet_metadata), legacy, "the tab acks this card");
+  assert.deepEqual(statusForSession(session, [legacy], fleet.fleet_metadata, NO_ACKS), { kind: "working" }, "the row reads what the board does");
+
+  // With both, the exact provider id wins over where the pane was seen.
+  const exact = card("claude:p-other", { state: "idle" });
+  assert.equal(cardForSession(session, [legacy, exact], fleet.fleet_metadata), exact);
 });

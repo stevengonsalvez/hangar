@@ -24,8 +24,8 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import { isAcked } from "./acks.ts";
-import { allSessions, ATTENTION_ORDER, label, providerId } from "./sessions.ts";
-import { deriveStatus, elicitationDetail, unhandled, type UiStatus } from "./status.ts";
+import { allSessions, ATTENTION_ORDER, keyLabel, label } from "./sessions.ts";
+import { deriveStatus, elicitationDetail, sessionForCard, unhandled, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
 /** Orca's own board buckets, left to right. Idle also holds a card whose
@@ -154,10 +154,12 @@ export function boardColumns(
   acks: AckMap,
 ): BoardColumn[] {
   const models = new Map((fleet?.fleet_snapshot ?? []).map((row) => [row.session_key, row.model]));
-  const rows = rowsByProvider(sessions, fleet);
+  const rows = allSessions(sessions);
   const cards: BoardCard[] = [];
   for (const card of agentStatus?.view?.cards ?? []) {
-    const session = rows.get(providerId(card.session_key));
+    // The same join the sidebar row and the tab use (`cardBelongsTo`), a
+    // legacy card's tmux session included, so all three read one status.
+    const session = sessionForCard(card, rows, fleet?.fleet_metadata);
     const attention = chipsOf(session);
     const status = deriveStatus(card, {
       attention,
@@ -167,7 +169,7 @@ export function boardColumns(
     if (bucketOf(status) === null) continue; // exited: not a status anyone acts on.
     cards.push({
       key: card.session_key,
-      title: label(session?.name ?? card.session_key),
+      title: label(session?.name ?? keyLabel(card.session_key)),
       sessionId: session?.id ?? null,
       status,
       evidenceObservedAt: card.evidence_observed_at,

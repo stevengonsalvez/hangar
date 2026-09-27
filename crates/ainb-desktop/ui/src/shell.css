@@ -288,19 +288,21 @@ body {
 
 /* The disclosure triangle this rule draws instead: a small chevron that
    turns with the details' own `open`, never a second, JS-tracked copy of
-   the state `sidebar.tsx` already reads off the DOM. */
+   the state `sidebar.tsx` already reads off the DOM. The two borders draw a
+   corner pointing down-right: turned 45deg it points down (open, as every
+   disclosure reads), turned -45deg it points right (collapsed). */
 .workspace-name::before {
   content: "";
   width: 6px;
   height: 6px;
   border-inline-end: 1px solid var(--muted-foreground);
   border-block-end: 1px solid var(--muted-foreground);
-  transform: rotate(-45deg);
+  transform: rotate(45deg);
   transition: transform var(--dur-fast) var(--ease-out-expo);
 }
 
 .workspace:not([open]) .workspace-name::before {
-  transform: rotate(45deg);
+  transform: rotate(-45deg);
 }
 
 .workspace-name-text {
@@ -629,15 +631,24 @@ body {
 .tab-close {
   padding: 2px 8px;
   color: var(--muted-foreground);
-  /* Visible on hover or keyboard focus, so the strip stays quiet until a
-     tab is actually in play; still reachable by keyboard either way. */
+  /* Always on the active tab, the one a person is looking at (its keyboard
+     focus lives in the terminal, never in the strip, so focus alone never
+     shows it). On the others it shows on hover or focus, as Orca's does,
+     and always where there is no hover to reveal it. */
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease-out-expo);
 }
 
+.tab.active .tab-close,
 .tab:hover .tab-close,
 .tab:focus-within .tab-close {
   opacity: 1;
+}
+
+@media (hover: none) {
+  .tab-close {
+    opacity: 1;
+  }
 }
 
 .terminal {
@@ -970,7 +981,7 @@ body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr minmax(220px, 320px);
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 300px);
   grid-template-rows: auto 1fr;
   gap: 12px;
   padding: 12px;
@@ -991,10 +1002,15 @@ body {
   color: var(--red);
 }
 
+/* The four columns share whatever width the waiting list leaves: at 1280x800
+   four 180px minimums overflowed the area and clipped the last column. The
+   120px floor keeps a column readable when the window is narrower still; past
+   it the area scrolls rather than squeezing a card to nothing. A card's title
+   ellipsizes. */
 .board-columns {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(180px, 1fr);
+  grid-auto-columns: minmax(120px, 1fr);
   gap: 10px;
   overflow: auto;
   min-height: 0;
