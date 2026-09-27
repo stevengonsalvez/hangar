@@ -240,8 +240,10 @@ enum LineOutcome {
     Processed,
     Raised,
     Retry,
-    /// The line's event id is already recorded, fully reduced, with
-    /// different content (timestamps): nothing more to do.
+    /// The line's event id is already on file with different content (an
+    /// `EventIdCollision`), and either that row is already reduced or its
+    /// event type differs, so replaying this line can never add anything.
+    /// Logged; the tail steps over it and a spool drain counts it recorded.
     Permanent,
     /// The store refuses this line for good (a CHECK or FK failure, an empty
     /// event type): no retry can ever succeed.
@@ -510,6 +512,13 @@ impl AttentionIngest {
                     return LineOutcome::Retry;
                 };
                 if stored.projection_revision.is_some() || stored.event_type != line.event_type {
+                    tracing::warn!(
+                        event_id,
+                        reduced = stored.projection_revision.is_some(),
+                        stored_type = %stored.event_type,
+                        line_type = %line.event_type,
+                        "hook event id already recorded differently; skipping"
+                    );
                     return LineOutcome::Permanent;
                 }
                 match FleetProviderEventRepo::append(&self.pool, &new_event(stored.observed_at))
@@ -517,6 +526,10 @@ impl AttentionIngest {
                 {
                     Ok(_) => observed_at = stored.observed_at,
                     Err(FleetProviderEventError::EventIdCollision { .. }) => {
+                        tracing::warn!(
+                            event_id,
+                            "hook event still differs from its unreduced record at the stored time; skipping"
+                        );
                         return LineOutcome::Permanent;
                     }
                     Err(error) if error.is_permanent() => {
