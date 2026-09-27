@@ -380,11 +380,89 @@ async fn answer_hold(
     now_ms: i64,
     request: &crate::hook_ingress::hold::HeldRequest,
 ) -> Result<AnswerResult, sqlx::Error> {
-    let decision = match request.decide_label(&params.answer) {
-        Ok(decision) => decision,
+    match request.decide_label(&params.answer) {
+        Ok(decision) => deliver_hold_decision(pool, events, params, now_ms, decision).await,
         // Refused before any claim: the row stays open for a valid answer.
-        Err(reason) => return Ok(AnswerResult::NoTarget { reason }),
+        Err(reason) => Ok(AnswerResult::NoTarget { reason }),
+    }
+}
+
+/// What a surface answers a held request with.
+#[derive(Debug, Clone, Copy)]
+pub enum HoldAnswer<'a> {
+    /// Approve a held permission.
+    Allow,
+    /// Deny a held permission, or decline a held question.
+    Deny,
+    /// Structured answers to a held question, checked against what it asked.
+    Answers(&'a [ainb_hangar_proto::fleet::FleetQuestionAnswer]),
+}
+
+/// Resolve the live hook hold on `params.attention_id` on behalf of `caller`:
+/// the one exact reply path for a held Claude request, shared by
+/// `attention/answer` and `fleet/action` (Approve, Deny, StructuredAnswer).
+///
+/// Same rules as [`answer_as`]: the scope gate judges the same hold read the
+/// answer is delivered to, an answer that does not fit the question claims
+/// nothing, and the first answer wins. `NoTarget` when no hold is live.
+///
+/// # Errors
+///
+/// Returns a [`sqlx::Error`] if reading the row or the conditional flip fails.
+pub async fn resolve_hold_as(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    caller: &crate::rpc::auth::Caller,
+    answer: HoldAnswer<'_>,
+) -> Result<AnswerOutcome, sqlx::Error> {
+    use crate::hook_ingress::hold::{HeldRequest, HoldDecision};
+    let Some(row) = AttentionRepo::get(pool, &params.attention_id).await? else {
+        return Ok(AnswerOutcome::Answered(AnswerResult::NoTarget {
+            reason: "no such attention row".to_string(),
+        }));
     };
+    let Some(request) = crate::hook_ingress::hold::registry().request_for(&row.id) else {
+        return Ok(AnswerOutcome::Answered(AnswerResult::NoTarget {
+            reason: "no live hook hold for this request".to_string(),
+        }));
+    };
+    if !crate::answer_scope::caller_may_answer(caller, row.kind, true) {
+        return Ok(AnswerOutcome::ScopeRefused { kind: row.kind });
+    }
+    if row.state != "open" {
+        return Ok(AnswerOutcome::Answered(AnswerResult::AlreadyAnswered {
+            by: row.answered_by.unwrap_or_else(|| "unknown".to_string()),
+        }));
+    }
+    let decision = match (answer, &request) {
+        (HoldAnswer::Allow, HeldRequest::Permission) => Ok(HoldDecision::Allow { message: None }),
+        (HoldAnswer::Deny, _) => Ok(HoldDecision::Deny { message: None }),
+        (HoldAnswer::Answers(answers), HeldRequest::Ask { .. }) => request.decide_answers(answers),
+        (HoldAnswer::Allow, HeldRequest::Ask { .. }) => {
+            Err("a question needs answers, not an approval".to_string())
+        }
+        (HoldAnswer::Answers(_), HeldRequest::Permission) => {
+            Err("a permission needs allow or deny, not answers".to_string())
+        }
+    };
+    match decision {
+        Ok(decision) => deliver_hold_decision(pool, events, params, now_ms, decision)
+            .await
+            .map(AnswerOutcome::Answered),
+        Err(reason) => Ok(AnswerOutcome::Answered(AnswerResult::NoTarget { reason })),
+    }
+}
+
+/// Claim the row (first answer wins) and hand `decision` to the live hold.
+async fn deliver_hold_decision(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    decision: crate::hook_ingress::hold::HoldDecision,
+) -> Result<AnswerResult, sqlx::Error> {
     if let Some(lost) = claim(pool, params, now_ms).await? {
         return Ok(lost);
     }
