@@ -238,3 +238,26 @@ test("statusLabel reads in the spec table's own words", () => {
   assert.equal(statusLabel({ kind: "idle" }), "Idle");
   assert.equal(statusLabel({ kind: "unverifiable" }), "Unverifiable");
 });
+
+test("a wire value this build has never seen reads as unverifiable, never a throw", () => {
+  // A host at another version: there is no error boundary, so a throw in a
+  // render would blank the whole shell over one unknown word.
+  const paused = { ...input("working", null, false), state: "paused" as unknown as AgentState };
+  assert.deepEqual(deriveStatus(paused), { kind: "unverifiable" });
+  const hold = { ...input("waiting", null, false), wait_kind: "hold" as unknown as WaitKind };
+  assert.deepEqual(deriveStatus(hold), { kind: "needs", need: "wait" });
+  const odd = session("s-odd", { status: "Paused" as unknown as Session_Serialize["status"] });
+  assert.doesNotThrow(() => statusForSession(odd, [], {}, NO_ACKS));
+  assert.equal(statusLabel({ kind: "paused" } as unknown as UiStatus), "Unverifiable");
+});
+
+test("an attention kind this build does not know neither throws nor outranks a real one", () => {
+  const info = session("s-info", {
+    attention: [
+      { kind: "Info", detail: null },
+      { kind: "Done", detail: null },
+    ] as unknown as Session_Serialize["attention"],
+  });
+  assert.doesNotThrow(() => statusForSession(info, [], {}, NO_ACKS));
+  assert.deepEqual(statusForSession(info, [], {}, NO_ACKS), { kind: "done" }, "the Done chip still shows");
+});
