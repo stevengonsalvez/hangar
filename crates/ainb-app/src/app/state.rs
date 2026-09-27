@@ -4612,7 +4612,7 @@ impl AppState {
         // Also try to auto-detect workspace shells from tmux
         self.auto_detect_workspace_shells().await;
 
-        crate::models::workspace::sort_sessions_recent_first(&mut self.sessions.workspaces);
+        crate::models::workspace::sort_recent_first(&mut self.sessions.workspaces);
         crate::models::workspace::carry_host_rows(&held, &mut self.sessions.workspaces);
 
         // Reset selection state before setting new selection
@@ -4865,7 +4865,7 @@ impl AppState {
                             // comparison below: the scan finds rows in tmux's
                             // alphabetical order, so comparing unsorted rows
                             // against sorted ones would call every scan a change.
-                            crate::models::workspace::sort_sessions_recent_first(&mut workspaces);
+                            crate::models::workspace::sort_recent_first(&mut workspaces);
 
                             info!(
                                 "Separated {} SSH sessions from {} workspaces",
