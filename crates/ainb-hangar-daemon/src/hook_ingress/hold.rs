@@ -772,7 +772,10 @@ mod tests {
         assert!(reg.resolve("att-late", HoldDecision::Allow { message: None }));
         assert_eq!(
             w.settle(got),
-            HoldEnd::Decided(HeldRequest::Permission, HoldDecision::Allow { message: None }),
+            HoldEnd::Decided(
+                HeldRequest::Permission,
+                HoldDecision::Allow { message: None }
+            ),
             "resolve reported a delivery, so the hook must print it"
         );
         // The waiter settles first: the slot is gone before it is dropped, so

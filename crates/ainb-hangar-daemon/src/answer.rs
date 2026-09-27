@@ -2253,9 +2253,21 @@ mod tests {
             text: None,
         }];
         let cases = [
-            (AttentionKind::Approval, HeldRequest::Permission, HoldAnswer::Allow),
-            (AttentionKind::Approval, HeldRequest::Permission, HoldAnswer::Deny),
-            (AttentionKind::AskUserQuestion, question, HoldAnswer::Answers(&answers)),
+            (
+                AttentionKind::Approval,
+                HeldRequest::Permission,
+                HoldAnswer::Allow,
+            ),
+            (
+                AttentionKind::Approval,
+                HeldRequest::Permission,
+                HoldAnswer::Deny,
+            ),
+            (
+                AttentionKind::AskUserQuestion,
+                question,
+                HoldAnswer::Answers(&answers),
+            ),
         ];
         let callers = [
             Caller::Device {
