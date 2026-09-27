@@ -30,7 +30,15 @@
 use super::registry;
 
 /// Rows a renderer may never set, each with why.
+///
+/// One entry is here for ownership, not trust: `ui_preferences.theme` is the
+/// terminal UI's own colour theme, and the desktop's theme has one owner, its
+/// Settings > Appearance switch. See [`TUI_THEME_REASON`].
 pub const DENIED: &[(&str, &str)] = &[
+    (
+        "ui_preferences.theme",
+        "the terminal UI's own theme; the desktop's is Settings > Appearance",
+    ),
     ("presets.file", "a file the host reads presets from"),
     (
         "general.skill_install_real_homes",
@@ -305,7 +313,6 @@ pub const ALLOWED: &[&str] = &[
     "workspace_defaults.worktree_collision_behavior",
     "workspace_defaults.scan_max_depth",
     "workspace_defaults.scan_cache_ttl_secs",
-    "ui_preferences.theme",
     "ui_preferences.show_container_status",
     "ui_preferences.show_git_status",
     "ui_preferences.show_session_menu_bar",
@@ -360,6 +367,12 @@ pub const SECRET_REASON: &str =
 /// `Text` intents stop at the same count.
 pub const MAX_TEXT_CHARS: usize = 2_000;
 
+/// Why a renderer may not set `ui_preferences.theme`: the settings page's
+/// own copy (`TUI_THEME_REASON` in `ainb-desktop/ui/src/settings.ts`) says the
+/// same, so the person sees where the desktop's theme lives.
+pub const TUI_THEME_REASON: &str =
+    "this is the terminal UI's theme; the desktop's is Settings > Appearance above";
+
 /// Why a renderer may not edit the row `key`, or `None` when it may.
 ///
 /// `key` is a concrete dotted key as a row carries it; map segments collapse
@@ -371,6 +384,9 @@ pub fn refusal(key: &str) -> Option<&'static str> {
     let normalised = registry::registry_key(key);
     if registry::row(key).is_some_and(|row| matches!(row.kind, registry::RowKind::Secret)) {
         return Some(SECRET_REASON);
+    }
+    if normalised == "ui_preferences.theme" {
+        return Some(TUI_THEME_REASON);
     }
     if DENIED.iter().any(|(pattern, _)| *pattern == normalised) {
         return Some(DENIED_REASON);
@@ -463,7 +479,8 @@ mod tests {
 
     #[test]
     fn there_are_no_prefixes_so_a_sibling_row_is_not_allowed_by_its_neighbour() {
-        assert_eq!(refusal("ui_preferences.theme"), None);
+        assert_eq!(refusal("ui_preferences.show_git_status"), None);
+        assert_eq!(refusal("ui_preferences.theme"), Some(TUI_THEME_REASON));
         assert_eq!(
             refusal("ui_preferences.preferred_editor"),
             Some(DENIED_REASON)
