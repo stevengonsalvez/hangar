@@ -4,7 +4,7 @@
 //! SQLite owns canonical state and revision order. Live broadcasts only wake
 //! subscribers after the matching revision commits.
 
-use ainb_fleet_core::discover::{discover_all_tmux_panes, discover_from_tmux};
+use ainb_fleet_core::discover::discover_all_tmux_panes;
 use ainb_fleet_core::read::{ModelInfo, capture_pane};
 use ainb_fleet_core::types::{
     AttentionState, Confidence, FleetSession, LifecycleState, ManagementState, Provider,
@@ -1713,22 +1713,6 @@ pub enum ReconcilePass {
     PanesAndMissing,
 }
 
-/// Reconcile every exact tmux pane into the authoritative registry.
-///
-/// Discovery failures leave durable state untouched. A missing tmux server is
-/// reported by fleet-core as an empty roster, not an error.
-///
-/// # Errors
-/// Propagates a discovery or store failure.
-pub async fn reconcile_tmux_once(
-    pool: &SqlitePool,
-    events: &EventSink,
-    observed_at: i64,
-    pass: ReconcilePass,
-) -> anyhow::Result<usize> {
-    reconcile_discovered_panes(pool, events, discover_from_tmux().await?, observed_at, pass).await
-}
-
 /// How long discovery may keep reporting nothing before the sweep believes it.
 ///
 /// See [`SweepGuard`]. Long enough to ride out a slow or restarting tmux server,
@@ -1762,7 +1746,7 @@ const SWEEP_BLIP_TOLERANCE_MS: i64 = 60_000;
 /// `tmux -L` socket, a process tree it cannot classify) is missing on every
 /// sample, which proves nothing about the session, so such a row keeps its
 /// lifecycle and is left to `SessionEnd` and the stale reaper.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SweepGuard {
     /// Whether the last trusted sample listed any pane.
     saw_panes: bool,
@@ -1771,6 +1755,19 @@ pub struct SweepGuard {
     /// Every row discovery has seen live since the daemon started or tmux last
     /// failed for longer than the tolerance.
     seen_live: std::collections::HashSet<String>,
+}
+
+impl Default for SweepGuard {
+    /// A fresh guard assumes the last sample saw panes, so an empty roster at
+    /// daemon start (tmux not up yet, tmux-resurrect still restoring) gets the
+    /// same tolerance as one mid-run rather than retiring the whole board.
+    fn default() -> Self {
+        Self {
+            saw_panes: true,
+            distrusted_since: None,
+            seen_live: std::collections::HashSet::new(),
+        }
+    }
 }
 
 impl SweepGuard {
@@ -1790,12 +1787,12 @@ impl SweepGuard {
 
 /// Fold one discovery result into the registry, unless `guard` distrusts it.
 ///
-/// What the reconciler loop runs. `discovery` is EVERY tmux pane
+/// What the reconciler loop runs, and the only production entry point into
+/// pane reconciliation. `discovery` is EVERY tmux pane
 /// (`discover_all_tmux_panes`), because the guard judges the whole roster; only
 /// the agent panes are reconciled, the same set `discover_from_tmux` returns.
-/// [`reconcile_tmux_once`] and [`reconcile_discovered_panes`] stay unguarded
-/// for their current callers. A distrusted successful sample is always empty,
-/// so skipping it skips no pane that needed correlating.
+/// A distrusted successful sample is always empty, so skipping it skips no
+/// pane that needed correlating.
 ///
 /// # Errors
 /// Propagates a store failure. A discovery failure is logged, not returned.
@@ -1842,10 +1839,10 @@ pub async fn reconcile_tmux_sample(
     .await
 }
 
-/// Fold one discovery sample into the registry.
+/// Fold one discovery sample into the registry, with no [`SweepGuard`].
 ///
-/// Split from [`reconcile_tmux_once`] so pane-to-row correlation is testable
-/// without a live tmux server, and public for the same reason: the pane-binding
+/// Test support only, so production has no unguarded entry point: pane-to-row
+/// correlation is testable without a live tmux server, and the pane-binding
 /// gate (issue #916) needs tier-5 rows in the store with no tmux on the box.
 ///
 /// The sweep never derives "is this pane live?" for itself. It consults one
@@ -1860,6 +1857,10 @@ pub async fn reconcile_tmux_sample(
 ///
 /// Unguarded: every row counts as seen live, so a managed Claude row whose pane
 /// this sample omits is retired on the second consecutive miss.
+///
+/// # Errors
+/// Propagates a store failure.
+#[cfg(any(test, feature = "test-support"))]
 pub async fn reconcile_discovered_panes(
     pool: &SqlitePool,
     events: &EventSink,
@@ -1885,7 +1886,7 @@ async fn reconcile_panes(
     let mut discovered = discovered_session_keys(&sessions, &owners);
     let live_bindings =
         restore_tmux_transport(pool, events, &registered, &sessions, observed_at).await?;
-    // Union in the rows the restore pass found live by (target, fingerprint).
+    // Union in the rows the restore pass found live by pane (`PaneKey`).
     // Without this the two halves disagree about what "missing" means and an
     // orphaned-key row churns forever — see `restore_tmux_transport`.
     discovered.extend(live_bindings);
@@ -2005,6 +2006,12 @@ async fn reconcile_panes(
     }
 
     let snapshot = FleetRepo::snapshot(pool).await?;
+    if let Some(seen) = seen_live.as_deref_mut() {
+        // Bounded by the roster: an archived row can never be retired again.
+        let registered: std::collections::HashSet<&str> =
+            snapshot.sessions.iter().map(|row| row.session_key.as_str()).collect();
+        seen.retain(|key| registered.contains(key.as_str()));
+    }
     let (mut demoted, mut deferred) = (0, 0);
     for row in snapshot.sessions {
         // TRANSITION, NOT STATE. The guard keys off `transport_health` ALONE —
@@ -2181,7 +2188,8 @@ fn pane_claim_rank(row: &FleetSessionRow) -> (bool, bool, i64, i64, &str) {
     )
 }
 
-/// The MANAGED row whose tmux binding is byte-identical to this pane's.
+/// The MANAGED row whose fingerprint is byte-identical to this pane's, on the
+/// same [`PaneKey`].
 ///
 /// Ranked by [`pane_claim_rank`], the same order [`correlated_managed_row`] and
 /// [`restore_tmux_transport`] use. A pane holds a succession of provider
@@ -2197,8 +2205,8 @@ fn exact_managed_row<'a>(
         .iter()
         .filter(|row| {
             row.management_state == "MANAGED"
-                && row.tmux_target == session.exact_tmux_target
                 && row.process_start_fingerprint == session.process_start_fingerprint
+                && row_pane_key(row) == session_pane_key(session)
         })
         .max_by_key(|row| pane_claim_rank(row))
 }
@@ -2328,19 +2336,20 @@ fn tmux_missing_event(row: &FleetSessionRow, observed_at: i64) -> NewFleetEvent 
 /// The scanner infers the provider from the pane's process tree and often
 /// yields `unknown`, so an unknown provider correlates to any managed row for
 /// the pane; a confidently different provider does not.
+///
+/// Opt-in: only a fingerprint [`pane_identity`] can parse correlates at all.
 fn correlated_managed_row<'a>(
     registered: &'a [FleetSessionRow],
     session: &FleetSession,
 ) -> Option<&'a FleetSessionRow> {
-    let target = session.exact_tmux_target.as_deref()?;
-    let pane = pane_identity(session.process_start_fingerprint.as_deref()?)?;
+    pane_identity(session.process_start_fingerprint.as_deref()?)?;
+    let pane = session_pane_key(session)?;
     let provider = session.provider.as_str();
     registered
         .iter()
         .filter(|row| {
             row.management_state == "MANAGED"
-                && row.tmux_target.as_deref() == Some(target)
-                && row.process_start_fingerprint.as_deref().and_then(pane_identity) == Some(pane)
+                && row_pane_key(row).as_ref() == Some(&pane)
                 && (provider == Provider::Unknown.as_str() || row.provider == provider)
         })
         // One pane holds a succession of provider sessions over time (a resumed
@@ -2362,46 +2371,64 @@ fn pane_identity(fingerprint: &str) -> Option<(&str, &str)> {
     (!pane.is_empty() && !session_started.is_empty()).then_some((pane, session_started))
 }
 
-/// One physical tmux pane: its target plus the stable half of its fingerprint.
-type PaneKey = (String, String);
+/// One physical tmux pane, as every pass that resolves a pane to a row keys it.
+///
+/// By its identity (pane id plus `session_started`) whenever the fingerprint
+/// carries one. The target is `session:window.pane`, and tmux rewrites it under
+/// a live pane: closing a sibling renumbers the pane index, `renumber-windows`
+/// the window, `rename-session` the session. Keyed by target, an idle Claude in
+/// `s:1.1` stopped matching the moment the shell in `s:1.0` closed, and the
+/// missing sweep then retired a live session to EXITED, which `restore` never
+/// undoes. The identity is also what survives `pid` drift between the hook's
+/// read and the scan (see [`correlated_managed_row`]).
+///
+/// A fingerprint in any other shape falls back to target plus the raw string.
+/// A missing and an empty fingerprint then share a key, which is safe because
+/// the target alone is already pane-unique at one instant.
+///
+/// Exact matching, correlation and restore all key through [`pane_key`], so
+/// they rank owners identically: two passes naming different owners for one
+/// pane is the shielded-forever bug `pane_claim_rank` documents.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PaneKey {
+    /// The tmux pane id and its server session's start time.
+    Identity {
+        pane: String,
+        session_started: String,
+    },
+    /// The target and the whole fingerprint, for an unfamiliar fingerprint.
+    Target { target: String, fingerprint: String },
+}
+
+/// The key for a pane reached at `target`; `None` when there is no tmux route.
+fn pane_key(target: Option<&str>, fingerprint: Option<&str>) -> Option<PaneKey> {
+    let target = target?;
+    Some(match fingerprint.and_then(pane_identity) {
+        Some((pane, session_started)) => PaneKey::Identity {
+            pane: pane.to_string(),
+            session_started: session_started.to_string(),
+        },
+        None => PaneKey::Target {
+            target: target.to_string(),
+            fingerprint: fingerprint.unwrap_or_default().to_string(),
+        },
+    })
+}
 
 /// The pane a registry row is bound to, or `None` when it has no tmux route.
 fn row_pane_key(row: &FleetSessionRow) -> Option<PaneKey> {
-    Some((
-        row.tmux_target.clone()?,
-        stable_pane_id(row.process_start_fingerprint.as_deref()),
-    ))
+    pane_key(
+        row.tmux_target.as_deref(),
+        row.process_start_fingerprint.as_deref(),
+    )
 }
 
 /// The pane a discovered session was scanned from.
 fn session_pane_key(session: &FleetSession) -> Option<PaneKey> {
-    Some((
-        session.exact_tmux_target.clone()?,
-        stable_pane_id(session.process_start_fingerprint.as_deref()),
-    ))
-}
-
-/// The pane-identifying part of a fingerprint, falling back to the whole string
-/// for any shape [`pane_identity`] does not recognise.
-///
-/// Keying on the raw fingerprint would split one pane in two whenever `pid`
-/// drifted between the hook's read and the scan, which is the same drift
-/// [`correlated_managed_row`] exists for: both halves of the pane would then
-/// claim liveness, and neither the winner-takes-the-binding rule below nor the
-/// missing-sweep could retire either of them.
-///
-/// A missing fingerprint and an empty one both yield `""`, so they share a pane
-/// key. That is safe only because `tmux_target` is already `session:window.pane`
-/// and therefore pane-unique on its own; the fingerprint narrows a *reused*
-/// target, it does not carry the identity by itself.
-fn stable_pane_id(fingerprint: Option<&str>) -> String {
-    let Some(fingerprint) = fingerprint else {
-        return String::new();
-    };
-    match pane_identity(fingerprint) {
-        Some((pane, session_started)) => format!("pane={pane};session_started={session_started}"),
-        None => fingerprint.to_string(),
-    }
+    pane_key(
+        session.exact_tmux_target.as_deref(),
+        session.process_start_fingerprint.as_deref(),
+    )
 }
 
 /// Whether the discovered row already says what this scan would say.
@@ -2749,12 +2776,12 @@ pub async fn mark_tmux_unavailable(
     Ok(changed)
 }
 
-/// Returns every `session_key` whose tmux binding is LIVE by (target,
-/// fingerprint), whether or not this pass emitted an event for it.
+/// Returns every `session_key` whose tmux binding is LIVE by pane
+/// ([`PaneKey`]), whether or not this pass emitted an event for it.
 ///
 /// The caller must union that set into its own `discovered` set. Both halves of
 /// the reconcile then agree on what "missing" means, which is the thing that was
-/// broken: this loop matches by (target, fingerprint) so a provider-qualified
+/// broken: this loop matches by pane (`PaneKey`) so a provider-qualified
 /// MANAGED row stays reachable, while the missing-sweep matches by `session_key`.
 /// When a pane's `session_key` changes but the pane does not, the orphaned
 /// predecessor row satisfies this loop and NOT the sweep's, so it flip-flopped —
@@ -2785,22 +2812,31 @@ async fn restore_tmux_transport(
     //
     // A pane is a single thing, so at most one session row can really own it.
     // When a pane's key changes but the pane does not, BOTH the old row and the
-    // new one match by (target, fingerprint), and reporting both live pinned the
+    // new one match by pane key, and reporting both live pinned the
     // orphan HEALTHY forever — `reap_stale_sessions` skips any row that is not
     // UNAVAILABLE, so it never reached EXITED and `archive_dead_sessions` never
     // took it either. That left a ghost in the roster advertising an attachable
     // pane that belongs to a different session. Claiming liveness for the winner
     // only lets every loser fall through to the missing-sweep and retire, which
     // is the behaviour that existed before the flip-flop fix and must survive it.
-    let live_panes: std::collections::HashSet<PaneKey> =
-        discovered.iter().filter_map(session_pane_key).collect();
+    // Each live pane with the target it has NOW, which a renumber or rename
+    // may have moved away from the one its owner row recorded.
+    let live_panes: std::collections::HashMap<PaneKey, &str> = discovered
+        .iter()
+        .filter_map(|session| {
+            Some((
+                session_pane_key(session)?,
+                session.exact_tmux_target.as_deref()?,
+            ))
+        })
+        .collect();
     let mut owner_of_pane: std::collections::HashMap<PaneKey, &FleetSessionRow> =
         std::collections::HashMap::new();
     for row in registered {
         let Some(pane) = row_pane_key(row) else {
             continue;
         };
-        if !live_panes.contains(&pane) {
+        if !live_panes.contains_key(&pane) {
             continue;
         }
         match owner_of_pane.get(&pane) {
@@ -2817,7 +2853,8 @@ async fn restore_tmux_transport(
         let Some(pane) = row_pane_key(row) else {
             continue;
         };
-        let live = owners.contains(row.session_key.as_str()) && live_panes.contains(&pane);
+        let current_target = live_panes.get(&pane).copied();
+        let live = owners.contains(row.session_key.as_str()) && current_target.is_some();
         // Report liveness BEFORE the emit guards below. A row can be live and
         // still not need an event (already HEALTHY, or EXITED); it is just as
         // not-missing in those cases, and reporting only the rows that emitted
@@ -2826,7 +2863,7 @@ async fn restore_tmux_transport(
             live_bindings.insert(row.session_key.clone());
         }
         // An EXITED row is never restored, even when a pane still matches its
-        // target and fingerprint. Matching here is by (target, fingerprint) —
+        // pane key. Matching here is by pane (`PaneKey`),
         // deliberately, so a MANAGED row whose key is provider-qualified is still
         // reachable — while the missing-sweep matches by session_key. When those
         // two disagree the row flip-flops: this loop restores it to HEALTHY, the
@@ -2836,7 +2873,7 @@ async fn restore_tmux_transport(
         // They disagree whenever a pane's session_key changes but the pane does
         // not — which is exactly what happens when provider detection improves,
         // since the provider is part of `SessionKey::legacy`. The old row is
-        // orphaned, stays EXITED, and still matches by target+fingerprint.
+        // orphaned, stays EXITED, and still matches by pane key.
         // Settled means transport AND the capability blob this event rewrites
         // alongside it, not transport alone. `codex_app_server_event` writes
         // HEALTHY together with `codex_managed_capabilities`, which hard-codes
@@ -2844,7 +2881,13 @@ async fn restore_tmux_transport(
         // transport-only guard that row is HEALTHY forever and never gets those
         // flags back, so a live managed Codex session loses Attach and every
         // lifecycle control after its first app-server event.
-        if !live || tmux_transport_settled(row, true) || row.lifecycle_state == "EXITED" {
+        // The pane is matched by identity, so its target may have moved under
+        // it; attach and send go by target, so the binding follows the pane.
+        let retarget = current_target.filter(|target| row.tmux_target.as_deref() != Some(target));
+        if !live
+            || (tmux_transport_settled(row, true) && retarget.is_none())
+            || row.lifecycle_state == "EXITED"
+        {
             continue;
         }
         let event = NewFleetEvent {
@@ -2857,6 +2900,7 @@ async fn restore_tmux_transport(
             patch: FleetSessionPatch {
                 capabilities: Some(capabilities_for_tmux_state(row, true)),
                 transport_health: Some("HEALTHY".to_string()),
+                tmux_target: retarget.map(str::to_string),
                 ..FleetSessionPatch::default()
             },
         };
@@ -6637,6 +6681,198 @@ mod tests {
             transition_count(pool, &key).await,
             1,
             "one transition, then quiet"
+        );
+    }
+
+    /// tmux renumbers a pane when a sibling closes: an idle Claude in `s:1.1`
+    /// becomes `s:1.0` when the shell beside it exits. Its pane id and session
+    /// start do not change, so the row must stay owned, HEALTHY and never
+    /// EXITED, and its binding must follow the pane to the new target.
+    #[tokio::test]
+    async fn a_renumbered_pane_stays_owned_and_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let fingerprint = "pane=%90;pid=930;session_started=1785400000";
+        let key =
+            hooked_session(pool, &sink, "sess-renum", "s_renum:1.1", fingerprint, 1_000).await;
+        let mut guard = SweepGuard::default();
+        let before = scanned_pane("s_renum:1.1", fingerprint, Provider::Claude);
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![before]), 30_000).await;
+
+        let after = scanned_pane("s_renum:1.0", fingerprint, Provider::Claude);
+        for at in [60_000, 90_000, 120_000] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![after.clone()]), at).await;
+            let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            assert_eq!(row.lifecycle_state, "RUNNING", "sweep at {at}");
+            assert_eq!(row.transport_health, "HEALTHY", "sweep at {at}");
+            assert_eq!(
+                row.tmux_target.as_deref(),
+                Some("s_renum:1.0"),
+                "sweep at {at}"
+            );
+        }
+        let rows = FleetRepo::snapshot(pool).await.unwrap().sessions;
+        assert_eq!(rows.len(), 1, "the pane stays owned: no second row for it");
+    }
+
+    /// The termination contract, class by class: whatever a row is, applying
+    /// the sweep's own patch settles `needs_tmux_missing_event` within two
+    /// events, so no class can reopen the emit loop behind the 832,711-row
+    /// incident.
+    #[test]
+    fn every_row_class_settles_within_two_missing_events() {
+        let row =
+            |provider: &str, management: &str, authority: &str, lifecycle: &str| FleetSessionRow {
+                session_key: format!("{provider}:{management}:{authority}:{lifecycle}"),
+                provider: provider.to_string(),
+                management_state: management.to_string(),
+                lifecycle_authority: authority.to_string(),
+                lifecycle_state: lifecycle.to_string(),
+                transport_health: "HEALTHY".to_string(),
+                tmux_target: Some("s:1.1".to_string()),
+                ..blank_row()
+            };
+        let apply = |row: &mut FleetSessionRow| {
+            let patch = tmux_missing_event(row, 1_000).patch;
+            if let Some(health) = patch.transport_health {
+                row.transport_health = health;
+            }
+            if let Some(lifecycle) = patch.lifecycle_state {
+                row.lifecycle_state = lifecycle;
+            }
+            if let Some(capabilities) = patch.capabilities {
+                row.capabilities = capabilities;
+            }
+        };
+        let none = std::collections::HashSet::new();
+        for (label, mut row, events_to_settle, settled_lifecycle) in [
+            (
+                "managed claude",
+                row("claude", "MANAGED", "authoritative", "RUNNING"),
+                2,
+                "EXITED",
+            ),
+            (
+                "managed codex",
+                row("codex", "MANAGED", "authoritative", "RUNNING"),
+                1,
+                "RUNNING",
+            ),
+            (
+                "degraded codex hook",
+                row("codex", "DEGRADED", "authoritative", "RUNNING"),
+                1,
+                "RUNNING",
+            ),
+            (
+                "unmanaged inferred",
+                row("claude", "DEGRADED", "inferred", "RUNNING"),
+                1,
+                "EXITED",
+            ),
+            (
+                "unmanaged authoritative",
+                row("claude", "DEGRADED", "authoritative", "TURN_COMPLETE"),
+                1,
+                "TURN_COMPLETE",
+            ),
+            (
+                "exited, still healthy",
+                row("claude", "MANAGED", "authoritative", "EXITED"),
+                1,
+                "EXITED",
+            ),
+        ] {
+            let mut applied = 0;
+            while needs_tmux_missing_event(&row, &none) {
+                assert!(
+                    applied < 2,
+                    "{label}: still emitting after {applied} events"
+                );
+                apply(&mut row);
+                applied += 1;
+            }
+            assert_eq!(applied, events_to_settle, "{label}");
+            assert_eq!(row.transport_health, "UNAVAILABLE", "{label}");
+            assert_eq!(row.lifecycle_state, settled_lifecycle, "{label}");
+        }
+    }
+
+    /// After a daemon restart the guard has seen nothing live. A row already
+    /// UNAVAILABLE from before, whose pane never comes back, is therefore not
+    /// the sweep's to retire: it writes nothing, not even on the boot-time
+    /// empty sample, and the stale reaper retires it on its own clock. That
+    /// empty boot sample touches no HEALTHY row either.
+    #[tokio::test]
+    async fn a_restarted_daemon_leaves_an_unseen_row_to_the_reaper() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let key = hooked_session(
+            pool,
+            &sink,
+            "sess-restart",
+            "tmux_restart:1.1",
+            "pane=%91;pid=931;session_started=1785400000",
+            1_000,
+        )
+        .await;
+        reconcile_discovered_panes(
+            pool,
+            &sink,
+            Vec::new(),
+            30_000,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("sweep before the restart");
+        let before = event_count(pool, &key).await;
+        // Registered after the sweep, so still HEALTHY when the daemon restarts.
+        let live = hooked_session(
+            pool,
+            &sink,
+            "sess-restart-live",
+            "tmux_restart:2.1",
+            "pane=%92;pid=932;session_started=1785400000",
+            40_000,
+        )
+        .await;
+
+        let mut guard = SweepGuard::default();
+        let other = scanned_pane(
+            "tmux_other:1.1",
+            "pane=%1;pid=1;session_started=1",
+            Provider::Unknown,
+        );
+        guarded_sweep(pool, &sink, &mut guard, Ok(Vec::new()), 60_000).await;
+        assert_eq!(
+            FleetRepo::get_session(pool, &live).await.unwrap().unwrap().transport_health,
+            "HEALTHY",
+            "an empty roster at boot is distrusted like one mid-run"
+        );
+        for at in [90_000, 120_000, 150_000] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![other.clone()]), at).await;
+        }
+        assert_eq!(
+            event_count(pool, &key).await,
+            before,
+            "the sweep writes nothing"
+        );
+        let held = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(held.lifecycle_state, "RUNNING");
+
+        reap_stale_sessions(pool, &sink, 30_000 + SESSION_STALE_TTL_MS)
+            .await
+            .expect("reap");
+        let reaped = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            reaped.lifecycle_state, "EXITED",
+            "the reaper still retires it"
         );
     }
 
