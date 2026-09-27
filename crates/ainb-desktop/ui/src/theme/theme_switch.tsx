@@ -9,26 +9,29 @@ const CHOICES: readonly { value: ThemePreference; label: string }[] = [
 ];
 
 /**
- * Settings > Appearance > Theme: System, Light or Dark, as Orca offers it. A
- * radio group, so the arrow keys and a screen reader treat it as one choice.
+ * Settings > Appearance > Theme: System, Light or Dark, as Orca offers it.
+ * Native radio inputs under one name, drawn as a segmented control: the arrow
+ * keys move the choice and a screen reader reads one group, with no keyboard
+ * handling of our own to get wrong.
  */
 export function ThemeSwitch(props: { value: ThemePreference; onChange(next: ThemePreference): void }) {
   return (
-    <div class="theme-switch" role="radiogroup" aria-label="Theme">
+    <fieldset class="theme-switch">
+      <legend class="visually-hidden">Theme</legend>
       <For each={CHOICES}>
         {(choice) => (
-          <button
-            type="button"
-            role="radio"
-            class="theme-choice"
-            data-theme-choice={choice.value}
-            aria-checked={props.value === choice.value}
-            onClick={() => props.onChange(choice.value)}
-          >
-            {choice.label}
-          </button>
+          <label class="theme-choice" data-theme-choice={choice.value}>
+            <input
+              type="radio"
+              name="ainb-theme"
+              value={choice.value}
+              checked={props.value === choice.value}
+              onChange={() => props.onChange(choice.value)}
+            />
+            <span>{choice.label}</span>
+          </label>
         )}
       </For>
-    </div>
+    </fieldset>
   );
 }
