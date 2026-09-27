@@ -1015,7 +1015,6 @@ fn picker_probe(label: &str) -> &str {
     &label[..end]
 }
 
-/// Emit the `AttentionAnswered` nudge on the fleet-wide attention stream.
 /// Wake every fleet reader for `row`'s session: the answer changed what the
 /// agent-status read says, and nothing else writes a fleet revision for it
 /// ([`crate::attention_wake`]).
@@ -1037,6 +1036,7 @@ async fn wake_readers(
     .await;
 }
 
+/// Emit the `AttentionAnswered` nudge on the fleet-wide attention stream.
 fn emit_answered(events: &EventSink, params: &AnswerParams) {
     events.emit_attention(HangarEvent::AttentionAnswered {
         attention_id: params.attention_id.clone(),
