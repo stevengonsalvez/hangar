@@ -287,3 +287,81 @@ async fn an_approval_whose_hold_ended_is_never_typed_into_a_pane() {
         "{result:?}"
     );
 }
+
+fn permission_for(session: &str, call: &str, command: &str) -> Value {
+    json!({
+        "hook_event_name": "PermissionRequest",
+        "session_id": session,
+        "cwd": "/tmp/hold-test",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_use_id": call,
+    })
+}
+
+/// The open approval row raised for one tool call.
+async fn row_for_call(w: &World, session: &str, call: &str) -> String {
+    for _ in 0..100 {
+        let rows = AttentionRepo::list_fleet(w.store.pool()).await.unwrap();
+        if let Some(row) = rows.into_iter().find(|r| {
+            r.session_id == session
+                && r.kind == AttentionKind::Approval
+                && r.state == "open"
+                && serde_json::from_str::<Value>(&r.payload).is_ok_and(|p| p["tool_use_id"] == call)
+        }) {
+            return row.id;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no open approval row for {call}");
+}
+
+/// The hostile rebind from the review of #187: a dangerous request's hook
+/// drops, a harmless request is held, the dangerous one re-hooks, and the
+/// harmless one is approved. The approval must reach only the harmless hook.
+/// Repeated because the old binding failed by hash order, in 4 of 6 runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_never_reaches_another_requests_hook() {
+    for run in 0..6 {
+        let w = Arc::new(World::start().await);
+        let s = session(&format!("rebind{run}"));
+        let danger = permission_for(&s, "call-danger", "rm -rf /important");
+        let harmless = permission_for(&s, "call-ls", "ls");
+
+        let first = w.hold(danger.clone());
+        let danger_row = row_for_call(&w, &s, "call-danger").await;
+        first.abort(); // the dangerous hook's connection drops
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let held_ls = w.hold(harmless);
+        let ls_row = row_for_call(&w, &s, "call-ls").await;
+        assert_ne!(danger_row, ls_row);
+
+        let danger_again = w.hold(danger);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(matches!(
+            w.answer(&ls_row, "allow").await,
+            AnswerResult::Delivered { .. }
+        ));
+        let (status, body) = held_ls.await.unwrap();
+        assert_eq!(status, 200, "run {run}");
+        assert!(body.contains("\"allow\""), "run {run}: {body}");
+
+        // The dangerous hook got nothing from that approval: still waiting.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !danger_again.is_finished(),
+            "run {run}: the approval leaked"
+        );
+
+        // Its own row still answers it, and only it.
+        assert!(matches!(
+            w.answer(&danger_row, "deny").await,
+            AnswerResult::Delivered { .. }
+        ));
+        let (status, body) = danger_again.await.unwrap();
+        assert_eq!(status, 200, "run {run}");
+        assert!(body.contains("\"deny\""), "run {run}: {body}");
+    }
+}
