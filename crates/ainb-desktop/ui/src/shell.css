@@ -1002,13 +1002,15 @@ body {
   color: var(--red);
 }
 
-/* The four columns share whatever width the waiting list leaves, rather than
-   each claiming a fixed minimum: at 1280x800 four 180px minimums overflowed
-   the area and clipped the last column. A card's title ellipsizes instead. */
+/* The four columns share whatever width the waiting list leaves: at 1280x800
+   four 180px minimums overflowed the area and clipped the last column. The
+   120px floor keeps a column readable when the window is narrower still; past
+   it the area scrolls rather than squeezing a card to nothing. A card's title
+   ellipsizes. */
 .board-columns {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(0, 1fr);
+  grid-auto-columns: minmax(120px, 1fr);
   gap: 10px;
   overflow: auto;
   min-height: 0;
