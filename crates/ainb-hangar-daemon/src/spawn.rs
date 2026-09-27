@@ -236,24 +236,86 @@ pub async fn worktree_create(
         .env_remove("TMUX")
         .spawn()
         .map_err(|e| SpawnError::Failed(format!("could not run {bin}: {e}")))?;
-    // Dropping the wait on timeout leaves the child running; tokio reaps it.
-    let output = match tokio::time::timeout(RUN_TIMEOUT, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
+    // The wait runs in its own task, so it outlives both a timeout here and a
+    // caller that stops waiting (a closed connection drops this future). The
+    // task is what drains `ainb run`'s stdout and stderr: dropping the wait
+    // would close both pipes, and `ainb run`'s next write would die on EPIPE
+    // before its own rollback ran, orphaning the tmux session, the worktree
+    // and the branch.
+    let mut wait = tokio::spawn(child.wait_with_output());
+    let timeout = run_timeout();
+    let output = match tokio::time::timeout(timeout, &mut wait).await {
+        Ok(Ok(Ok(output))) => output,
+        Ok(Ok(Err(e))) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
         Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
         Err(_) => {
+            // Nobody is waiting on the answer any more, so the run's own
+            // outcome goes to the log, where an operator can find it.
+            tokio::spawn(async move {
+                match wait.await {
+                    Ok(Ok(output)) if output.status.success() => {
+                        tracing::info!("`ainb run` finished after its create timed out");
+                    }
+                    Ok(Ok(output)) => tracing::warn!(
+                        status = %output.status,
+                        stderr = %stderr_tail(&output.stderr),
+                        "`ainb run` failed after its create timed out"
+                    ),
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "waiting on a timed-out `ainb run` failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "the wait on a timed-out `ainb run` ended");
+                    }
+                }
+            });
             return Err(SpawnError::Failed(format!(
                 "`ainb run` is still running after {}s: the worktree may still be creating; check the sidebar",
-                RUN_TIMEOUT.as_secs()
+                timeout.as_secs()
             )));
         }
     };
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let lines: Vec<&str> = stderr.lines().collect();
-        let tail = lines[lines.len().saturating_sub(5)..].join("\n");
-        return Err(SpawnError::Failed(format!("`ainb run` failed: {tail}")));
+        return Err(SpawnError::Failed(format!(
+            "`ainb run` failed: {}",
+            stderr_tail(&output.stderr)
+        )));
     }
     parse_run_output(&String::from_utf8_lossy(&output.stdout)).map_err(SpawnError::Failed)
+}
+
+/// The last five lines of a run's stderr: the CLI's own last words.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    lines[lines.len().saturating_sub(5)..].join("\n")
+}
+
+/// Test seam: a shorter wait than [`RUN_TIMEOUT`], in milliseconds, or 0 for
+/// the real one. A test of what happens after the timeout should not sit
+/// through two minutes of it.
+#[cfg(any(test, feature = "test-support"))]
+static RUN_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shorten the wait on `ainb run`, or restore it with `None`. Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_run_timeout_for_test(timeout: Option<Duration>) {
+    let ms = timeout.map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    RUN_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn run_timeout() -> Duration {
+    match RUN_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => RUN_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+/// Compiled out of a shipped daemon: always the real wait.
+#[cfg(not(any(test, feature = "test-support")))]
+const fn run_timeout() -> Duration {
+    RUN_TIMEOUT
 }
 
 #[cfg(test)]
