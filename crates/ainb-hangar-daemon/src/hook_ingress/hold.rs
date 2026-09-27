@@ -225,10 +225,28 @@ struct Slot {
     tx: watch::Sender<Option<HoldDecision>>,
 }
 
-/// The live holds, keyed by the request's stable key.
+/// The live holds. A hold is keyed by its request's stable key, and each hold
+/// is bound to exactly one attention row: the two maps are kept 1:1, so an
+/// answer to a row reaches exactly the hook that raised it.
 #[derive(Default)]
 pub struct HoldRegistry {
-    slots: Mutex<HashMap<String, Slot>>,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    /// Hold key to its slot.
+    slots: HashMap<String, Slot>,
+    /// Attention row id to the one hold key bound to it.
+    by_attention: HashMap<String, String>,
+}
+
+impl Inner {
+    fn remove(&mut self, key: &str) -> Option<Slot> {
+        let slot = self.slots.remove(key)?;
+        self.by_attention.remove(&slot.attention_id);
+        Some(slot)
+    }
 }
 
 /// A registered hold. Waiting on it yields the decision, or `None`.
@@ -246,20 +264,28 @@ pub fn registry() -> &'static HoldRegistry {
 }
 
 impl HoldRegistry {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Slot>> {
-        self.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Register a hold for `key`, or join the live one. `None` when the
-    /// registry is full.
+    /// Register a hold for `key` on `attention_id`, or join the live one.
+    ///
+    /// `None` when the registry is full, when `key` is already held on a
+    /// DIFFERENT row, or when `attention_id` is already held by a DIFFERENT
+    /// key. Refusing both keeps each row bound to exactly one request, so an
+    /// answer meant for one tool call can never reach another; the refused
+    /// hook answers `{}` and its agent prompts on its own.
     pub fn register(
         &'static self,
         key: &str,
         attention_id: &str,
         request: HeldRequest,
     ) -> Option<Waiter> {
-        let mut slots = self.lock();
-        if let Some(slot) = slots.get(key) {
+        let mut inner = self.lock();
+        if let Some(slot) = inner.slots.get(key) {
+            if slot.attention_id != attention_id {
+                return None;
+            }
             return Some(Waiter {
                 registry: self,
                 key: key.to_string(),
@@ -267,11 +293,11 @@ impl HoldRegistry {
                 request: slot.request.clone(),
             });
         }
-        if slots.len() >= MAX_HOLDS {
+        if inner.by_attention.contains_key(attention_id) || inner.slots.len() >= MAX_HOLDS {
             return None;
         }
         let (tx, rx) = watch::channel(None);
-        slots.insert(
+        inner.slots.insert(
             key.to_string(),
             Slot {
                 attention_id: attention_id.to_string(),
@@ -279,6 +305,7 @@ impl HoldRegistry {
                 tx,
             },
         );
+        inner.by_attention.insert(attention_id.to_string(), key.to_string());
         Some(Waiter {
             registry: self,
             key: key.to_string(),
@@ -290,24 +317,21 @@ impl HoldRegistry {
     /// The live request held for an attention row.
     #[must_use]
     pub fn request_for(&self, attention_id: &str) -> Option<HeldRequest> {
-        self.lock()
-            .values()
-            .find(|s| s.attention_id == attention_id)
-            .map(|s| s.request.clone())
+        let inner = self.lock();
+        let key = inner.by_attention.get(attention_id)?;
+        inner.slots.get(key).map(|s| s.request.clone())
     }
 
-    /// Deliver `decision` to every waiter on the row's hold and drop the hold.
-    /// `false` when no live hold (every waiter already gone) took it.
+    /// Deliver `decision` to every waiter on the one hold bound to the row,
+    /// and drop that hold. `false` when no live hold took it.
     pub fn resolve(&self, attention_id: &str, decision: HoldDecision) -> bool {
-        let mut slots = self.lock();
-        let Some(key) = slots
-            .iter()
-            .find(|(_, s)| s.attention_id == attention_id)
-            .map(|(k, _)| k.clone())
-        else {
+        let mut inner = self.lock();
+        let Some(key) = inner.by_attention.get(attention_id).cloned() else {
             return false;
         };
-        let slot = slots.remove(&key).expect("found above");
+        let Some(slot) = inner.remove(&key) else {
+            return false;
+        };
         slot.tx.send(Some(decision)).is_ok()
     }
 
@@ -321,19 +345,19 @@ impl HoldRegistry {
     #[must_use]
     pub fn keys_for_session(&self, session: &str) -> Vec<String> {
         let prefix = format!("{session}:");
-        self.lock().keys().filter(|k| k.starts_with(&prefix)).cloned().collect()
+        self.lock().slots.keys().filter(|k| k.starts_with(&prefix)).cloned().collect()
     }
 
     /// The attention row a live hold is for.
     #[must_use]
     pub fn attention_for(&self, key: &str) -> Option<String> {
-        self.lock().get(key).map(|s| s.attention_id.clone())
+        self.lock().slots.get(key).map(|s| s.attention_id.clone())
     }
 
     /// Live holds, for tests and health.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.lock().slots.len()
     }
 
     /// Whether no hold is live.
@@ -347,17 +371,41 @@ impl Drop for Waiter {
     /// A waiter dropped before a decision (its connection cut, its future
     /// cancelled) frees the slot once it was the last one on that hold.
     fn drop(&mut self) {
-        let mut slots = self.registry.lock();
-        if slots.get(&self.key).is_some_and(|slot| slot.tx.receiver_count() <= 1) {
-            slots.remove(&self.key);
+        let mut inner = self.registry.lock();
+        if inner.slots.get(&self.key).is_some_and(|slot| slot.tx.receiver_count() <= 1) {
+            inner.remove(&self.key);
+        }
+    }
+}
+
+/// How a hold ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldEnd {
+    /// A human decided.
+    Decided(HeldRequest, HoldDecision),
+    /// The hold was released without a decision (the agent moved on and a
+    /// status event cancelled it); whoever cancelled owns the row.
+    Released,
+    /// The deadline passed with no decision.
+    TimedOut,
+}
+
+impl HoldEnd {
+    /// The decision, if one was made.
+    #[must_use]
+    pub fn decision(self) -> Option<(HeldRequest, HoldDecision)> {
+        match self {
+            Self::Decided(r, d) => Some((r, d)),
+            Self::Released | Self::TimedOut => None,
         }
     }
 }
 
 impl Waiter {
-    /// Wait up to `deadline` for a decision. On timeout the hold is dropped
-    /// so a late answer finds nothing to resolve.
-    pub async fn wait(mut self, deadline: Duration) -> Option<(HeldRequest, HoldDecision)> {
+    /// Wait up to `deadline` for a decision. On any end the hold is dropped
+    /// (by `Drop`, once this was its last waiter) so a late answer finds
+    /// nothing to resolve.
+    pub async fn wait(mut self, deadline: Duration) -> HoldEnd {
         let rx = &mut self.rx;
         let got = tokio::time::timeout(deadline, async {
             loop {
@@ -369,11 +417,12 @@ impl Waiter {
                 }
             }
         })
-        .await
-        .ok()
-        .flatten();
-        // Drop frees the slot when this was the last waiter on it.
-        got.map(|d| (self.request.clone(), d))
+        .await;
+        match got {
+            Ok(Some(d)) => HoldEnd::Decided(self.request.clone(), d),
+            Ok(None) => HoldEnd::Released,
+            Err(_) => HoldEnd::TimedOut,
+        }
     }
 }
 
@@ -507,7 +556,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(reg.resolve("att-1", HoldDecision::Allow { message: None }));
         for r in [ra.await.unwrap(), rb.await.unwrap()] {
-            assert_eq!(r.unwrap().1, HoldDecision::Allow { message: None });
+            assert_eq!(
+                r.decision().unwrap().1,
+                HoldDecision::Allow { message: None }
+            );
         }
         assert!(reg.is_empty());
         assert!(
@@ -531,13 +583,34 @@ mod tests {
     async fn a_deadline_or_a_cancel_answers_nothing() {
         let reg = leaked();
         let w = reg.register("s:t2", "att-2", HeldRequest::Permission).unwrap();
-        assert!(w.wait(Duration::from_millis(30)).await.is_none());
+        assert_eq!(w.wait(Duration::from_millis(30)).await, HoldEnd::TimedOut);
         assert!(reg.is_empty(), "a timed-out hold is dropped");
         let w = reg.register("s:t3", "att-3", HeldRequest::Permission).unwrap();
         let waiting = tokio::spawn(w.wait(Duration::from_secs(5)));
         tokio::time::sleep(Duration::from_millis(20)).await;
         reg.cancel("s:t3");
-        assert!(waiting.await.unwrap().is_none());
+        assert_eq!(waiting.await.unwrap(), HoldEnd::Released);
+    }
+
+    #[test]
+    fn a_row_is_bound_to_exactly_one_request() {
+        let reg = leaked();
+        let _a = reg.register("s:call-a", "att-a", HeldRequest::Permission).unwrap();
+        assert!(
+            reg.register("s:call-b", "att-a", HeldRequest::Permission).is_none(),
+            "a second request may not bind a row already held"
+        );
+        assert!(
+            reg.register("s:call-a", "att-b", HeldRequest::Permission).is_none(),
+            "a held request may not move to another row"
+        );
+        let _b = reg.register("s:call-b", "att-b", HeldRequest::Permission).unwrap();
+        assert!(reg.resolve("att-b", HoldDecision::Allow { message: None }));
+        assert_eq!(
+            reg.attention_for("s:call-a").as_deref(),
+            Some("att-a"),
+            "untouched"
+        );
     }
 
     #[test]
