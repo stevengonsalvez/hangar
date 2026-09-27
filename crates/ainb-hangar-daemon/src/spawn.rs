@@ -455,12 +455,18 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
     let home = dirs::home_dir()
         .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
     let dir = resolve_shell_dir(&params.worktree_path, &home, &managed_worktrees(&home))?;
+    // tmux expands formats in `-c`, so a `#` in a folder name would be read
+    // as one (`#S` renames the directory, `#(cmd)` runs a command). `##` is
+    // tmux's literal `#`.
+    let start_dir = dir
+        .to_str()
+        .ok_or_else(|| SpawnError::Invalid("worktree_path is not valid UTF-8".into()))?
+        .replace('#', "##");
     for _ in 0..SHELL_NAME_TRIES {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let name = format!("ainb-sh-{}", &id[..8]);
         let mut tmux = tokio::process::Command::new("tmux");
-        tmux.args(["new-session", "-d", "-s", &name, "-c"])
-            .arg(&dir)
+        tmux.args(["new-session", "-d", "-s", &name, "-c", &start_dir])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -476,8 +482,10 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
             Err(_) => {
+                // The server may still make the session after its client is
+                // gone, so name it: nothing else would ever find it.
                 return Err(SpawnError::Failed(format!(
-                    "tmux did not answer within {}s",
+                    "tmux did not answer within {}s; the shell may still appear as {name}",
                     SHELL_TMUX_TIMEOUT.as_secs()
                 )));
             }
