@@ -41,10 +41,19 @@ export type UiStatus =
   | { kind: "unverifiable" }
   | { kind: "exited" };
 
-/** A value the type system says cannot happen: a new wire variant added in
- * Rust fails to compile here instead of falling into a silent default. */
-export function assertNever(value: never): never {
-  throw new Error(`unhandled status input: ${String(value)}`);
+/**
+ * A value the type system says cannot happen, and what to show if it does.
+ *
+ * Compile time: the `never` parameter makes a switch that misses a variant
+ * fail to type-check, so a wire variant added in Rust is handled here before
+ * it ships. Run time: a host at another version can still send a value this
+ * build has never seen, and throwing inside a render blanks the whole shell
+ * (there is no error boundary). So it answers `fallback`, the most honest
+ * reading of "something this build cannot name" at each call site.
+ */
+export function unhandled<T>(value: never, fallback: T): T {
+  console.warn(`unhandled status input from the host: ${String(value)}`);
+  return fallback;
 }
 
 /** The `AgentCardFrame` fields the mapping reads. A fixture only has to carry
@@ -85,7 +94,7 @@ function needFromWaitKind(waitKind: WaitKind | null, elicitation: boolean): Need
     case "waiting":
       return elicitation ? "elicitation" : "wait";
     default:
-      return assertNever(waitKind);
+      return unhandled(waitKind, elicitation ? "elicitation" : "wait");
   }
 }
 
@@ -123,7 +132,7 @@ export function deriveStatus(card: CardStatusInput, opts: DeriveStatusOptions = 
     case "unverifiable":
       break;
     default:
-      return assertNever(card.state);
+      return unhandled(card.state, { kind: "unverifiable" });
   }
   // An error chip (or an error wait_kind) outranks what the card was doing.
   if ((opts.attention ?? []).includes("Err") || card.wait_kind === "error") {
@@ -202,7 +211,7 @@ export function statusForSession(
         // Done on this row shows again.
         return isAcked(acks, rowAckKey(session.id), 0) ? { kind: "idle" } : { kind: "done" };
       default:
-        return assertNever(ring);
+        return unhandled(ring, { kind: "unverifiable" });
     }
   }
   const lifecycle = rowStatus(session.status);
@@ -223,7 +232,7 @@ export function statusForSession(
     case "stopped":
       return { kind: "exited" };
     default:
-      return assertNever(lifecycle);
+      return unhandled(lifecycle, { kind: "unverifiable" });
   }
 }
 
@@ -270,6 +279,6 @@ export function statusLabel(status: UiStatus): string {
     case "exited":
       return "Exited";
     default:
-      return assertNever(status);
+      return unhandled(status, "Unverifiable");
   }
 }
