@@ -199,10 +199,14 @@ export function validate(fields: ComposerFields): FieldError[] {
   } else if (!fields.projectPath.startsWith("/")) {
     errors.push({ field: "projectPath", message: "The project path must be absolute." });
   }
-  if (fields.model.trim() !== "" && !textOk(fields.model, SPAWN_FIELD_MAX)) {
+  // Checked as sent: `toArgs` trims these, so padding a person typed around a
+  // value must not refuse what the daemon would accept.
+  const model = fields.model.trim();
+  if (model !== "" && !textOk(model, SPAWN_FIELD_MAX)) {
     errors.push({ field: "model", message: "Model is too long or has control characters." });
   }
-  if (fields.base.trim() !== "" && !refOk(fields.base, SPAWN_FIELD_MAX)) {
+  const base = fields.base.trim();
+  if (base !== "" && !refOk(base, SPAWN_FIELD_MAX)) {
     errors.push({ field: "base", message: "Not a valid git ref." });
   }
   const explicitBranch = fields.branch.trim();
