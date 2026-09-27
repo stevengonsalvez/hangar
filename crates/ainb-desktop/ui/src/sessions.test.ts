@@ -9,7 +9,7 @@ import type {
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { idleCount, isSelected, label, LABEL_CHARS, ringCount, ringFor } from "./sessions.ts";
+import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, ringCount, ringFor } from "./sessions.ts";
 
 function session(id: string, status: SessionStatus = "Running", marks: AttentionKind[] = []): Session_Serialize {
   return {
@@ -45,7 +45,21 @@ test("header counts are per ring kind and idle status", () => {
   assert.equal(ringCount(sessions, "Ask"), 2);
   assert.equal(ringCount(sessions, "Err"), 1);
   assert.equal(ringCount(sessions, "Wait"), 0);
-  assert.equal(idleCount(sessions), 2);
+  // "c" is Idle but rings Ask: it needs a person, so it is not idle as well.
+  assert.equal(idleCount(sessions), 1);
+});
+
+test("a waiting session is counted once, in need-you, never also as idle", () => {
+  // The driven run's two readings: one waiting session read "1 need you 1
+  // idle", and with a second, idle session "1 need you 2 idle".
+  const one = { workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"])] }] } as unknown as SessionsView_Serialize;
+  assert.equal(ringCount(one, "Ask"), 1);
+  assert.equal(idleCount(one), 0);
+  const two = {
+    workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"]), session("i", "Idle")] }],
+  } as unknown as SessionsView_Serialize;
+  assert.equal(ringCount(two, "Ask"), 1);
+  assert.equal(idleCount(two), 1);
 });
 
 test("a label drops control and format characters and stops at the cap", () => {
@@ -70,4 +84,12 @@ test("a chip kind this build does not know is skipped, never ranked first", () =
     ({ ...session("u", "Idle"), attention: marks.map((kind) => ({ kind, detail: null })) }) as unknown as Session_Serialize;
   assert.equal(ringFor(unknown(["Info", "Done"])), "Done");
   assert.equal(ringFor(unknown(["Info"])), null);
+});
+
+test("a card no session row names reads as a name, never as its raw key", () => {
+  // `SessionKey::legacy`: the tmux target, which may itself carry `:`.
+  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:4242-17"), "hangar-dev:1.0");
+  assert.equal(keyLabel("legacy:claude:tmux:"), "tmux");
+  assert.equal(keyLabel("claude:5f0c9a1e-77aa-4c1d-9e4b-000000000000"), "claude 5f0c9a1e");
+  assert.equal(keyLabel("bare"), "bare");
 });
