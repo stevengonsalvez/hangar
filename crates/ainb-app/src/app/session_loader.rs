@@ -133,6 +133,13 @@ impl SessionLoader {
                             format!("Missing worktree for session {}", session_id),
                         );
                         session.id = session_id;
+                        // The container's creation time, as for a healthy
+                        // Boss row: the list is sorted by creation, so the
+                        // scan's own clock would move this row every refresh.
+                        session.created_at = container
+                            .created
+                            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
                         session.container_id = container.id.clone();
                         session.set_status(SessionStatus::Error(
                             "Worktree missing - container orphaned".to_string(),
