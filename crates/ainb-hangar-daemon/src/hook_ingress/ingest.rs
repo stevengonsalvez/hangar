@@ -18,7 +18,7 @@ use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttent
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
-use super::hold::{HOLD_DEADLINE, HeldRequest, HoldRegistry};
+use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldRegistry};
 use super::{HookEvent, HookReply, HookSink};
 use crate::attention_ingest::AttentionIngest;
 use crate::events::EventSink;
@@ -96,15 +96,14 @@ impl IngestSink {
             return HookReply::NoContent;
         }
         let key = hold_key(session, &event.payload);
+        // Bind to exactly the row THIS request raised, never "the latest
+        // open row": that could be another tool call's, and its answer would
+        // then reach this hook.
         let attention_id = match &request {
             HeldRequest::Permission => {
                 self.raise_approval(event, session, event_id, &key, now_ms).await
             }
-            // The ingest already raised (or joined) the question's row.
-            HeldRequest::Ask { .. } => AttentionRepo::open_ask_ids_for_session(&self.pool, session)
-                .await
-                .ok()
-                .and_then(|ids| ids.last().cloned()),
+            HeldRequest::Ask { tool_input } => self.ask_row(session, event_id, tool_input).await,
         };
         let Some(attention_id) = attention_id else {
             return HookReply::NoContent;
@@ -114,11 +113,14 @@ impl IngestSink {
             return HookReply::NoContent;
         };
         match waiter.wait(HOLD_DEADLINE).await {
-            Some((request, decision)) => {
+            HoldEnd::Decided(request, decision) => {
                 request.render(&decision).map_or(HookReply::NoContent, HookReply::Json)
             }
-            None => {
-                // No decision reached this hook: its own prompt takes over.
+            // The agent moved on: the status event that cancelled the hold
+            // retires the row as resolved:agent.
+            HoldEnd::Released => HookReply::NoContent,
+            HoldEnd::TimedOut => {
+                // No decision in time: the agent's own prompt takes over.
                 self.retire_approval(&attention_id, RESOLVED_NATIVE).await;
                 HookReply::NoContent
             }
@@ -173,16 +175,34 @@ impl IngestSink {
                 });
                 Some(row.id)
             }
-            // A duplicate of a request already open: join its row.
-            Ok(false) => AttentionRepo::open_approval_ids_for_session(&self.pool, session)
+            // A duplicate of a request already open: join ITS row, found by
+            // this request's own key.
+            Ok(false) => AttentionRepo::open_id_for_request_key(&self.pool, session, &request_key)
                 .await
                 .ok()
-                .and_then(|ids| ids.last().cloned()),
+                .flatten(),
             Err(e) => {
                 tracing::warn!(error = %e, "hook ingress: approval row insert failed");
                 None
             }
         }
+    }
+
+    /// The open ask row this question raised: the row the ingest just wrote
+    /// for this very line, else (a re-announced question) the open row with
+    /// this question's own request key.
+    async fn ask_row(&self, session: &str, event_id: &str, tool_input: &Value) -> Option<String> {
+        let own = format!("att:{session}:{event_id}");
+        if let Ok(Some(row)) = AttentionRepo::get(&self.pool, &own).await {
+            if row.state == "open" {
+                return Some(own);
+            }
+        }
+        let key = crate::attention_ingest::ask_request_key(tool_input)?;
+        AttentionRepo::open_id_for_request_key(&self.pool, session, &key)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Close an approval row that ended without an answer through the daemon.
