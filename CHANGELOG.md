@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- the session list (TUI and desktop) is now ordered newest first: projects and worktrees by their newest session, a worktree's sessions kept together, instead of tmux's alphabetical order; next/previous session walk the same order
 
 ## [1.28.5] - 2026-09-13
 ### Fixed

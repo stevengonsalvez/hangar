@@ -14,10 +14,18 @@ import type {
 /** Precedence, tightest first, as `AttentionKind`'s `Ord` in Rust. */
 export const ATTENTION_ORDER: readonly AttentionKind[] = ["Ask", "Wait", "Approve", "Err", "Done"];
 
+/** The kinds that want a person now: the footer's one "N need you" count
+ * sums these, and a row ringing one of them is never also counted idle.
+ * `Done` is not one: a finished turn is for reading, not answering. */
+export const NEED_YOU: readonly AttentionKind[] = ["Ask", "Approve", "Wait", "Err"];
+
 /** The kinds that block a turn: the header's attention badge counts these. */
 export const BLOCKING: readonly AttentionKind[] = ["Ask", "Wait", "Approve"];
 
-export type RowStatus = "running" | "idle" | "stopped" | "error";
+/** A row's lifecycle as the sidebar reads it. `unknown` is a status this build
+ * has never seen (a host at another version): never guessed into `stopped`,
+ * which would draw a live agent as exited. */
+export type RowStatus = "running" | "idle" | "stopped" | "error" | "unknown";
 
 export function rowStatus(status: SessionStatus): RowStatus {
   if (typeof status === "object") return "error";
@@ -28,9 +36,10 @@ export function rowStatus(status: SessionStatus): RowStatus {
       return "idle";
     case "Stopped":
       return "stopped";
-    // A host at another version may send a status this build does not know.
+    // A host at another version may send a status this build does not know:
+    // said as unknown, not guessed.
     default:
-      return "stopped";
+      return "unknown";
   }
 }
 
@@ -44,6 +53,9 @@ export function ringFor(session: Session_Serialize): AttentionKind | null {
   let ring: AttentionKind | null = null;
   // Optional: a host at another version may not send it.
   for (const mark of session.attention ?? []) {
+    // A kind this build does not know (a host at another version) is
+    // skipped: `indexOf` would read -1 and rank it above every real kind.
+    if (!ATTENTION_ORDER.includes(mark.kind)) continue;
     if (ring === null || ATTENTION_ORDER.indexOf(mark.kind) < ATTENTION_ORDER.indexOf(ring)) ring = mark.kind;
   }
   return ring;
@@ -68,6 +80,41 @@ export function allSessions(view: SessionsView_Serialize | undefined): Session_S
   return view?.workspaces.flatMap((workspace) => workspace.sessions) ?? [];
 }
 
+/** The provider session id inside a `provider:session-id` key: `board.ts`'s
+ * join, `status.ts`'s join, and nowhere else, so a third copy never drifts
+ * from the other two. */
+export function providerId(sessionKey: string): string {
+  const at = sessionKey.indexOf(":");
+  return at < 0 ? sessionKey : sessionKey.slice(at + 1);
+}
+
+/** A legacy key's exact tmux target (`session:window.pane`), or `null` for
+ * any other key. `SessionKey::legacy` writes `legacy:<provider>:<target>:
+ * <fingerprint>`; the target may itself hold `:`, the fingerprint never does. */
+export function legacyTarget(sessionKey: string): string | null {
+  return /^legacy:[^:]+:(.+):[^:]*$/.exec(sessionKey)?.[1] ?? null;
+}
+
+/** The tmux session a legacy key's target names: the part before the window,
+ * which tmux never lets a session name contain. */
+export function legacyTmuxSession(sessionKey: string): string | null {
+  return legacyTarget(sessionKey)?.split(":")[0] ?? null;
+}
+
+/**
+ * What a card is called when no session row names it. A legacy card's key is
+ * `legacy:<provider>:<tmux target>:<fingerprint>` (`SessionKey::legacy`): its
+ * name is the tmux target, the thing a person would recognise. Any other key
+ * is `<provider>:<session id>`: the provider and the id's first 8 characters.
+ * Never the raw key, which is an identifier and not a name.
+ */
+export function keyLabel(sessionKey: string): string {
+  const legacy = legacyTarget(sessionKey);
+  if (legacy !== null) return legacy;
+  const at = sessionKey.indexOf(":");
+  return at < 0 ? sessionKey : `${sessionKey.slice(0, at)} ${sessionKey.slice(at + 1, at + 9)}`;
+}
+
 /**
  * Whether `sessionId` is the session list's selected row.
  *
@@ -84,7 +131,17 @@ export function ringCount(view: SessionsView_Serialize | undefined, kind: Attent
   return allSessions(view).filter((session) => ringFor(session) === kind).length;
 }
 
-/** How many rows are idle, the header's last count. */
+/**
+ * How many rows are idle, the footer's last count. A row ringing a
+ * [`NEED_YOU`] kind is waiting on a person, whatever its lifecycle says: an
+ * agent blocked on a question sits at an idle prompt, so its status reads
+ * `Idle` too. Counting it here as well as in "need you" showed one waiting
+ * session as "1 need you 1 idle"; such a row lands in exactly one of the two
+ * counts. A row that only rings `Done` is idle, and counts here.
+ */
 export function idleCount(view: SessionsView_Serialize | undefined): number {
-  return allSessions(view).filter((session) => session.status === "Idle").length;
+  return allSessions(view).filter((session) => {
+    const ring = ringFor(session);
+    return session.status === "Idle" && (ring === null || !NEED_YOU.includes(ring));
+  }).length;
 }

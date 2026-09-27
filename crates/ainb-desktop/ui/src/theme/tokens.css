@@ -40,9 +40,10 @@
   --state-working: rgb(96, 165, 250);
   --state-done: rgb(94, 234, 212);
   --state-error: rgb(251, 113, 133);
-  --state-idle: rgb(148 163 184 / 0.55);
+  --state-idle: rgb(148 163 184 / 0.85);
 
-  /* Terminals keep the dark palette in both themes (see theme.ts). */
+  /* The terminal's own background, matching `TERMINAL_THEMES` (theme.ts):
+     it follows the window's theme, as Orca's does. */
   --terminal-bg: #0b0e14;
 
   /* Type */
@@ -77,6 +78,8 @@
 
 :root.light {
   color-scheme: light;
+
+  --terminal-bg: #ffffff;
 
   --background: #ffffff;
   --card: #f8fafc;

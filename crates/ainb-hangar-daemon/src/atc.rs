@@ -615,7 +615,7 @@ const fn yes() -> bool {
 /// (the layout both the workspace build and the release tarball produce, and the
 /// one that keeps a rebuild or a `brew upgrade` moving both together), then
 /// `ainb` on `$PATH`.
-fn ainb_bin() -> String {
+pub(crate) fn ainb_bin() -> String {
     if let Some(pinned) = std::env::var("AINB_BIN").ok().filter(|s| !s.is_empty()) {
         return pinned;
     }

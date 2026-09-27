@@ -18,12 +18,13 @@ use std::time::Duration;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
+use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
-use ainb_desktop::terminal::{TabEvents, TabsView, Terminals, Tmux};
+use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
 use ainb_desktop::updater::{self, Check, Install, Phase, Settings as UpdateSettings, Updater};
 use ainb_hangar_proto::agent_status::AgentState;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -276,6 +277,60 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
     if let Some(terminals) = &window.terminals {
         terminals.close(&key);
     }
+}
+
+/// Create a worktree with an agent in it, then open its tab.
+///
+/// The daemon does the work (`worktree/create`); this command only asks and
+/// attaches the tmux session it names. The sidebar picks the session up on
+/// its next scan. A refusal comes back as the sentence the composer shows.
+#[tauri::command]
+async fn worktree_create(
+    app: tauri::AppHandle,
+    window: tauri::State<'_, Window>,
+    args: CreateWorktreeArgs,
+) -> Result<CreatedWorktree, String> {
+    let client = ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| ainb_desktop::create::refusal_text(&error))?;
+    let created = ainb_desktop::create::request(&client, args).await?;
+    tracing::info!(session = %created.session_id, "window created a worktree session");
+    // The session exists either way; a tab that cannot open is said out loud
+    // rather than leaving the person with a closed composer and nothing new.
+    let attach_problem = match (
+        &window.terminals,
+        uuid::Uuid::parse_str(&created.session_id),
+    ) {
+        (None, _) => Some("no tmux was found".to_string()),
+        (Some(_), Err(error)) => Some(format!(
+            "the daemon named session {:?}: {error}",
+            created.session_id
+        )),
+        (Some(terminals), Ok(id)) => {
+            let target = TabTarget::Session {
+                id,
+                tmux: created.tmux_session_name.clone(),
+            };
+            // A report back is the tab failing to attach; the reducer shows it
+            // in its own words, so this does not repeat it.
+            if let Some(report) = terminals.open(target) {
+                window.shell.dispatch(report);
+            }
+            None
+        }
+    };
+    if let Some(problem) = attach_problem {
+        let message = intent::toast_text(&format!(
+            "Created {} but could not open its tab: {problem}",
+            created.branch
+        ));
+        tracing::warn!(%message, "worktree created without a tab");
+        if let Err(error) = app.emit("toast", &message) {
+            tracing::warn!(%error, "toast not delivered to the webview");
+        }
+    }
+    Ok(created)
 }
 
 /// The most of the sidecar log "show log" returns.
@@ -859,6 +914,7 @@ fn main() {
             terminal_input,
             terminal_resize,
             terminal_close,
+            worktree_create,
             update_check,
             update_apply,
             update_settings

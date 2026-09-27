@@ -73,6 +73,11 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // exactly the invocation the warning exists to catch.
     let mut shared_checkout = false;
 
+    // The branch this run cut, if it cut one: a failed launch deletes it
+    // with the worktree, so a retry under the same name is not refused as
+    // "already exists" over a branch nothing ever ran on.
+    let mut created_branch: Option<String> = None;
+
     // Step 3: Create worktree if requested
     if args.worktree || args.create_branch.is_some() {
         let manager = WorktreeManager::new().context("Failed to initialize worktree manager")?;
@@ -94,9 +99,21 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 
         info!("Creating worktree for branch: {}", branch);
 
-        let worktree_info = manager
-            .create_worktree(session_id, &repo_path, &branch, args.base.as_deref())
-            .context("Failed to create worktree")?;
+        let existed = local_branch_exists(&repo_path, &branch);
+        let worktree_info =
+            match manager.create_worktree(session_id, &repo_path, &branch, args.base.as_deref()) {
+                Ok(info) => info,
+                Err(error) => {
+                    // The branch may be cut even when the worktree add then fails.
+                    if !existed {
+                        delete_created_branch(&repo_path, Some(&branch));
+                    }
+                    return Err(error).context("Failed to create worktree");
+                }
+            };
+        if !existed {
+            created_branch = Some(branch.clone());
+        }
 
         work_dir = worktree_info.path;
         branch_name = branch;
@@ -183,6 +200,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
             }
             Err(error) => {
                 rollback_failed_interactive_launch(session_id, None, rollback_worktree()).await;
+                delete_created_branch(&repo_path, created_branch.as_deref());
                 return Err(error)
                     .context("Codex failed to start; AINB ran failed-session cleanup");
             }
@@ -257,6 +275,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     if let Err(error) = tmux.start(&work_dir).await {
         rollback_failed_interactive_launch(session_id, Some(tmux.name()), rollback_worktree())
             .await;
+        delete_created_branch(&repo_path, created_branch.as_deref());
         return Err(error).context("Failed to start tmux session");
     }
 
@@ -287,6 +306,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
                     rollback_worktree(),
                 )
                 .await;
+                delete_created_branch(&repo_path, created_branch.as_deref());
                 return Err(error)
                     .context("Codex failed to start; AINB ran failed-session cleanup");
             }
@@ -339,6 +359,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // this write must not lost-update the store.
     if let Err(error) = mutate_session_store(|store| store.upsert(metadata)) {
         rollback_failed_interactive_launch(session_id, Some(&tmux_name), rollback_worktree()).await;
+        delete_created_branch(&repo_path, created_branch.as_deref());
         if codex_thread_id.is_some() {
             if let Err(cleanup_error) = discard_codex_remote_thread(session_id).await {
                 warn!("Failed to discard claimed Codex thread for {session_id}: {cleanup_error:#}");
@@ -352,13 +373,17 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // Step 10: Print session info. Under `--format json` stdout carries exactly one
     // JSON object and nothing else, so a subprocess caller can parse it.
     if args.json {
-        let created = CreatedSession {
-            session_id,
-            tmux_session_name: &tmux_name,
-            worktree_path: work_dir.to_string_lossy(),
-            branch: &branch_name,
-            claude_session_id: claude_session_id.as_deref(),
-            model: model.as_deref(),
+        // The daemon's own result type, so the CLI and `worktree/create`
+        // cannot disagree on a field. Every field is text, so serializing
+        // cannot fail after the session exists; a non-UTF-8 directory is
+        // reported lossily (the tmux name is the handle a caller attaches by).
+        let created = ainb_hangar_proto::spawn::WorktreeCreateResult {
+            session_id: session_id.to_string(),
+            tmux_session_name: tmux_name.clone(),
+            worktree_path: work_dir.to_string_lossy().into_owned(),
+            branch: branch_name.clone(),
+            claude_session_id: claude_session_id.clone(),
+            model: model.clone(),
         };
         println!(
             "{}",
@@ -425,28 +450,6 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// What `ainb --format json run` prints on stdout: the one line a subprocess caller
-/// (the hangar daemon's `worktree/create`) parses to find the session it made.
-///
-/// Field names are a wire contract with that caller. Add fields; never rename
-/// or remove one.
-///
-/// Every field is text, so serializing cannot fail: a failure here would come
-/// after the session exists and leave it running with nothing reported.
-#[derive(Debug, serde::Serialize)]
-struct CreatedSession<'a> {
-    session_id: Uuid,
-    tmux_session_name: &'a str,
-    /// A non-UTF-8 directory is reported lossily; the tmux session name is
-    /// the handle a caller attaches by.
-    worktree_path: std::borrow::Cow<'a, str>,
-    branch: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    claude_session_id: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<&'a str>,
-}
-
 /// A human-readable progress line: stdout normally, stderr under `--format json` so
 /// stdout carries only the one JSON object.
 fn human(json: bool, line: std::fmt::Arguments<'_>) {
@@ -472,6 +475,29 @@ fn local_branch_exists(repo: &std::path::Path, branch: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Delete `branch` from `repo` when this run created it. Called after the
+/// rollback has removed the worktree (git refuses to delete a branch a
+/// worktree has checked out). Best-effort: a failure leaves the branch and
+/// says so on stderr, never masking the launch error being returned.
+fn delete_created_branch(repo: &std::path::Path, branch: Option<&str>) {
+    let Some(branch) = branch else { return };
+    let deleted = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["branch", "-D", "--", branch])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    // Only a branch that is really still there is worth a note: one the run
+    // never got as far as creating (or that is already gone) needs nothing.
+    if !deleted && local_branch_exists(repo, branch) {
+        eprintln!(
+            "note: could not delete branch '{branch}' this run created; remove it with git branch -D"
+        );
+    }
 }
 
 /// Flag combinations refused before anything is created.
@@ -929,6 +955,62 @@ fn attach_to_session(session_name: &str) -> Result<()> {
 
     // If exec returns, it means it failed
     anyhow::bail!("Failed to attach to session: {err}")
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::{delete_created_branch, local_branch_exists};
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn the_rollback_deletes_the_branch_the_run_created() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        git(repo.path(), &["branch", "ainb/made-by-run"]);
+        assert!(local_branch_exists(repo.path(), "ainb/made-by-run"));
+
+        delete_created_branch(repo.path(), Some("ainb/made-by-run"));
+        assert!(
+            !local_branch_exists(repo.path(), "ainb/made-by-run"),
+            "the rollback deleted it"
+        );
+        assert!(local_branch_exists(repo.path(), "main"), "and nothing else");
+    }
+
+    #[test]
+    fn a_branch_the_run_never_made_is_left_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        delete_created_branch(repo.path(), Some("ainb/never-made"));
+        delete_created_branch(repo.path(), None);
+        assert!(local_branch_exists(repo.path(), "main"));
+    }
 }
 
 #[cfg(test)]
@@ -1887,22 +1969,20 @@ mod tests {
         assert!(err.to_string().contains("--worktree"), "got: {err}");
     }
 
-    /// The JSON line is a wire contract with the daemon: these field names
-    /// are what `worktree/create` parses.
+    /// The JSON line is the daemon's own `WorktreeCreateResult`: these field
+    /// names are what `worktree/create` parses.
     #[test]
     fn created_session_json_names_its_fields() {
-        let id = Uuid::nil();
-        let dir = std::path::PathBuf::from("/w/t");
-        let line = serde_json::to_value(CreatedSession {
-            session_id: id,
-            tmux_session_name: "tmux_t",
-            worktree_path: dir.to_string_lossy(),
-            branch: "ainb/t",
+        let line = serde_json::to_value(ainb_hangar_proto::spawn::WorktreeCreateResult {
+            session_id: Uuid::nil().to_string(),
+            tmux_session_name: "tmux_t".into(),
+            worktree_path: "/w/t".into(),
+            branch: "ainb/t".into(),
             claude_session_id: None,
-            model: Some("opus"),
+            model: Some("opus".into()),
         })
         .expect("serialize");
-        assert_eq!(line["session_id"], id.to_string());
+        assert_eq!(line["session_id"], Uuid::nil().to_string());
         assert_eq!(line["tmux_session_name"], "tmux_t");
         assert_eq!(line["worktree_path"], "/w/t");
         assert_eq!(line["branch"], "ainb/t");

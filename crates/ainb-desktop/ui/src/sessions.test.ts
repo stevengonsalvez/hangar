@@ -9,7 +9,7 @@ import type {
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { idleCount, isSelected, label, LABEL_CHARS, ringCount, ringFor } from "./sessions.ts";
+import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor, rowStatus } from "./sessions.ts";
 
 function session(id: string, status: SessionStatus = "Running", marks: AttentionKind[] = []): Session_Serialize {
   return {
@@ -45,7 +45,32 @@ test("header counts are per ring kind and idle status", () => {
   assert.equal(ringCount(sessions, "Ask"), 2);
   assert.equal(ringCount(sessions, "Err"), 1);
   assert.equal(ringCount(sessions, "Wait"), 0);
-  assert.equal(idleCount(sessions), 2);
+  // "c" is Idle but rings Ask: it needs a person, so it is not idle as well.
+  assert.equal(idleCount(sessions), 1);
+});
+
+test("a waiting session is counted once, in need-you, never also as idle", () => {
+  // The driven run's two readings: one waiting session read "1 need you 1
+  // idle", and with a second, idle session "1 need you 2 idle".
+  const one = { workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"])] }] } as unknown as SessionsView_Serialize;
+  assert.equal(ringCount(one, "Ask"), 1);
+  assert.equal(idleCount(one), 0);
+  const two = {
+    workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"]), session("i", "Idle")] }],
+  } as unknown as SessionsView_Serialize;
+  assert.equal(ringCount(two, "Ask"), 1);
+  assert.equal(idleCount(two), 1);
+});
+
+test("an idle session that only rings Done is idle, not left out of both counts", () => {
+  // A finished turn is for reading: it is not a need-you kind, so the row
+  // is counted idle rather than in neither total.
+  const done = { workspaces: [{ name: "r", sessions: [session("d", "Idle", ["Done"])] }] } as unknown as SessionsView_Serialize;
+  assert.deepEqual(
+    NEED_YOU.map((kind) => ringCount(done, kind)),
+    [0, 0, 0, 0],
+  );
+  assert.equal(idleCount(done), 1);
 });
 
 test("a label drops control and format characters and stops at the cap", () => {
@@ -63,4 +88,28 @@ test("the selected row is named by id, not by its place in the list", () => {
   assert.equal(isSelected(sessions, "boss"), true);
   assert.equal(isSelected(sessions, "live"), false);
   assert.equal(isSelected(undefined, "boss"), false);
+});
+
+test("a chip kind this build does not know is skipped, never ranked first", () => {
+  const unknown = (marks: string[]) =>
+    ({ ...session("u", "Idle"), attention: marks.map((kind) => ({ kind, detail: null })) }) as unknown as Session_Serialize;
+  assert.equal(ringFor(unknown(["Info", "Done"])), "Done");
+  assert.equal(ringFor(unknown(["Info"])), null);
+});
+
+test("a card no session row names reads as a name, never as its raw key", () => {
+  // `SessionKey::legacy`, with the fingerprint the daemon really writes
+  // (`pane=%N;pid=N;session_started=N`, `discover/tmux.rs`): the
+  // tmux target, which may itself carry `:`.
+  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:pane=%3;pid=41;session_started=1790000000"), "hangar-dev:1.0");
+  assert.equal(legacyTmuxSession("legacy:claude:hangar-dev:1.0:pane=%3;pid=41;session_started=1790000000"), "hangar-dev");
+  assert.equal(legacyTmuxSession("claude:5f0c9a1e"), null);
+  assert.equal(keyLabel("legacy:claude:tmux:"), "tmux");
+  assert.equal(keyLabel("claude:5f0c9a1e-77aa-4c1d-9e4b-000000000000"), "claude 5f0c9a1e");
+  assert.equal(keyLabel("bare"), "bare");
+});
+
+test("a status this build does not know is unknown, never guessed as stopped", () => {
+  assert.equal(rowStatus("Paused" as unknown as SessionStatus), "unknown");
+  assert.equal(rowStatus("Stopped"), "stopped");
 });

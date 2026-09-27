@@ -1931,11 +1931,26 @@ async fn handle(
         methods::WORKSPACE_SESSION_UPSERT => handle_session_upsert(pool, req).await,
         methods::WORKSPACE_SESSION_DELETE => handle_session_delete(pool, req).await,
         methods::WORKSPACE_SESSION_RECONCILE => handle_session_reconcile(pool).await,
+        // Dark: with the boot switch off this arm does not match and the
+        // request falls through to METHOD_NOT_FOUND below.
+        methods::WORKTREE_CREATE if crate::spawn::enabled() => handle_worktree_create(req).await,
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown method: {other}"),
             data: None,
         }),
+    }
+}
+
+/// `worktree/create`: a new worktree with one agent in it, made by the CLI's
+/// own create path (see [`crate::spawn`]).
+async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::WorktreeCreateParams =
+        parse_params(req, "WorktreeCreateParams")?;
+    match crate::spawn::worktree_create(&params).await {
+        Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
     }
 }
 

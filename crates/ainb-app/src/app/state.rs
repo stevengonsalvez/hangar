@@ -4612,6 +4612,7 @@ impl AppState {
         // Also try to auto-detect workspace shells from tmux
         self.auto_detect_workspace_shells().await;
 
+        crate::models::workspace::sort_recent_first(&mut self.sessions.workspaces);
         crate::models::workspace::carry_host_rows(&held, &mut self.sessions.workspaces);
 
         // Reset selection state before setting new selection
@@ -4860,6 +4861,11 @@ impl AppState {
                             // Remove empty workspaces (those that only had SSH sessions)
                             workspaces
                                 .retain(|w| !w.sessions.is_empty() || w.shell_session.is_some());
+                            // In the one order every surface shows, BEFORE the
+                            // comparison below: the scan finds rows in tmux's
+                            // alphabetical order, so comparing unsorted rows
+                            // against sorted ones would call every scan a change.
+                            crate::models::workspace::sort_recent_first(&mut workspaces);
 
                             info!(
                                 "Separated {} SSH sessions from {} workspaces",
@@ -9363,6 +9369,46 @@ impl AppState {
         }
     }
 
+    /// Put a session this window just created into its repo's workspace (a new
+    /// workspace when the repo has none yet), in the one recent-first order
+    /// every surface shows, and select it by id. A new session is the newest,
+    /// so it lands at the top of its workspace, not at the end, and the
+    /// cursors follow it wherever the sort put it. One `get_mut`, so both
+    /// cursors move in one change.
+    fn insert_created_session(
+        &mut self,
+        session: crate::models::Session,
+        repo_path: &std::path::Path,
+        workspace_name: String,
+    ) {
+        let new_id = session.id;
+        if let Some(workspace) = self.sessions.workspaces.iter_mut().find(|w| {
+            std::path::Path::new(&w.path).canonicalize().ok() == repo_path.canonicalize().ok()
+        }) {
+            workspace.sessions.push(session);
+        } else {
+            let mut workspace =
+                crate::models::Workspace::new(workspace_name, repo_path.to_path_buf());
+            workspace.sessions.push(session);
+            self.sessions.workspaces.push(workspace);
+        }
+        let sessions = self.sessions.get_mut();
+        crate::models::workspace::sort_recent_first(&mut sessions.workspaces);
+        if let Some((ws_idx, session_index)) =
+            sessions.workspaces.iter().enumerate().find_map(|(ws_idx, workspace)| {
+                workspace
+                    .sessions
+                    .iter()
+                    .position(|row| row.id == new_id)
+                    .map(|session_index| (ws_idx, session_index))
+            })
+        {
+            sessions.selected_workspace_index = Some(ws_idx);
+            sessions.selected_session_index = Some(session_index);
+            sessions.shell_selected = false;
+        }
+    }
+
     /// Create an Interactive mode session (host-based, no Docker)
     ///
     /// # Arguments
@@ -9503,32 +9549,7 @@ impl AppState {
                     session.display_name = Some(label.clone());
                 }
 
-                // Find or create workspace for this repo
-                if let Some((ws_idx, workspace)) =
-                    self.sessions.workspaces.iter_mut().enumerate().find(|(_, w)| {
-                        std::path::Path::new(&w.path).canonicalize().ok()
-                            == repo_path.canonicalize().ok()
-                    })
-                {
-                    workspace.sessions.push(session);
-                    // Auto-select the new session so the list scrolls to show it.
-                    // The workspace is borrowed out of this same section, so the
-                    // two cursors are set through one `get_mut` rather than two.
-                    let session_index = workspace.sessions.len() - 1;
-                    let sessions = self.sessions.get_mut();
-                    sessions.selected_workspace_index = Some(ws_idx);
-                    sessions.selected_session_index = Some(session_index);
-                } else {
-                    // Create new workspace
-                    let mut workspace =
-                        crate::models::Workspace::new(workspace_name, repo_path.to_path_buf());
-                    workspace.sessions.push(session);
-                    self.sessions.workspaces.push(workspace);
-                    // Auto-select the new workspace and session
-                    self.sessions.selected_workspace_index =
-                        Some(self.sessions.workspaces.len() - 1);
-                    self.sessions.selected_session_index = Some(0);
-                }
+                self.insert_created_session(session, repo_path, workspace_name);
 
                 // Store tmux session for attach operations
                 // Pass branch name (NOT tmux-prefixed name) to TmuxSession::new()

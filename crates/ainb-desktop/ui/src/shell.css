@@ -241,6 +241,22 @@ body {
   font-weight: normal;
 }
 
+.sidebar-new {
+  margin-inline-start: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.sidebar-new:hover {
+  color: var(--text);
+  border-color: var(--input);
+}
+
 .sidebar .empty {
   margin-inline: 12px;
   color: var(--muted-foreground);
@@ -272,19 +288,21 @@ body {
 
 /* The disclosure triangle this rule draws instead: a small chevron that
    turns with the details' own `open`, never a second, JS-tracked copy of
-   the state `sidebar.tsx` already reads off the DOM. */
+   the state `sidebar.tsx` already reads off the DOM. The two borders draw a
+   corner pointing down-right: turned 45deg it points down (open, as every
+   disclosure reads), turned -45deg it points right (collapsed). */
 .workspace-name::before {
   content: "";
   width: 6px;
   height: 6px;
   border-inline-end: 1px solid var(--muted-foreground);
   border-block-end: 1px solid var(--muted-foreground);
-  transform: rotate(-45deg);
+  transform: rotate(45deg);
   transition: transform var(--dur-fast) var(--ease-out-expo);
 }
 
 .workspace:not([open]) .workspace-name::before {
-  transform: rotate(45deg);
+  transform: rotate(-45deg);
 }
 
 .workspace-name-text {
@@ -346,6 +364,36 @@ body {
   flex-shrink: 0;
 }
 
+/* The composer's card while it creates: muted rather than bold, so it reads
+   as "on its way" beside the real cards it will join. */
+.worktree-card[data-pending="true"] .worktree-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+/* A small rotating ring, in fixed steps rather than eased, the same busy
+   read as the working status glyph (whose keyframes this reuses): the
+   composer's Create button and the sidebar's pending card both use it. */
+.spinner {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  animation: ring-spin 800ms steps(8, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
+}
+
 .agent-rows {
   margin: 0;
   padding: 0;
@@ -362,7 +410,9 @@ body {
   text-align: left;
   cursor: pointer;
   display: grid;
-  grid-template-columns: 8px minmax(0, max-content) minmax(0, 1fr);
+  /* 12px: the glyph's shapes (a question mark, a check, a spinner) need the
+     room to read as shapes rather than as a coloured dot. */
+  grid-template-columns: 12px minmax(0, max-content) minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   padding: 3px 8px;
@@ -397,42 +447,87 @@ body {
   box-shadow: inset 2px 0 0 var(--primary);
 }
 
-/* Status fills the dot; attention paints a ring around it. Idle is the
-   quiet default; every other state overrides the fill, the ring, or both. */
-.ring {
-  display: inline-block;
+/* P4's status vocabulary (spec: "Status vocabulary"): one `data-status`
+   value, one colour each, drawn by the sidebar's and the tab's glyph
+   (`.status-glyph`) and the board's card alike, so the same card reads the
+   same colour on every surface it appears on. `needs-*` all read amber
+   except its own `error`, which reads coral like every other error. */
+[data-status] {
+  --status-color: var(--idle);
+}
+
+[data-status^="needs-"] {
+  --status-color: var(--gold);
+}
+
+[data-status="needs-error"] {
+  --status-color: var(--red);
+}
+
+[data-status="working"] {
+  --status-color: var(--blue);
+}
+
+[data-status="done"] {
+  --status-color: var(--green);
+}
+
+[data-status="exited"] {
+  --status-color: var(--muted-foreground);
+}
+
+/* One glyph per status, on a sidebar row and a tab alike (`StatusGlyph`):
+   a shape and a colour, never colour alone. The words ride beside it in a
+   visually hidden label. */
+.status-glyph {
+  display: inline-grid;
+  place-items: center;
   flex-shrink: 0;
-  width: 8px;
-  height: 8px;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  color: var(--status-color, var(--idle));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.status-glyph[data-status^="needs-"]::before {
+  content: "?";
+}
+
+.status-glyph[data-status="needs-error"]::before {
+  content: "!";
+}
+
+.status-glyph[data-status="done"]::before {
+  content: "\2713";
+}
+
+.status-glyph[data-status="idle"]::before {
+  content: "\25CF";
+  font-size: 8px;
+}
+
+.status-glyph[data-status="exited"]::before {
+  content: "\00D7";
+}
+
+/* Unverifiable: a hollow dashed ring, held but unknown. */
+.status-glyph[data-status="unverifiable"] {
+  width: 10px;
+  height: 10px;
+  border: 2px dashed var(--idle);
   border-radius: 50%;
-  background: var(--idle);
-  box-shadow: 0 0 0 2px transparent;
 }
 
-.ring.idle,
-.ring.stopped {
-  background: var(--idle);
-}
-
-.ring.error {
-  background: var(--red);
-}
-
-/* Working: the compositor spinner, a rotating ring drawn in fixed steps
-   rather than eased, the way a busy indicator should read rather than a
-   smooth clock (`--dur-base` already zeroes under reduced motion). */
-.ring.running {
-  position: relative;
-  background: var(--blue);
-}
-
-.ring.running::after {
-  content: "";
-  position: absolute;
-  inset: -3px;
+/* Working: the compositor spinner, a ring turned in fixed steps. */
+.status-glyph[data-status="working"] {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--status-color);
+  border-top-color: transparent;
   border-radius: 50%;
-  border: 2px solid transparent;
-  border-top-color: var(--blue);
   animation: ring-spin 800ms steps(8, end) infinite;
 }
 
@@ -443,28 +538,10 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ring.running::after {
+  .status-glyph[data-status="working"] {
     animation: none;
-    border-color: var(--blue);
+    border-top-color: var(--status-color);
   }
-}
-
-[data-ring="ask"] .ring,
-[data-ring="approve"] .ring,
-[data-ring="wait"] .ring {
-  box-shadow: 0 0 0 2px var(--gold);
-}
-
-[data-ring="err"] .ring {
-  background: var(--red);
-  box-shadow: 0 0 0 2px var(--red);
-}
-
-/* Done, until acked (ack lands in P4): a filled mint dot rather than the
-   working spinner or the idle default. */
-[data-ring="done"] .ring {
-  background: var(--state-done);
-  box-shadow: 0 0 0 2px var(--state-done);
 }
 
 /* The hover tint is faint on purpose; the keyboard gets a real ring. */
@@ -488,6 +565,26 @@ body {
 .workarea > .empty {
   margin: 16px;
   color: var(--muted-foreground);
+}
+
+/* The selected session, after its tab closed: named, with the way back in. */
+.empty-selected {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.empty-selected .empty-name {
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.empty-selected .empty-branch {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .tabs {
@@ -554,15 +651,24 @@ body {
 .tab-close {
   padding: 2px 8px;
   color: var(--muted-foreground);
-  /* Visible on hover or keyboard focus, so the strip stays quiet until a
-     tab is actually in play; still reachable by keyboard either way. */
+  /* Always on the active tab, the one a person is looking at (its keyboard
+     focus lives in the terminal, never in the strip, so focus alone never
+     shows it). On the others it shows on hover or focus, as Orca's does,
+     and always where there is no hover to reveal it. */
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease-out-expo);
 }
 
+.tab.active .tab-close,
 .tab:hover .tab-close,
 .tab:focus-within .tab-close {
   opacity: 1;
+}
+
+@media (hover: none) {
+  .tab-close {
+    opacity: 1;
+  }
 }
 
 .terminal {
@@ -699,13 +805,203 @@ body {
   padding: 10px 14px;
 }
 
+/* The new-worktree composer (Mod+N): a floating surface like the palette's,
+   over `--float-bg`/`--float-border`/`--float-shadow` rather than the flat
+   `--panel` the palette reads, since this one is a form, not a scrolling
+   list, and wants the elevated look the design tokens reserve for menus,
+   popovers and dialogs. */
+.composer-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  overflow-y: auto;
+  padding-block: 8vh;
+  background: color-mix(in srgb, var(--background) 60%, transparent);
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 92vw);
+  height: fit-content;
+  padding: 20px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-xl);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  backdrop-filter: blur(20px);
+}
+
+.composer-title {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.composer-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.composer-row {
+  display: flex;
+  gap: 12px;
+}
+
+.composer-row .composer-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer-label {
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+}
+
+.composer input[type="text"],
+.composer select,
+.composer textarea {
+  padding: 6px 10px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+}
+
+.composer textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.composer input:focus-visible,
+.composer select:focus-visible,
+.composer textarea:focus-visible,
+.composer-agent:focus-visible,
+.composer-cancel:focus-visible,
+.composer-create:focus-visible,
+.composer-advanced summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -1px;
+}
+
+.composer input:disabled,
+.composer select:disabled,
+.composer textarea:disabled,
+.composer-agent:disabled {
+  opacity: 0.6;
+}
+
+.composer input[aria-invalid="true"],
+.composer select[aria-invalid="true"],
+.composer textarea[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
+.composer-hint {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+.composer-error {
+  margin: 0;
+  color: var(--destructive);
+  font-size: var(--text-meta);
+}
+
+.composer-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-agent {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+.composer-agent.selected {
+  border-color: var(--primary);
+  background: var(--highlight);
+  color: var(--primary);
+}
+
+.composer-advanced {
+  padding-block-start: 8px;
+  border-block-start: 1px solid var(--border);
+}
+
+.composer-advanced summary {
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+.composer-advanced .composer-field {
+  margin-block-start: 8px;
+}
+
+.composer-failure {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--destructive) 15%, transparent);
+  color: var(--destructive);
+  font-size: var(--text-sub);
+}
+
+.composer-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-block-start: 4px;
+}
+
+.composer-cancel {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.composer-create {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  cursor: pointer;
+}
+
+.composer-create:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 /* The board: columns of agents by the state the host gave them, beside the
    list of what is waiting on a human. */
 .board {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr minmax(220px, 320px);
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 300px);
   grid-template-rows: auto 1fr;
   gap: 12px;
   padding: 12px;
@@ -726,10 +1022,15 @@ body {
   color: var(--red);
 }
 
+/* The four columns share whatever width the waiting list leaves: at 1280x800
+   four 180px minimums overflowed the area and clipped the last column. The
+   120px floor keeps a column readable when the window is narrower still; past
+   it the area scrolls rather than squeezing a card to nothing. A card's title
+   ellipsizes. */
 .board-columns {
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(180px, 1fr);
+  grid-auto-columns: minmax(120px, 1fr);
   gap: 10px;
   overflow: auto;
   min-height: 0;
@@ -759,8 +1060,23 @@ body {
   color: var(--muted-foreground);
 }
 
-.board-column[data-state="waiting"] {
+.board-column[data-state="needs"] {
   border-color: var(--gold);
+}
+
+/* Idle is hidden behind a native disclosure, closed by default (spec): the
+   summary reads exactly like every other column's own heading. */
+.board-idle-toggle summary {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--gold);
+  cursor: pointer;
+}
+
+.board-idle-toggle[open] summary {
+  border-bottom: 1px solid var(--border);
 }
 
 .board-column ul,
@@ -788,13 +1104,22 @@ body {
   width: 100%;
   margin-top: 6px;
   padding: 8px;
+  padding-inline-start: 10px;
   border: 1px solid var(--highlight);
+  /* The status colour rides the start edge (P4): the same word every other
+     surface paints this card with, without repainting the whole card over
+     `.open`'s own gold border below. */
+  border-inline-start: 3px solid var(--status-color, var(--idle));
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
   text-align: left;
   font: inherit;
   cursor: pointer;
+}
+
+.board-card[data-status="unverifiable"] {
+  border-inline-start-style: dashed;
 }
 
 .board-card:hover:not(:disabled),
@@ -844,6 +1169,7 @@ body {
 }
 
 .card-chips .chip,
+.card-need,
 .row-kind {
   align-self: flex-start;
   padding: 0 5px;
@@ -857,6 +1183,24 @@ body {
 .chip[data-kind="Err"],
 .attention-row[data-kind="Err"] .row-kind {
   color: var(--red);
+}
+
+/* The need kind label a needs-you card shows (spec: "show the need kind
+   label"): the same amber as the chips above, coral for its own error. */
+.card-need[data-kind="error"] {
+  color: var(--red);
+}
+
+/* Unverifiable falls in with Idle (there is no fifth column for it), so its
+   own dashed badge is what tells the two apart on the card (spec: "a muted
+   dashed badge"). */
+.badge-unverifiable {
+  align-self: flex-start;
+  padding: 0 5px;
+  border: 1px dashed var(--idle);
+  border-radius: 4px;
+  color: var(--muted-foreground);
+  font-size: 11px;
 }
 
 /* The attention banner: the selected session's question, answered here. */
@@ -1216,6 +1560,61 @@ body {
 .daemons-panel th {
   color: var(--muted-foreground);
   font-size: 11px;
+}
+
+/* Settings > Appearance: the theme switch, a segmented control as Orca draws
+   it. The picked choice carries the accent; focus shows the ring. */
+.appearance-panel h3 {
+  margin: 0 0 8px;
+}
+
+.appearance-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.appearance-label {
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+}
+
+.theme-switch {
+  display: inline-flex;
+  margin: 0;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.theme-choice {
+  position: relative;
+  padding: 3px 10px;
+  border-radius: calc(var(--radius-sm) - 2px);
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+/* The native radio stays in the tree (keyboard, screen reader) but is drawn
+   by its label. */
+.theme-choice input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.theme-choice:has(input:checked) {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.theme-choice:has(input:focus-visible) {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
 }
 
 .review-withheld {
@@ -1753,4 +2152,15 @@ body {
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* The shell behind the composer: made inert while it is open. A wrapper
+   that draws no box, so the page's own flex layout is unchanged. */
+.shell-content {
+  display: contents;
+}
+
+.board-idle-toggle summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
 }

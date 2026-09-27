@@ -64,6 +64,10 @@ impl SessionLoader {
                             worktree_info.path.to_string_lossy().to_string(), // Use worktree path, not source repo
                         );
                         session.id = session_id;
+                        // The container's own creation time, never the scan's:
+                        // the list is sorted by creation, so `now()` here would
+                        // move the row on every refresh.
+                        session.created_at = container_created_at(container.created);
                         session.container_id = container.id;
                         session.branch_name = worktree_info.branch_name.clone();
                         session.mode = SessionMode::Boss;
@@ -126,6 +130,10 @@ impl SessionLoader {
                             format!("Missing worktree for session {}", session_id),
                         );
                         session.id = session_id;
+                        // The container's creation time, as for a healthy
+                        // Boss row: the list is sorted by creation, so the
+                        // scan's own clock would move this row every refresh.
+                        session.created_at = container_created_at(container.created);
                         session.container_id = container.id.clone();
                         session.set_status(SessionStatus::Error(
                             "Worktree missing - container orphaned".to_string(),
@@ -272,5 +280,39 @@ mod tests {
     async fn test_session_loader_creation() {
         let loader = SessionLoader::new().await;
         assert!(loader.is_ok());
+    }
+}
+
+/// When Docker made a container (`ContainerSummary.created`, unix seconds),
+/// as a session's creation time, or the epoch when Docker did not say. Never
+/// the scan's own clock: the session list is sorted by creation, so a time
+/// taken per scan would move the row on every refresh.
+fn container_created_at(created: Option<i64>) -> chrono::DateTime<chrono::Utc> {
+    created
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod created_at_tests {
+    use super::container_created_at;
+
+    #[test]
+    fn a_boss_row_is_dated_by_its_container_and_the_same_on_every_scan() {
+        // Healthy and orphaned rows both go through this: two scans of one
+        // container give one time, so the row never moves between refreshes.
+        let first = container_created_at(Some(1_790_000_000));
+        let second = container_created_at(Some(1_790_000_000));
+        assert_eq!(first, second);
+        assert_eq!(first.timestamp(), 1_790_000_000);
+    }
+
+    #[test]
+    fn a_container_docker_gave_no_time_sorts_last_not_first() {
+        assert_eq!(container_created_at(None), chrono::DateTime::UNIX_EPOCH);
+        assert_eq!(
+            container_created_at(Some(i64::MAX)),
+            chrono::DateTime::UNIX_EPOCH
+        );
     }
 }

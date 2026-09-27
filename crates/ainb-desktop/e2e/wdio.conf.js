@@ -26,6 +26,8 @@ export const config = {
     "./specs/inbox.e2e.js",
     "./specs/commits.e2e.js",
     "./specs/palette.e2e.js",
+    // Last: it closes a tab and folds a project, which no spec above expects.
+    "./specs/layout.e2e.js",
   ],
   maxInstances: 1,
   framework: "mocha",

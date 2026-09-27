@@ -15,6 +15,7 @@ import type {
   FleetView_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
+import { ackTurn, NO_ACKS, type AckMap } from "../../src/acks.ts";
 import { Board } from "../../src/board.tsx";
 import type { RendererIntent } from "../../src/tabs.ts";
 
@@ -48,6 +49,9 @@ function frames(names: { a: string; b: string }) {
           transport_health: "ok",
           wait_kind: "ask",
           has_open_request: true,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 1,
         },
         {
           session_key: "claude:pb",
@@ -57,6 +61,9 @@ function frames(names: { a: string; b: string }) {
           transport_health: "ok",
           wait_kind: null,
           has_open_request: false,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 1,
         },
       ],
     },
@@ -72,10 +79,12 @@ afterEach(() => {
 });
 
 /** The board, open over one frame set, with every chosen intent recorded. */
-async function open() {
-  const [view, setView] = createSignal(frames({ a: "a", b: "b" }));
+async function open(initial = frames({ a: "a", b: "b" })) {
+  const [view, setView] = createSignal(initial);
+  const [acks, setAcks] = createSignal<AckMap>(NO_ACKS);
   const chosen: RendererIntent[] = [];
   const transcripts: string[] = [];
+  const acked: [string, number][] = [];
   const container = document.createElement("div");
   document.body.appendChild(container);
   cleanup = render(
@@ -90,20 +99,30 @@ async function open() {
         get sessions() {
           return view().sessions;
         },
+        get acks() {
+          return acks();
+        },
         elsewhere: 0,
         onChoose: (intent: RendererIntent) => chosen.push(intent),
         onOpenTranscript: (key: string) => transcripts.push(key),
+        onAck: (sessionKey: string, turnMarker: number) => {
+          acked.push([sessionKey, turnMarker]);
+          setAcks((current) => ackTurn(current, sessionKey, turnMarker));
+        },
       }),
     container,
   );
   await settle();
   return {
     setView,
+    setAcks,
     chosen,
     transcripts,
+    acked,
     container,
     cards: () => [...container.querySelectorAll<HTMLButtonElement>(".board-card")],
     card: (key: string) => container.querySelector<HTMLButtonElement>(`.board-card[data-card="${key}"]`),
+    column: (state: string) => container.querySelector<HTMLElement>(`.board-column[data-state="${state}"]`),
     rows: () => [...container.querySelectorAll<HTMLButtonElement>(".attention-row")],
   };
 }
@@ -176,4 +195,118 @@ test("a card whose title changes keeps its node and shows the new title", async 
 
   assert.ok(board.card("claude:pb") === card, "the renamed card is the same node");
   assert.equal(card.querySelector(".card-title")?.textContent, "renamed");
+});
+
+test("the columns are Orca's own words, and a needs-you card carries its need", async () => {
+  const board = await open();
+  assert.deepEqual(
+    [...board.container.querySelectorAll(".board-column")].map((node) => node.getAttribute("data-state")),
+    ["needs", "working", "done", "idle"],
+  );
+  const needsCard = board.card("claude:pa")!;
+  assert.equal(needsCard.dataset.status, "needs-ask");
+  assert.equal(needsCard.querySelector(".card-need")?.textContent, "ask");
+  const workingCard = board.card("claude:pb")!;
+  assert.equal(workingCard.dataset.status, "working");
+  assert.equal(workingCard.querySelector(".card-need"), null, "only a needs-you card carries the chip");
+});
+
+/** A world with one idle, one unverifiable and one done card, for the idle
+ * toggle, the unverifiable badge and the Done ack. */
+function idleWorld() {
+  const sessions = {
+    workspaces: [
+      { name: "repo", sessions: [session("idle-row"), session("unv-row"), session("done-row")] },
+    ],
+    selected_session_id: null,
+  } as unknown as SessionsView_Serialize;
+  const fleet = {
+    fleet_metadata: {
+      "idle-row": { provider_session_id: "p-idle" },
+      "unv-row": { provider_session_id: "p-unv" },
+      "done-row": { provider_session_id: "p-done" },
+    },
+    fleet_snapshot: [],
+    daemon_attention: { by_session_id: {} },
+    daemon_reachable: true,
+  } as unknown as FleetView_Serialize;
+  const agentStatus = {
+    absent: null,
+    view: {
+      health: { kind: "fresh" },
+      cards: [
+        {
+          session_key: "claude:p-idle",
+          state: "idle",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 1,
+        },
+        {
+          session_key: "claude:p-unv",
+          state: "unverifiable",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: false,
+          tier: "pane_text",
+          evidence_observed_at: 1,
+        },
+        {
+          session_key: "claude:p-done",
+          state: "idle",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: true,
+          tier: "hook",
+          evidence_observed_at: 42,
+        },
+      ],
+    },
+  } as unknown as AgentStatusView;
+  return { sessions, fleet, agentStatus };
+}
+
+test("idle is hidden behind a native disclosure, closed by default", async () => {
+  const board = await open(idleWorld());
+  const idle = board.column("idle")!;
+  const details = idle.querySelector("details.board-idle-toggle") as HTMLDetailsElement;
+  assert.ok(details, "the idle column is a <details>");
+  assert.equal(details.open, false, "closed by default");
+  // The unverifiable card falls in with idle and carries its own badge.
+  const unverifiable = board.card("claude:p-unv")!;
+  assert.ok(details.contains(unverifiable), "an unverifiable card lives in the idle disclosure");
+  assert.equal(unverifiable.dataset.status, "unverifiable");
+  assert.ok(unverifiable.querySelector(".badge-unverifiable"), "the card carries the unverifiable badge");
+
+  details.open = true;
+  await settle();
+  assert.ok(details.contains(board.card("claude:p-idle")), "opening it still shows the plain idle card");
+});
+
+test("a Done card says click to open, and clicking it acks the turn and moves it to Idle", async () => {
+  const board = await open(idleWorld());
+  const done = board.card("claude:p-done")!;
+  assert.equal(done.dataset.status, "done");
+  assert.equal(done.querySelector(".card-line")?.textContent, "click to open");
+
+  done.click();
+  assert.deepEqual(board.acked, [["claude:p-done", 42]]);
+  await settle();
+
+  const afterAck = board.card("claude:p-done");
+  assert.ok(afterAck, "the same agent's card still draws");
+  assert.equal(afterAck.dataset.status, "idle", "acked: no longer Done");
+  const idleDetails = board.column("idle")!.querySelector("details.board-idle-toggle")!;
+  assert.ok(idleDetails.contains(afterAck), "and it moved into the idle disclosure");
 });

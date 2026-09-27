@@ -35,6 +35,22 @@ else
 fi
 
 agent=${AINB_AGENT:-claude}
+
+# One id per hook call, sent as X-Ainb-Event-Id and written into a spooled
+# copy, so the daemon records an event once even if it did record it before
+# the call failed. Linux has a kernel UUID source; macOS has uuidgen; else
+# 16 random bytes in hex.
+event_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null ||
+  uuidgen 2>/dev/null ||
+  od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+case "$event_id" in
+  *[!A-Za-z0-9-]* | '') event_id= ;;
+esac
+# Every source failed: the time and this shell's pid still name the call
+# uniquely enough to de-duplicate a replay.
+if [ -z "$event_id" ]; then
+  event_id="$(date +%s 2>/dev/null || printf 0)-$$-hook"
+fi
 # The same resolution as the daemon's hangar home: AINB_HANGAR_HOME, else the
 # default. Nothing else, so the script never reads files the daemon did not
 # write.
@@ -102,7 +118,7 @@ fi
 
 spool() {
   case "$event" in
-    PreToolUse | PostToolUse | PostToolUseFailure) return 0 ;;
+    PermissionRequest | PreToolUse | PostToolUse | PostToolUseFailure) return 0 ;;
   esac
   dir="$home/hangar/hook-spool"
   (umask 077 && mkdir -p "$dir") 2>/dev/null || return 0
@@ -122,9 +138,9 @@ spool() {
   line=$(printf '%s' "$payload" | tr '\n' ' ')
   (
     umask 077
-    printf '{"v":1,"source":"%s","event":"%s","pane_key":"%s","tmux_pane":"%s","parent":"%s","received_at_ms":%s000,"payload":%s}\n' \
+    printf '{"v":1,"source":"%s","event":"%s","pane_key":"%s","tmux_pane":"%s","parent":"%s","received_at_ms":%s000,"event_id":"%s","payload":%s}\n' \
       "$(safe "$agent")" "$(safe "$event")" "$(safe "${AINB_PANE_KEY:-}")" \
-      "$(safe "${TMUX_PANE:-}")" "$(safe "${AINB_PARENT_SESSION:-}")" "$now" "$line" >>"$file"
+      "$(safe "${TMUX_PANE:-}")" "$(safe "${AINB_PARENT_SESSION:-}")" "$now" "$event_id" "$line" >>"$file"
   ) 2>/dev/null || :
 }
 
@@ -139,6 +155,7 @@ post() {
     -H "X-Ainb-Pane-Key: ${AINB_PANE_KEY:-}" \
     -H "X-Ainb-Tmux-Pane: ${TMUX_PANE:-}" \
     -H "X-Ainb-Parent: ${AINB_PARENT_SESSION:-}" \
+    -H "X-Ainb-Event-Id: ${event_id}" \
     -w '\n%{http_code}' \
     --data-binary @- 2>/dev/null
 }

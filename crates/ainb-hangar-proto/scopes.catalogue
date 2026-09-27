@@ -188,6 +188,7 @@ terminal/floor                       allow    allow         allow   allow       
 terminal/resize                      allow    allow         allow   allow       deny
 hangar/issue_create                  allow    allow         allow   deny        deny
 hangar/issue_run                     allow    allow         allow   deny        deny
+worktree/create                      allow    allow         allow   deny        deny
 #
 event workspace                      allow    allow         allow   deny        deny
 event task_stream                    allow    allow         allow   deny        deny
