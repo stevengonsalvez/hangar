@@ -1,5 +1,6 @@
 import { createMemo, For, Show } from "solid-js";
 import type { AgentStatusView, FleetView_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
+import type { AckMap } from "./acks.ts";
 import {
   attentionRows,
   boardColumns,
@@ -12,6 +13,7 @@ import {
 } from "./board.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
 import { label } from "./sessions.ts";
+import { statusKey, statusLabel } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
 interface Props {
@@ -23,10 +25,17 @@ interface Props {
   sessions: SessionsView_Serialize | undefined;
   /** Open rows no session in this window can show: a root selector's memo. */
   elsewhere: number;
+  /** This viewer's Done acks (`acks.ts`), owned by `main.tsx` because the
+   * sidebar and the tab strip read the very same map: three surfaces
+   * disagreeing about which turn was opened is the bug a shared owner
+   * prevents. */
+  acks: AckMap;
   /** A row was chosen: dispatch its intent. */
   onChoose(intent: RendererIntent): void;
   /** An ACP card was chosen: open its transcript where a terminal would be. */
   onOpenTranscript(sessionKey: string): void;
+  /** A Done card was opened: ack its current turn. */
+  onAck(sessionKey: string, turnMarker: number): void;
 }
 
 /**
@@ -47,9 +56,11 @@ function sameColumns(a: BoardColumn[], b: BoardColumn[]): boolean {
  * is the `ask` pane when something is open on that agent.
  */
 export function Board(props: Props) {
-  const columns = createMemo(() => boardColumns(props.agentStatus, props.fleet, props.sessions), undefined, {
-    equals: sameColumns,
-  });
+  const columns = createMemo(
+    () => boardColumns(props.agentStatus, props.fleet, props.sessions, props.acks),
+    undefined,
+    { equals: sameColumns },
+  );
   const health = createMemo(() => boardHealth(props.agentStatus));
   const waiting = createMemo(() => attentionRows(props.fleet, props.sessions));
   // Drawn by key, not by object identity (#1267). Every frame that reaches
@@ -66,6 +77,15 @@ export function Board(props: Props) {
   const show = (sessionId: string | null, openRequest: boolean) => {
     if (sessionId === null) return;
     for (const intent of showIntents(sessionId, openRequest)) props.onChoose(intent);
+  };
+
+  /** A card was chosen, from either its column or the attention list. A
+   * Done card acks on the same click that opens it (spec: "click to open"):
+   * there is no separate dismiss, opening it IS reading it. */
+  const choose = (card: BoardCard) => {
+    if (card.status.kind === "done") props.onAck(card.key, card.evidenceObservedAt);
+    if (card.sessionId === null && card.acp) props.onOpenTranscript(card.key);
+    else show(card.sessionId, card.hasOpenRequest);
   };
 
   const healthLine = () => {
@@ -97,53 +117,84 @@ export function Board(props: Props) {
             const column = () => columnList().byKey.get(columnKey);
             const cards = createMemo(() => keyedList(column()?.cards ?? [], (card) => card.key));
             const cardKeys = createMemo(() => cards().keys, [], { equals: sameKeys });
+            const list = () => (
+              <Show when={cardKeys().length > 0} fallback={<p class="empty">Nothing here</p>}>
+                <ul>
+                  <For each={cardKeys()}>
+                    {(cardKey) => {
+                      // The card as the latest frame has it, read when it is
+                      // drawn and again when it is clicked.
+                      const card = () => cards().byKey.get(cardKey);
+                      return (
+                        <li>
+                          <button
+                            type="button"
+                            class="board-card"
+                            classList={{ open: card()?.hasOpenRequest, unverifiable: card()?.status.kind === "unverifiable" }}
+                            data-card={card()?.key}
+                            data-status={card() && statusKey(card()!.status)}
+                            title={card() && statusLabel(card()!.status)}
+                            disabled={card()?.sessionId === null && !card()?.acp}
+                            onClick={() => {
+                              const now = card();
+                              if (now !== undefined) choose(now);
+                            }}
+                          >
+                            <span class="card-title">{card()?.title}</span>
+                            <Show when={needOf(card())}>
+                              {(need) => (
+                                <span class="card-need chip" data-kind={need()}>
+                                  {need()}
+                                </span>
+                              )}
+                            </Show>
+                            <span class="card-line">{cardLine(card())}</span>
+                            <Show when={card()?.status.kind === "unverifiable"}>
+                              <span class="badge-unverifiable">Unverifiable</span>
+                            </Show>
+                            <Show when={(card()?.attention.length ?? 0) > 0}>
+                              <span class="card-chips">
+                                <For each={card()?.attention}>
+                                  {(kind) => (
+                                    <span class="chip" data-kind={kind}>
+                                      {kind}
+                                    </span>
+                                  )}
+                                </For>
+                              </span>
+                            </Show>
+                          </button>
+                        </li>
+                      );
+                    }}
+                  </For>
+                </ul>
+              </Show>
+            );
             return (
               <div class="board-column" data-state={column()?.state}>
-                <h2>
-                  {COLUMN_TITLES[column()?.state ?? "idle"]}
-                  <span class="board-count">{cardKeys().length}</span>
-                </h2>
-                <Show when={cardKeys().length > 0} fallback={<p class="empty">Nothing here</p>}>
-                  <ul>
-                    <For each={cardKeys()}>
-                      {(cardKey) => {
-                        // The card as the latest frame has it, read when it is
-                        // drawn and again when it is clicked.
-                        const card = () => cards().byKey.get(cardKey);
-                        return (
-                          <li>
-                            <button
-                              type="button"
-                              class="board-card"
-                              classList={{ open: card()?.hasOpenRequest }}
-                              data-card={card()?.key}
-                              disabled={card()?.sessionId === null && !card()?.acp}
-                              onClick={() => {
-                                const now = card();
-                                if (now === undefined) return;
-                                if (now.sessionId === null && now.acp) props.onOpenTranscript(now.key);
-                                else show(now.sessionId, now.hasOpenRequest);
-                              }}
-                            >
-                              <span class="card-title">{card()?.title}</span>
-                              <span class="card-line">{cardLine(card())}</span>
-                              <Show when={(card()?.attention.length ?? 0) > 0}>
-                                <span class="card-chips">
-                                  <For each={card()?.attention}>
-                                    {(kind) => (
-                                      <span class="chip" data-kind={kind}>
-                                        {kind}
-                                      </span>
-                                    )}
-                                  </For>
-                                </span>
-                              </Show>
-                            </button>
-                          </li>
-                        );
-                      }}
-                    </For>
-                  </ul>
+                <Show
+                  when={column()?.state === "idle"}
+                  fallback={
+                    <>
+                      <h2>
+                        {COLUMN_TITLES[column()?.state ?? "needs"]}
+                        <span class="board-count">{cardKeys().length}</span>
+                      </h2>
+                      {list()}
+                    </>
+                  }
+                >
+                  {/* Idle is hidden by default (spec): a native disclosure,
+                      closed until a person asks for it, rather than a JS flag
+                      this component would have to remember on its own. */}
+                  <details class="board-idle-toggle">
+                    <summary>
+                      {COLUMN_TITLES.idle}
+                      <span class="board-count">{cardKeys().length}</span>
+                    </summary>
+                    {list()}
+                  </details>
                 </Show>
               </div>
             );
@@ -194,9 +245,20 @@ export function Board(props: Props) {
   );
 }
 
-/** The line under a card's title: what it is and how it is reachable. */
+/** The need a needs-you card is blocked on, or `null` for every other
+ * column: the small chip beside its title (spec: "show the need kind
+ * label"). */
+function needOf(card: BoardCard | undefined): string | null {
+  return card !== undefined && card.status.kind === "needs" ? card.status.need : null;
+}
+
+/** The line under a card's title: what it is and how it is reachable. A
+ * Done card says only "click to open" (spec): opening it is the one thing
+ * left to do with it, and provider/model/lifecycle already read on every
+ * other column. */
 function cardLine(card: BoardCard | undefined): string {
   if (card === undefined) return "";
+  if (card.status.kind === "done") return "click to open";
   // The model is free text off the frame, drawn through the same rule as a
   // session name, so a bidi override or an escape cannot restyle the card.
   const parts = [

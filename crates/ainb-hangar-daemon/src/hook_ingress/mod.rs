@@ -23,13 +23,15 @@ mod endpoint;
 mod guard;
 pub mod hold;
 mod ingest;
+mod spool;
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ainb_hangar_proto::hooks::{
-    HookSource, PANE_KEY_HEADER, PARENT_HEADER, PaneKey, TMUX_PANE_HEADER,
+    EVENT_ID_HEADER, HookSource, PANE_KEY_HEADER, PARENT_HEADER, PaneKey, TMUX_PANE_HEADER,
+    is_valid_event_id,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -37,6 +39,7 @@ use tokio::sync::Semaphore;
 pub use endpoint::{EndpointFiles, remove_stale};
 pub use guard::{Judge, MAX_BODY, MAX_CONNECTIONS, MAX_HEAD, Refusal, Route};
 pub use ingest::{IngestSink, MAX_INLINE_PAYLOAD, RESOLVED_BY_AGENT, RESOLVED_NATIVE, event_line};
+pub use spool::{DrainReport, drain_spool};
 
 use crate::local_http::{read_body, read_head, write_response};
 
@@ -69,6 +72,13 @@ pub struct HookEvent {
     pub parent: Option<String>,
     /// The raw hook JSON; always an object.
     pub payload: serde_json::Value,
+    /// The script-minted event id ([`EVENT_ID_HEADER`]), when well formed.
+    /// The same id rides in a spooled copy, so a replay is recorded once.
+    pub event_id: Option<String>,
+    /// When the hook fired, for a replayed spool line (epoch milliseconds).
+    /// `None` for a live call: the daemon's clock stamps it. `Some` marks the
+    /// event as a replay, which never releases a live hold.
+    pub received_at_ms: Option<i64>,
 }
 
 /// What the listener writes back for an admitted call.
@@ -81,6 +91,13 @@ pub enum HookReply {
     /// `503`: the event could not be recorded (a store fault). The hook
     /// spools it and the next daemon start replays it.
     Unavailable,
+    /// `204` to a live hook; to a spool drain, "already recorded": the event
+    /// id is on file with different content, so replaying it can never
+    /// succeed and the drain moves on.
+    AlreadyRecorded,
+    /// `204` to a live hook; to a spool drain, "skip": the store refuses the
+    /// event for good (malformed), and it is logged, never retried.
+    Rejected,
 }
 
 /// Where admitted hook calls go.
@@ -182,6 +199,13 @@ pub async fn start_with(
     let token = uuid::Uuid::new_v4().to_string();
     let files = EndpointFiles::publish(hangar_home, port, &token)?;
     let judge = Arc::new(Judge::new(token, port));
+    // Replay what hooks spooled while no daemon was listening, alongside live
+    // traffic: both go through the same idempotent sink.
+    let drain_sink = sink.clone();
+    let drain_home = hangar_home.to_path_buf();
+    tokio::spawn(async move {
+        drain_spool(&drain_home, &*drain_sink).await;
+    });
     let task = tokio::spawn(serve(listener, judge, sink, limits));
     Ok(Running {
         addr,
@@ -264,6 +288,11 @@ async fn handle(
         .get(&PARENT_HEADER.to_ascii_lowercase())
         .filter(|v| !v.is_empty() && v.len() <= 256)
         .cloned();
+    let event_id = head
+        .headers
+        .get(&EVENT_ID_HEADER.to_ascii_lowercase())
+        .filter(|v| is_valid_event_id(v))
+        .cloned();
     // The judge already refused a declared length over MAX_BODY (413), so a
     // `None` here is a peer that closed before sending the body it declared.
     let body =
@@ -298,6 +327,8 @@ async fn handle(
         tmux_pane,
         parent,
         payload,
+        event_id,
+        received_at_ms: None,
     };
     let deadline = if hold {
         limits.hold_deadline
@@ -324,7 +355,9 @@ async fn handle(
     });
     drop(hold_permit);
     match reply {
-        HookReply::NoContent => write_response(stream, 204, "text/plain", b"").await,
+        HookReply::NoContent | HookReply::AlreadyRecorded | HookReply::Rejected => {
+            write_response(stream, 204, "text/plain", b"").await
+        }
         HookReply::Json(body) => write_response(stream, 200, "application/json", &body).await,
         HookReply::Unavailable => write_response(stream, 503, "text/plain", b"unavailable").await,
     }

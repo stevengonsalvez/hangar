@@ -344,6 +344,9 @@ pub mod single_instance;
 /// [`ainb_hangar_store::repo::skill::SkillRepo::upsert_by_name`] — idempotent
 /// and all-or-nothing.
 pub mod skills_sync;
+/// `worktree/create`: the daemon as the one owner of new work, dark behind
+/// `AINB_HANGAR_SPAWN` (desktop redesign P3a).
+pub mod spawn;
 /// Claim-time squad-leader briefing builder (multica `squad_briefing.go` parity,
 /// gap #7).
 ///

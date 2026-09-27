@@ -53,7 +53,6 @@ allow ui.tick_rate_ms
 allow ui_preferences.show_container_status
 allow ui_preferences.show_git_status
 allow ui_preferences.show_session_menu_bar
-allow ui_preferences.theme
 allow usage_client.codex_ttl_secs
 allow usage_client.fetch_timeout_secs
 allow workspace_defaults.branch_prefix
@@ -117,6 +116,7 @@ deny plugins.enabled
 deny presets.file
 deny skills.catalog_release
 deny ui_preferences.preferred_editor
+deny ui_preferences.theme
 deny usage.currency.code
 deny usage.currency.symbol
 deny usage.currency.usd_rate

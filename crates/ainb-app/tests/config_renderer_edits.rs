@@ -21,7 +21,7 @@ use ainb_app::app::pointer;
 use ainb_app::app::screens::ids as screen_ids;
 use ainb_app::config::registry::{self, RowKind};
 use ainb_app::config::renderer_edit::{
-    self, ALLOWED, DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON,
+    self, ALLOWED, DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON,
 };
 use ainb_app::config::settings_model::{
     ConfigCategory, ConfigRowEdit, ConfigSetting, ConfigValue, SecretValue,
@@ -219,13 +219,20 @@ fn every_denied_row_is_refused_from_a_renderer_by_name_and_by_key_sequence() {
         }
         let key = concrete(pattern);
         let mut state = text_row(&key);
+        // Refused like every denied row, but with its own sentence: the TUI's
+        // theme names where the desktop's lives instead.
+        let reason = if *pattern == "ui_preferences.theme" {
+            TUI_THEME_REASON
+        } else {
+            DENIED_REASON
+        };
 
         // By name: the command's action is judged before the reducer runs it,
         // and the reducer drops the payload even so, with a notice.
         let action = set_row_action(&keymap, &key, "evil");
         assert_eq!(
             state.remote_command_refusal(&action),
-            Some(DENIED_REASON),
+            Some(reason),
             "{key}: {why}"
         );
         let effects = edit(
@@ -247,7 +254,7 @@ fn every_denied_row_is_refused_from_a_renderer_by_name_and_by_key_sequence() {
         // open anyway, Enter in it is refused too.
         assert_eq!(
             state.remote_command_refusal(&enter(&keymap, &state)),
-            Some(DENIED_REASON),
+            Some(reason),
             "{key}: Enter opens its popup"
         );
         let _ = dispatch(
@@ -263,7 +270,7 @@ fn every_denied_row_is_refused_from_a_renderer_by_name_and_by_key_sequence() {
         }
         assert_eq!(
             state.remote_command_refusal(&enter(&keymap, &state)),
-            Some(DENIED_REASON),
+            Some(reason),
             "{key}: Enter in the popup writes it"
         );
     }

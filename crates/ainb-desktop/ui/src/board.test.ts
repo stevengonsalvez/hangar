@@ -8,7 +8,9 @@ import type {
   FleetView_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
+import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
+import { cardForSession, statusForSession } from "./status.ts";
+import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -19,6 +21,8 @@ function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCard
     state: "working",
     has_open_request: false,
     wait_kind: null,
+    turn_complete: false,
+    tier: "hook",
     ...over,
   } as AgentCardFrame;
 }
@@ -57,14 +61,16 @@ function world(...rows: [string, string, string][]): {
   };
 }
 
-test("the columns are the host's states, whatever the lifecycle says", () => {
-  // A card the host calls idle stays idle even though its lifecycle reads
-  // RUNNING: the renderer never re-derives a state.
+test("the columns are Orca's own words, never the raw AgentState", () => {
+  // A card the host calls idle still reads idle whatever its lifecycle says,
+  // and a card the host calls waiting lands in "needs": the renderer maps
+  // through `status.ts` and never re-derives a state of its own.
   const { sessions, fleet } = world(["u-1", "api", "p-1"]);
   const columns = boardColumns(
     status(card("claude:p-1", { state: "idle", lifecycle: "RUNNING" }), card("codex:p-2", { state: "waiting" })),
     fleet,
     sessions,
+    NO_ACKS,
   );
   assert.deepEqual(
     columns.map((column) => column.state),
@@ -73,12 +79,92 @@ test("the columns are the host's states, whatever the lifecycle says", () => {
   const by = Object.fromEntries(columns.map((column) => [column.state, column.cards.map((c) => c.key)]));
   assert.deepEqual(by.idle, ["claude:p-1"]);
   assert.deepEqual(by.working, []);
-  assert.deepEqual(by.waiting, ["codex:p-2"]);
+  assert.deepEqual(by.needs, ["codex:p-2"]);
+});
+
+test("a needs-you card carries the need kind its wait_kind names", () => {
+  const { sessions, fleet } = world();
+  const [needs] = boardColumns(
+    status(
+      card("a:1", { state: "waiting", wait_kind: "ask" }),
+      card("b:2", { state: "waiting", wait_kind: "approval" }),
+      card("c:3", { state: "waiting", wait_kind: null }),
+    ),
+    fleet,
+    sessions,
+    NO_ACKS,
+  ).filter((column) => column.state === "needs");
+  const by = Object.fromEntries(needs.cards.map((c) => [c.key, c.status]));
+  assert.deepEqual(by["a:1"], { kind: "needs", need: "ask" });
+  assert.deepEqual(by["b:2"], { kind: "needs", need: "approve" });
+  assert.deepEqual(by["c:3"], { kind: "needs", need: "wait" }, "no wait_kind still needs a human, by default wait");
+});
+
+test("an idle card whose turn just finished reads done until this viewer acks it", () => {
+  const { sessions, fleet } = world();
+  const agentStatus = status(card("a:1", { state: "idle", turn_complete: true, evidence_observed_at: 7 }));
+  const before = boardColumns(agentStatus, fleet, sessions, NO_ACKS);
+  assert.deepEqual(
+    before.map((column) => [column.state, column.cards.map((c) => c.key)]),
+    [
+      ["needs", []],
+      ["working", []],
+      ["done", ["a:1"]],
+      ["idle", []],
+    ],
+  );
+
+  const acked: AckMap = ackTurn(NO_ACKS, "a:1", 7);
+  const after = boardColumns(agentStatus, fleet, sessions, acked);
+  const by = Object.fromEntries(after.map((column) => [column.state, column.cards.map((c) => c.key)]));
+  assert.deepEqual(by.done, [], "acked at this turn: the Done card is gone");
+  assert.deepEqual(by.idle, ["a:1"], "and the card reads idle instead");
+});
+
+test("a later turn's Done shows again after an earlier turn was acked", () => {
+  const { sessions, fleet } = world();
+  const acked = ackTurn(NO_ACKS, "a:1", 7);
+  const laterTurn = status(card("a:1", { state: "idle", turn_complete: true, evidence_observed_at: 8 }));
+  const columns = boardColumns(laterTurn, fleet, sessions, acked);
+  const by = Object.fromEntries(columns.map((column) => [column.state, column.cards.map((c) => c.key)]));
+  assert.deepEqual(by.done, ["a:1"], "turn 8 was never acked, only turn 7 was");
+});
+
+test("an exited agent's card is hidden, not a fifth column", () => {
+  const { sessions, fleet } = world();
+  const columns = boardColumns(status(card("a:1", { state: "exited" })), fleet, sessions, NO_ACKS);
+  assert.deepEqual(
+    columns.flatMap((column) => column.cards.map((c) => c.key)),
+    [],
+  );
+});
+
+test("an unverifiable card falls in with idle, marked unverifiable rather than drawn as plainly idle", () => {
+  const { sessions, fleet } = world();
+  const columns = boardColumns(status(card("a:1", { state: "unverifiable" })), fleet, sessions, NO_ACKS);
+  const [idle] = columns.filter((column) => column.state === "idle");
+  assert.deepEqual(idle.cards.map((c) => c.status), [{ kind: "unverifiable" }]);
+});
+
+test("a working card with an Err attention chip still needs a human", () => {
+  const sessions = {
+    workspaces: [{ name: "repo", sessions: [{ id: "u-1", name: "api", attention: [{ kind: "Err", detail: null }] }] }],
+  } as unknown as SessionsView_Serialize;
+  const fleet = {
+    fleet_metadata: { "u-1": { provider_session_id: "p-1" } },
+    fleet_snapshot: [],
+    daemon_attention: { by_session_id: {}, all: {}, reachable: true, error: null, not_running: false },
+    attention_elsewhere: 0,
+  } as unknown as FleetView_Serialize;
+  const columns = boardColumns(status(card("claude:p-1", { state: "working" })), fleet, sessions, NO_ACKS);
+  const by = Object.fromEntries(columns.map((column) => [column.state, column.cards.map((c) => c.key)]));
+  assert.deepEqual(by.needs, ["claude:p-1"]);
+  assert.deepEqual(by.working, []);
 });
 
 test("a card takes its row's name and the fleet's model, and one with no row still draws", () => {
   const { sessions, fleet } = world(["u-1", "api", "p-1"]);
-  const [working] = boardColumns(status(card("claude:p-1"), card("claude:p-9")), fleet, sessions).filter(
+  const [working] = boardColumns(status(card("claude:p-1"), card("claude:p-9")), fleet, sessions, NO_ACKS).filter(
     (column) => column.state === "working",
   );
   const known = working.cards.find((c) => c.key === "claude:p-1")!;
@@ -88,18 +174,22 @@ test("a card takes its row's name and the fleet's model, and one with no row sti
   const stray = working.cards.find((c) => c.key === "claude:p-9");
   assert.ok(stray, "an agent the sidebar has not listed is still on the board");
   assert.equal(stray.sessionId, null);
-  assert.equal(stray.title, "claude:p-9");
+  assert.equal(stray.title, "claude p-9", "named by provider and id, not the raw key");
 });
 
 test("an agent with something open floats to the top of its column", () => {
   const { sessions, fleet } = world();
-  const [waiting] = boardColumns(
-    status(card("a:1", { state: "waiting" }), card("b:2", { state: "waiting", has_open_request: true })),
+  const [needs] = boardColumns(
+    status(
+      card("a:1", { state: "waiting" }),
+      card("b:2", { state: "waiting", has_open_request: true }),
+    ),
     fleet,
     sessions,
-  );
+    NO_ACKS,
+  ).filter((column) => column.state === "needs");
   assert.deepEqual(
-    waiting.cards.map((c) => c.key),
+    needs.cards.map((c) => c.key),
     ["b:2", "a:1"],
   );
 });
@@ -148,4 +238,71 @@ test("a click selects the row without attaching it, then shows the pane it is ab
     { Command: ["session_list.select_tab", { tab: "Ask" }] },
   ]);
   assert.deepEqual(showIntents("u-1", false)[1], { Command: ["session_list.select_tab", { tab: "Preview" }] });
+});
+
+test("the proof line lists every agent state, zero included", () => {
+  // `scripts/proof/d2-board.sh` waits for "waiting is 0": a state with no
+  // cards must still be on the line, or that wait can never succeed.
+  assert.deepEqual(agentStateCounts([]), [
+    ["working", 0],
+    ["waiting", 0],
+    ["idle", 0],
+    ["unverifiable", 0],
+    ["exited", 0],
+  ]);
+  const counted = agentStateCounts([
+    card("a:1", { state: "working" }),
+    card("a:2", { state: "working" }),
+    card("a:3", { state: "idle" }),
+    { state: "paused" } as unknown as AgentCardFrame,
+  ]);
+  assert.deepEqual(counted, [
+    ["working", 2],
+    ["waiting", 0],
+    ["idle", 1],
+    ["unverifiable", 0],
+    ["exited", 0],
+  ], "a state this build does not know is left off, since the host could not parse it back");
+});
+
+test("a legacy card joins its session row by tmux session, and without one is titled by its target", () => {
+  // The fingerprint the daemon really writes (`fleet-core` `discover/tmux.rs`
+  // `process_start_fingerprint`): the pane id, pid and session start.
+  const key = (target: string) => `legacy:claude:${target}:pane=%3;pid=41;session_started=1790000000`;
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  (sessions.workspaces[0].sessions[0] as { tmux_session_name: string | null }).tmux_session_name = "api-7f3a";
+  const columns = boardColumns(
+    status(card(key("api-7f3a:0.1"), { state: "waiting" }), card(key("orphan:1.0"), { state: "waiting" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  const cards = columns.flatMap((column) => column.cards);
+  const joined = cards.find((c) => c.key === key("api-7f3a:0.1"))!;
+  assert.equal(joined.title, "api", "named by its session row");
+  assert.equal(joined.sessionId, "u-1", "and opens it");
+  const orphan = cards.find((c) => c.key === key("orphan:1.0"))!;
+  assert.equal(orphan.title, "orphan:1.0");
+  assert.equal(orphan.sessionId, null);
+});
+
+test("the board, the sidebar row and the tab ack share one join, a legacy card included", () => {
+  // Before: the board joined a legacy card by tmux session while the row and
+  // the tab joined by provider id only, so the board said Working, the row
+  // said unverifiable, and opening the tab never acked the board's Done.
+  const key = "legacy:claude:api-7f3a:0.1:pane=%3;pid=41;session_started=1790000000";
+  const { sessions, fleet } = world(["u-1", "api", "p-other"]);
+  const row = sessions.workspaces[0].sessions[0] as { tmux_session_name: string | null };
+  row.tmux_session_name = "api-7f3a";
+  const legacy = card(key, { state: "working" });
+  const [onBoard] = boardColumns(status(legacy), fleet, sessions, NO_ACKS).flatMap((column) => column.cards);
+  assert.equal(onBoard.sessionId, "u-1");
+  assert.deepEqual(onBoard.status, { kind: "working" });
+  const session = sessions.workspaces[0].sessions[0];
+  assert.equal(cardForSession(session, [legacy], fleet.fleet_metadata), legacy, "the tab acks this card");
+  assert.deepEqual(statusForSession(session, [legacy], fleet.fleet_metadata, NO_ACKS), { kind: "working" }, "the row reads what the board does");
+
+  // With both, the exact provider id wins over where the pane was seen.
+  const exact = card("claude:p-other", { state: "idle" });
+  assert.equal(cardForSession(session, [legacy, exact], fleet.fleet_metadata), exact);
 });

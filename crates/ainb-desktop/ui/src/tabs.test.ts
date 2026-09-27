@@ -9,6 +9,8 @@ import {
   openRowIntent,
   rowOf,
   stepTab,
+  acceleratorAllowedUnderModal,
+  type Accelerator,
   terminalMayTakeFocus,
   type Tab,
 } from "./tabs.ts";
@@ -42,6 +44,20 @@ test("elsewhere the shell's mod is ctrl+shift and plain ctrl reaches the pane", 
   assert.equal(accelerator(key("KeyW", { ctrl: true }), false), null);
   assert.equal(accelerator(key("KeyC", { ctrl: true }), false), null);
   assert.equal(accelerator(key("Digit1", { meta: true }), false), null);
+});
+
+test("the composer opens on Cmd+N on macOS and Ctrl+Shift+N elsewhere", () => {
+  assert.deepEqual(accelerator(key("KeyN", { meta: true }), true), { kind: "new" });
+  assert.deepEqual(accelerator(key("KeyN", { ctrl: true, shift: true }), false), { kind: "new" });
+
+  // Plain Ctrl+N is the pane's (next-history, vim completion): never taken.
+  assert.equal(accelerator(key("KeyN", { ctrl: true }), false), null);
+  // Shift on macOS, Alt, or the other platform's modifier: not the chord.
+  assert.equal(accelerator(key("KeyN", { meta: true, shift: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { meta: true, alt: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { ctrl: true }), true), null);
+  assert.equal(accelerator(key("KeyN", { meta: true }), false), null);
+  assert.equal(accelerator(key("KeyN"), true), null);
 });
 
 test("copy and paste are the shell's only elsewhere, and native on macOS", () => {
@@ -96,10 +112,29 @@ test("a terminal takes focus for a person, and for the host only when no text fi
   // The open palette owns the keyboard whoever asks.
   assert.equal(terminalMayTakeFocus({ palette: true, byHost: false, active: row }), false);
   assert.equal(terminalMayTakeFocus({ palette: true, byHost: true, active: row }), false);
+  // So does the open composer: a modal, for a person's chord as much as the host.
+  assert.equal(terminalMayTakeFocus({ palette: false, composer: true, byHost: false, active: row }), false);
+  assert.equal(terminalMayTakeFocus({ palette: false, composer: true, byHost: true, active: null }), false);
   // The host's answer stands down for a text field; a person's chord does not.
   assert.equal(terminalMayTakeFocus({ palette: false, byHost: true, active: composer }), false);
   assert.equal(terminalMayTakeFocus({ palette: false, byHost: false, active: composer }), true);
   // Nothing else in the way: both take it.
   assert.equal(terminalMayTakeFocus({ palette: false, byHost: true, active: row }), true);
   assert.equal(terminalMayTakeFocus({ palette: false, byHost: false, active: null }), true);
+});
+
+test("under the open composer no chord reaches the shell but new", () => {
+  const chords: Accelerator[] = [
+    { kind: "tab", index: 0 },
+    { kind: "prev" },
+    { kind: "next" },
+    { kind: "close" },
+    { kind: "palette" },
+    { kind: "attention" },
+    { kind: "hosts" },
+    { kind: "copy" },
+    { kind: "paste" },
+  ];
+  for (const chord of chords) assert.equal(acceleratorAllowedUnderModal(chord), false, chord.kind);
+  assert.equal(acceleratorAllowedUnderModal({ kind: "new" }), true);
 });

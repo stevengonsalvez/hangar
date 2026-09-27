@@ -436,6 +436,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "specta",
 ]
 
 [[package]]

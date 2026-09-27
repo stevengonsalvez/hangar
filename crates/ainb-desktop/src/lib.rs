@@ -24,6 +24,7 @@
 #[cfg(feature = "typescript-bindings")]
 pub mod bindings;
 pub mod clipboard;
+pub mod create;
 pub mod daemons_panel;
 pub mod executor;
 pub mod host;
