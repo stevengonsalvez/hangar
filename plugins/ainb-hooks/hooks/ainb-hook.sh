@@ -113,7 +113,7 @@ fi
 
 spool() {
   case "$event" in
-    PreToolUse | PostToolUse | PostToolUseFailure) return 0 ;;
+    PermissionRequest | PreToolUse | PostToolUse | PostToolUseFailure) return 0 ;;
   esac
   dir="$home/hangar/hook-spool"
   (umask 077 && mkdir -p "$dir") 2>/dev/null || return 0
