@@ -257,7 +257,7 @@ impl IngestSink {
         // Retire first, release second: by the time a released hook answers
         // `{}`, its row already reads resolved:agent.
         if let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await {
-            self.retire_passed(this_call, open).await;
+            self.retire_passed(this_call, p, open).await;
         }
         for key in keys {
             self.holds.cancel(&key);
@@ -266,7 +266,12 @@ impl IngestSink {
 
     /// Retire the hook-hold approval rows among `open` that the moved-on
     /// event covers: the one call, or every hold of the session.
-    async fn retire_passed(&self, this_call: Option<Option<&str>>, open: Vec<String>) {
+    async fn retire_passed(
+        &self,
+        this_call: Option<Option<&str>>,
+        event: &Value,
+        open: Vec<String>,
+    ) {
         for id in open {
             let Ok(Some(row)) = AttentionRepo::get(&self.pool, &id).await else {
                 continue;
@@ -277,9 +282,17 @@ impl IngestSink {
             if payload.get("source").and_then(Value::as_str) != Some("hook_hold") {
                 continue;
             }
+            let held_id = payload.get("tool_use_id").and_then(Value::as_str);
             let same_call = match this_call {
                 None => true,
-                Some(call) => payload.get("tool_use_id").and_then(Value::as_str) == call,
+                // Both carry an id: it names the call.
+                Some(Some(call)) if held_id.is_some() => held_id == Some(call),
+                // No id on one side: the tool and its input name the call, as
+                // they do in the hold key.
+                Some(_) => {
+                    payload.get("tool_name") == event.get("tool_name")
+                        && payload.get("tool_input") == event.get("tool_input")
+                }
             };
             if same_call {
                 self.retire_approval(&id, RESOLVED_BY_AGENT).await;
