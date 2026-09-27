@@ -134,10 +134,14 @@ pub fn carry_host_rows(held: &[Workspace], found: &mut [Workspace]) {
     }
 }
 
-/// Put every workspace's sessions in the one order every surface shows and
-/// steps through: worktrees newest first, a worktree's sessions kept together
-/// (newest first within it), and the session id to break a tie, so the order
-/// never depends on how the scan happened to find the rows.
+/// Put the workspaces, and every workspace's sessions, in the one order every
+/// surface shows and steps through, newest first at both levels:
+///
+/// - projects, each placed by its newest session (one with none goes last);
+/// - within a project, worktrees, each placed by its newest session, with a
+///   worktree's sessions kept together (newest first within it);
+/// - ties broken by name or path and then the session id, so the order never
+///   depends on how the scan happened to find the rows.
 ///
 /// The scan finds rows in `tmux list-sessions` order, which is alphabetical by
 /// session name. The desktop drew that order while the palette's "next
@@ -146,15 +150,15 @@ pub fn carry_host_rows(held: &[Workspace], found: &mut [Workspace]) {
 /// TUI, the desktop and every step command the same list (Orca's recent-first
 /// default).
 ///
-/// A worktree is placed by its NEWEST session, so starting a second agent in
-/// an old worktree brings the whole worktree up, not just the new row.
 /// Creation, not access time: opening a session must never move its row out
-/// from under the pointer that opened it.
-pub fn sort_sessions_recent_first(workspaces: &mut [Workspace]) {
+/// from under the pointer that opened it. Every row's `created_at` is stable
+/// across scans for this reason (the store's time, tmux's, or the
+/// container's; never the scan's own clock).
+pub fn sort_recent_first(workspaces: &mut [Workspace]) {
     use std::cmp::Reverse;
     use std::collections::HashMap;
 
-    for workspace in workspaces {
+    for workspace in workspaces.iter_mut() {
         let mut newest: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
         for session in &workspace.sessions {
             newest
@@ -162,7 +166,7 @@ pub fn sort_sessions_recent_first(workspaces: &mut [Workspace]) {
                 .and_modify(|at| *at = (*at).max(session.created_at))
                 .or_insert(session.created_at);
         }
-        workspace.sessions.sort_by_key(|session| {
+        workspace.sessions.sort_by_cached_key(|session| {
             (
                 Reverse(newest[&session.workspace_path]),
                 session.workspace_path.clone(),
@@ -171,6 +175,15 @@ pub fn sort_sessions_recent_first(workspaces: &mut [Workspace]) {
             )
         });
     }
+    workspaces.sort_by_cached_key(|workspace| {
+        (
+            // `Reverse(None)` sorts after every `Reverse(Some(_))`: a project
+            // with no sessions (a shell only) goes last.
+            Reverse(workspace.sessions.iter().map(|session| session.created_at).max()),
+            workspace.name.clone(),
+            workspace.path.clone(),
+        )
+    });
 }
 
 #[cfg(test)]
@@ -198,7 +211,7 @@ mod tests {
             session("c-middle", "/wt/c", 200),
         ];
         let mut workspaces = vec![workspace];
-        sort_sessions_recent_first(&mut workspaces);
+        sort_recent_first(&mut workspaces);
         assert_eq!(names(&workspaces[0]), ["b-newest", "c-middle", "a-oldest"]);
     }
 
@@ -213,10 +226,27 @@ mod tests {
             session("old-second-agent", "/wt/old", 300),
         ];
         let mut workspaces = vec![workspace];
-        sort_sessions_recent_first(&mut workspaces);
+        sort_recent_first(&mut workspaces);
         assert_eq!(
             names(&workspaces[0]),
             ["old-second-agent", "old-first-agent", "mid"]
+        );
+    }
+
+    #[test]
+    fn projects_come_newest_first_by_their_newest_session() {
+        let mut old = Workspace::new("aaa-old".into(), "/aaa".into());
+        old.sessions = vec![session("old", "/aaa/wt", 100)];
+        let mut new = Workspace::new("zzz-new".into(), "/zzz".into());
+        new.sessions = vec![session("new", "/zzz/wt", 300)];
+        let shell_only = Workspace::new("mmm-shell".into(), "/mmm".into());
+        let mut workspaces = vec![old, shell_only, new];
+        sort_recent_first(&mut workspaces);
+        let order: Vec<&str> = workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            order,
+            ["zzz-new", "aaa-old", "mmm-shell"],
+            "a project with no sessions goes last"
         );
     }
 
@@ -230,8 +260,8 @@ mod tests {
         forward[0].sessions = vec![one.clone(), two.clone()];
         let mut backward = vec![Workspace::new("repo".into(), "/repo".into())];
         backward[0].sessions = vec![two, one];
-        sort_sessions_recent_first(&mut forward);
-        sort_sessions_recent_first(&mut backward);
+        sort_recent_first(&mut forward);
+        sort_recent_first(&mut backward);
         assert_eq!(names(&forward[0]), names(&backward[0]));
     }
 }
