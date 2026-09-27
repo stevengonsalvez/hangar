@@ -95,6 +95,10 @@ fn seed_onboarding(home: &Path) {
 /// branch is one commit ahead of `main`, and a private tmux server.
 struct World {
     home: tempfile::TempDir,
+    /// What `$HOME` is set to for `ainb`: the home itself, or a symlink to it.
+    home_env: PathBuf,
+    /// Holds the symlink `home_env` goes through, when there is one.
+    _home_link: Option<tempfile::TempDir>,
     repo: tempfile::TempDir,
     tmux_dir: PathBuf,
     base_head: String,
@@ -137,11 +141,25 @@ impl World {
             PathBuf::from("/tmp").join(format!("ainb-run-json-{}-{nonce}", std::process::id()));
         std::fs::create_dir_all(&tmux_dir).expect("create private tmux socket dir");
         Self {
+            home_env: home.path().to_path_buf(),
+            _home_link: None,
             home,
             repo,
             tmux_dir,
             base_head,
         }
+    }
+
+    /// [`Self::new`] with `$HOME` reached through a symlink, as a home under
+    /// `/home -> /var/home`, or macOS's `/var -> /private/var`, is.
+    fn with_symlinked_home() -> Self {
+        let mut world = Self::new();
+        let link_dir = tempfile::tempdir().expect("link tempdir");
+        let link = link_dir.path().join("home");
+        std::os::unix::fs::symlink(world.home.path(), &link).expect("symlink the home");
+        world.home_env = link;
+        world._home_link = Some(link_dir);
+        world
     }
 
     /// `ainb --format json run --worktree <extra...> --name <name>`.
@@ -165,7 +183,7 @@ impl World {
                 name,
             ])
             .args(extra)
-            .env("HOME", self.home.path())
+            .env("HOME", &self.home_env)
             .env("PATH", &path_env)
             .env("TMUX_TMPDIR", &self.tmux_dir)
             .env_remove("TMUX")
@@ -198,7 +216,7 @@ impl World {
                 "--existing-worktree",
             ])
             .arg(tree)
-            .env("HOME", self.home.path())
+            .env("HOME", &self.home_env)
             .env("PATH", path_env)
             .env("TMUX_TMPDIR", &self.tmux_dir)
             .env_remove("TMUX")
@@ -475,9 +493,40 @@ fn run_json_existing_worktree_refuses_a_main_checkout_or_an_unmanaged_tree() {
         ],
     );
 
+    let by_name = world.home.path().join(".agents-in-a-box/worktrees/by-name");
+    std::fs::create_dir_all(&by_name).expect("by-name");
+    // In the managed place, but a link out to the stray tree.
+    let link = by_name.join("app--link--00000000");
+    std::os::unix::fs::symlink(&stray, &link).expect("symlink");
+    let sub = stray.join("sub");
+    std::fs::create_dir_all(&sub).expect("subdir");
+    // A managed tree whose source repository is gone.
+    let doomed = tempfile::tempdir().expect("doomed repo");
+    git(doomed.path(), &["init", "-q"]);
+    git(
+        doomed.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    let orphan = by_name.join("gone--x--00000000");
+    git(
+        doomed.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "x",
+            &orphan.display().to_string(),
+        ],
+    );
+    drop(doomed);
+
     for (tree, why) in [
-        (world.repo.path().to_path_buf(), "linked git worktree"),
+        (world.repo.path().to_path_buf(), "main checkout"),
         (stray, "worktree ainb created"),
+        (link, "worktree ainb created"),
+        (sub, "top of a git worktree"),
+        (orphan, "not a git worktree"),
     ] {
         let out = world.add_agent("gemini", &tree);
         assert!(!out.status.success(), "must be refused: {}", describe(&out));
@@ -500,9 +549,10 @@ fn run_json_existing_worktree_refuses_a_main_checkout_or_an_unmanaged_tree() {
     );
 }
 
-/// A launch that fails after it joined the tree (here tmux cannot be run at
-/// all) takes nothing with it: the tree, its branch, the first agent and the
-/// first session's row all survive, and the failed session leaves no row.
+/// A launch that fails after it joined the tree (here at the tmux start: a
+/// stand-in `tmux` that always exits 1) takes nothing with it: the tree, its
+/// branch, the first agent and the first session's row all survive, and the
+/// failed session leaves no row.
 #[test]
 fn run_json_existing_worktree_failing_after_the_join_deletes_nothing() {
     if !tmux_available() {
@@ -519,16 +569,39 @@ fn run_json_existing_worktree_failing_after_the_join_deletes_nothing() {
     let tree = PathBuf::from(created["worktree_path"].as_str().expect("worktree_path"));
     let first_name = created["tmux_session_name"].as_str().unwrap_or_default().to_string();
 
-    // Only the fake agents on PATH: the provider check passes, the tmux start
-    // cannot.
-    let out = world.add_agent_on_path("gemini", &tree, &world.home.path().display().to_string());
+    // The fake agents, real git (the join checks the tree with it), and a
+    // `tmux` that refuses everything: the run gets past the join and fails
+    // exactly at the tmux start.
+    let bin = tempfile::tempdir().expect("fake bin");
+    std::fs::write(bin.path().join("tmux"), "#!/bin/sh\nexit 1\n").expect("fake tmux");
+    std::fs::set_permissions(
+        bin.path().join("tmux"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod fake tmux");
+    let real_git = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("find git")
+            .stdout,
+    )
+    .expect("utf-8 path");
+    std::os::unix::fs::symlink(real_git.trim(), bin.path().join("git")).expect("link git");
+    let path_env = format!("{}:{}", bin.path().display(), world.home.path().display());
+    let out = world.add_agent_on_path("gemini", &tree, &path_env);
     let first_alive = world.alive_exact(&first_name);
     let rows = world.stored_sessions();
     world.kill_exact(&first_name);
 
     assert!(
         !out.status.success(),
-        "must fail without tmux: {}",
+        "must fail at the tmux start: {}",
+        describe(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Failed to start tmux session"),
+        "it failed at the tmux start, after the join: {}",
         describe(&out)
     );
     assert!(
@@ -551,4 +624,49 @@ fn run_json_existing_worktree_failing_after_the_join_deletes_nothing() {
         1,
         "the first session's link is kept"
     );
+}
+
+/// With `$HOME` behind a symlink, the added session records the tree the way
+/// the first one did (the manager's spelling, not the resolved path), so the
+/// two rows share one `worktree_path` and fold into one sidebar card.
+#[test]
+fn run_json_existing_worktree_through_a_symlinked_home_keeps_the_first_spelling() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let world = World::with_symlinked_home();
+    let name = format!("run-json-link-{}", std::process::id());
+    let first = world.run("gemini", &name, &["--create-branch", "ainb/linked"]);
+    let Some(created) = one_json_line(&first) else {
+        world.kill(&name);
+        panic!("first run must print one JSON line: {}", describe(&first));
+    };
+    let tree = PathBuf::from(created["worktree_path"].as_str().expect("worktree_path"));
+
+    let second = world.add_agent("gemini", &tree);
+    let added = one_json_line(&second);
+    let rows = world.stored_sessions();
+    world.kill_exact(created["tmux_session_name"].as_str().unwrap_or_default());
+    if let Some(added) = &added {
+        world.kill_exact(added["tmux_session_name"].as_str().unwrap_or_default());
+    }
+
+    assert!(
+        tree.starts_with(&world.home_env),
+        "the first run spells the tree through the link: {}",
+        tree.display()
+    );
+    let added = added.unwrap_or_else(|| {
+        panic!(
+            "stdout must be exactly one JSON line: {}",
+            describe(&second)
+        )
+    });
+    assert_eq!(added["worktree_path"], created["worktree_path"], "{added}");
+    let in_tree = rows
+        .iter()
+        .filter(|row| row["worktree_path"] == created["worktree_path"])
+        .count();
+    assert_eq!(in_tree, 2, "both rows name the one tree: {rows:?}");
 }
