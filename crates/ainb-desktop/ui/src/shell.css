@@ -1542,6 +1542,52 @@ body {
   font-size: 11px;
 }
 
+/* Settings > Appearance: the theme switch, a segmented control as Orca draws
+   it. The picked choice carries the accent; focus shows the ring. */
+.appearance-panel h3 {
+  margin: 0 0 8px;
+}
+
+.appearance-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.appearance-label {
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+}
+
+.theme-switch {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.theme-choice {
+  padding: 3px 10px;
+  border: 0;
+  border-radius: calc(var(--radius-sm) - 2px);
+  background: transparent;
+  color: var(--muted-foreground);
+  font: inherit;
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.theme-choice[aria-checked="true"] {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.theme-choice:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
 .review-withheld {
   border-color: var(--red);
   color: var(--text);
