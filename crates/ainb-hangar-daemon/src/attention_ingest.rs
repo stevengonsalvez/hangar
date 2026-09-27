@@ -240,6 +240,22 @@ enum LineOutcome {
     Processed,
     Raised,
     Retry,
+    /// The line's event id is already recorded with different content: no
+    /// retry can ever succeed.
+    Permanent,
+}
+
+/// What [`AttentionIngest::ingest_line`] did with one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestLine {
+    /// Recorded (or already recorded identically).
+    Recorded,
+    /// Refused for good: the event id is already recorded with different
+    /// content (a replay of an event first recorded live, whose timestamps
+    /// differ). Retrying cannot help; a replay treats it as done.
+    Permanent,
+    /// A store fault; the same line may succeed later.
+    Transient,
 }
 
 impl AttentionIngest {
@@ -385,7 +401,9 @@ impl AttentionIngest {
                         committed_end = line_start;
                     }
                     LineOutcome::Processed => committed_end = line_start,
-                    LineOutcome::Retry => break,
+                    // The tail keeps its long-standing behaviour: stop and
+                    // retry the line on the next pass.
+                    LineOutcome::Retry | LineOutcome::Permanent => break,
                 }
             } else {
                 committed_end = line_start;
@@ -398,10 +416,14 @@ impl AttentionIngest {
     /// Ingest one canonical hook line that arrived outside the tail: the HTTP
     /// hook listener (hooks-and-answers). The same reduction and attention
     /// decision the tail applies, idempotent by the line's `event_id`; no
-    /// cursor moves. `false` is a store fault: the caller answers 503 so the
-    /// hook spools the event for the next daemon start.
-    pub async fn ingest_line(&self, raw: &str, now_ms: i64) -> bool {
-        !matches!(self.process_line(raw, 0, now_ms).await, LineOutcome::Retry)
+    /// cursor moves. [`IngestLine::Transient`] is a store fault: the caller
+    /// answers 503 so the hook spools the event for the next daemon start.
+    pub async fn ingest_line(&self, raw: &str, now_ms: i64) -> IngestLine {
+        match self.process_line(raw, 0, now_ms).await {
+            LineOutcome::Processed | LineOutcome::Raised => IngestLine::Recorded,
+            LineOutcome::Permanent => IngestLine::Permanent,
+            LineOutcome::Retry => IngestLine::Transient,
+        }
     }
 
     /// Process one hook line. Store faults return `Retry`, leaving the cursor
@@ -447,7 +469,7 @@ impl AttentionIngest {
         };
         let session_key =
             (!line.session_id.is_empty()).then(|| format!("{provider}:{}", line.session_id));
-        if FleetProviderEventRepo::append(
+        if let Err(error) = FleetProviderEventRepo::append(
             &self.pool,
             &NewFleetProviderEvent {
                 event_id: event_id.clone(),
@@ -467,9 +489,12 @@ impl AttentionIngest {
             },
         )
         .await
-        .is_err()
         {
-            tracing::warn!("fleet provider event persistence failed");
+            if error.is_permanent() {
+                tracing::warn!(error = %error, event_id, "fleet provider event already recorded differently");
+                return LineOutcome::Permanent;
+            }
+            tracing::warn!(error = %error, "fleet provider event persistence failed");
             return LineOutcome::Retry;
         }
         if line.cwd.is_empty() && line.session_id.is_empty() {
