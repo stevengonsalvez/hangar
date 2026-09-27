@@ -91,5 +91,12 @@ describe("the window at its default size", () => {
       timeout: 15_000,
       timeoutMsg: "the close control did not close the tab",
     });
+    // Closing a tab detaches the window from the session; the session itself
+    // runs on, so its row stays in the sidebar.
+    await browser.pause(1_000);
+    assert.ok(
+      await $(`.session-row[data-session="${session.id}"]`).isExisting(),
+      "closing the tab removed the session's row: it should only have detached",
+    );
   });
 });
