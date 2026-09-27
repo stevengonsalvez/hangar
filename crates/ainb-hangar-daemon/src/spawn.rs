@@ -225,11 +225,18 @@ pub async fn worktree_create(
     let mut resolved = params.clone();
     resolved.repo_path = repo.to_string_lossy().into_owned();
     let bin = crate::atc::ainb_bin();
+    // `ainb run` writes to files, never to pipes the daemon holds. With pipes,
+    // anything that stopped the daemon reading them (a create that timed out,
+    // a caller that went away, a daemon restart) would turn `ainb run`'s next
+    // write into EPIPE, killing it before its own rollback ran and orphaning
+    // the tmux session, the worktree and the branch. A file takes every write
+    // whatever the daemon is doing.
+    let logs = RunLogs::create()?;
     let child = tokio::process::Command::new(&bin)
         .args(run_argv(&resolved))
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(logs.stdout()?)
+        .stderr(logs.stderr()?)
         // The daemon may itself run inside a tmux pane; an inherited $TMUX
         // would point `ainb run`'s tmux calls at that client's server
         // context instead of the default one sessions live on.
@@ -237,15 +244,13 @@ pub async fn worktree_create(
         .spawn()
         .map_err(|e| SpawnError::Failed(format!("could not run {bin}: {e}")))?;
     // The wait runs in its own task, so it outlives both a timeout here and a
-    // caller that stops waiting (a closed connection drops this future). The
-    // task is what drains `ainb run`'s stdout and stderr: dropping the wait
-    // would close both pipes, and `ainb run`'s next write would die on EPIPE
-    // before its own rollback ran, orphaning the tmux session, the worktree
-    // and the branch.
-    let mut wait = tokio::spawn(child.wait_with_output());
+    // caller that stops waiting (a closed connection drops this future), and
+    // the run's outcome is still recorded.
+    let mut child = child;
+    let mut wait = tokio::spawn(async move { child.wait().await });
     let timeout = run_timeout();
-    let output = match tokio::time::timeout(timeout, &mut wait).await {
-        Ok(Ok(Ok(output))) => output,
+    let status = match tokio::time::timeout(timeout, &mut wait).await {
+        Ok(Ok(Ok(status))) => status,
         Ok(Ok(Err(e))) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
         Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
         Err(_) => {
@@ -253,12 +258,12 @@ pub async fn worktree_create(
             // outcome goes to the log, where an operator can find it.
             tokio::spawn(async move {
                 match wait.await {
-                    Ok(Ok(output)) if output.status.success() => {
+                    Ok(Ok(status)) if status.success() => {
                         tracing::info!("`ainb run` finished after its create timed out");
                     }
-                    Ok(Ok(output)) => tracing::warn!(
-                        status = %output.status,
-                        stderr = %stderr_tail(&output.stderr),
+                    Ok(Ok(status)) => tracing::warn!(
+                        %status,
+                        stderr = %stderr_tail(&logs.read_stderr()),
                         "`ainb run` failed after its create timed out"
                     ),
                     Ok(Err(error)) => {
@@ -268,6 +273,7 @@ pub async fn worktree_create(
                         tracing::warn!(%error, "the wait on a timed-out `ainb run` ended");
                     }
                 }
+                logs.remove();
             });
             return Err(SpawnError::Failed(format!(
                 "`ainb run` is still running after {}s: the worktree may still be creating; check the sidebar",
@@ -275,13 +281,71 @@ pub async fn worktree_create(
             )));
         }
     };
-    if !output.status.success() {
+    let stdout = logs.read_stdout();
+    let stderr = logs.read_stderr();
+    logs.remove();
+    if !status.success() {
         return Err(SpawnError::Failed(format!(
             "`ainb run` failed: {}",
-            stderr_tail(&output.stderr)
+            stderr_tail(&stderr)
         )));
     }
-    parse_run_output(&String::from_utf8_lossy(&output.stdout)).map_err(SpawnError::Failed)
+    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Failed)
+}
+
+/// Where one `ainb run` writes its stdout and stderr: two files under the
+/// daemon's log dir (`<hangar>/hangar/logs/spawn/`), readable by the daemon's
+/// user only, removed once the run's outcome is read.
+struct RunLogs {
+    stdout: std::path::PathBuf,
+    stderr: std::path::PathBuf,
+}
+
+impl RunLogs {
+    fn create() -> Result<Self, SpawnError> {
+        let dir = crate::log_dir()
+            .map_err(|e| SpawnError::Failed(format!("no log directory for `ainb run`: {e}")))?
+            .join("spawn");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| SpawnError::Failed(format!("creating {}: {e}", dir.display())))?;
+        let name = uuid::Uuid::new_v4().simple().to_string();
+        Ok(Self {
+            stdout: dir.join(format!("{name}.stdout")),
+            stderr: dir.join(format!("{name}.stderr")),
+        })
+    }
+
+    fn open(path: &std::path::Path) -> Result<std::process::Stdio, SpawnError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map(std::process::Stdio::from)
+            .map_err(|e| SpawnError::Failed(format!("creating {}: {e}", path.display())))
+    }
+
+    fn stdout(&self) -> Result<std::process::Stdio, SpawnError> {
+        Self::open(&self.stdout)
+    }
+
+    fn stderr(&self) -> Result<std::process::Stdio, SpawnError> {
+        Self::open(&self.stderr)
+    }
+
+    fn read_stdout(&self) -> Vec<u8> {
+        std::fs::read(&self.stdout).unwrap_or_default()
+    }
+
+    fn read_stderr(&self) -> Vec<u8> {
+        std::fs::read(&self.stderr).unwrap_or_default()
+    }
+
+    fn remove(&self) {
+        let _ = std::fs::remove_file(&self.stdout);
+        let _ = std::fs::remove_file(&self.stderr);
+    }
 }
 
 /// The last five lines of a run's stderr: the CLI's own last words.
