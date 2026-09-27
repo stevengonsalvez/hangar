@@ -15,7 +15,10 @@ export function StatusGlyph(props: { status: UiStatus | null }) {
       {(status) => (
         <>
           <span class="status-glyph" data-status={statusKey(status())} aria-hidden="true" />
-          <span class="visually-hidden">{statusLabel(status())}</span>
+          {/* The trailing separator keeps the words apart from the name that
+              follows, so a screen reader hears "Working, api", not
+              "Workingapi". */}
+          <span class="visually-hidden">{`${statusLabel(status())}, `}</span>
         </>
       )}
     </Show>
