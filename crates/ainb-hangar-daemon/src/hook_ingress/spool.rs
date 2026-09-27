@@ -57,6 +57,9 @@ pub struct DrainReport {
     pub replayed: usize,
     /// Lines refused: holds, tool events, unknown sources, malformed lines.
     pub skipped: usize,
+    /// Lines whose event id was already recorded with different content (a
+    /// live event later spooled): nothing to replay, and the drain moves on.
+    pub already_recorded: usize,
 }
 
 /// Drain every spool file under `hangar_home` through `sink`.
@@ -83,7 +86,13 @@ pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport
             continue;
         };
         let Some(text) = read_checked(&aside).await else {
-            report.files_kept += 1;
+            // An aside we could not read (loosened mode, a second link) is
+            // still only ours to drop: remove it once it is past its age.
+            if aside_expired(&aside) {
+                let _ = std::fs::remove_file(&aside);
+            } else {
+                report.files_kept += 1;
+            }
             continue;
         };
         match drain_text(&text, sink, &mut report).await {
@@ -167,7 +176,7 @@ fn claim(path: &Path) -> Option<PathBuf> {
 /// this user's regular file, `0600` or tighter, one link, within the size
 /// cap. `Some("")` for a file past [`MAX_SPOOL_AGE`], which the caller
 /// removes unreplayed. Read on a blocking thread.
-async fn read_checked(path: &Path) -> Option<String> {
+async fn read_checked(path: &Path) -> Option<Vec<u8>> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
@@ -193,15 +202,28 @@ async fn read_checked(path: &Path) -> Option<String> {
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > MAX_SPOOL_AGE);
         if expired {
-            return Some(String::new());
+            return Some(Vec::new());
         }
-        let mut text = String::new();
-        file.take(MAX_SPOOL_FILE).read_to_string(&mut text).ok()?;
-        Some(text)
+        // Bytes, not a String: one invalid UTF-8 byte must cost one line,
+        // not the whole file.
+        let mut bytes = Vec::new();
+        file.take(MAX_SPOOL_FILE).read_to_end(&mut bytes).ok()?;
+        Some(bytes)
     })
     .await
     .ok()
     .flatten()
+}
+
+/// Whether `path` is an aside (a name this drain gave) older than
+/// [`MAX_SPOOL_AGE`]. Unlinking a name removes only that link.
+fn aside_expired(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(DRAINING))
+        && std::fs::symlink_metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > MAX_SPOOL_AGE)
 }
 
 /// How replaying one file ended.
@@ -215,18 +237,26 @@ enum Drained {
 }
 
 /// Replay one file's lines.
-async fn drain_text(text: &str, sink: &dyn HookSink, report: &mut DrainReport) -> Drained {
-    if text.is_empty() {
+async fn drain_text(bytes: &[u8], sink: &dyn HookSink, report: &mut DrainReport) -> Drained {
+    if bytes.is_empty() {
         return Drained::Expired;
     }
-    for raw in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Some(event) = (raw.len() <= super::MAX_BODY).then(|| replayable_event(raw)).flatten()
-        else {
+    for raw in bytes.split(|&b| b == b'\n') {
+        if raw.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let event = std::str::from_utf8(raw)
+            .ok()
+            .filter(|l| l.len() <= super::MAX_BODY)
+            .and_then(replayable_event);
+        let Some(event) = event else {
             report.skipped += 1;
             continue;
         };
         match sink.ingest(event).await {
+            // Only a store fault stops the drain.
             HookReply::Unavailable => return Drained::StoreFault,
+            HookReply::AlreadyRecorded => report.already_recorded += 1,
             HookReply::NoContent | HookReply::Json(_) => report.replayed += 1,
         }
     }
@@ -420,8 +450,8 @@ mod tests {
             "a.jsonl",
             &[line("Stop", Some("aaaaaaaa-0002"))],
         );
-        // Another start faults on the first line again: a second aside of
-        // `a` is made, and the first is not overwritten.
+        // Another start faults again on the oldest aside and stops there: the
+        // new `a.jsonl` is left untouched, the first aside is not overwritten.
         let report = drain_spool(
             home.path(),
             &Flaky {
@@ -540,5 +570,132 @@ mod tests {
         assert!(replayable_event(&sneaky).is_none());
         let unknown = line("Stop", None).replace("\"claude\"", "\"nobody\"");
         assert!(replayable_event(&unknown).is_none());
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Answers `AlreadyRecorded` for one id, records the rest.
+    struct Recorded {
+        known: String,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl HookSink for Recorded {
+        fn ingest(
+            &self,
+            event: HookEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
+            let id = event.event_id.unwrap();
+            let reply = if id == self.known {
+                HookReply::AlreadyRecorded
+            } else {
+                self.seen.lock().unwrap().push(id);
+                HookReply::NoContent
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn stop(id: &str) -> String {
+        serde_json::json!({"v": 1, "source": "claude", "event": "Stop", "event_id": id,
+                           "payload": {"hook_event_name": "Stop", "session_id": "s"}})
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn an_already_recorded_line_is_skipped_and_the_drain_goes_on() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+        write(
+            &dir,
+            "a.jsonl",
+            format!("{}\n", stop("aaaaaaaa-known")).as_bytes(),
+        );
+        write(
+            &dir,
+            "b.jsonl",
+            format!("{}\n", stop("bbbbbbbb-0001")).as_bytes(),
+        );
+        let sink = Recorded {
+            known: "aaaaaaaa-known".into(),
+            seen: Mutex::new(Vec::new()),
+        };
+        let report = drain_spool(home.path(), &sink).await;
+        assert_eq!(
+            (report.already_recorded, report.replayed, report.files_done),
+            (1, 1, 2)
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "both files gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_invalid_utf8_byte_costs_one_line() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+        let mut bytes = format!("{}\n", stop("cccccccc-0001")).into_bytes();
+        bytes.extend_from_slice(b"{\"v\":1,\"source\":\"claude\",\"event\":\"Stop\xff\"}\n");
+        bytes.extend_from_slice(format!("{}\n", stop("cccccccc-0002")).as_bytes());
+        write(&dir, "c.jsonl", &bytes);
+        let sink = Recorded {
+            known: String::new(),
+            seen: Mutex::new(Vec::new()),
+        };
+        let report = drain_spool(home.path(), &sink).await;
+        assert_eq!((report.replayed, report.skipped), (2, 1));
+        assert_eq!(
+            sink.seen.lock().unwrap().clone(),
+            ["cccccccc-0001", "cccccccc-0002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_aside_expires() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+        let name = format!(".x.jsonl{DRAINING}0000000000001-0000000000-abc");
+        write(
+            &dir,
+            &name,
+            format!("{}\n", stop("dddddddd-0001")).as_bytes(),
+        );
+        let aside = dir.join(&name);
+        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let sink = Recorded {
+            known: String::new(),
+            seen: Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            drain_spool(home.path(), &sink).await.files_kept,
+            1,
+            "young: kept"
+        );
+        let old = std::time::SystemTime::now() - MAX_SPOOL_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&aside)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drain_spool(home.path(), &sink).await;
+        assert!(!aside.exists(), "an old unreadable aside is removed");
+        assert!(sink.seen.lock().unwrap().is_empty());
     }
 }
