@@ -6353,10 +6353,19 @@ async fn close_session_ask_attention(
     for id in ids {
         match AttentionRepo::mark_answered_if_open(pool, &id, answered_by, answer, now_ms).await {
             Ok(1) => {
+                crate::attention_wake::wake(
+                    pool,
+                    events,
+                    &session.session_key,
+                    &id,
+                    crate::attention_wake::AttentionChange::Closed,
+                    now_ms,
+                )
+                .await;
                 events.emit_attention(ainb_hangar_proto::events::HangarEvent::AttentionAnswered {
                     attention_id: id,
                     by: answered_by.to_string(),
-                })
+                });
             }
             // Another surface won the race; it already owns the close.
             Ok(_) => {}
