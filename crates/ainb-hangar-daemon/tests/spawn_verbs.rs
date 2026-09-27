@@ -490,9 +490,28 @@ async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree(
         assert!(ok, "git {args:?}");
     }
     let stray = registered.managed_worktree(elsewhere.path(), "stray--x--00000000", "x");
+    // A whole repository sitting where a managed tree would: in the right
+    // place, but a main checkout, not a linked worktree.
+    let planted = registered
+        .home
+        .path()
+        .join(".agents-in-a-box/worktrees/by-name/planted--main--00000000");
+    std::fs::create_dir_all(&planted).unwrap();
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&planted)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(ok, "git init {}", planted.display());
+    let planted = std::fs::canonicalize(planted).unwrap().display().to_string();
     switch_on(&fake_ainb(tools.path(), true));
 
-    for (path, why) in [(registered.repo(), "by-name"), (stray, "registered")] {
+    for (path, why) in [
+        (registered.repo(), "directly in"),
+        (planted, "main checkout"),
+        (stray, "registered"),
+    ] {
         let response = call_method(
             m::WORKTREE_AGENT_ADD,
             serde_json::json!({ "worktree_path": path, "agent": "claude" }),
