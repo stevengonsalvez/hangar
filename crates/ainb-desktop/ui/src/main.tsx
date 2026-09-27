@@ -358,7 +358,10 @@ function Shell() {
     if (event.defaultPrevented) return;
 
     const shell = accelerator(event, MAC);
-    if (shell) {
+    // Under the composer, a chord the modal refuses is not the shell's to
+    // swallow: left alone it reaches the focused field, so Ctrl+Shift+C and
+    // Ctrl+Shift+V still copy and paste there off macOS.
+    if (shell && !(composer.open() && !acceleratorAllowedUnderModal(shell))) {
       event.preventDefault();
       onAccelerator(shell);
     }
