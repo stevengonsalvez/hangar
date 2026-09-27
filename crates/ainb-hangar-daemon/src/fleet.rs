@@ -2871,7 +2871,7 @@ fn states_for_hook(
     payload: &Value,
 ) -> (Option<LifecycleState>, Option<AttentionState>) {
     match event_type {
-        "SessionStart" => (Some(LifecycleState::Starting), Some(AttentionState::None)),
+        "SessionStart" => session_start_states(payload),
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
         | "PostToolBatch" | "SubagentStart" | "TaskCreated" => {
             (Some(LifecycleState::Running), Some(AttentionState::None))
@@ -2892,6 +2892,34 @@ fn states_for_hook(
         ),
         "SessionEnd" => (Some(LifecycleState::Exited), Some(AttentionState::None)),
         _ => (None, None),
+    }
+}
+
+/// What a `SessionStart` says, which depends on why the session started.
+///
+/// Claude fires it at an empty prompt for `startup`, `resume` and `clear`: no
+/// turn is running, so the session is Idle. It used to read `Starting`, which
+/// every surface draws as Working with a spinner until the first prompt, so a
+/// fresh session looked busy while it waited for the operator.
+///
+/// `compact` is different: a compaction can run in the middle of a turn, and
+/// the turn's own hooks already hold the right state. Asserting nothing keeps
+/// it from flashing Idle under a working agent.
+///
+/// Without a known `source` the old `Starting` stands. Idle is this
+/// vocabulary's "finished and free", a claim `status_one_truth` bars any
+/// sequence without a terminal event from making, and a bare `SessionStart`
+/// (Codex `session_configured`, the OSC `session_start` frame) carries no
+/// evidence of an empty prompt. An unfamiliar value may equally be another
+/// mid-turn restart like `compact`. The next turn hook corrects either.
+fn session_start_states(payload: &Value) -> (Option<LifecycleState>, Option<AttentionState>) {
+    let hook = payload.get("payload").unwrap_or(payload);
+    match hook.get("source").and_then(Value::as_str) {
+        Some("startup" | "resume" | "clear") => {
+            (Some(LifecycleState::Idle), Some(AttentionState::None))
+        }
+        Some("compact") => (None, None),
+        _ => (Some(LifecycleState::Starting), Some(AttentionState::None)),
     }
 }
 
@@ -4572,6 +4600,101 @@ mod tests {
             states_for_hook("SessionEnd", &serde_json::json!({})),
             (Some(LifecycleState::Exited), Some(AttentionState::None))
         );
+    }
+
+    /// A session at Claude's empty prompt is Idle, not Working, whichever way it
+    /// got there; a compaction asserts nothing, so a mid-turn one cannot flash
+    /// Idle.
+    #[test]
+    fn session_start_reads_idle_by_source() {
+        let idle = (Some(LifecycleState::Idle), Some(AttentionState::None));
+        let starting = (Some(LifecycleState::Starting), Some(AttentionState::None));
+        for (payload, expected) in [
+            (
+                serde_json::json!({ "payload": { "source": "startup" } }),
+                idle,
+            ),
+            (
+                serde_json::json!({ "payload": { "source": "resume" } }),
+                idle,
+            ),
+            (
+                serde_json::json!({ "payload": { "source": "clear" } }),
+                idle,
+            ),
+            // The daemon's HTTP ingress hands over Claude's JSON unwrapped.
+            (serde_json::json!({ "source": "startup" }), idle),
+            (
+                serde_json::json!({ "payload": { "source": "compact" } }),
+                (None, None),
+            ),
+            // Codex `session_configured` and the OSC frame carry no source,
+            // and an unfamiliar one may be mid-turn: neither may claim Idle.
+            (serde_json::json!({}), starting),
+            (
+                serde_json::json!({ "payload": { "source": "teleport" } }),
+                starting,
+            ),
+        ] {
+            assert_eq!(
+                states_for_hook("SessionStart", &payload),
+                expected,
+                "{payload}"
+            );
+        }
+    }
+
+    /// The whole first turn through the store: idle at the prompt, working once
+    /// a prompt is submitted, done when the turn stops.
+    #[tokio::test]
+    async fn a_new_session_is_idle_until_its_first_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        for (at, event_type, payload, lifecycle) in [
+            (
+                1,
+                "SessionStart",
+                serde_json::json!({ "source": "startup" }),
+                "IDLE",
+            ),
+            (2, "UserPromptSubmit", serde_json::json!({}), "RUNNING"),
+            (
+                3,
+                "SessionStart",
+                serde_json::json!({ "source": "compact" }),
+                "RUNNING",
+            ),
+            (4, "Stop", serde_json::json!({}), "TURN_COMPLETE"),
+            (
+                5,
+                "SessionStart",
+                serde_json::json!({ "source": "clear" }),
+                "IDLE",
+            ),
+        ] {
+            apply_hook(
+                pool,
+                &sink,
+                HookObservation {
+                    event_id: format!("first-turn:{at}"),
+                    provider: "claude",
+                    provider_session_id: "sess-first",
+                    event_type,
+                    cwd: "/work/repo",
+                    payload: &serde_json::json!({ "payload": payload }),
+                    observed_at: at,
+                    transcript_model: None,
+                },
+            )
+            .await
+            .expect("hook applies");
+            let row = FleetRepo::get_session(pool, "claude:sess-first").await.unwrap().unwrap();
+            assert_eq!(row.lifecycle_state, lifecycle, "after {event_type} at {at}");
+            assert_eq!(row.attention_state, "NONE");
+        }
     }
 
     #[test]
