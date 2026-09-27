@@ -331,8 +331,14 @@ impl AppState {
     }
 
     /// A newer Fleet revision was observed: section 20 goes stale until a read
-    /// at or past it lands.
+    /// at or past it lands, and the attention poller is woken, because a
+    /// revision is when a request can have been raised or answered. Without the
+    /// nudge the board moved on the revision while the "need you" count and
+    /// the Waiting panel waited out the poller's five-second clock.
     pub fn observe_agent_status_head(&mut self, head_revision: i64) -> bool {
+        if head_revision > self.agent_status.head_revision {
+            self.host.attention_poll_nudge.notify_one();
+        }
         self.agent_status.update(|section| section.observe_head(head_revision))
     }
 
@@ -13422,6 +13428,7 @@ impl AppState {
             &self.fleet.fleet_snapshot,
             &self.host.attention_poll_running,
             &self.host.daemon_attention_generation,
+            &self.host.attention_poll_nudge,
         );
         self.refresh_attention(crate::fleet::daemons::heartbeat::now_ms());
 
