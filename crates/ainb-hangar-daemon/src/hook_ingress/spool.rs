@@ -15,11 +15,17 @@
 //! - Holds never replay. `PermissionRequest` and the tool events are refused
 //!   here even if a file names them (the script never spools them): a
 //!   replayed approval would be a phantom.
-//! - Only this user's regular files are read (no symlinks), each capped at
-//!   [`MAX_SPOOL_FILE`]. A file is renamed aside before it is read, so a hook
-//!   appending meanwhile starts a fresh file instead of racing the drain.
-//! - A store fault (503 from the sink) stops the drain and keeps the file; the
-//!   next start replays it again, harmlessly, by id.
+//! - The spool directory must be this user's, not group or world writable.
+//!   Each file is opened `O_NOFOLLOW` and checked ON THE OPEN DESCRIPTOR: a
+//!   regular file this user owns, mode `0600` or tighter, one link, at most
+//!   [`MAX_SPOOL_FILE`], and younger than [`MAX_SPOOL_AGE`] (an older one is
+//!   removed unreplayed). Lines over the listener's body cap are skipped.
+//! - A file is moved aside before it is read, by link-then-unlink under a
+//!   unique, time-ordered name, so a hook appending meanwhile starts a fresh
+//!   file and no aside is ever overwritten.
+//! - A store fault (503 from the sink) stops the WHOLE drain and keeps every
+//!   file not yet finished; the next start replays them, oldest first,
+//!   harmlessly by id.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -32,6 +38,10 @@ use super::{HookEvent, HookReply, HookSink};
 
 /// Largest spool file the drain reads. The script stops appending at 5 MiB.
 pub const MAX_SPOOL_FILE: u64 = 6 * 1024 * 1024;
+
+/// Oldest spool file the drain replays; the script also resets a file this
+/// old. A week-old status event would only move a session backwards.
+pub const MAX_SPOOL_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 /// Marker in the name a file is renamed to while it drains.
 const DRAINING: &str = ".draining.";
@@ -53,6 +63,9 @@ pub struct DrainReport {
 pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport {
     let dir = hangar_home.join("hangar").join(SPOOL_DIR_NAME);
     let mut report = DrainReport::default();
+    if !dir_is_ours(&dir) {
+        return report;
+    }
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return report;
     };
@@ -61,17 +74,32 @@ pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport
         .map(|e| e.path())
         .filter(|p| is_spool_name(p))
         .collect();
+    // Asides (`.<name>.draining.<ms>-<uuid>`) sort before live files, and
+    // among one file's asides by time: oldest events replay first.
     files.sort();
     for path in files {
-        let Some(draining) = claim(&path) else {
+        let Some(aside) = claim(&path) else {
             report.files_kept += 1;
             continue;
         };
-        if drain_file(&draining, sink, &mut report).await {
-            let _ = std::fs::remove_file(&draining);
-            report.files_done += 1;
-        } else {
+        let Some(text) = read_checked(&aside).await else {
             report.files_kept += 1;
+            continue;
+        };
+        match drain_text(&text, sink, &mut report).await {
+            Drained::Done => {
+                let _ = std::fs::remove_file(&aside);
+                report.files_done += 1;
+            }
+            Drained::Expired => {
+                let _ = std::fs::remove_file(&aside);
+            }
+            Drained::StoreFault => {
+                // Stop everything: the store is not taking events, and every
+                // file left untouched keeps its place for the next start.
+                report.files_kept += 1;
+                break;
+            }
         }
     }
     if report != DrainReport::default() {
@@ -80,47 +108,129 @@ pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport
     report
 }
 
-/// A spool file (`*.jsonl`) or one left mid-drain by an earlier start.
+/// The spool directory is a real directory this user owns that nobody else
+/// can write.
+fn dir_is_ours(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    let ok = meta.file_type().is_dir()
+        && meta.uid() == nix::unistd::geteuid().as_raw()
+        && meta.mode() & 0o022 == 0;
+    if !ok {
+        tracing::warn!(dir = %dir.display(), "hook spool: refusing a directory that is not ours or is writable by others");
+    }
+    ok
+}
+
+/// A spool file (`*.jsonl`) or one moved aside by an earlier start.
 fn is_spool_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.ends_with(".jsonl") || n.contains(DRAINING))
 }
 
-/// Check the file is this user's regular file within the cap, then rename it
-/// aside (unless it already is). `None` leaves it where it is.
+/// Move a live spool file aside under a unique, time-ordered name, never
+/// onto an existing file (link, then unlink the original). An aside is
+/// already claimed. `None` leaves the file where it is.
 fn claim(path: &Path) -> Option<PathBuf> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    let ours = meta.uid() == nix::unistd::geteuid().as_raw();
-    if !meta.file_type().is_file() || !ours || meta.len() > MAX_SPOOL_FILE {
-        tracing::warn!(path = %path.display(), "hook spool: refusing a file that is not ours, not regular, or too large");
-        return None;
-    }
     let name = path.file_name()?.to_str()?;
     if name.contains(DRAINING) {
         return Some(path.to_path_buf());
     }
-    let aside = path.with_file_name(format!(".{name}{DRAINING}{}", std::process::id()));
-    std::fs::rename(path, &aside).ok()?;
+    // Refuse a symlink before touching it; the descriptor checks follow.
+    if !std::fs::symlink_metadata(path).ok()?.file_type().is_file() {
+        tracing::warn!(path = %path.display(), "hook spool: refusing a non-regular file");
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    // Time, then a per-process sequence (two claims in one millisecond keep
+    // their order), then a uuid (two processes never collide).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let aside = path.with_file_name(format!(
+        ".{name}{DRAINING}{now_ms:013}-{seq:010}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // `hard_link` fails if `aside` exists, so nothing is ever overwritten.
+    std::fs::hard_link(path, &aside).ok()?;
+    if std::fs::remove_file(path).is_err() {
+        let _ = std::fs::remove_file(&aside);
+        return None;
+    }
     Some(aside)
 }
 
-/// Replay one claimed file. `false` on a store fault (keep the file).
-async fn drain_file(path: &Path, sink: &dyn HookSink, report: &mut DrainReport) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
+/// Open `path` without following a symlink and check the open descriptor:
+/// this user's regular file, `0600` or tighter, one link, within the size
+/// cap. `Some("")` for a file past [`MAX_SPOOL_AGE`], which the caller
+/// removes unreplayed. Read on a blocking thread.
+async fn read_checked(path: &Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        let ok = meta.file_type().is_file()
+            && meta.uid() == nix::unistd::geteuid().as_raw()
+            && meta.mode() & 0o077 == 0
+            && meta.nlink() == 1
+            && meta.len() <= MAX_SPOOL_FILE;
+        if !ok {
+            tracing::warn!(path = %path.display(), "hook spool: refusing a file that is not ours, not private, linked elsewhere, or too large");
+            return None;
+        }
+        let expired = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > MAX_SPOOL_AGE);
+        if expired {
+            return Some(String::new());
+        }
+        let mut text = String::new();
+        file.take(MAX_SPOOL_FILE).read_to_string(&mut text).ok()?;
+        Some(text)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// How replaying one file ended.
+enum Drained {
+    /// Every line was replayed or refused.
+    Done,
+    /// The file was past its age; nothing replayed.
+    Expired,
+    /// The sink answered 503; stop the drain.
+    StoreFault,
+}
+
+/// Replay one file's lines.
+async fn drain_text(text: &str, sink: &dyn HookSink, report: &mut DrainReport) -> Drained {
+    if text.is_empty() {
+        return Drained::Expired;
+    }
     for raw in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Some(event) = replayable_event(raw) else {
+        let Some(event) = (raw.len() <= super::MAX_BODY).then(|| replayable_event(raw)).flatten()
+        else {
             report.skipped += 1;
             continue;
         };
         match sink.ingest(event).await {
-            HookReply::Unavailable => return false,
+            HookReply::Unavailable => return Drained::StoreFault,
             HookReply::NoContent | HookReply::Json(_) => report.replayed += 1,
         }
     }
-    true
+    Drained::Done
 }
 
 /// The status event one spool line replays, or `None` when it must not be.
@@ -153,7 +263,12 @@ fn replayable_event(raw: &str) -> Option<HookEvent> {
         parent: non_empty(line.parent).filter(|p| p.len() <= 256),
         payload: line.payload,
         event_id: Some(event_id),
-        received_at_ms: (line.received_at_ms > 0).then_some(line.received_at_ms),
+        // Always set: it is what marks the event as a replay for the sink.
+        received_at_ms: Some(if line.received_at_ms > 0 {
+            line.received_at_ms
+        } else {
+            ainb_hangar_core::clock::HangarClock::now_ms(&ainb_hangar_core::clock::SystemClock)
+        }),
     })
 }
 
@@ -195,11 +310,15 @@ mod tests {
         .to_string()
     }
 
+    /// Write a spool file as the script does: 0600 in a 0700 directory.
     fn spool(home: &Path, name: &str, lines: &[String]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = home.join("hangar").join(SPOOL_DIR_NAME);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join(name);
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         path
     }
 
@@ -243,25 +362,154 @@ mod tests {
         );
     }
 
+    /// Answers 503 for the first `faults` calls, then records.
+    struct Flaky {
+        faults: Mutex<usize>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl HookSink for Flaky {
+        fn ingest(
+            &self,
+            event: HookEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HookReply> + Send + '_>> {
+            let mut faults = self.faults.lock().unwrap();
+            let reply = if *faults > 0 {
+                *faults -= 1;
+                HookReply::Unavailable
+            } else {
+                self.seen.lock().unwrap().push(event.event_id.unwrap());
+                HookReply::NoContent
+            };
+            Box::pin(async move { reply })
+        }
+    }
+
+    fn spool_dir(home: &Path) -> PathBuf {
+        home.join("hangar").join(SPOOL_DIR_NAME)
+    }
+
     #[tokio::test]
-    async fn a_store_fault_keeps_the_file_for_the_next_start() {
+    async fn a_store_fault_stops_the_drain_and_a_restart_loses_nothing() {
         let home = tempfile::tempdir().unwrap();
         spool(
             home.path(),
-            "s.jsonl",
+            "a.jsonl",
+            &[line("Stop", Some("aaaaaaaa-0001"))],
+        );
+        spool(
+            home.path(),
+            "b.jsonl",
             &[line("Stop", Some("bbbbbbbb-0001"))],
         );
-        let report = drain_spool(home.path(), &recorder(HookReply::Unavailable)).await;
-        assert_eq!(report.files_kept, 1);
-        let again = recorder(HookReply::NoContent);
-        let report = drain_spool(home.path(), &again).await;
-        assert_eq!(
-            (report.replayed, report.files_done),
-            (1, 1),
-            "picked up mid-drain"
+        let sink = Flaky {
+            faults: Mutex::new(1),
+            seen: Mutex::new(Vec::new()),
+        };
+        let report = drain_spool(home.path(), &sink).await;
+        assert_eq!(report.replayed, 0, "the drain stopped at the first fault");
+        assert!(
+            spool_dir(home.path()).join("b.jsonl").exists(),
+            "b was never touched"
         );
-        let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+
+        // The hook spools more for `a` while the daemon is down again.
+        let dir = spool_dir(home.path());
+        spool(
+            home.path(),
+            "a.jsonl",
+            &[line("Stop", Some("aaaaaaaa-0002"))],
+        );
+        // Another start faults on the first line again: a second aside of
+        // `a` is made, and the first is not overwritten.
+        let report = drain_spool(
+            home.path(),
+            &Flaky {
+                faults: Mutex::new(1),
+                seen: Mutex::new(Vec::new()),
+            },
+        )
+        .await;
+        assert_eq!(report.replayed, 0);
+
+        // A clean start replays everything, oldest aside first, nothing lost.
+        let report = drain_spool(home.path(), &sink).await;
+        assert_eq!(report.replayed, 3, "{report:?}");
+        let seen = sink.seen.lock().unwrap().clone();
+        assert_eq!(seen, ["aaaaaaaa-0001", "aaaaaaaa-0002", "bbbbbbbb-0001"]);
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn claiming_never_overwrites_an_existing_aside() {
+        let home = tempfile::tempdir().unwrap();
+        let first = claim(&spool(
+            home.path(),
+            "c.jsonl",
+            &[line("Stop", Some("cccccccc-0001"))],
+        ))
+        .unwrap();
+        let second = claim(&spool(
+            home.path(),
+            "c.jsonl",
+            &[line("Stop", Some("cccccccc-0002"))],
+        ))
+        .unwrap();
+        assert_ne!(first, second);
+        assert!(std::fs::read_to_string(&first).unwrap().contains("cccccccc-0001"));
+        assert!(std::fs::read_to_string(&second).unwrap().contains("cccccccc-0002"));
+        assert!(first < second, "asides sort by time");
+    }
+
+    #[tokio::test]
+    async fn loose_files_and_directories_are_refused_and_old_files_expire() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let loose = spool(
+            home.path(),
+            "loose.jsonl",
+            &[line("Stop", Some("dddddddd-0001"))],
+        );
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = spool(
+            home.path(),
+            "linked.jsonl",
+            &[line("Stop", Some("dddddddd-0002"))],
+        );
+        std::fs::hard_link(&linked, home.path().join("elsewhere")).unwrap();
+        let old = spool(
+            home.path(),
+            "old.jsonl",
+            &[line("Stop", Some("dddddddd-0003"))],
+        );
+        let week_ago =
+            std::time::SystemTime::now() - MAX_SPOOL_AGE - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(week_ago)
+            .unwrap();
+        let sink = recorder(HookReply::NoContent);
+        let report = drain_spool(home.path(), &sink).await;
+        assert_eq!(report.replayed, 0, "{report:?}");
+        assert_eq!(report.files_kept, 2, "0644 and a second link are refused");
+        assert!(!old.exists(), "an expired file is removed unreplayed");
+
+        // A group-writable spool directory is refused whole.
+        let dir = spool_dir(home.path());
+        spool(
+            home.path(),
+            "ok.jsonl",
+            &[line("Stop", Some("dddddddd-0004"))],
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            drain_spool(home.path(), &sink).await,
+            DrainReport::default()
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(drain_spool(home.path(), &sink).await.replayed, 1);
     }
 
     #[tokio::test]
