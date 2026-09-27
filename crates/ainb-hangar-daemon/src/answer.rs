@@ -398,9 +398,10 @@ pub enum HoldAnswer<'a> {
     Answers(&'a [ainb_hangar_proto::fleet::FleetQuestionAnswer]),
 }
 
-/// Resolve the live hook hold on `params.attention_id` on behalf of `caller`:
-/// the one exact reply path for a held Claude request, shared by
-/// `attention/answer` and `fleet/action` (Approve, Deny, StructuredAnswer).
+/// Resolve the live hook hold on `params.attention_id` on behalf of `caller`,
+/// for `fleet/action` (Approve, Deny, StructuredAnswer, DismissStructured).
+/// `attention/answer` reaches the same claim-and-deliver step
+/// (`deliver_hold_decision`) through [`answer_as`], with a label answer.
 ///
 /// Same rules as [`answer_as`]: the scope gate judges the same hold read the
 /// answer is delivered to, an answer that does not fit the question claims
