@@ -64,6 +64,13 @@ impl SessionLoader {
                             worktree_info.path.to_string_lossy().to_string(), // Use worktree path, not source repo
                         );
                         session.id = session_id;
+                        // The container's own creation time, never the scan's:
+                        // the list is sorted by creation, so `now()` here would
+                        // move the row on every refresh.
+                        session.created_at = container
+                            .created
+                            .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
                         session.container_id = container.id;
                         session.branch_name = worktree_info.branch_name.clone();
                         session.mode = SessionMode::Boss;
