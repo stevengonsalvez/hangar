@@ -14,6 +14,7 @@
 // own four words).
 
 import type {
+  AgentState,
   AgentStatusView,
   AttentionKind,
   FleetView_Serialize,
@@ -24,7 +25,7 @@ import type {
 import type { AckMap } from "./acks.ts";
 import { isAcked } from "./acks.ts";
 import { allSessions, ATTENTION_ORDER, label, providerId } from "./sessions.ts";
-import { assertNever, deriveStatus, elicitationDetail, type UiStatus } from "./status.ts";
+import { deriveStatus, elicitationDetail, unhandled, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
 /** Orca's own board buckets, left to right. Idle also holds a card whose
@@ -135,7 +136,7 @@ function bucketOf(status: UiStatus): BoardColumnKind | null {
     case "exited":
       return null;
     default:
-      return assertNever(status);
+      return unhandled(status, "idle");
   }
 }
 
@@ -276,4 +277,36 @@ export function showIntents(sessionId: string, openRequest: boolean): RendererIn
     { Command: ["session_list.select_row", { target: { session: sessionId }, open: false }] },
     { Command: ["session_list.select_tab", { tab: openRequest ? "Ask" : "Preview" }] },
   ];
+}
+
+/** Every `AgentState`, in the order the proof line lists them. A `Record`, so
+ * a state added in Rust fails the type check here until it is listed. */
+const AGENT_STATE_ORDER: Record<AgentState, number> = {
+  working: 0,
+  waiting: 1,
+  idle: 2,
+  unverifiable: 3,
+  exited: 4,
+};
+
+/**
+ * How many cards the agent status frame carries per raw `AgentState`, for
+ * the `renderer_applied` proof line only. Deliberately NOT the board's own
+ * bucket counts: that Tauri command's `board` argument is typed
+ * `Vec<(AgentState, usize)>` on the Rust side, and the board draws by the
+ * operator's four words (needs/working/done/idle), which that enum cannot
+ * parse. The wire contract stays what it was; the UI's bucketing is
+ * `boardColumns`.
+ *
+ * Every state is listed, zero included: a proof that waits for "waiting is
+ * 0" must read a 0, not a state missing from the line. A state this build
+ * does not know is left out, since the host could not parse it back.
+ */
+export function agentStateCounts(cards: readonly { state: AgentState }[]): [AgentState, number][] {
+  const states = Object.keys(AGENT_STATE_ORDER) as AgentState[];
+  const counts = new Map<AgentState, number>(states.map((state) => [state, 0]));
+  for (const card of cards) {
+    if (counts.has(card.state)) counts.set(card.state, (counts.get(card.state) ?? 0) + 1);
+  }
+  return states.map((state) => [state, counts.get(state) ?? 0]);
 }
