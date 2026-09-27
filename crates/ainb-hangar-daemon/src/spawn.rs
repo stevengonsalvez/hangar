@@ -217,8 +217,10 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
 /// The directory every managed worktree lives in:
 /// `<home>/.agents-in-a-box/worktrees/by-name`, with `$AINB_HOME` standing in
 /// for the home as it does for the CLI's own worktree manager, so the daemon
-/// and the `ainb run` it spawns agree on it.
-fn managed_worktrees(home: &Path) -> PathBuf {
+/// and the `ainb run` it spawns agree on it. `ainb-core`'s
+/// `managed_worktrees_layout` test pins it to the manager's own path.
+#[must_use]
+pub fn managed_worktrees(home: &Path) -> PathBuf {
     std::env::var_os("AINB_HOME")
         .map_or_else(|| home.to_path_buf(), PathBuf::from)
         .join(".agents-in-a-box")
@@ -226,14 +228,61 @@ fn managed_worktrees(home: &Path) -> PathBuf {
         .join("by-name")
 }
 
+/// The source repository of the linked worktree whose top is `canonical`, or
+/// why `canonical` is not one: not in a git checkout, not the top of it, or
+/// the repository's main checkout (its git dir is the common one). Git's own
+/// answer, so a submodule or a stray `.git` file is not mistaken for a tree.
+///
+/// Shared with `ainb run --existing-worktree`, which makes the same check
+/// before it starts anything, so the two cannot disagree on what a tree is.
+///
+/// # Errors
+/// The reason, phrased to follow the name of the path being checked.
+pub fn linked_worktree_source(canonical: &Path) -> Result<PathBuf, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(canonical)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .ok_or_else(|| "is not a git worktree".to_string())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // `--git-common-dir` may be relative to the directory git ran in.
+    let resolved: Vec<Option<PathBuf>> = stdout
+        .lines()
+        .map(|line| std::fs::canonicalize(canonical.join(line.trim())).ok())
+        .collect();
+    let [Some(top), Some(git_dir), Some(common_dir)] = resolved.as_slice() else {
+        return Err("is not a git worktree".into());
+    };
+    if top != canonical {
+        return Err("is not the top of a git worktree".into());
+    }
+    if git_dir == common_dir {
+        return Err("is a repository's main checkout, not a linked worktree".into());
+    }
+    common_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "has no source repository".into())
+}
+
 /// `worktree_path` as the canonical top of a linked worktree that ainb
 /// manages, cut from a repository inside a registered root, or why not.
 ///
 /// A second agent shares the tree with the first, so every check is against
 /// the disk, not the request: no `.` or `..` components, a direct child of the
-/// managed worktree directory (the only place `ainb run --worktree` puts a
-/// tree, so a worktree nested inside one is refused), the top of its checkout, a LINKED worktree (its git dir
-/// differs from the common one; the main checkout is what `worktree/create`
+/// managed worktree directory once symlinks are resolved (the only place
+/// `ainb run --worktree` puts a tree, so a nested worktree or a link out to
+/// one elsewhere is refused), a linked worktree's top
+/// ([`linked_worktree_source`]; the main checkout is what `worktree/create`
 /// exists to keep agents out of), and a source repository that
 /// [`resolve_repo`] accepts. `managed` is [`managed_worktrees`], passed in so
 /// a test does not depend on the process's `$AINB_HOME`.
@@ -260,44 +309,8 @@ fn resolve_worktree(
             managed.display()
         )));
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&canonical)
-        .args([
-            "rev-parse",
-            "--show-toplevel",
-            "--absolute-git-dir",
-            "--git-common-dir",
-        ])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .ok_or_else(|| SpawnError::Invalid("worktree_path is not a git worktree".into()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    // `--git-common-dir` may be relative to the directory git ran in.
-    let resolved: Vec<Option<PathBuf>> = stdout
-        .lines()
-        .map(|line| std::fs::canonicalize(canonical.join(line.trim())).ok())
-        .collect();
-    let [Some(top), Some(git_dir), Some(common_dir)] = resolved.as_slice() else {
-        return Err(SpawnError::Invalid(
-            "worktree_path is not a git worktree".into(),
-        ));
-    };
-    if *top != canonical {
-        return Err(SpawnError::Invalid(
-            "worktree_path is not the top of a git worktree".into(),
-        ));
-    }
-    if git_dir == common_dir {
-        return Err(SpawnError::Invalid(
-            "worktree_path is a repository's main checkout, not a linked worktree".into(),
-        ));
-    }
-    let source = common_dir
-        .parent()
-        .ok_or_else(|| SpawnError::Invalid("worktree_path has no source repository".into()))?;
+    let source = linked_worktree_source(&canonical)
+        .map_err(|why| SpawnError::Invalid(format!("worktree_path {why}")))?;
     resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
         SpawnError::Invalid(why) => SpawnError::Invalid(format!(
             "the worktree's source repository is refused: {why}"
@@ -363,7 +376,13 @@ pub async fn worktree_agent_add(
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
     let home = dirs::home_dir()
         .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
-    let tree = resolve_worktree(&params.worktree_path, &home, &managed_worktrees(&home))?;
+    // git and the filesystem, off the async workers.
+    let path = params.worktree_path.clone();
+    let tree = tokio::task::spawn_blocking(move || {
+        resolve_worktree(&path, &home, &managed_worktrees(&home))
+    })
+    .await
+    .map_err(|e| SpawnError::Failed(format!("checking the worktree: {e}")))??;
     let mut resolved = params.clone();
     resolved.worktree_path = tree.to_string_lossy().into_owned();
     run_ainb(agent_add_argv(&resolved), "the agent may still be starting").await
@@ -817,6 +836,23 @@ mod tests {
             ],
         );
         refused(&nested, &managed, "directly in");
+        // A link in the managed place out to a tree elsewhere.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("outside");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "outside",
+                &outside.display().to_string(),
+            ],
+        );
+        let link = managed.join("app--link--00000000");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        refused(&link, &managed, "directly in");
     }
 
     #[test]
