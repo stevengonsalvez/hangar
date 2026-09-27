@@ -212,15 +212,17 @@ describe("answering from the window", () => {
     // `<surface>@<host>`: the surface is what the person sat at.
     assert.match(second.by, /^desktop@/, `the desktop answered, not the terminal: ${JSON.stringify(second)}`);
 
-    // The board's card is the daemon's view of the agent, which stays waiting
-    // until the agent's next hook event; the fixture agent fires none, so the
-    // card is still there. The request itself reads answered, as the second
-    // surface just found. Selecting the row opened its terminal tab, so the
-    // board is brought back to be read.
+    // The board's card is the daemon's view of the agent, and it stops
+    // reading waiting once the request is answered: the answer closes the
+    // inbox row and wakes every fleet reader (#188), so the window re-reads at
+    // once rather than on the agent's next hook, which the fixture agent never
+    // fires. Selecting the row opened its terminal tab, so the board is
+    // brought back to be read.
     await click(".board-tab .tab-title");
     await $(card).waitForExist({
+      reverse: true,
       timeout: 30_000,
-      timeoutMsg: "the agent's card left the board",
+      timeoutMsg: "the answered question's card stayed in the waiting column",
     });
   });
 
