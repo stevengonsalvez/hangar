@@ -1729,6 +1729,119 @@ pub async fn reconcile_tmux_once(
     reconcile_discovered_panes(pool, events, discover_from_tmux().await?, observed_at, pass).await
 }
 
+/// How long discovery may keep reporting nothing before the sweep believes it.
+///
+/// See [`SweepGuard`]. Long enough to ride out a slow or restarting tmux server,
+/// short enough that a server whose panes really all closed is still noticed:
+/// its rows reach UNAVAILABLE within about 90s and EXITED 30s later. Without the
+/// bound they never would, because the stale reaper only retires a tmux-bound
+/// row once it is UNAVAILABLE (`reap_stale_sessions`), so a sample this guard
+/// kept distrusting forever would strand the row at its last hook state.
+const SWEEP_BLIP_TOLERANCE_MS: i64 = 60_000;
+
+/// Decides whether one discovery sample may count a pane as missing.
+///
+/// A missing pane is news the sweep writes (UNAVAILABLE, then EXITED for a
+/// managed Claude row), so a sample that cannot be trusted to list every live
+/// pane must not count: a discovery that errored or timed out, or one that
+/// found no panes at all when the last trusted sample found some. Nothing is
+/// written for such a sample, not even the `mark_tmux_unavailable` downgrade.
+///
+/// "No panes" means no tmux pane of any kind, not no agent pane. Closing the
+/// last Claude session leaves its shell panes behind, and that is exactly the
+/// exit this sweep exists to report; a tmux server that briefly lists nothing
+/// lists no shells either.
+///
+/// Distrust lasts [`SWEEP_BLIP_TOLERANCE_MS`] from the first suspect sample in
+/// a run. A run that outlasts it is no longer a blip: the tmux server really
+/// is gone or broken, and the sweep, `SessionEnd` and the stale reaper take it
+/// from there.
+///
+/// The guard also remembers which rows discovery has seen live. Only those can
+/// be retired by the sweep: a pane discovery never lists (a Claude on another
+/// `tmux -L` socket, a process tree it cannot classify) is missing on every
+/// sample, which proves nothing about the session, so such a row keeps its
+/// lifecycle and is left to `SessionEnd` and the stale reaper.
+#[derive(Debug, Default)]
+pub struct SweepGuard {
+    /// Whether the last trusted sample listed any pane.
+    saw_panes: bool,
+    /// When the current run of distrusted samples began.
+    distrusted_since: Option<i64>,
+    /// Every row discovery has seen live since the daemon started or tmux last
+    /// failed for longer than the tolerance.
+    seen_live: std::collections::HashSet<String>,
+}
+
+impl SweepGuard {
+    /// Whether this sample may count a miss. `pane_count` is every tmux pane
+    /// discovery listed, agent or not, and `None` when discovery failed.
+    pub fn admits(&mut self, pane_count: Option<usize>, observed_at: i64) -> bool {
+        let trusted = pane_count.is_some_and(|count| count > 0 || !self.saw_panes);
+        if trusted {
+            self.saw_panes = pane_count.is_some_and(|count| count > 0);
+            self.distrusted_since = None;
+            return true;
+        }
+        let since = *self.distrusted_since.get_or_insert(observed_at);
+        observed_at.saturating_sub(since) >= SWEEP_BLIP_TOLERANCE_MS
+    }
+}
+
+/// Fold one discovery result into the registry, unless `guard` distrusts it.
+///
+/// What the reconciler loop runs. `discovery` is EVERY tmux pane
+/// (`discover_all_tmux_panes`), because the guard judges the whole roster; only
+/// the agent panes are reconciled, the same set `discover_from_tmux` returns.
+/// [`reconcile_tmux_once`] and [`reconcile_discovered_panes`] stay unguarded
+/// for their current callers. A distrusted successful sample is always empty,
+/// so skipping it skips no pane that needed correlating.
+///
+/// # Errors
+/// Propagates a store failure. A discovery failure is logged, not returned.
+pub async fn reconcile_tmux_sample(
+    pool: &SqlitePool,
+    events: &EventSink,
+    guard: &mut SweepGuard,
+    discovery: anyhow::Result<Vec<FleetSession>>,
+    observed_at: i64,
+    pass: ReconcilePass,
+) -> anyhow::Result<usize> {
+    let admitted = guard.admits(discovery.as_ref().ok().map(Vec::len), observed_at);
+    let panes = match discovery {
+        Ok(panes) => panes,
+        Err(error) => {
+            tracing::debug!(error = %error, admitted, "fleet tmux discovery unavailable");
+            if !admitted {
+                return Ok(0);
+            }
+            // The downgrade sets every routed row UNAVAILABLE without a sweep
+            // having missed its pane, which is exactly the state
+            // `managed_claude_row_exits` reads as "one miss already counted".
+            // Forgetting what was seen live means no row can be retired until
+            // discovery sees it live again, so an outage never stands in for
+            // the first miss.
+            guard.seen_live.clear();
+            return Ok(mark_tmux_unavailable(pool, events, observed_at).await?);
+        }
+    };
+    if !admitted {
+        return Ok(0);
+    }
+    // `Provider::Unknown` is how discovery says "no agent in this pane's
+    // process tree"; dropping those is exactly `discover_from_tmux`'s filter.
+    let agents = panes.into_iter().filter(|pane| pane.provider != Provider::Unknown).collect();
+    reconcile_panes(
+        pool,
+        events,
+        agents,
+        observed_at,
+        pass,
+        Some(&mut guard.seen_live),
+    )
+    .await
+}
+
 /// Fold one discovery sample into the registry.
 ///
 /// Split from [`reconcile_tmux_once`] so pane-to-row correlation is testable
@@ -1744,12 +1857,28 @@ pub async fn reconcile_tmux_once(
 /// `session_key`, so a row the two disagreed about was set HEALTHY by one and
 /// UNAVAILABLE by the other, one applied event each, every three seconds,
 /// forever.
+///
+/// Unguarded: every row counts as seen live, so a managed Claude row whose pane
+/// this sample omits is retired on the second consecutive miss.
 pub async fn reconcile_discovered_panes(
     pool: &SqlitePool,
     events: &EventSink,
     sessions: Vec<FleetSession>,
     observed_at: i64,
     pass: ReconcilePass,
+) -> anyhow::Result<usize> {
+    reconcile_panes(pool, events, sessions, observed_at, pass, None).await
+}
+
+/// [`reconcile_discovered_panes`], recording into `seen_live` (when given) the
+/// rows this sample found live, and retiring only managed rows found there.
+async fn reconcile_panes(
+    pool: &SqlitePool,
+    events: &EventSink,
+    sessions: Vec<FleetSession>,
+    observed_at: i64,
+    pass: ReconcilePass,
+    mut seen_live: Option<&mut std::collections::HashSet<String>>,
 ) -> anyhow::Result<usize> {
     let registered = FleetRepo::snapshot(pool).await?.sessions;
     let owners = pane_owners(&registered, &sessions);
@@ -1760,6 +1889,9 @@ pub async fn reconcile_discovered_panes(
     // Without this the two halves disagree about what "missing" means and an
     // orphaned-key row churns forever — see `restore_tmux_transport`.
     discovered.extend(live_bindings);
+    if let Some(seen) = seen_live.as_deref_mut() {
+        seen.extend(discovered.iter().cloned());
+    }
 
     let mut applied = 0;
     for (session, owner) in sessions.iter().zip(&owners) {
@@ -1873,6 +2005,7 @@ pub async fn reconcile_discovered_panes(
     }
 
     let snapshot = FleetRepo::snapshot(pool).await?;
+    let (mut demoted, mut deferred) = (0, 0);
     for row in snapshot.sessions {
         // TRANSITION, NOT STATE. The guard keys off `transport_health` ALONE —
         // the thing `tmux_missing_event` actually always writes.
@@ -1891,8 +2024,36 @@ pub async fn reconcile_discovered_panes(
         // discovery loop puts the session in `discovered` and flips
         // `transport_health` back to HEALTHY, so the next disappearance is a real
         // transition and emits again.
+        //
+        // The patch now also retires a managed Claude row, on the second miss
+        // (`managed_claude_row_exits`). That is still one transition per fact:
+        // the first miss writes UNAVAILABLE, the second writes EXITED, and the
+        // guard stops at EXITED because both read the same predicate.
         if !needs_tmux_missing_event(&row, &discovered) {
             continue;
+        }
+        if managed_claude_row_exits(&row) {
+            // Each skip below writes nothing, so the guard/patch complement
+            // still holds: the row stays UNAVAILABLE with its lifecycle, which
+            // the stale reaper retires if nothing else does.
+            //
+            // Never seen live: this sample omitting the pane proves nothing.
+            if seen_live.as_deref().is_some_and(|seen| !seen.contains(&row.session_key)) {
+                continue;
+            }
+            // The store would refuse the lifecycle write (`should_replace`
+            // keeps the newer authoritative stamp) yet still append a
+            // transport-only event, every sweep, until the clock caught up.
+            if row.lifecycle_updated_at > observed_at {
+                continue;
+            }
+            if demoted == MAX_MANAGED_EXITS_PER_SWEEP {
+                // Left UNAVAILABLE and not EXITED, so the guard still admits it
+                // and the next sweep carries on where this one stopped.
+                deferred += 1;
+                continue;
+            }
+            demoted += 1;
         }
         let event = tmux_missing_event(&row, observed_at);
         match FleetRepo::apply_event(pool, &event).await {
@@ -1907,8 +2068,27 @@ pub async fn reconcile_discovered_panes(
             Err(error) => tracing::warn!(error = %error, "fleet tmux exit reconcile failed"),
         }
     }
+    if deferred > 0 {
+        tracing::warn!(
+            deferred,
+            limit = MAX_MANAGED_EXITS_PER_SWEEP,
+            "fleet tmux sweep deferred managed session exits to the next sweep"
+        );
+    }
     Ok(applied)
 }
+
+/// The most managed Claude sessions one missing sweep may retire to EXITED.
+///
+/// A person closes sessions one or two at a time, and the sweep runs every 30s,
+/// so 8 per sweep (16 a minute) never delays a real `/exit`. What it bounds is
+/// the failure the two-sweep gate cannot see: discovery wrongly omitting many
+/// live panes twice in a row. On the measured fleet (63 live panes) that would
+/// take eight sweeps, four minutes, to empty the board instead of one, and any
+/// pane that shows up again in the meantime is restored to HEALTHY and never
+/// retired. Deferred rows stay UNAVAILABLE, which the guard still admits, so
+/// the next sweep finishes them and the loop still terminates.
+const MAX_MANAGED_EXITS_PER_SWEEP: usize = 8;
 
 /// The registry row that owns each discovered pane, positionally aligned with
 /// `sessions`.
@@ -2055,7 +2235,8 @@ fn tmux_transport_settled(row: &FleetSessionRow, available: bool) -> bool {
 /// The loop's termination condition, split out so it is testable without a real
 /// tmux server. It must be the exact complement of what
 /// [`tmux_missing_event`]'s patch writes, or the emit never terminates — see the
-/// comment at the call site for the 832,711-row incident that proved it.
+/// comment at the call site for the 832,711-row incident that proved it. Both
+/// halves read [`missing_pane_exits`], so they cannot drift apart.
 fn needs_tmux_missing_event(
     row: &FleetSessionRow,
     discovered: &std::collections::HashSet<String>,
@@ -2066,15 +2247,50 @@ fn needs_tmux_missing_event(
     if row.transport_health != "UNAVAILABLE" {
         return true;
     }
-    // Transport is only half of what the patch writes: it also demotes an
-    // inferred, unmanaged row to EXITED. `mark_tmux_unavailable` sets
-    // UNAVAILABLE without ever touching lifecycle, so a row that reached
-    // UNAVAILABLE down that path has not had the demotion applied and is not
-    // settled yet. Still terminating: the patch sets EXITED for exactly the
-    // class this arm admits.
-    row.management_state != "MANAGED"
-        && row.lifecycle_authority == "inferred"
-        && row.lifecycle_state != "EXITED"
+    // Transport is only half of what the patch writes: it also demotes the
+    // rows `missing_pane_exits` names to EXITED. `mark_tmux_unavailable` sets
+    // UNAVAILABLE without ever touching lifecycle, and a managed Claude row is
+    // only demoted on the miss AFTER the one that set UNAVAILABLE, so a row
+    // sitting at UNAVAILABLE has not necessarily had the demotion applied and
+    // is not settled yet. Still terminating: the patch sets EXITED for exactly
+    // the class this arm admits, and EXITED closes the arm.
+    missing_pane_exits(row) && row.lifecycle_state != "EXITED"
+}
+
+/// Does a sweep that cannot find this row's pane retire it to EXITED?
+///
+/// The single predicate behind both halves of the sweep's termination contract:
+/// [`tmux_missing_event`] writes EXITED exactly when it holds, and
+/// [`needs_tmux_missing_event`] keeps emitting only while it holds and the row
+/// is not EXITED yet.
+fn missing_pane_exits(row: &FleetSessionRow) -> bool {
+    inferred_row_exits(row) || managed_claude_row_exits(row)
+}
+
+/// A scanner-only row: nothing but the pane ever said it was alive, so the pane
+/// going away is the whole story and the first miss retires it.
+fn inferred_row_exits(row: &FleetSessionRow) -> bool {
+    row.management_state != "MANAGED" && row.lifecycle_authority == "inferred"
+}
+
+/// A hook-backed Claude row whose pane was already missing on an earlier sweep.
+///
+/// Without this a Claude session closed with `/exit` stayed at its last hook
+/// state (Done, `TURN_COMPLETE`) until a `SessionEnd` hook or the 15-minute
+/// stale reaper, and `SessionEnd` is the hook most likely to be cut short:
+/// Claude gives it about 1.5s. Observed on a Mac: the card still read Done
+/// more than 50s after `/exit`.
+///
+/// Gated on the SECOND consecutive miss, which is what `transport_health ==
+/// "UNAVAILABLE"` records: the first miss writes UNAVAILABLE only, and a pane
+/// that reappears in between is flipped back to HEALTHY by discovery, which
+/// resets the count without any in-memory counter. One discovery that failed
+/// to list a live pane therefore cannot fake an exit. Codex is excluded because
+/// its app-server manager owns that lifecycle (see `recover_codex_manager`).
+fn managed_claude_row_exits(row: &FleetSessionRow) -> bool {
+    row.provider == "claude"
+        && row.management_state == "MANAGED"
+        && row.transport_health == "UNAVAILABLE"
 }
 
 fn tmux_missing_event(row: &FleetSessionRow, observed_at: i64) -> NewFleetEvent {
@@ -2087,9 +2303,7 @@ fn tmux_missing_event(row: &FleetSessionRow, observed_at: i64) -> NewFleetEvent 
         payload: "{}".to_string(),
         patch: FleetSessionPatch {
             capabilities: Some(capabilities_for_tmux_state(row, false)),
-            lifecycle_state: (row.management_state != "MANAGED"
-                && row.lifecycle_authority == "inferred")
-                .then(|| "EXITED".to_string()),
+            lifecycle_state: missing_pane_exits(row).then(|| "EXITED".to_string()),
             transport_health: Some("UNAVAILABLE".to_string()),
             ..FleetSessionPatch::default()
         },
@@ -2260,6 +2474,7 @@ pub fn spawn_tmux_reconciler(pool: SqlitePool, events: EventSink) -> tokio::task
         // queries slower. `Delay` re-bases the schedule on completion instead.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut tick: u32 = 0;
+        let mut guard = SweepGuard::default();
         loop {
             // The breadcrumb keeps one coarse phase for the process, so a death
             // during the sleep must not still name the pass that already
@@ -2275,11 +2490,12 @@ pub fn spawn_tmux_reconciler(pool: SqlitePool, events: EventSink) -> tokio::task
             tick = tick.wrapping_add(1);
 
             crate::observability::note_phase("fleet:tmux-reconcile");
-            if let Err(error) = reconcile_tmux_once(&pool, &events, observed_at, pass).await {
-                tracing::debug!(error = %error, "fleet tmux discovery unavailable");
-                if let Err(downgrade) = mark_tmux_unavailable(&pool, &events, observed_at).await {
-                    tracing::warn!(error = %downgrade, "fleet tmux downgrade failed");
-                }
+            let discovery = discover_all_tmux_panes().await;
+            if let Err(error) =
+                reconcile_tmux_sample(&pool, &events, &mut guard, discovery, observed_at, pass)
+                    .await
+            {
+                tracing::warn!(error = %error, "fleet tmux reconcile failed");
             }
             // Runs whether or not discovery succeeded: the rows it retires are
             // precisely the ones discovery can no longer see.
@@ -6057,13 +6273,14 @@ mod tests {
         format!("claude:{session_id}")
     }
 
-    /// A session whose pane is gone must be told so exactly ONCE.
+    /// A session whose pane is gone must be told so once per fact: unreachable,
+    /// then (for a managed Claude row, one sweep later) exited, then nothing.
     ///
     /// The store's "did this change anything?" test is authority plus timestamp,
     /// not value equality, so an authoritative event always bumps the row and
     /// always appends to `fleet_event` even when it writes what is already
     /// there. The sweep's only guard was `EXITED && UNAVAILABLE`, and this
-    /// sweep deliberately never demotes a MANAGED row's lifecycle, so every
+    /// sweep then never demoted a MANAGED row's lifecycle, so every
     /// hook-backed session with a dead pane re-emitted `tmux_missing` every
     /// three seconds, forever. Measured live: 91,779 rows in one day against a
     /// ~17k/day baseline for the entire table.
@@ -6103,16 +6320,508 @@ mod tests {
 
         assert_eq!(
             transition_count(pool, &key).await,
-            1,
-            "a dead pane is news once; after that the row already says so"
+            2,
+            "a dead pane is news twice (unreachable, then exited); after that the \
+             row already says so"
         );
         let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
         assert_eq!(row.transport_health, "UNAVAILABLE");
+        assert_eq!(row.lifecycle_state, "EXITED");
         assert_eq!(
-            row.last_observed_at, 2_000,
-            "a settled row must stop refreshing its own staleness clock, or the \
-             stale reaper can never retire it"
+            row.last_observed_at, 5_000,
+            "a settled row must stop refreshing its own staleness clock after the \
+             second sweep, or the stale reaper can never retire it"
         );
+    }
+
+    /// Every `fleet_event` row for one session, whatever its type.
+    async fn event_count(pool: &SqlitePool, session_key: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM fleet_event WHERE session_key = ?")
+            .bind(session_key)
+            .fetch_one(pool)
+            .await
+            .expect("count events")
+    }
+
+    /// Finish a turn on a hooked session, as Claude's `Stop` hook does.
+    async fn stop_hook(pool: &SqlitePool, sink: &EventSink, session_id: &str, observed_at: i64) {
+        apply_hook(
+            pool,
+            sink,
+            HookObservation {
+                event_id: format!("stop:{session_id}:{observed_at}"),
+                provider: "claude",
+                provider_session_id: session_id,
+                event_type: "Stop",
+                cwd: "/work/repo",
+                payload: &serde_json::json!({}),
+                observed_at,
+                transcript_model: None,
+            },
+        )
+        .await
+        .expect("stop hook applies");
+    }
+
+    /// A Claude session closed with `/exit` sat at Done (`TURN_COMPLETE`) for
+    /// as long as its `SessionEnd` hook failed to land, up to the 15-minute
+    /// reaper. The sweep now retires it on the second consecutive miss.
+    #[tokio::test]
+    async fn a_finished_claude_session_whose_pane_is_gone_exits_on_the_second_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let key = hooked_session(
+            pool,
+            &sink,
+            "sess-done",
+            "tmux_done:1.1",
+            "pane=%81;pid=911;session_started=1785400000",
+            1_000,
+        )
+        .await;
+        stop_hook(pool, &sink, "sess-done", 1_500).await;
+        let done = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(done.lifecycle_state, "TURN_COMPLETE");
+        assert_eq!(done.management_state, "MANAGED");
+
+        reconcile_discovered_panes(
+            pool,
+            &sink,
+            Vec::new(),
+            30_000,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("sweep 1");
+        let first = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(first.transport_health, "UNAVAILABLE");
+        assert_eq!(
+            first.lifecycle_state, "TURN_COMPLETE",
+            "one miss is not an exit"
+        );
+
+        reconcile_discovered_panes(
+            pool,
+            &sink,
+            Vec::new(),
+            60_000,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("sweep 2");
+        let second = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            second.lifecycle_state, "EXITED",
+            "the second consecutive miss is"
+        );
+        assert_eq!(second.transport_health, "UNAVAILABLE");
+
+        let settled = event_count(pool, &key).await;
+        reconcile_discovered_panes(
+            pool,
+            &sink,
+            Vec::new(),
+            90_000,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("sweep 3");
+        assert_eq!(
+            event_count(pool, &key).await,
+            settled,
+            "an exited row is not news again"
+        );
+        assert!(!needs_tmux_missing_event(
+            &second,
+            &std::collections::HashSet::new()
+        ));
+    }
+
+    /// The count of misses lives in `transport_health`, so a pane that comes back
+    /// between two misses starts the count again instead of completing it.
+    #[tokio::test]
+    async fn a_pane_that_reappears_between_sweeps_does_not_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_back:1.1";
+        let fingerprint = "pane=%82;pid=912;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-back", target, fingerprint, 1_000).await;
+        let pane = scanned_pane(target, fingerprint, Provider::Claude);
+        // Another pane keeps every sample trusted, so only the gate is tested.
+        let other = scanned_pane(
+            "tmux_other:1.1",
+            "pane=%1;pid=1;session_started=1",
+            Provider::Unknown,
+        );
+        let mut guard = SweepGuard::default();
+        for (at, panes) in [
+            (30_000, vec![pane.clone(), other.clone()]),
+            (60_000, vec![other.clone()]),
+            (90_000, vec![pane, other.clone()]),
+            (120_000, vec![other]),
+        ] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(panes), at).await;
+        }
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            row.transport_health, "UNAVAILABLE",
+            "the last sweep missed it"
+        );
+        assert_eq!(row.lifecycle_state, "RUNNING", "but it was back in between");
+    }
+
+    /// A pane discovery never lists (a Claude on another tmux socket, a tree it
+    /// cannot classify) is missing on every sample. That proves nothing, so the
+    /// row keeps its lifecycle and settles after one transition.
+    #[tokio::test]
+    async fn a_pane_discovery_never_saw_is_not_retired_by_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let key = hooked_session(
+            pool,
+            &sink,
+            "sess-unseen",
+            "tmux_elsewhere:1.1",
+            "pane=%86;pid=916;session_started=1785400000",
+            1_000,
+        )
+        .await;
+        let other = scanned_pane(
+            "tmux_other:1.1",
+            "pane=%1;pid=1;session_started=1",
+            Provider::Unknown,
+        );
+        let mut guard = SweepGuard::default();
+        for at in [30_000, 60_000, 90_000, 120_000] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![other.clone()]), at).await;
+        }
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(row.transport_health, "UNAVAILABLE");
+        assert_eq!(
+            row.lifecycle_state, "RUNNING",
+            "never seen live, never retired"
+        );
+        assert_eq!(
+            transition_count(pool, &key).await,
+            1,
+            "and not re-emitted either"
+        );
+    }
+
+    /// A long tmux outage marks every routed row UNAVAILABLE. That must not
+    /// count as the first miss: a live pane the first sample after the outage
+    /// happens to omit is not retired.
+    #[tokio::test]
+    async fn an_outage_cannot_stand_in_for_the_first_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_outage:1.1";
+        let fingerprint = "pane=%87;pid=917;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-outage", target, fingerprint, 1_000).await;
+        let pane = scanned_pane(target, fingerprint, Provider::Claude);
+        let other = scanned_pane(
+            "tmux_other:1.1",
+            "pane=%1;pid=1;session_started=1",
+            Provider::Unknown,
+        );
+        let mut guard = SweepGuard::default();
+        guarded_sweep(
+            pool,
+            &sink,
+            &mut guard,
+            Ok(vec![pane.clone(), other.clone()]),
+            30_000,
+        )
+        .await;
+        for at in [40_000, 70_000, 100_000] {
+            guarded_sweep(
+                pool,
+                &sink,
+                &mut guard,
+                Err(anyhow::anyhow!("tmux hung")),
+                at,
+            )
+            .await;
+        }
+        let downgraded = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            downgraded.transport_health, "UNAVAILABLE",
+            "the outage was believed"
+        );
+
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![other.clone()]), 130_000).await;
+        let after = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            after.lifecycle_state, "RUNNING",
+            "one real miss is not an exit"
+        );
+
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![pane, other]), 160_000).await;
+        let back = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(back.transport_health, "HEALTHY");
+        assert_eq!(back.lifecycle_state, "RUNNING");
+    }
+
+    /// A row whose lifecycle is stamped later than the sweep's clock would have
+    /// the exit refused by the store while a transport-only event still landed,
+    /// every sweep, until the clock caught up. It is skipped instead.
+    ///
+    /// A Claude hook stamps transport along with lifecycle, so today only a
+    /// lifecycle-only producer reaches this state; the event below is one.
+    #[tokio::test]
+    async fn a_sweep_older_than_the_rows_lifecycle_does_not_churn_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let key = hooked_session(
+            pool,
+            &sink,
+            "sess-skew",
+            "tmux_skew:1.1",
+            "pane=%88;pid=918;session_started=1785400000",
+            1_000,
+        )
+        .await;
+        reconcile_discovered_panes(
+            pool,
+            &sink,
+            Vec::new(),
+            30_000,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("sweep 1");
+        FleetRepo::apply_event(
+            pool,
+            &NewFleetEvent {
+                event_id: "lifecycle-ahead".to_string(),
+                session_key: key.clone(),
+                observed_at: 500_000,
+                authority: ObservationAuthority::Authoritative,
+                event_type: "lifecycle_only".to_string(),
+                payload: "{}".to_string(),
+                patch: FleetSessionPatch {
+                    lifecycle_state: Some("TURN_COMPLETE".to_string()),
+                    ..FleetSessionPatch::default()
+                },
+            },
+        )
+        .await
+        .expect("lifecycle ahead of the sweep clock");
+        for at in [60_000, 90_000] {
+            reconcile_discovered_panes(pool, &sink, Vec::new(), at, ReconcilePass::PanesAndMissing)
+                .await
+                .expect("sweep");
+        }
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(row.transport_health, "UNAVAILABLE");
+        assert_eq!(
+            row.lifecycle_state, "TURN_COMPLETE",
+            "the newer stamp stands"
+        );
+        assert_eq!(
+            transition_count(pool, &key).await,
+            1,
+            "one transition, then quiet"
+        );
+    }
+
+    /// One missing sweep through the reconciler loop's guarded entry point.
+    async fn guarded_sweep(
+        pool: &SqlitePool,
+        sink: &EventSink,
+        guard: &mut SweepGuard,
+        discovery: anyhow::Result<Vec<FleetSession>>,
+        observed_at: i64,
+    ) {
+        reconcile_tmux_sample(
+            pool,
+            sink,
+            guard,
+            discovery,
+            observed_at,
+            ReconcilePass::PanesAndMissing,
+        )
+        .await
+        .expect("guarded sweep");
+    }
+
+    /// A discovery sample that failed, or that listed no pane at all right after
+    /// one that listed some, is a blip, not two misses.
+    #[tokio::test]
+    async fn two_blips_after_a_trusted_sweep_touch_no_managed_row() {
+        let failed = || Err(anyhow::anyhow!("tmux list-panes timed out"));
+        for (label, blips) in [
+            ("empty", [Ok(Vec::new()), Ok(Vec::new())]),
+            ("failed", [failed(), failed()]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open_in(dir.path()).await.unwrap();
+            let sink = EventBroker::new().sink();
+            let pool = store.pool();
+
+            let target = "tmux_blip:1.1";
+            let fingerprint = "pane=%83;pid=913;session_started=1785400000";
+            let key = hooked_session(pool, &sink, "sess-blip", target, fingerprint, 1_000).await;
+            let pane = scanned_pane(target, fingerprint, Provider::Claude);
+            let mut guard = SweepGuard::default();
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![pane]), 30_000).await;
+            let before = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            let events_before = event_count(pool, &key).await;
+
+            for (at, blip) in [60_000, 89_999].into_iter().zip(blips) {
+                guarded_sweep(pool, &sink, &mut guard, blip, at).await;
+            }
+            let after = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            assert_eq!(
+                event_count(pool, &key).await,
+                events_before,
+                "{label}: no event"
+            );
+            assert_eq!(
+                after.lifecycle_state, before.lifecycle_state,
+                "{label}: lifecycle"
+            );
+            assert_eq!(
+                after.transport_health, before.transport_health,
+                "{label}: transport"
+            );
+            assert_eq!(after.version, before.version, "{label}: no write at all");
+        }
+    }
+
+    /// Distrust is bounded. When every pane on the server really closed, the
+    /// empty roster is believed once it has lasted `SWEEP_BLIP_TOLERANCE_MS`,
+    /// because the stale reaper only retires an UNAVAILABLE tmux-bound row and
+    /// would otherwise never reach this one.
+    #[tokio::test]
+    async fn an_empty_roster_that_outlasts_the_tolerance_is_believed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_closed:1.1";
+        let fingerprint = "pane=%84;pid=914;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-closed", target, fingerprint, 1_000).await;
+        let mut guard = SweepGuard::default();
+        let pane = scanned_pane(target, fingerprint, Provider::Claude);
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![pane]), 30_000).await;
+        guarded_sweep(pool, &sink, &mut guard, Ok(Vec::new()), 60_000).await;
+        guarded_sweep(pool, &sink, &mut guard, Ok(Vec::new()), 89_999).await;
+        let held = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            held.transport_health, "HEALTHY",
+            "still inside the tolerance"
+        );
+
+        guarded_sweep(pool, &sink, &mut guard, Ok(Vec::new()), 120_000).await;
+        let first = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            first.transport_health, "UNAVAILABLE",
+            "the outage is believed"
+        );
+        assert_eq!(first.lifecycle_state, "RUNNING");
+
+        guarded_sweep(pool, &sink, &mut guard, Ok(Vec::new()), 150_000).await;
+        let second = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(second.lifecycle_state, "EXITED");
+    }
+
+    /// The last Claude session closing leaves its shell panes, so the roster is
+    /// not empty and the sweep counts the miss at once.
+    #[tokio::test]
+    async fn shell_panes_left_behind_keep_the_sweep_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_last:1.1";
+        let fingerprint = "pane=%85;pid=915;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-last", target, fingerprint, 1_000).await;
+        let mut guard = SweepGuard::default();
+        let agent = scanned_pane(target, fingerprint, Provider::Claude);
+        // `/exit` hands the pane back to the shell that launched Claude: the
+        // same pane and pane pid, but no agent in its tree any more.
+        let shell = scanned_pane(target, fingerprint, Provider::Unknown);
+        for (at, panes) in [
+            (30_000, vec![agent]),
+            (60_000, vec![shell.clone()]),
+            (90_000, vec![shell]),
+        ] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(panes), at).await;
+        }
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(row.lifecycle_state, "EXITED");
+    }
+
+    /// A sweep retires at most `MAX_MANAGED_EXITS_PER_SWEEP` managed sessions.
+    /// The rest wait one sweep at UNAVAILABLE, and each row still gets exactly
+    /// one EXITED transition.
+    #[tokio::test]
+    async fn managed_exits_are_rate_bounded_per_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let mut keys = Vec::new();
+        for n in 0..10 {
+            keys.push(
+                hooked_session(
+                    pool,
+                    &sink,
+                    &format!("sess-bulk-{n}"),
+                    &format!("tmux_bulk:{n}.1"),
+                    &format!("pane=%9{n};pid=92{n};session_started=1785400000"),
+                    1_000,
+                )
+                .await,
+            );
+        }
+        let exited = || async {
+            let mut count = 0;
+            for key in &keys {
+                let row = FleetRepo::get_session(pool, key).await.unwrap().unwrap();
+                if row.lifecycle_state == "EXITED" {
+                    count += 1;
+                }
+            }
+            count
+        };
+        for (at, expected) in [
+            (30_000, 0),
+            (60_000, MAX_MANAGED_EXITS_PER_SWEEP),
+            (90_000, 10),
+            (120_000, 10),
+        ] {
+            reconcile_discovered_panes(pool, &sink, Vec::new(), at, ReconcilePass::PanesAndMissing)
+                .await
+                .expect("sweep");
+            assert_eq!(exited().await, expected, "exited after the sweep at {at}");
+        }
+        for key in &keys {
+            assert_eq!(
+                transition_count(pool, key).await,
+                2,
+                "{key}: one UNAVAILABLE transition, then exactly one EXITED"
+            );
+        }
     }
 
     /// The whole convergence chain, in the order the daemon runs it: the sweep
