@@ -9,7 +9,7 @@ import type {
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, ringCount, ringFor } from "./sessions.ts";
+import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor } from "./sessions.ts";
 
 function session(id: string, status: SessionStatus = "Running", marks: AttentionKind[] = []): Session_Serialize {
   return {
@@ -62,6 +62,17 @@ test("a waiting session is counted once, in need-you, never also as idle", () =>
   assert.equal(idleCount(two), 1);
 });
 
+test("an idle session that only rings Done is idle, not left out of both counts", () => {
+  // A finished turn is for reading: it is not a need-you kind, so the row
+  // is counted idle rather than in neither total.
+  const done = { workspaces: [{ name: "r", sessions: [session("d", "Idle", ["Done"])] }] } as unknown as SessionsView_Serialize;
+  assert.deepEqual(
+    NEED_YOU.map((kind) => ringCount(done, kind)),
+    [0, 0, 0, 0],
+  );
+  assert.equal(idleCount(done), 1);
+});
+
 test("a label drops control and format characters and stops at the cap", () => {
   assert.equal(label("feat/\u202Eevil\u001b[31m\u200Bx"), "feat/evil[31mx");
   assert.equal(label("\u{1F600}".repeat(100)), "\u{1F600}".repeat(LABEL_CHARS));
@@ -87,8 +98,11 @@ test("a chip kind this build does not know is skipped, never ranked first", () =
 });
 
 test("a card no session row names reads as a name, never as its raw key", () => {
-  // `SessionKey::legacy`: the tmux target, which may itself carry `:`.
-  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:4242-17"), "hangar-dev:1.0");
+  // `SessionKey::legacy`, with the fingerprint the daemon really writes: the
+  // tmux target, which may itself carry `:`.
+  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:pid=1;started=10"), "hangar-dev:1.0");
+  assert.equal(legacyTmuxSession("legacy:claude:hangar-dev:1.0:pid=1;started=10"), "hangar-dev");
+  assert.equal(legacyTmuxSession("claude:5f0c9a1e"), null);
   assert.equal(keyLabel("legacy:claude:tmux:"), "tmux");
   assert.equal(keyLabel("claude:5f0c9a1e-77aa-4c1d-9e4b-000000000000"), "claude 5f0c9a1e");
   assert.equal(keyLabel("bare"), "bare");
