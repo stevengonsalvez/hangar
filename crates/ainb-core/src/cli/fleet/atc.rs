@@ -2831,10 +2831,15 @@ fn install_http_hooks() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("unreadable hook endpoint {}: {e}", endpoint.display()))?;
     // A crash leaves the endpoint behind: only a live daemon counts.
     let pid = i32::try_from(published.pid).context("hook endpoint pid out of range")?;
-    anyhow::ensure!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok(),
-        "the hook endpoint names pid {pid}, which is not running; start the hangar daemon with AINB_HANGAR_HOOK_LISTEN=1"
-    );
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::EPERM) => anyhow::bail!(
+            "the hook endpoint names pid {pid}, which belongs to another user; its hooks would not be ours"
+        ),
+        Err(_) => anyhow::bail!(
+            "the hook endpoint names pid {pid}, which is not running; start the hangar daemon with AINB_HANGAR_HOOK_LISTEN=1"
+        ),
+    }
     anyhow::ensure!(
         hangar_home
             .join("hangar")
@@ -2845,19 +2850,23 @@ fn install_http_hooks() -> anyhow::Result<()> {
     let paths = ainb_plugin_notifyd::paths::Paths::under(hangar_home.clone());
     let script = ainb_plugin_notifyd::install::extract_http_hook_script(&paths)?;
     let before = plumbing::settings::snapshot_settings(&home)?;
+    let prior = plumbing::settings::installed_transport(&home);
     plumbing::settings::install_claude_hooks_for(
         &home,
         &script,
         plumbing::hooks::HookTransport::Http,
         &hangar_home,
     )?;
+    let written = plumbing::settings::snapshot_settings(&home)?;
     // Without the marker the plugin's notify.sh would put a second waiter on
     // every PermissionRequest beside the daemon's hold. Never leave http hooks
     // installed without it: put the settings back exactly as they were (the
-    // same bytes, or no file) and report.
+    // same bytes, or no file) and the marker back to what those settings
+    // need (an http host keeps its marker), then report.
     if let Err(e) = set_transport_marker(plumbing::hooks::HookTransport::Http) {
-        let restored = plumbing::settings::restore_settings(&home, before.as_deref());
-        let _ = clear_transport_marker();
+        let restored =
+            plumbing::settings::restore_settings(&home, before.as_deref(), written.as_deref());
+        let _ = set_transport_marker(prior.unwrap_or(plumbing::hooks::HookTransport::Legacy));
         return Err(e.context(match restored {
             Ok(()) => {
                 "could not write the http transport marker; settings.json was restored as it was"
