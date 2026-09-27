@@ -67,8 +67,9 @@ pub async fn wake_for_provider_session(
 }
 
 /// Wake readers for the fleet row `session_key`, which must already exist:
-/// an event for an unknown key would create a row.
-pub async fn wake(
+/// an event for an unknown key would create a row. Private so every caller
+/// goes through [`wake_for_provider_session`], which only names rows that do.
+async fn wake(
     pool: &SqlitePool,
     events: &EventSink,
     session_key: &str,
