@@ -223,6 +223,7 @@ ainb-hangar-secrets = { path = "../ainb-hangar-secrets", features = ["test-backe
 assert_cmd = "2"
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+proptest = { workspace = true }
 # `test-util` gives the ATC beat-timeout test a paused clock, so it proves the
 # 90s ceiling in milliseconds instead of actually sleeping for it. Dev-only:
 # dev-dependency features never reach a normal build.

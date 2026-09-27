@@ -45,8 +45,9 @@ use ainb_hangar_store::repo::autopilot_webhook::{
     AutopilotWebhookRepo, DeliveryOutcome, NewDelivery, WebhookSecretStore,
 };
 use sqlx::SqlitePool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::local_http;
 
 /// The outcome of processing one webhook request: the HTTP status to return plus
 /// the structured delivery record that was logged.
@@ -278,18 +279,24 @@ pub async fn serve(
     secrets: Arc<WebhookSecretStore>,
     clock: Arc<dyn HangarClock + Send + Sync>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let (stream, _peer) = match listener.accept().await {
+        let (mut stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
                 tracing::warn!(error = %e, "webhook ingress: accept failed");
                 continue;
             }
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            let _ = write_response(&mut stream, 503, "busy").await;
+            continue;
+        };
         let pool = pool.clone();
         let secrets = secrets.clone();
         let clock = clock.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = handle_connection(stream, &pool, &secrets, &*clock).await {
                 tracing::debug!(error = %e, "webhook ingress: connection error");
             }
@@ -305,10 +312,17 @@ async fn handle_connection(
     secrets: &WebhookSecretStore,
     clock: &dyn HangarClock,
 ) -> std::io::Result<()> {
-    let Some(req) = read_request(&mut stream).await? else {
-        // Malformed request line / headers — answer 400 and close.
-        write_response(&mut stream, 400, "bad request").await?;
-        return Ok(());
+    let req = match read_request(&mut stream).await? {
+        ReadOutcome::Request(req) => req,
+        // Malformed request line / headers, or over the cap: answer 400 and close.
+        ReadOutcome::Malformed => {
+            write_response(&mut stream, 400, "bad request").await?;
+            return Ok(());
+        }
+        ReadOutcome::TimedOut => {
+            write_response(&mut stream, 408, "request timeout").await?;
+            return Ok(());
+        }
     };
 
     // Route: POST /hangar/webhook/<id>. Anything else is a 404.
@@ -353,78 +367,56 @@ struct ParsedRequest {
     body: Vec<u8>,
 }
 
-/// Read and parse one HTTP/1.1 request from `stream`. Returns `Ok(None)` on a
-/// malformed head (the caller answers 400). Reads exactly `Content-Length` body
-/// bytes after the header terminator. A hard cap bounds the body so a hostile
-/// client cannot exhaust memory.
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<ParsedRequest>> {
-    /// Upper bound on a webhook request (head + body). Webhook payloads are tiny;
-    /// 64 KiB is generous and caps a memory-exhaustion attempt.
-    const MAX_REQUEST: usize = 64 * 1024;
+/// Upper bound on a webhook request (head + body). Webhook payloads are tiny;
+/// 64 KiB is generous and caps a memory-exhaustion attempt.
+const MAX_REQUEST: usize = 64 * 1024;
 
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 4096];
-
-    // Read until we have the full header block (CRLFCRLF).
-    let header_end = loop {
-        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
-            break pos + 4;
-        }
-        if buf.len() > MAX_REQUEST {
-            return Ok(None);
-        }
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            // Connection closed before a full header — malformed.
-            return Ok(None);
-        }
-        buf.extend_from_slice(&chunk[..n]);
+/// Read and parse one HTTP/1.1 request from `stream`, strictly (see
+/// [`local_http`]). Malformed, over [`MAX_REQUEST`], or short is
+/// [`ReadOutcome::Malformed`] (400); head or body slower than
+/// [`REQUEST_DEADLINE`] is [`ReadOutcome::TimedOut`] (408).
+async fn read_request(stream: &mut TcpStream) -> std::io::Result<ReadOutcome> {
+    let head = tokio::time::timeout(REQUEST_DEADLINE, local_http::read_head(stream, MAX_REQUEST));
+    let Ok(head) = head.await else {
+        return Ok(ReadOutcome::TimedOut);
     };
-
-    let head = String::from_utf8_lossy(&buf[..header_end]);
-    let mut lines = head.split("\r\n");
-    let Some(request_line) = lines.next() else {
-        return Ok(None);
+    let Some(mut head) = head? else {
+        return Ok(ReadOutcome::Malformed);
     };
-    let mut parts = request_line.split_whitespace();
-    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
-        return Ok(None);
+    let remaining = MAX_REQUEST.saturating_sub(head.head_len);
+    let body = tokio::time::timeout(
+        REQUEST_DEADLINE,
+        local_http::read_body(stream, &mut head, remaining),
+    );
+    let Ok(body) = body.await else {
+        return Ok(ReadOutcome::TimedOut);
     };
-
-    let mut headers = HashMap::new();
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
-        }
-    }
-
-    let content_length: usize =
-        headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-    if header_end + content_length > MAX_REQUEST {
-        return Ok(None);
-    }
-
-    // Body bytes already buffered, plus any remaining to read.
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-
-    Ok(Some(ParsedRequest {
-        method: method.to_string(),
-        path: path.to_string(),
-        headers,
+    let Some(body) = body? else {
+        return Ok(ReadOutcome::Malformed);
+    };
+    Ok(ReadOutcome::Request(ParsedRequest {
+        method: head.method,
+        path: head.path,
+        headers: head.headers,
         body,
     }))
 }
+
+/// What reading one request produced.
+enum ReadOutcome {
+    /// A well-formed request.
+    Request(ParsedRequest),
+    /// Malformed, oversized, or short: answer 400.
+    Malformed,
+    /// Head or body did not arrive within [`REQUEST_DEADLINE`]: answer 408.
+    TimedOut,
+}
+
+/// How long the head, and then the body, may take to arrive.
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Most connections served at once; past this a connection gets 503.
+pub const MAX_CONNECTIONS: usize = 64;
 
 /// Extract a top-level `"event"` string from a JSON body, if present. A
 /// non-JSON or event-less body yields `None` (the request simply has no event).
@@ -435,35 +427,5 @@ fn event_from_body(body: &[u8]) -> Option<String> {
 
 /// Write a minimal HTTP/1.1 response with a plain-text body and close.
 async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    let reason = reason_phrase(status);
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {len}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        len = body.len(),
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
-}
-
-/// A minimal reason-phrase table for the statuses the ingress returns.
-const fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Internal Server Error",
-    }
-}
-
-/// Find the first index of `needle` in `haystack` (a tiny substring search; the
-/// header block is small so a naive scan is fine).
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+    local_http::write_response(stream, status, "text/plain", body.as_bytes()).await
 }
