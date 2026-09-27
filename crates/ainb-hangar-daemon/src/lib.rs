@@ -40,6 +40,10 @@ mod acp_transcript;
 /// exactly once (first-answer-wins), into the right session (C1 misroute guard),
 /// via the one verified send path. Backs the `attention/answer` RPC.
 pub mod answer;
+/// The kind-based scope gate inside `attention/answer`: an approval, or an
+/// ask that resolves a live hook hold, takes `fleet/action` Approve's column
+/// verdict (hooks-and-answers, review F2).
+pub mod answer_scope;
 /// ATC on the daemon (D12, spec P9 §4.7): the instance registry, the heartbeat
 /// cron (the launchd/systemd timer's daemon-native replacement — reusing the
 /// autopilot scheduler's DB-durable tick loop), the store-backed retry cap, and
@@ -1534,12 +1538,20 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
         // loop returns, so a clean shutdown removes the endpoint files. A bind
         // failure is logged, never fatal.
         let _hook_ingress = if crate::hook_ingress::enabled_from_env() {
-            match crate::hook_ingress::start(
-                &dir,
-                std::sync::Arc::new(crate::hook_ingress::DiscardSink),
-            )
-            .await
-            {
+            // Its own AttentionIngest over the same pool, event sink and
+            // paths as the tail: one reduction for both transports.
+            let sink = crate::hook_ingress::IngestSink::new(
+                crate::attention_ingest::AttentionIngest::new(
+                    store.pool().clone(),
+                    broker.sink(),
+                    dir.join("events.jsonl"),
+                    dir.join("hangar").join("attention_ingest.offset"),
+                ),
+                dir.clone(),
+                store.pool().clone(),
+                broker.sink(),
+            );
+            match crate::hook_ingress::start(&dir, std::sync::Arc::new(sink)).await {
                 Ok(running) => {
                     tracing::info!(
                         port = running.port(),

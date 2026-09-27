@@ -395,6 +395,15 @@ impl AttentionIngest {
         raised
     }
 
+    /// Ingest one canonical hook line that arrived outside the tail: the HTTP
+    /// hook listener (hooks-and-answers). The same reduction and attention
+    /// decision the tail applies, idempotent by the line's `event_id`; no
+    /// cursor moves. `false` is a store fault: the caller answers 503 so the
+    /// hook spools the event for the next daemon start.
+    pub async fn ingest_line(&self, raw: &str, now_ms: i64) -> bool {
+        !matches!(self.process_line(raw, 0, now_ms).await, LineOutcome::Retry)
+    }
+
     /// Process one hook line. Store faults return `Retry`, leaving the cursor
     /// before this line so the next pass replays it through idempotent event IDs.
     async fn process_line(&self, raw: &str, offset: u64, now_ms: i64) -> LineOutcome {
@@ -1056,6 +1065,15 @@ fn permission_context_from_hook_payload(
 fn request_key_of(kind: AttentionKind, context: &serde_json::Value) -> Option<String> {
     (kind == AttentionKind::AskUserQuestion)
         .then(|| ainb_plugin_notifyd::broker::request_fingerprint(context))
+}
+
+/// The `request_key` the ingest stamps on the ask row an `AskUserQuestion`
+/// tool input raises: the same fingerprint [`request_key_of`] derives, so the
+/// hook hold binds to exactly the row its own question raised.
+pub(crate) fn ask_request_key(tool_input: &serde_json::Value) -> Option<String> {
+    let context =
+        serde_json::to_value(NeedsContext::Ask(ask_data_from_tool_input(tool_input)?)).ok()?;
+    request_key_of(AttentionKind::AskUserQuestion, &context)
 }
 
 /// Map a classified need to its attention kind.

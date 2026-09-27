@@ -13772,10 +13772,21 @@ async fn handle_attention_answer(
     if let Some(stamp) = crate::answer::answered_by_caller(caller, connection) {
         params.answered_by = stamp;
     }
-    let result = crate::answer::answer(pool, events, &params, SystemClock.now_ms())
+    // The kind-based scope gate (review F2) runs inside `answer_as`, on the
+    // same hold read that picks the delivery path.
+    match crate::answer::answer_as(pool, events, &params, SystemClock.now_ms(), caller)
         .await
-        .map_err(|e| store_err(&e))?;
-    to_value(&result)
+        .map_err(|e| store_err(&e))?
+    {
+        crate::answer::AnswerOutcome::Answered(result) => to_value(&result),
+        crate::answer::AnswerOutcome::ScopeRefused { kind } => Err(mutation::rejected(
+            ainb_hangar_proto::mutation::REASON_SCOPE,
+            format!(
+                "this scope may not answer a {} row (an approval takes fleet/action Approve's verdict)",
+                kind.as_str()
+            ),
+        )),
+    }
 }
 
 /// Dispatch `atc/register` (spec P9, D12): register (or re-register) an ATC

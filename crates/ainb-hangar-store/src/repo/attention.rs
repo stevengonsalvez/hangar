@@ -614,6 +614,31 @@ impl AttentionRepo {
         rows.iter().map(|r| r.try_get("id")).collect()
     }
 
+    /// The id of the OPEN row a session raised for one request, found by the
+    /// request's stable `request_key` (0080). `None` when no such row is open.
+    ///
+    /// The one lookup a caller that must bind to a specific request may use:
+    /// "the latest open row of a kind" can name another request's row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the query fails.
+    pub async fn open_id_for_request_key(
+        pool: &SqlitePool,
+        session_id: &str,
+        request_key: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT id FROM attention \
+             WHERE session_id = ? AND request_key = ? AND state = 'open' \
+             ORDER BY created_at ASC, id ASC LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(request_key)
+        .fetch_optional(pool)
+        .await
+    }
+
     /// The ids of every still-`open` `approval` row a session raised, oldest
     /// first.
     ///
