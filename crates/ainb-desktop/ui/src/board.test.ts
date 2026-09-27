@@ -264,9 +264,22 @@ test("the proof line lists every agent state, zero included", () => {
   ], "a state this build does not know is left off, since the host could not parse it back");
 });
 
-test("a legacy card with no session row is titled by its tmux target", () => {
+test("a legacy card joins its session row by tmux session, and without one is titled by its target", () => {
+  // The fingerprint the daemon really writes (`SessionKey::legacy`).
+  const key = (target: string) => `legacy:claude:${target}:pid=1;started=10`;
   const { sessions, fleet } = world(["u-1", "api", "p-1"]);
-  const columns = boardColumns(status(card("legacy:claude:hangar-dev:1.0:4242-17", { state: "waiting" })), fleet, sessions, NO_ACKS);
-  const titles = columns.flatMap((column) => column.cards.map((c) => c.title));
-  assert.deepEqual(titles, ["hangar-dev:1.0"]);
+  (sessions.workspaces[0].sessions[0] as { tmux_session_name: string | null }).tmux_session_name = "api-7f3a";
+  const columns = boardColumns(
+    status(card(key("api-7f3a:0.1"), { state: "waiting" }), card(key("orphan:1.0"), { state: "waiting" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  const cards = columns.flatMap((column) => column.cards);
+  const joined = cards.find((c) => c.key === key("api-7f3a:0.1"))!;
+  assert.equal(joined.title, "api", "named by its session row");
+  assert.equal(joined.sessionId, "u-1", "and opens it");
+  const orphan = cards.find((c) => c.key === key("orphan:1.0"))!;
+  assert.equal(orphan.title, "orphan:1.0");
+  assert.equal(orphan.sessionId, null);
 });
