@@ -2,10 +2,11 @@
 //!
 //! A Claude `PermissionRequest`, or `PreToolUse` on `AskUserQuestion`, POSTs to
 //! `/hook/claude/hold` and the connection stays open here until a human
-//! decides, the deadline passes, or the agent moves on. An answer from any
-//! surface (`attention/answer`, `fleet/action`) resolves the hold with a
-//! [`HoldDecision`], and the daemon, never the client, renders the JSON the
-//! hook prints.
+//! decides, the deadline passes, or the agent moves on. `attention/answer`
+//! (by attention row) and `fleet/action` Approve, Deny and StructuredAnswer
+//! (by session and request fingerprint) resolve it through
+//! [`crate::answer::resolve_hold_as`] with a [`HoldDecision`], and the
+//! daemon, never the client, renders the JSON the hook prints.
 //!
 //! Every way a hold ends without a decision returns `{}`: Claude then shows its
 //! own prompt and the keyboard decides. Nothing here ever auto-approves or
@@ -228,13 +229,41 @@ pub fn decide_permission(label: &str) -> Result<HoldDecision, String> {
     }
 }
 
+/// The stable identity of one held request: its session and its tool call
+/// (`tool_use_id`, or the tool and its input when there is no id). A tuple,
+/// not a joined string, so no session can be a prefix of another's.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HoldKey {
+    /// The provider session id.
+    pub session: String,
+    /// The tool call within it.
+    pub call: String,
+}
+
+impl HoldKey {
+    /// The key for `call` in `session`.
+    #[must_use]
+    pub fn new(session: &str, call: &str) -> Self {
+        Self {
+            session: session.to_string(),
+            call: call.to_string(),
+        }
+    }
+}
+
 struct Slot {
     attention_id: String,
+    /// The request fingerprint the Fleet reducer stamped for this request,
+    /// which `fleet/action` names it by.
+    fingerprint: Option<String>,
+    /// Bumped per registration, so a waiter left over from an earlier hold
+    /// under the same key can never remove a newer one.
+    generation: u64,
     request: HeldRequest,
     tx: watch::Sender<Option<HoldDecision>>,
 }
 
-/// The live holds. A hold is keyed by its request's stable key, and each hold
+/// The live holds. A hold is keyed by its request's [`HoldKey`], and each hold
 /// is bound to exactly one attention row: the two maps are kept 1:1, so an
 /// answer to a row reaches exactly the hook that raised it.
 #[derive(Default)]
@@ -245,13 +274,15 @@ pub struct HoldRegistry {
 #[derive(Default)]
 struct Inner {
     /// Hold key to its slot.
-    slots: HashMap<String, Slot>,
+    slots: HashMap<HoldKey, Slot>,
     /// Attention row id to the one hold key bound to it.
-    by_attention: HashMap<String, String>,
+    by_attention: HashMap<String, HoldKey>,
+    /// The last generation handed out.
+    generation: u64,
 }
 
 impl Inner {
-    fn remove(&mut self, key: &str) -> Option<Slot> {
+    fn remove(&mut self, key: &HoldKey) -> Option<Slot> {
         let slot = self.slots.remove(key)?;
         self.by_attention.remove(&slot.attention_id);
         Some(slot)
@@ -261,7 +292,8 @@ impl Inner {
 /// A registered hold. Waiting on it yields the decision, or `None`.
 pub struct Waiter {
     registry: &'static HoldRegistry,
-    key: String,
+    key: HoldKey,
+    generation: u64,
     rx: watch::Receiver<Option<HoldDecision>>,
     request: HeldRequest,
 }
@@ -278,6 +310,7 @@ impl HoldRegistry {
     }
 
     /// Register a hold for `key` on `attention_id`, or join the live one.
+    /// `fingerprint` is the Fleet request fingerprint, when known.
     ///
     /// `None` when the registry is full, when `key` is already held on a
     /// DIFFERENT row, or when `attention_id` is already held by a DIFFERENT
@@ -286,8 +319,9 @@ impl HoldRegistry {
     /// hook answers `{}` and its agent prompts on its own.
     pub fn register(
         &'static self,
-        key: &str,
+        key: &HoldKey,
         attention_id: &str,
+        fingerprint: Option<&str>,
         request: HeldRequest,
     ) -> Option<Waiter> {
         let mut inner = self.lock();
@@ -297,7 +331,8 @@ impl HoldRegistry {
             }
             return Some(Waiter {
                 registry: self,
-                key: key.to_string(),
+                key: key.clone(),
+                generation: slot.generation,
                 rx: slot.tx.subscribe(),
                 request: slot.request.clone(),
             });
@@ -305,19 +340,24 @@ impl HoldRegistry {
         if inner.by_attention.contains_key(attention_id) || inner.slots.len() >= MAX_HOLDS {
             return None;
         }
+        inner.generation += 1;
+        let generation = inner.generation;
         let (tx, rx) = watch::channel(None);
         inner.slots.insert(
-            key.to_string(),
+            key.clone(),
             Slot {
                 attention_id: attention_id.to_string(),
+                fingerprint: fingerprint.map(str::to_string),
+                generation,
                 request: request.clone(),
                 tx,
             },
         );
-        inner.by_attention.insert(attention_id.to_string(), key.to_string());
+        inner.by_attention.insert(attention_id.to_string(), key.clone());
         Some(Waiter {
             registry: self,
-            key: key.to_string(),
+            key: key.clone(),
+            generation,
             rx,
             request,
         })
@@ -329,6 +369,20 @@ impl HoldRegistry {
         let inner = self.lock();
         let key = inner.by_attention.get(attention_id)?;
         inner.slots.get(key).map(|s| s.request.clone())
+    }
+
+    /// The attention row of the ONE live hold in `session` whose Fleet
+    /// request fingerprint is `fingerprint`. `None` when there is none, or
+    /// when two holds share it (ambiguous: nothing is answered).
+    #[must_use]
+    pub fn attention_for_request(&self, session: &str, fingerprint: &str) -> Option<String> {
+        let inner = self.lock();
+        let mut matches = inner
+            .slots
+            .iter()
+            .filter(|(k, s)| k.session == session && s.fingerprint.as_deref() == Some(fingerprint));
+        let (_, slot) = matches.next()?;
+        matches.next().is_none().then(|| slot.attention_id.clone())
     }
 
     /// Deliver `decision` to every waiter on the one hold bound to the row,
@@ -346,20 +400,19 @@ impl HoldRegistry {
 
     /// End the hold for `key` without a decision (the agent moved on). Every
     /// waiter answers `{}`.
-    pub fn cancel(&self, key: &str) {
+    pub fn cancel(&self, key: &HoldKey) {
         self.lock().remove(key);
     }
 
     /// Keys of the live holds for one session.
     #[must_use]
-    pub fn keys_for_session(&self, session: &str) -> Vec<String> {
-        let prefix = format!("{session}:");
-        self.lock().slots.keys().filter(|k| k.starts_with(&prefix)).cloned().collect()
+    pub fn keys_for_session(&self, session: &str) -> Vec<HoldKey> {
+        self.lock().slots.keys().filter(|k| k.session == session).cloned().collect()
     }
 
     /// The attention row a live hold is for.
     #[must_use]
-    pub fn attention_for(&self, key: &str) -> Option<String> {
+    pub fn attention_for(&self, key: &HoldKey) -> Option<String> {
         self.lock().slots.get(key).map(|s| s.attention_id.clone())
     }
 
@@ -378,10 +431,15 @@ impl HoldRegistry {
 
 impl Drop for Waiter {
     /// A waiter dropped before a decision (its connection cut, its future
-    /// cancelled) frees the slot once it was the last one on that hold.
+    /// cancelled) frees the slot once it was the last one on that hold, and
+    /// only if the slot is still the one it waited on.
     fn drop(&mut self) {
         let mut inner = self.registry.lock();
-        if inner.slots.get(&self.key).is_some_and(|slot| slot.tx.receiver_count() <= 1) {
+        if inner
+            .slots
+            .get(&self.key)
+            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
+        {
             inner.remove(&self.key);
         }
     }
@@ -556,8 +614,22 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_request_joins_the_live_hold_and_both_get_the_decision() {
         let reg = leaked();
-        let a = reg.register("s:t1", "att-1", HeldRequest::Permission).unwrap();
-        let b = reg.register("s:t1", "att-1", HeldRequest::Permission).unwrap();
+        let a = reg
+            .register(
+                &HoldKey::new("s", "t1"),
+                "att-1",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let b = reg
+            .register(
+                &HoldKey::new("s", "t1"),
+                "att-1",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         assert_eq!(reg.len(), 1);
         let (ra, rb) = (
             tokio::spawn(a.wait(Duration::from_secs(5))),
@@ -581,8 +653,22 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_waiter_frees_its_slot_only_when_it_was_the_last() {
         let reg = leaked();
-        let a = reg.register("s:d1", "att-d1", HeldRequest::Permission).unwrap();
-        let b = reg.register("s:d1", "att-d1", HeldRequest::Permission).unwrap();
+        let a = reg
+            .register(
+                &HoldKey::new("s", "d1"),
+                "att-d1",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let b = reg
+            .register(
+                &HoldKey::new("s", "d1"),
+                "att-d1",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         drop(a);
         assert_eq!(reg.len(), 1, "b still waits");
         drop(b);
@@ -592,34 +678,140 @@ mod tests {
     #[tokio::test]
     async fn a_deadline_or_a_cancel_answers_nothing() {
         let reg = leaked();
-        let w = reg.register("s:t2", "att-2", HeldRequest::Permission).unwrap();
+        let w = reg
+            .register(
+                &HoldKey::new("s", "t2"),
+                "att-2",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         assert_eq!(w.wait(Duration::from_millis(30)).await, HoldEnd::TimedOut);
         assert!(reg.is_empty(), "a timed-out hold is dropped");
-        let w = reg.register("s:t3", "att-3", HeldRequest::Permission).unwrap();
+        let w = reg
+            .register(
+                &HoldKey::new("s", "t3"),
+                "att-3",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         let waiting = tokio::spawn(w.wait(Duration::from_secs(5)));
         tokio::time::sleep(Duration::from_millis(20)).await;
-        reg.cancel("s:t3");
+        reg.cancel(&HoldKey::new("s", "t3"));
         assert_eq!(waiting.await.unwrap(), HoldEnd::Released);
     }
 
     #[test]
     fn a_row_is_bound_to_exactly_one_request() {
         let reg = leaked();
-        let _a = reg.register("s:call-a", "att-a", HeldRequest::Permission).unwrap();
+        let _a = reg
+            .register(
+                &HoldKey::new("s", "call-a"),
+                "att-a",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         assert!(
-            reg.register("s:call-b", "att-a", HeldRequest::Permission).is_none(),
+            reg.register(
+                &HoldKey::new("s", "call-b"),
+                "att-a",
+                None,
+                HeldRequest::Permission
+            )
+            .is_none(),
             "a second request may not bind a row already held"
         );
         assert!(
-            reg.register("s:call-a", "att-b", HeldRequest::Permission).is_none(),
+            reg.register(
+                &HoldKey::new("s", "call-a"),
+                "att-b",
+                None,
+                HeldRequest::Permission
+            )
+            .is_none(),
             "a held request may not move to another row"
         );
-        let _b = reg.register("s:call-b", "att-b", HeldRequest::Permission).unwrap();
+        let _b = reg
+            .register(
+                &HoldKey::new("s", "call-b"),
+                "att-b",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
         assert!(reg.resolve("att-b", HoldDecision::Allow { message: None }));
         assert_eq!(
-            reg.attention_for("s:call-a").as_deref(),
+            reg.attention_for(&HoldKey::new("s", "call-a")).as_deref(),
             Some("att-a"),
             "untouched"
+        );
+    }
+
+    #[test]
+    fn a_stale_waiter_never_removes_a_newer_hold() {
+        let reg = leaked();
+        let key = HoldKey::new("s", "g1");
+        let old = reg.register(&key, "att-g1", None, HeldRequest::Permission).unwrap();
+        assert!(reg.resolve("att-g1", HoldDecision::Allow { message: None }));
+        let _new = reg.register(&key, "att-g2", None, HeldRequest::Permission).unwrap();
+        drop(old);
+        assert_eq!(
+            reg.attention_for(&key).as_deref(),
+            Some("att-g2"),
+            "the newer hold survives"
+        );
+    }
+
+    #[test]
+    fn a_fleet_request_finds_only_its_own_unambiguous_hold() {
+        let reg = leaked();
+        let _a = reg
+            .register(
+                &HoldKey::new("s1", "c1"),
+                "att-f1",
+                Some("fp-a"),
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let _b = reg
+            .register(
+                &HoldKey::new("s1", "c2"),
+                "att-f2",
+                Some("fp-b"),
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let _c = reg
+            .register(
+                &HoldKey::new("s2", "c1"),
+                "att-f3",
+                Some("fp-a"),
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        assert_eq!(
+            reg.attention_for_request("s1", "fp-a").as_deref(),
+            Some("att-f1")
+        );
+        assert_eq!(
+            reg.attention_for_request("s2", "fp-a").as_deref(),
+            Some("att-f3")
+        );
+        assert_eq!(reg.attention_for_request("s1", "fp-x"), None);
+        let _d = reg
+            .register(
+                &HoldKey::new("s1", "c3"),
+                "att-f4",
+                Some("fp-a"),
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        assert_eq!(
+            reg.attention_for_request("s1", "fp-a"),
+            None,
+            "ambiguous: answer nothing"
         );
     }
 
@@ -630,13 +822,32 @@ mod tests {
         let mut live = Vec::new();
         for i in 0..MAX_HOLDS {
             live.push(
-                reg.register(&format!("k{i}"), &format!("a{i}"), HeldRequest::Permission)
-                    .unwrap(),
+                reg.register(
+                    &HoldKey::new("s", &format!("k{i}")),
+                    &format!("a{i}"),
+                    None,
+                    HeldRequest::Permission,
+                )
+                .unwrap(),
             );
         }
-        assert!(reg.register("one-more", "a", HeldRequest::Permission).is_none());
         assert!(
-            reg.register("k0", "a0", HeldRequest::Permission).is_some(),
+            reg.register(
+                &HoldKey::new("s", "one-more"),
+                "a",
+                None,
+                HeldRequest::Permission
+            )
+            .is_none()
+        );
+        assert!(
+            reg.register(
+                &HoldKey::new("s", "k0"),
+                "a0",
+                None,
+                HeldRequest::Permission
+            )
+            .is_some(),
             "joining is not a new slot"
         );
         drop(live);
