@@ -55,12 +55,8 @@ export interface ProjectGroup {
 }
 
 /** `session.created_at` as epoch millis, or `-Infinity` when it is missing
- * or unparsable: sorts to the bottom of "newest first" rather than throwing,
- * which is what "unknown fields tolerated" means for a timestamp.
- *
- * Creation, not `last_accessed`: opening a session touches its access time,
- * so sorting by it would move the card under the pointer that just clicked
- * it. A card's place changes only when a newer worktree appears. */
+ * or unparsable: loses to any dated session rather than throwing, which is
+ * what "unknown fields tolerated" means for a timestamp. */
 function createdAt(session: Session_Serialize): number {
   const parsed = Date.parse(session.created_at ?? "");
   return Number.isNaN(parsed) ? -Infinity : parsed;
@@ -83,12 +79,6 @@ function primaryOf(sessions: readonly Session_Serialize[]): Session_Serialize {
   return primary;
 }
 
-/** The newest `createdAt` among `sessions`, for the group's own sort: a card
- * moves up when a session is added to its worktree. */
-function newestCreated(sessions: readonly Session_Serialize[]): number {
-  return sessions.reduce((newest, session) => Math.max(newest, createdAt(session)), -Infinity);
-}
-
 function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
   const primary = primaryOf(sessions);
   const changes = primary.git_changes;
@@ -104,8 +94,21 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
 }
 
 /**
- * `sessions` folded into one card per worktree path, newest card first. `fallbackPath` is the project's own path, for a session that
- * carries no `workspace_path` of its own (an older host, a test fixture):
+ * `sessions` folded into one card per worktree path, in the frame's own order
+ * (a card sits where its first session does). Never re-sorted: the host's
+ * "Select next session" and "Select previous session" walk the frame's order,
+ * so a card drawn anywhere else moves the selection somewhere the eye does not
+ * expect, or nowhere at all from what looks like the first row. The frame's
+ * order does not follow access time either, so opening a session never moves
+ * its card under the pointer.
+ *
+ * Folding still bends that order when one worktree's sessions are not next to
+ * each other in the frame: `[a1, b, a2]` draws a1, a2, b while the host walks
+ * a1, b, a2. Only a host order that keeps a worktree's sessions together
+ * closes that; the renderer cannot without splitting the card.
+ *
+ * `fallbackPath` is the project's own path, for a session that carries no
+ * `workspace_path` of its own (an older host, a test fixture):
  * every such session in one project folds into the SAME card rather than
  * one each, which is the closest a missing field can get to the real shape.
  */
@@ -117,14 +120,12 @@ export function worktreeCards(sessions: readonly Session_Serialize[], fallbackPa
     if (bucket) bucket.push(session);
     else byPath.set(key, [session]);
   }
-  return [...byPath.entries()]
-    .map(([key, group]) => cardFor(key, group))
-    .sort((a, b) => newestCreated(b.sessions) - newestCreated(a.sessions));
+  return [...byPath.entries()].map(([key, group]) => cardFor(key, group));
 }
 
 /**
- * The Sessions frame as the sidebar draws it: one group per project, sorted
- * recent (Orca's default), each holding the worktree cards its sessions fold
+ * The Sessions frame as the sidebar draws it: one group per project, in the
+ * frame's order, each holding the worktree cards its sessions fold
  * into. A project with no sessions is dropped, matching the frame's own rule
  * that an empty workspace draws nothing (`sidebar.test.ts`).
  */

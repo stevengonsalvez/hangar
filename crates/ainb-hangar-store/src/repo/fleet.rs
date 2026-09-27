@@ -1424,6 +1424,28 @@ impl FleetRepo {
         Ok(row.is_some())
     }
 
+    /// The keys of every visible fleet row registered under
+    /// `provider_session_id`, oldest key first. Empty when none is, and never
+    /// a key that does not exist: a caller writing an event against one of
+    /// these extends a row, it never creates one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`sqlx::Error`] if the query fails.
+    pub async fn session_keys_for_provider_session(
+        pool: &SqlitePool,
+        provider_session_id: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT session_key FROM fleet_session \
+             WHERE provider_session_id = ? AND visible = 1 \
+             ORDER BY session_key",
+        )
+        .bind(provider_session_id)
+        .fetch_all(pool)
+        .await
+    }
+
     /// Validate optimistic concurrency and optional structured request identity.
     pub async fn validate_action_target(
         pool: &SqlitePool,
