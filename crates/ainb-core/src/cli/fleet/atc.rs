@@ -2829,7 +2829,13 @@ fn install_http_hooks() -> anyhow::Result<()> {
     })?;
     let published = ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
         .map_err(|e| anyhow::anyhow!("unreadable hook endpoint {}: {e}", endpoint.display()))?;
-    // A crash leaves the endpoint behind: only a live daemon counts.
+    // A crash leaves the endpoint behind: only a live daemon counts. Pid 0
+    // and 1 are never the daemon, and kill(0) would signal our own group.
+    anyhow::ensure!(
+        published.pid > 1,
+        "the hook endpoint names pid {}, which cannot be the hangar daemon",
+        published.pid
+    );
     let pid = i32::try_from(published.pid).context("hook endpoint pid out of range")?;
     match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
         Ok(()) => {}
