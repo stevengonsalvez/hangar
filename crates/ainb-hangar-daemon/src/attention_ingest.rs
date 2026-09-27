@@ -1067,6 +1067,15 @@ fn request_key_of(kind: AttentionKind, context: &serde_json::Value) -> Option<St
         .then(|| ainb_plugin_notifyd::broker::request_fingerprint(context))
 }
 
+/// The `request_key` the ingest stamps on the ask row an `AskUserQuestion`
+/// tool input raises: the same fingerprint [`request_key_of`] derives, so the
+/// hook hold binds to exactly the row its own question raised.
+pub(crate) fn ask_request_key(tool_input: &serde_json::Value) -> Option<String> {
+    let context =
+        serde_json::to_value(NeedsContext::Ask(ask_data_from_tool_input(tool_input)?)).ok()?;
+    request_key_of(AttentionKind::AskUserQuestion, &context)
+}
+
 /// Map a classified need to its attention kind.
 fn kind_of(ctx: &NeedsContext) -> AttentionKind {
     match ctx {
