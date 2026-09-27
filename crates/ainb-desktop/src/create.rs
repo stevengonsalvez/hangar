@@ -89,8 +89,9 @@ pub fn params(args: CreateWorktreeArgs, op_id: OpId) -> WorktreeCreateParams {
     }
 }
 
-/// A fresh op id for one submit: a retry of the same submit reuses it, a new
-/// submit mints another.
+/// A fresh op id for one request. Every call to [`request`] mints its own:
+/// nothing in the window retries a submit, so two submits (a person pressing
+/// Create twice) are two ops the daemon keeps apart, never one it would fold.
 #[must_use]
 pub fn mint_op_id() -> OpId {
     OpId::parse(format!("desktop-create-{}", uuid::Uuid::new_v4().simple()))
