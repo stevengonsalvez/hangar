@@ -46,6 +46,11 @@ event_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null ||
 case "$event_id" in
   *[!A-Za-z0-9-]* | '') event_id= ;;
 esac
+# Every source failed: the time and this shell's pid still name the call
+# uniquely enough to de-duplicate a replay.
+if [ -z "$event_id" ]; then
+  event_id="$(date +%s 2>/dev/null || printf 0)-$$-hook"
+fi
 # The same resolution as the daemon's hangar home: AINB_HANGAR_HOME, else the
 # default. Nothing else, so the script never reads files the daemon did not
 # write.
