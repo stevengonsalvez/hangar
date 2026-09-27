@@ -98,10 +98,11 @@ test("a chip kind this build does not know is skipped, never ranked first", () =
 });
 
 test("a card no session row names reads as a name, never as its raw key", () => {
-  // `SessionKey::legacy`, with the fingerprint the daemon really writes: the
+  // `SessionKey::legacy`, with the fingerprint the daemon really writes
+  // (`pane=%N;pid=N;session_started=N`, `discover/tmux.rs`): the
   // tmux target, which may itself carry `:`.
-  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:pid=1;started=10"), "hangar-dev:1.0");
-  assert.equal(legacyTmuxSession("legacy:claude:hangar-dev:1.0:pid=1;started=10"), "hangar-dev");
+  assert.equal(keyLabel("legacy:claude:hangar-dev:1.0:pane=%3;pid=41;session_started=1790000000"), "hangar-dev:1.0");
+  assert.equal(legacyTmuxSession("legacy:claude:hangar-dev:1.0:pane=%3;pid=41;session_started=1790000000"), "hangar-dev");
   assert.equal(legacyTmuxSession("claude:5f0c9a1e"), null);
   assert.equal(keyLabel("legacy:claude:tmux:"), "tmux");
   assert.equal(keyLabel("claude:5f0c9a1e-77aa-4c1d-9e4b-000000000000"), "claude 5f0c9a1e");
