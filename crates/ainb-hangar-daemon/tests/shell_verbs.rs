@@ -131,6 +131,9 @@ impl World {
         std::env::remove_var("AINB_HOME");
         std::env::set_var("TMUX_TMPDIR", &tmux_dir);
         std::env::remove_var("TMUX");
+        // tmux reads `$XDG_CONFIG_HOME/tmux/tmux.conf` too; a developer's
+        // could set a `default-shell` or hooks that move the pane.
+        std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
         // A plain shell with no startup files: a developer's rc could `cd`
         // somewhere else and move the pane off the directory under test.
         std::env::set_var("SHELL", "/bin/sh");
@@ -246,6 +249,35 @@ async fn a_shell_opens_in_a_registered_repository_top() {
     assert_eq!(world.pane_path(&name), repo);
 }
 
+/// tmux reads `-c` as a format. A registered folder whose name holds one is
+/// still the folder the shell opens in, not what the format expands to.
+#[tokio::test]
+async fn a_folder_name_that_reads_as_a_tmux_format_is_taken_literally() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let odd = world.home.path().join("code/c#{session_name}");
+    std::fs::create_dir_all(&odd).unwrap();
+    git(&odd, &["init", "-q", "-b", "main"]);
+    let odd = canonical(&odd);
+
+    let response = world.shell(&odd).await;
+
+    let name = response["result"]["tmux_session_name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a shell was made: {response}"))
+        .to_string();
+    assert_eq!(response["result"]["worktree_path"], odd.as_str());
+    assert_eq!(
+        world.pane_path(&name),
+        odd,
+        "the literal folder, not a format"
+    );
+}
+
 /// A directory outside every registered folder, or one reached through
 /// `..`, is refused before tmux runs: no session, not even a server.
 #[tokio::test]
@@ -314,10 +346,19 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
     std::env::remove_var("HANGAR_CLAUDE_OAUTH_TOKEN");
     std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
 
-    assert!(
-        response["result"]["tmux_session_name"].is_string(),
-        "{response}"
-    );
+    let name = response["result"]["tmux_session_name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a shell was made: {response}"))
+        .to_string();
+    let session = world.tmux(&["show-environment", "-t", &format!("={name}")]);
+    let session = String::from_utf8_lossy(&session.stdout);
+    for secret in [
+        "HANGAR_CLAUDE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "sk-ant-oat",
+    ] {
+        assert!(!session.contains(secret), "{secret} reached the session");
+    }
     let global = world.tmux(&["show-environment", "-g"]);
     assert!(global.status.success(), "the server is up");
     let global = String::from_utf8_lossy(&global.stdout);
