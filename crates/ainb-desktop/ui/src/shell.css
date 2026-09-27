@@ -241,6 +241,22 @@ body {
   font-weight: normal;
 }
 
+.sidebar-new {
+  margin-inline-start: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.sidebar-new:hover {
+  color: var(--text);
+  border-color: var(--input);
+}
+
 .sidebar .empty {
   margin-inline: 12px;
   color: var(--muted-foreground);
@@ -344,6 +360,36 @@ body {
 
 .worktree-card-meta .model {
   flex-shrink: 0;
+}
+
+/* The composer's card while it creates: muted rather than bold, so it reads
+   as "on its way" beside the real cards it will join. */
+.worktree-card[data-pending="true"] .worktree-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+/* A small rotating ring, in fixed steps rather than eased, the same busy
+   read as `.ring.running::after`'s (whose keyframes this reuses): the
+   composer's Create button and the sidebar's pending card both use it. */
+.spinner {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  animation: ring-spin 800ms steps(8, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+  }
 }
 
 .agent-rows {
@@ -697,6 +743,196 @@ body {
 .palette .empty {
   color: var(--muted-foreground);
   padding: 10px 14px;
+}
+
+/* The new-worktree composer (Mod+N): a floating surface like the palette's,
+   over `--float-bg`/`--float-border`/`--float-shadow` rather than the flat
+   `--panel` the palette reads, since this one is a form, not a scrolling
+   list, and wants the elevated look the design tokens reserve for menus,
+   popovers and dialogs. */
+.composer-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  overflow-y: auto;
+  padding-block: 8vh;
+  background: color-mix(in srgb, var(--background) 60%, transparent);
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 92vw);
+  height: fit-content;
+  padding: 20px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-xl);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  backdrop-filter: blur(20px);
+}
+
+.composer-title {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-body);
+  font-weight: 600;
+}
+
+.composer-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.composer-row {
+  display: flex;
+  gap: 12px;
+}
+
+.composer-row .composer-field {
+  flex: 1;
+  min-width: 0;
+}
+
+.composer-label {
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+}
+
+.composer input[type="text"],
+.composer select,
+.composer textarea {
+  padding: 6px 10px;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+}
+
+.composer textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.composer input:focus-visible,
+.composer select:focus-visible,
+.composer textarea:focus-visible,
+.composer-agent:focus-visible,
+.composer-cancel:focus-visible,
+.composer-create:focus-visible,
+.composer-advanced summary:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -1px;
+}
+
+.composer input:disabled,
+.composer select:disabled,
+.composer textarea:disabled,
+.composer-agent:disabled {
+  opacity: 0.6;
+}
+
+.composer input[aria-invalid="true"],
+.composer select[aria-invalid="true"],
+.composer textarea[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
+.composer-hint {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+.composer-error {
+  margin: 0;
+  color: var(--destructive);
+  font-size: var(--text-meta);
+}
+
+.composer-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-agent {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+.composer-agent.selected {
+  border-color: var(--primary);
+  background: var(--highlight);
+  color: var(--primary);
+}
+
+.composer-advanced {
+  padding-block-start: 8px;
+  border-block-start: 1px solid var(--border);
+}
+
+.composer-advanced summary {
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+  cursor: pointer;
+}
+
+.composer-advanced .composer-field {
+  margin-block-start: 8px;
+}
+
+.composer-failure {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--destructive) 15%, transparent);
+  color: var(--destructive);
+  font-size: var(--text-sub);
+}
+
+.composer-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-block-start: 4px;
+}
+
+.composer-cancel {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.composer-create {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  cursor: pointer;
+}
+
+.composer-create:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 /* The board: columns of agents by the state the host gave them, beside the
@@ -1753,4 +1989,10 @@ body {
   clip: rect(0 0 0 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* The shell behind the composer: made inert while it is open. A wrapper
+   that draws no box, so the page's own flex layout is unchanged. */
+.shell-content {
+  display: contents;
 }

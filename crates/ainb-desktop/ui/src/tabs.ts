@@ -60,6 +60,7 @@ export type Accelerator =
   | { kind: "next" }
   | { kind: "close" }
   | { kind: "palette" }
+  | { kind: "new" }
   | { kind: "attention" }
   | { kind: "hosts" }
   | { kind: "copy" }
@@ -101,11 +102,25 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
       return { kind: "close" };
     case "KeyK":
       return { kind: "palette" };
+    // The new-worktree composer: Cmd+N on macOS, Ctrl+Shift+N elsewhere, like
+    // every chord here. Plain Ctrl+N belongs to the pane (next-history in a
+    // shell, completion in vim), so off macOS it needs the Shift.
+    case "KeyN":
+      return { kind: "new" };
     case "KeyU":
       return { kind: "attention" };
     default:
       return null;
   }
+}
+
+/**
+ * Whether `shell` may run while a modal (the new-worktree composer) is open.
+ * Only `new` may: every other chord switches, closes or focuses a tab, which
+ * would act on the shell behind the modal and hand it the keyboard.
+ */
+export function acceleratorAllowedUnderModal(shell: Accelerator): boolean {
+  return shell.kind === "new";
 }
 
 /** The shape of a focused element this needs: `document.activeElement` fits. */
@@ -130,6 +145,8 @@ export function keyboardTaken(active: FocusedLike | null | undefined): boolean {
 export type FocusRequest = {
   /** The palette is open: it owns the keyboard until it closes. */
   palette: boolean;
+  /** The new-worktree composer is open: a modal owns the keyboard too. */
+  composer?: boolean;
   /**
    * The host asked, on its own schedule (a tab-open answer, the strip tidying
    * up), rather than a person pressing a tab chord or clicking a tab.
@@ -148,7 +165,7 @@ export type FocusRequest = {
  * chord or click on a tab is that person moving the keyboard, and it moves.
  */
 export function terminalMayTakeFocus(request: FocusRequest): boolean {
-  if (request.palette) return false;
+  if (request.palette || request.composer) return false;
   return !(request.byHost && keyboardTaken(request.active));
 }
 
