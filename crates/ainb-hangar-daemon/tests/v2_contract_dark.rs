@@ -87,7 +87,7 @@ async fn every_v2_method_is_method_not_found_by_default() {
     }
 }
 
-/// The hello reply advertises `catalogue_strings()`, and none of the eight
+/// The hello reply advertises `catalogue_strings()`, and none of the nine
 /// dark capabilities is in it.
 #[test]
 fn no_v2_capability_is_advertised() {
@@ -112,7 +112,7 @@ fn no_v2_method_is_in_the_mutation_registry() {
     }
 }
 
-/// The switches are the two names the owner decided (DV16): boot-time
+/// The switches are the names the owner decided (DV16): boot-time
 /// environment variables, never `daemon_config` keys a connected surface could
 /// set through `hangar/daemon_config_set`.
 #[test]
@@ -122,10 +122,14 @@ fn the_phase_switches_are_env_only() {
         "AINB_HANGAR_PEER_LISTEN"
     );
     assert_eq!(ainb_hangar_daemon::term::STREAM_ENV, "AINB_TERMINAL_STREAM");
+    assert_eq!(
+        ainb_hangar_daemon::hook_ingress::LISTEN_ENV,
+        "AINB_HANGAR_HOOK_LISTEN"
+    );
     for descriptor in ainb_hangar_core::daemon_config::DAEMON_CONFIG_REGISTRY {
         let key = descriptor.key.to_ascii_lowercase();
         assert!(
-            !key.contains("peer") && !key.starts_with("terminal"),
+            !key.contains("peer") && !key.starts_with("terminal") && !key.contains("hook_listen"),
             "{} looks like a phase switch in daemon_config",
             descriptor.key
         );
