@@ -165,3 +165,81 @@ async fn spooled_status_replays_once_and_holds_never_do() {
     assert!(spool_lines(home.path()).is_empty());
     drop(running);
 }
+
+/// Review of #192 (C1): an event recorded live and then spooled (the case the
+/// script-minted id exists for) is recorded with a different timestamp, so
+/// the store reports an id collision. The drain must count it as already
+/// recorded and go on to the next file, not stop on it forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_recorded_live_then_spooled_does_not_block_the_drain() {
+    use ainb_hangar_daemon::hook_ingress::{HookEvent, HookReply, HookSink};
+    use ainb_hangar_proto::hooks::HookSource;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).await.unwrap();
+    let broker = EventBroker::new();
+    let ingest = AttentionIngest::new(
+        store.pool().clone(),
+        broker.sink(),
+        home.path().join("events.jsonl"),
+        home.path().join("cursor"),
+    );
+    let sink = IngestSink::new(
+        ingest,
+        home.path().to_path_buf(),
+        store.pool().clone(),
+        broker.sink(),
+    );
+    let session = format!("collide-{}", std::process::id());
+    let other = format!("{session}-other");
+    let payload = |s: &str| serde_json::json!({"hook_event_name": "Stop", "session_id": s, "cwd": "/tmp/collide", "transcript_path": ""});
+
+    // Live: recorded under the daemon's clock.
+    let live = HookEvent {
+        source: HookSource::Claude,
+        hold: false,
+        pane_key: None,
+        tmux_pane: None,
+        parent: None,
+        payload: payload(&session),
+        event_id: Some("feedfeed-0001".into()),
+        received_at_ms: None,
+    };
+    assert_eq!(sink.ingest(live).await, HookReply::NoContent);
+
+    // The same event spooled (the script's clock, in seconds), plus another
+    // session's event in a later file.
+    let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let line = |s: &str, id: &str| {
+        serde_json::json!({"v": 1, "source": "claude", "event": "Stop",
+                           "received_at_ms": 1_700_000_000_000_i64, "event_id": id,
+                           "payload": payload(s)})
+        .to_string()
+    };
+    for (name, text) in [
+        ("a.jsonl", line(&session, "feedfeed-0001")),
+        ("b.jsonl", line(&other, "feedfeed-0002")),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("{text}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let report = hook_ingress::drain_spool(home.path(), &sink).await;
+    assert_eq!(report.already_recorded, 1, "{report:?}");
+    assert_eq!(report.replayed, 1, "{report:?}");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "both files are gone"
+    );
+    assert_eq!(provider_events(&store, &session).await, 1, "recorded once");
+    assert_eq!(
+        provider_events(&store, &other).await,
+        1,
+        "the later file drained"
+    );
+}
