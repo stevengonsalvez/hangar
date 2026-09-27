@@ -4612,6 +4612,7 @@ impl AppState {
         // Also try to auto-detect workspace shells from tmux
         self.auto_detect_workspace_shells().await;
 
+        crate::models::workspace::sort_sessions_recent_first(&mut self.sessions.workspaces);
         crate::models::workspace::carry_host_rows(&held, &mut self.sessions.workspaces);
 
         // Reset selection state before setting new selection
@@ -4860,6 +4861,11 @@ impl AppState {
                             // Remove empty workspaces (those that only had SSH sessions)
                             workspaces
                                 .retain(|w| !w.sessions.is_empty() || w.shell_session.is_some());
+                            // In the one order every surface shows, BEFORE the
+                            // comparison below: the scan finds rows in tmux's
+                            // alphabetical order, so comparing unsorted rows
+                            // against sorted ones would call every scan a change.
+                            crate::models::workspace::sort_sessions_recent_first(&mut workspaces);
 
                             info!(
                                 "Separated {} SSH sessions from {} workspaces",
