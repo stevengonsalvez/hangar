@@ -71,7 +71,7 @@ test("a session with no workspace_path falls back to the project path, folding w
   assert.equal(cards[0].sessions.length, 2);
 });
 
-test("cards sort newest created first", () => {
+test("cards keep the frame's order, the order the host's next and previous walk", () => {
   const cards = worktreeCards(
     [
       session({ id: "stale", workspace_path: "/repo/old", created_at: "2024-01-01T00:00:00Z" }),
@@ -79,10 +79,10 @@ test("cards sort newest created first", () => {
     ],
     "/repo",
   );
-  assert.deepEqual(cards.map((card) => card.key), ["/repo/new", "/repo/old"]);
+  assert.deepEqual(cards.map((card) => card.key), ["/repo/old", "/repo/new"], "not newest first");
 });
 
-test("a session missing created_at sorts to the bottom, never throws", () => {
+test("a session missing created_at keeps its place, never throws", () => {
   const cards = worktreeCards(
     [
       session({ id: "no-clock", workspace_path: "/repo/unknown", created_at: undefined as unknown as string }),
@@ -90,7 +90,7 @@ test("a session missing created_at sorts to the bottom, never throws", () => {
     ],
     "/repo",
   );
-  assert.deepEqual(cards.map((card) => card.key), ["/repo/dated", "/repo/unknown"]);
+  assert.deepEqual(cards.map((card) => card.key), ["/repo/unknown", "/repo/dated"]);
 });
 
 test("a card's title, branch and model come from its newest session", () => {
@@ -198,13 +198,13 @@ test("collapsed projects read as empty, and write as a no-op, when storage is ab
   assert.doesNotThrow(() => writeCollapsed(new ThrowingStorage(), new Set(["x"])));
 });
 
-test("opening a session does not move its card: the order is by creation", () => {
+test("opening a session does not move its card: the order is the frame's", () => {
   const sessions = [
     session({ id: "old", workspace_path: "/repo/old", created_at: "2024-01-01T00:00:00Z", last_accessed: "2024-09-01T00:00:00Z" }),
     session({ id: "new", workspace_path: "/repo/new", created_at: "2024-06-01T00:00:00Z", last_accessed: "2024-06-01T00:00:00Z" }),
   ];
   assert.deepEqual(
     worktreeCards(sessions, "/repo").map((card) => card.key),
-    ["/repo/new", "/repo/old"],
+    ["/repo/old", "/repo/new"],
   );
 });
