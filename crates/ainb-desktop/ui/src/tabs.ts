@@ -123,6 +123,33 @@ export function acceleratorAllowedUnderModal(shell: Accelerator): boolean {
   return shell.kind === "new";
 }
 
+/** Whether an open modal refuses `shell`: the one gate the window's keydown
+ * handler and every other path into the shell's chords (a terminal's own key
+ * handler) both ask. */
+export function modalBlocks(shell: Accelerator, modalOpen: boolean): boolean {
+  return modalOpen && !acceleratorAllowedUnderModal(shell);
+}
+
+/**
+ * The window's keydown handler: a shell chord runs, and its key is taken, so
+ * nothing else also acts on it. A chord an open modal refuses is left alone
+ * entirely, not taken and not run: it reaches the focused field, so under the
+ * composer Ctrl+Shift+C and Ctrl+Shift+V still copy and paste off macOS.
+ */
+export function shellKeydown(deps: {
+  mac: boolean;
+  modalOpen(): boolean;
+  run(shell: Accelerator): void;
+}): (event: KeyboardEvent) => void {
+  return (event) => {
+    if (event.defaultPrevented) return;
+    const shell = accelerator(event, deps.mac);
+    if (shell === null || modalBlocks(shell, deps.modalOpen())) return;
+    event.preventDefault();
+    deps.run(shell);
+  };
+}
+
 /** The shape of a focused element this needs: `document.activeElement` fits. */
 interface FocusedLike {
   tagName: string;
