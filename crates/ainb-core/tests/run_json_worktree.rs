@@ -174,6 +174,70 @@ impl World {
             .expect("ainb run")
     }
 
+    /// `ainb --format json run --existing-worktree <tree>`, the argv the
+    /// daemon's `worktree/agent_add` builds: no `--name`, so the tmux name is
+    /// the one `ainb run` picks and the JSON reports.
+    fn add_agent(&self, tool: &str, tree: &Path) -> Output {
+        let path_env = format!(
+            "{}:{}",
+            self.home.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new(env!("CARGO_BIN_EXE_ainb"))
+            .args([
+                "--format",
+                "json",
+                "run",
+                "--tool",
+                tool,
+                "--existing-worktree",
+            ])
+            .arg(tree)
+            .env("HOME", self.home.path())
+            .env("PATH", &path_env)
+            .env("TMUX_TMPDIR", &self.tmux_dir)
+            .env_remove("TMUX")
+            .env_remove("AINB_HOME")
+            .output()
+            .expect("ainb run --existing-worktree")
+    }
+
+    /// Kill a session by the exact tmux name `ainb run` reported.
+    fn kill_exact(&self, tmux_name: &str) {
+        let _ = tmux(
+            &self.tmux_dir,
+            &["kill-session", "-t", &format!("={tmux_name}")],
+        );
+    }
+
+    fn alive_exact(&self, tmux_name: &str) -> bool {
+        tmux(
+            &self.tmux_dir,
+            &["has-session", "-t", &format!("={tmux_name}")],
+        )
+        .status
+        .success()
+    }
+
+    /// The session rows `ainb run` wrote, from the store under this `$HOME`.
+    fn stored_sessions(&self) -> Vec<serde_json::Value> {
+        let path = self.home.path().join(".agents-in-a-box/sessions.json");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let store: serde_json::Value = serde_json::from_str(&text).expect("sessions.json parses");
+        store["sessions"]
+            .as_object()
+            .map(|rows| rows.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// How many `by-session/<uuid>` links exist: one per worktree ainb made.
+    fn by_session_links(&self) -> usize {
+        let dir = self.home.path().join(".agents-in-a-box/worktrees/by-session");
+        std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0)
+    }
+
     fn session_alive(&self, name: &str) -> bool {
         let exact = format!("={}", ainb::tmux::sanitize_session_name(name));
         tmux(&self.tmux_dir, &["has-session", "-t", &exact]).status.success()
@@ -314,4 +378,119 @@ fn run_refuses_base_for_an_existing_branch_and_creates_nothing() {
     let by_session = world.home.path().join(".agents-in-a-box/worktrees/by-session");
     let made = std::fs::read_dir(&by_session).map(|entries| entries.count()).unwrap_or(0);
     assert_eq!(made, 0, "no worktree was created");
+}
+
+/// A second agent joins the worktree a first run made: same tree, same
+/// branch, its own tmux session and session row, and no second
+/// `by-session` link (deleting it would follow the link and remove the tree
+/// the first agent is still working in).
+#[test]
+fn run_json_existing_worktree_adds_a_second_agent_to_the_same_tree() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let world = World::new();
+    let name = format!("run-json-first-{}", std::process::id());
+    let first = world.run("gemini", &name, &["--create-branch", "ainb/shared"]);
+    let Some(created) = one_json_line(&first) else {
+        world.kill(&name);
+        panic!("first run must print one JSON line: {}", describe(&first));
+    };
+    let tree = PathBuf::from(created["worktree_path"].as_str().expect("worktree_path"));
+
+    let second = world.add_agent("claude", &tree);
+    let added = one_json_line(&second);
+    let second_name =
+        added.as_ref().and_then(|v| v["tmux_session_name"].as_str()).map(str::to_string);
+    let first_name = created["tmux_session_name"].as_str().unwrap_or_default();
+    let first_alive = world.alive_exact(first_name);
+    let listed = tmux(&world.tmux_dir, &["list-sessions", "-F", "#{session_name}"]);
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let second_alive = second_name.as_deref().is_some_and(|n| world.alive_exact(n));
+    let rows = world.stored_sessions();
+    let links = world.by_session_links();
+    world.kill(&name);
+    if let Some(second_name) = &second_name {
+        world.kill_exact(second_name);
+    }
+
+    assert!(
+        second.status.success(),
+        "agent add failed: {}",
+        describe(&second)
+    );
+    let added = added.unwrap_or_else(|| {
+        panic!(
+            "stdout must be exactly one JSON line: {}",
+            describe(&second)
+        )
+    });
+    assert_eq!(added["worktree_path"], created["worktree_path"], "{added}");
+    assert_eq!(
+        added["branch"], "ainb/shared",
+        "the tree's own branch: {added}"
+    );
+    assert_ne!(
+        added["tmux_session_name"], created["tmux_session_name"],
+        "a session of its own"
+    );
+    assert_ne!(added["session_id"], created["session_id"]);
+    assert!(first_alive, "the first agent is untouched: live {listed:?}");
+    assert!(second_alive, "the second agent is running: live {listed:?}");
+    let in_tree = rows
+        .iter()
+        .filter(|row| row["worktree_path"] == created["worktree_path"])
+        .count();
+    assert_eq!(in_tree, 2, "two session rows in the one tree: {rows:?}");
+    assert_eq!(links, 1, "only the first run links the tree by session");
+}
+
+/// `--existing-worktree` joins only a tree ainb made: a repository's own
+/// checkout, or a linked worktree outside `worktrees/by-name`, is refused
+/// with nothing started, nothing stored and nothing on stdout.
+#[test]
+fn run_json_existing_worktree_refuses_a_main_checkout_or_an_unmanaged_tree() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let world = World::new();
+    let unmanaged = tempfile::tempdir().expect("unmanaged tempdir");
+    let stray = unmanaged.path().join("stray");
+    git(
+        world.repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "stray",
+            &stray.display().to_string(),
+        ],
+    );
+
+    for (tree, why) in [
+        (world.repo.path().to_path_buf(), "linked git worktree"),
+        (stray, "worktree ainb created"),
+    ] {
+        let out = world.add_agent("gemini", &tree);
+        assert!(!out.status.success(), "must be refused: {}", describe(&out));
+        assert!(
+            out.stdout.iter().all(u8::is_ascii_whitespace),
+            "nothing on stdout when refused: {}",
+            describe(&out)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(why),
+            "the reason is on stderr: {}",
+            describe(&out)
+        );
+    }
+    assert!(world.stored_sessions().is_empty(), "no session was stored");
+    let listed = tmux(&world.tmux_dir, &["list-sessions", "-F", "#{session_name}"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
+        "no tmux session was started"
+    );
 }
