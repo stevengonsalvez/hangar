@@ -301,10 +301,18 @@ impl HookSink for IngestSink {
                 &raw,
                 stored,
             );
-            if !self.ingest.ingest_line(&line.to_string(), now_ms).await {
+            match self.ingest.ingest_line(&line.to_string(), now_ms).await {
+                crate::attention_ingest::IngestLine::Recorded => {}
+                // Recorded before, differently: nothing to add, and a hold on
+                // it is not safe to open twice.
+                crate::attention_ingest::IngestLine::Permanent => {
+                    return HookReply::AlreadyRecorded;
+                }
                 // A store fault: 503 makes a status hook spool the event, and
                 // the next daemon start replays it. A hold never spools.
-                return HookReply::Unavailable;
+                crate::attention_ingest::IngestLine::Transient => {
+                    return HookReply::Unavailable;
+                }
             }
             if event.hold {
                 self.hold(&event, &event_id, now_ms).await

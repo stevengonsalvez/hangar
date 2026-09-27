@@ -91,6 +91,10 @@ pub enum HookReply {
     /// `503`: the event could not be recorded (a store fault). The hook
     /// spools it and the next daemon start replays it.
     Unavailable,
+    /// `204` to a live hook; to a spool drain, "already recorded": the event
+    /// id is on file with different content, so replaying it can never
+    /// succeed and the drain moves on.
+    AlreadyRecorded,
 }
 
 /// Where admitted hook calls go.
@@ -348,7 +352,9 @@ async fn handle(
     });
     drop(hold_permit);
     match reply {
-        HookReply::NoContent => write_response(stream, 204, "text/plain", b"").await,
+        HookReply::NoContent | HookReply::AlreadyRecorded => {
+            write_response(stream, 204, "text/plain", b"").await
+        }
         HookReply::Json(body) => write_response(stream, 200, "application/json", &body).await,
         HookReply::Unavailable => write_response(stream, 503, "text/plain", b"unavailable").await,
     }
