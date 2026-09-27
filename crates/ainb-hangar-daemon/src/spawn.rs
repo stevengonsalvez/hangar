@@ -230,8 +230,9 @@ fn managed_worktrees(home: &Path) -> PathBuf {
 /// manages, cut from a repository inside a registered root, or why not.
 ///
 /// A second agent shares the tree with the first, so every check is against
-/// the disk, not the request: no `.` or `..` components, under the managed
-/// worktree directory, the top of its checkout, a LINKED worktree (its git dir
+/// the disk, not the request: no `.` or `..` components, a direct child of the
+/// managed worktree directory (the only place `ainb run --worktree` puts a
+/// tree, so a worktree nested inside one is refused), the top of its checkout, a LINKED worktree (its git dir
 /// differs from the common one; the main checkout is what `worktree/create`
 /// exists to keep agents out of), and a source repository that
 /// [`resolve_repo`] accepts. `managed` is [`managed_worktrees`], passed in so
@@ -252,13 +253,12 @@ fn resolve_worktree(
             "worktree_path is not a directory on this host: {worktree_path}"
         ))
     })?;
-    let managed = std::fs::canonicalize(managed).ok();
-    if !managed.is_some_and(|dir| canonical.starts_with(&dir) && canonical != dir) {
-        return Err(SpawnError::Invalid(
-            "worktree_path is not a worktree ainb created: it must be under \
-             ~/.agents-in-a-box/worktrees/by-name"
-                .into(),
-        ));
+    let managed_dir = std::fs::canonicalize(managed).ok();
+    if managed_dir.is_none() || canonical.parent() != managed_dir.as_deref() {
+        return Err(SpawnError::Invalid(format!(
+            "worktree_path is not a worktree ainb created: it must be a folder directly in {}",
+            managed.display()
+        )));
     }
     let out = std::process::Command::new("git")
         .arg("-C")
@@ -794,11 +794,29 @@ mod tests {
         refused(&tree.join("../app--feat--1a2b3c4d"), &managed, "..");
         let sub = tree.join("src");
         std::fs::create_dir_all(&sub).unwrap();
-        refused(&sub, &managed, "top of a git worktree");
+        refused(&sub, &managed, "directly in");
+        // In the managed place but inside a checkout, not the top of one.
+        let inside = repo.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+        refused(&inside, &repo, "top of a git worktree");
         // The main checkout, even when it sits where a managed tree would.
-        refused(&repo, &managed, "by-name");
+        refused(&repo, &managed, "directly in");
         refused(&repo, repo.parent().unwrap(), "main checkout");
-        refused(&managed, &managed, "by-name");
+        refused(&managed, &managed, "directly in");
+        // A linked worktree nested inside a managed one is not a tree ainb made.
+        let nested = tree.join("inner");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "inner",
+                &nested.display().to_string(),
+            ],
+        );
+        refused(&nested, &managed, "directly in");
     }
 
     #[test]
