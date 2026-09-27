@@ -735,10 +735,11 @@ fn matches_event(
         // corrupt or truncated (`read_cursor`; `write_cursor` is best-effort).
         // A replayed line older than the retention TTL would rebuild the
         // original payload, mismatch the blanked row, and come back as
-        // `EventIdCollision` -- which `process_line` maps to `LineOutcome::Retry`
-        // and `ingest_once` turns into a `break` that never advances
-        // `committed_end`. The pipeline would then stall on that one line
-        // forever, every pass, behind a single `warn!`.
+        // `EventIdCollision`. `process_line` now maps that to
+        // `LineOutcome::Permanent`, which the tail steps over, so the pipeline
+        // would no longer stall; but the replayed line would be skipped as a
+        // collision instead of recognised as the same event, and logged as
+        // one on every replay.
         && (row.raw_payload.is_empty() || row.raw_payload == event.raw_payload)
         && row.raw_blake3 == raw_blake3
 }
@@ -1297,9 +1298,9 @@ mod tests {
     /// to 0 whenever the file is missing, corrupt or truncated. A replayed line
     /// older than the retention TTL rebuilds the original payload; if that were
     /// compared against the blanked row it would raise `EventIdCollision`,
-    /// which `process_line` maps to `LineOutcome::Retry` and `ingest_once`
-    /// turns into a `break` that never advances the cursor. Hook ingest would
-    /// then stall on that one line forever, behind a single `warn!`.
+    /// which `process_line` maps to `LineOutcome::Permanent` (the tail steps
+    /// over it). Before that mapping this stalled hook ingest on the one line
+    /// forever; today it would skip a legitimate replay as a collision.
     #[tokio::test]
     async fn replaying_an_evicted_event_is_absorbed_not_a_collision() {
         let dir = tempfile::tempdir().unwrap();
