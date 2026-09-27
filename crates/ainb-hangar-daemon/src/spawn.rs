@@ -454,7 +454,13 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
     let home = dirs::home_dir()
         .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
-    let dir = resolve_shell_dir(&params.worktree_path, &home, &managed_worktrees(&home))?;
+    // git and the filesystem, off the async workers.
+    let path = params.worktree_path.clone();
+    let dir = tokio::task::spawn_blocking(move || {
+        resolve_shell_dir(&path, &home, &managed_worktrees(&home))
+    })
+    .await
+    .map_err(|e| SpawnError::Failed(format!("checking the shell's folder: {e}")))??;
     // tmux expands formats in `-c`, so a `#` in a folder name would be read
     // as one (`#S` renames the directory, `#(cmd)` runs a command). `##` is
     // tmux's literal `#`.
