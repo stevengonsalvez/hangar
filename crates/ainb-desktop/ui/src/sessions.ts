@@ -22,7 +22,10 @@ export const NEED_YOU: readonly AttentionKind[] = ["Ask", "Approve", "Wait", "Er
 /** The kinds that block a turn: the header's attention badge counts these. */
 export const BLOCKING: readonly AttentionKind[] = ["Ask", "Wait", "Approve"];
 
-export type RowStatus = "running" | "idle" | "stopped" | "error";
+/** A row's lifecycle as the sidebar reads it. `unknown` is a status this build
+ * has never seen (a host at another version): never guessed into `stopped`,
+ * which would draw a live agent as exited. */
+export type RowStatus = "running" | "idle" | "stopped" | "error" | "unknown";
 
 export function rowStatus(status: SessionStatus): RowStatus {
   if (typeof status === "object") return "error";
@@ -33,9 +36,10 @@ export function rowStatus(status: SessionStatus): RowStatus {
       return "idle";
     case "Stopped":
       return "stopped";
-    // A host at another version may send a status this build does not know.
+    // A host at another version may send a status this build does not know:
+    // said as unknown, not guessed.
     default:
-      return "stopped";
+      return "unknown";
   }
 }
 
