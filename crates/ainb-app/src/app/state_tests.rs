@@ -4066,6 +4066,76 @@ mod tests {
         );
     }
 
+    /// A background scan lands in the one recent-first order, whatever order
+    /// tmux listed the rows in, and `next_session` walks exactly that order.
+    /// Rescanning the same rows is then no change at all: the scan's rows are
+    /// sorted before they are compared, so an unsorted rescan of an
+    /// unchanged list never reframes it.
+    #[test]
+    fn a_scan_lands_recent_first_and_next_session_walks_that_order() {
+        use crate::app::state::WorkspaceLoadResult;
+        use crate::models::{Session, Workspace};
+        use chrono::{TimeZone, Utc};
+
+        let session = |name: &str, worktree: &str, created_s: i64| {
+            let mut session = Session::new(name.to_string(), worktree.to_string());
+            session.created_at = Utc.timestamp_opt(created_s, 0).unwrap();
+            session
+        };
+        // Alphabetical, as `tmux list-sessions` lists them: a1, b, a2.
+        let mut found = Workspace::new("api".to_string(), "/repo/api".into());
+        found.add_session(session("a1", "/repo/api/wt-a", 100));
+        found.add_session(session("b", "/repo/api/wt-b", 200));
+        found.add_session(session("a2", "/repo/api/wt-a", 300));
+
+        let mut state = AppState::new();
+        let tx = state.start_background_workspace_loading();
+        tx.send(WorkspaceLoadResult::Success(vec![found.clone()]))
+            .expect("send load result");
+        assert!(
+            state.check_workspace_loading_complete(),
+            "the scan was applied"
+        );
+
+        // wt-a holds the newest session, so it comes first, both its rows
+        // together, newest first; then wt-b.
+        let names: Vec<String> = state.sessions.workspaces[0]
+            .sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect();
+        assert_eq!(names, ["a2", "a1", "b"]);
+
+        let name_of = |state: &AppState| {
+            state
+                .get_selected_session_id()
+                .and_then(|id| state.find_session(id))
+                .map(|session| session.name.clone())
+        };
+        let mut walked = vec![name_of(&state)];
+        state.next_session();
+        walked.push(name_of(&state));
+        state.next_session();
+        walked.push(name_of(&state));
+        assert_eq!(
+            walked,
+            [
+                Some("a2".to_string()),
+                Some("a1".to_string()),
+                Some("b".to_string())
+            ],
+            "next_session steps through the rows in the order they are shown"
+        );
+
+        // The same rows again, in tmux's order: nothing changed.
+        let tx = state.start_background_workspace_loading();
+        tx.send(WorkspaceLoadResult::Success(vec![found])).expect("send rescan");
+        assert!(
+            !state.check_workspace_loading_complete(),
+            "an unchanged rescan is not a change, whatever order it arrives in"
+        );
+    }
+
     /// The provider id is the scan's to learn: `to_session_model` is its only
     /// writer, so a scan that found one must land it, and a held value is
     /// only the fallback for a scan that found none. Carrying the held value
