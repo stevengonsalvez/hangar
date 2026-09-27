@@ -175,9 +175,12 @@ be removed ({e}); `ainb fleet atc repair {}` re-asserts a single scheduler",
     // Stop hook commits its completion to the parent's inbox. Opt out with
     // `--no-hooks` (tests / poll-only deployments).
     let mut hooks_installed = false;
+    // No `--hooks`: keep whatever transport is installed, so a plain re-run
+    // of setup never reverts an http install to legacy.
     let transport = matches
         .get_one::<String>("hooks")
         .and_then(|raw| plumbing::hooks::HookTransport::parse(raw))
+        .or_else(|| dirs::home_dir().and_then(|h| plumbing::settings::installed_transport(&h)))
         .unwrap_or(plumbing::hooks::HookTransport::Legacy);
     if !matches.get_flag("no-hooks") && transport == plumbing::hooks::HookTransport::Http {
         match install_http_hooks() {
@@ -2780,10 +2783,31 @@ fn notify_home() -> anyhow::Result<std::path::PathBuf> {
     Ok(ainb_plugin_notifyd::paths::Paths::from_home()?.base)
 }
 
-/// Remove the `http` transport marker where notify.sh reads it.
-fn clear_transport_marker() -> anyhow::Result<()> {
-    plumbing::settings::record_transport(&notify_home()?, plumbing::hooks::HookTransport::Legacy)?;
+/// Every home a transport marker is kept under: where notify.sh reads it
+/// (notifyd's resolution) and the hangar home the http hooks are pinned to,
+/// which differ when `AINB_HOME` and `AINB_HANGAR_HOME` do.
+fn marker_homes() -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut homes = vec![notify_home()?];
+    if let Some(hangar) = hook_hangar_home() {
+        if !homes.contains(&hangar) {
+            homes.push(hangar);
+        }
+    }
+    Ok(homes)
+}
+
+/// Write (`Http`) or remove (`Legacy`) the transport marker under every
+/// marker home.
+fn set_transport_marker(transport: plumbing::hooks::HookTransport) -> anyhow::Result<()> {
+    for home in marker_homes()? {
+        plumbing::settings::record_transport(&home, transport)?;
+    }
     Ok(())
+}
+
+/// Remove the `http` transport marker wherever it is kept.
+fn clear_transport_marker() -> anyhow::Result<()> {
+    set_transport_marker(plumbing::hooks::HookTransport::Legacy)
 }
 
 /// `atc setup --hooks=http`: point the managed Claude hooks at `ainb-hook.sh`.
@@ -2803,8 +2827,14 @@ fn install_http_hooks() -> anyhow::Result<()> {
             endpoint.display()
         )
     })?;
-    ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
+    let published = ainb_hangar_proto::hooks::HookEndpoint::parse_env_file(&text)
         .map_err(|e| anyhow::anyhow!("unreadable hook endpoint {}: {e}", endpoint.display()))?;
+    // A crash leaves the endpoint behind: only a live daemon counts.
+    let pid = i32::try_from(published.pid).context("hook endpoint pid out of range")?;
+    anyhow::ensure!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok(),
+        "the hook endpoint names pid {pid}, which is not running; start the hangar daemon with AINB_HANGAR_HOOK_LISTEN=1"
+    );
     anyhow::ensure!(
         hangar_home
             .join("hangar")
@@ -2814,6 +2844,7 @@ fn install_http_hooks() -> anyhow::Result<()> {
     );
     let paths = ainb_plugin_notifyd::paths::Paths::under(hangar_home.clone());
     let script = ainb_plugin_notifyd::install::extract_http_hook_script(&paths)?;
+    let before = plumbing::settings::snapshot_settings(&home)?;
     plumbing::settings::install_claude_hooks_for(
         &home,
         &script,
@@ -2822,24 +2853,18 @@ fn install_http_hooks() -> anyhow::Result<()> {
     )?;
     // Without the marker the plugin's notify.sh would put a second waiter on
     // every PermissionRequest beside the daemon's hold. Never leave http hooks
-    // installed without it: put the legacy set back and report.
-    let marked = notify_home().and_then(|base| {
-        plumbing::settings::record_transport(&base, plumbing::hooks::HookTransport::Http)
-    });
-    if let Err(e) = marked {
-        let legacy_home = home.join(".agents-in-a-box");
-        let legacy = ainb_plugin_notifyd::install::canonical_hook_script(
-            &ainb_plugin_notifyd::paths::Paths::under(&legacy_home),
-        );
-        let rollback = plumbing::settings::install_claude_hooks_for(
-            &home,
-            &legacy,
-            plumbing::hooks::HookTransport::Legacy,
-            &legacy_home,
-        );
-        return Err(e.context(match rollback {
-            Ok(_) => "could not write the http transport marker; the legacy hooks were put back",
-            Err(_) => "could not write the http transport marker, and putting the legacy hooks back failed",
+    // installed without it: put the settings back exactly as they were (the
+    // same bytes, or no file) and report.
+    if let Err(e) = set_transport_marker(plumbing::hooks::HookTransport::Http) {
+        let restored = plumbing::settings::restore_settings(&home, before.as_deref());
+        let _ = clear_transport_marker();
+        return Err(e.context(match restored {
+            Ok(()) => {
+                "could not write the http transport marker; settings.json was restored as it was"
+            }
+            Err(_) => {
+                "could not write the http transport marker, and restoring settings.json failed"
+            }
         }));
     }
     Ok(())
