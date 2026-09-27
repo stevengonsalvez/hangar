@@ -44,6 +44,9 @@ export function ringFor(session: Session_Serialize): AttentionKind | null {
   let ring: AttentionKind | null = null;
   // Optional: a host at another version may not send it.
   for (const mark of session.attention ?? []) {
+    // A kind this build does not know (a host at another version) is
+    // skipped: `indexOf` would read -1 and rank it above every real kind.
+    if (!ATTENTION_ORDER.includes(mark.kind)) continue;
     if (ring === null || ATTENTION_ORDER.indexOf(mark.kind) < ATTENTION_ORDER.indexOf(ring)) ring = mark.kind;
   }
   return ring;
@@ -66,6 +69,14 @@ export function label(text: string): string {
 /** Every session row the Sessions frame lists, across its workspaces. */
 export function allSessions(view: SessionsView_Serialize | undefined): Session_Serialize[] {
   return view?.workspaces.flatMap((workspace) => workspace.sessions) ?? [];
+}
+
+/** The provider session id inside a `provider:session-id` key: `board.ts`'s
+ * join, `status.ts`'s join, and nowhere else, so a third copy never drifts
+ * from the other two. */
+export function providerId(sessionKey: string): string {
+  const at = sessionKey.indexOf(":");
+  return at < 0 ? sessionKey : sessionKey.slice(at + 1);
 }
 
 /**

@@ -64,3 +64,10 @@ test("the selected row is named by id, not by its place in the list", () => {
   assert.equal(isSelected(sessions, "live"), false);
   assert.equal(isSelected(undefined, "boss"), false);
 });
+
+test("a chip kind this build does not know is skipped, never ranked first", () => {
+  const unknown = (marks: string[]) =>
+    ({ ...session("u", "Idle"), attention: marks.map((kind) => ({ kind, detail: null })) }) as unknown as Session_Serialize;
+  assert.equal(ringFor(unknown(["Info", "Done"])), "Done");
+  assert.equal(ringFor(unknown(["Info"])), null);
+});

@@ -3,6 +3,7 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
+import { ackTurn, pruneAcks, readAcks, rowAckKey, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
 import {
@@ -17,7 +18,7 @@ import {
   shellUsage,
   SUBSCRIBED,
 } from "./subscription.ts";
-import { allSessions, label } from "./sessions.ts";
+import { allSessions, label, ringFor } from "./sessions.ts";
 import { ROOT_SELECTORS } from "./selectors.ts";
 import { AcpCard } from "./acp.tsx";
 import { transcriptIntent, transcriptView } from "./acp.ts";
@@ -26,14 +27,16 @@ import { phaseOf, questionFor, type Refusal, sendInOrder } from "./answer.ts";
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
+import { agentStateCounts } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
 import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
-import { boardColumns } from "./board.ts";
 import { Palette } from "./palette.tsx";
 import { createComposerFlow } from "./composer.ts";
+import { cardForSession, statusForTarget } from "./status.ts";
+import { TerminalTab } from "./terminal_tab.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { Titlebar } from "./titlebar.tsx";
@@ -78,6 +81,19 @@ const ATTENTION_SELECTORS = [
 const TOAST_MS = 5000;
 
 const MAC = navigator.userAgent.includes("Mac");
+
+/**
+ * `window.localStorage`, or `undefined` when it is missing, throws (a
+ * private window, blocked site data), or this module evaluates with no
+ * `window` at all: the same guard `sidebar.tsx` and `theme.ts` use.
+ */
+function safeStorage(): AckStorage | undefined {
+  try {
+    return window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
 
 function Shell() {
   const store = createFrameStore(SUBSCRIBED);
@@ -165,6 +181,47 @@ function Shell() {
         focusers.get(key)?.();
       }
     });
+  // Done-until-ack, per viewer: one map, read once from this window's own
+  // storage, shared by the sidebar row, the tab chip and the board card, so
+  // the three surfaces can never disagree about which turn was opened.
+  const [acks, setAcks] = createSignal<AckMap>(readAcks(safeStorage()));
+  const ackSession = (sessionKey: string, turnMarker: number) => {
+    setAcks((current) => {
+      const next = ackTurn(current, sessionKey, turnMarker);
+      if (next !== current) writeAcks(safeStorage(), next);
+      return next;
+    });
+  };
+  // Prune acks to what this window can still see: the cards, and the rows
+  // whose Done is only a chip. A chip that clears drops its row ack, so its
+  // next Done shows again, and storage never grows with every session ever.
+  createEffect(() => {
+    // Not before both frames have landed: an empty first read would prune
+    // every ack this viewer stored last time.
+    const view = agentStatus()?.view;
+    if (view === null || view === undefined || sessions() === undefined) return;
+    const live = new Set<string>(view.cards.map((card) => card.session_key));
+    for (const row of allSessions(sessions())) {
+      if (ringFor(row) === "Done") live.add(rowAckKey(row.id));
+    }
+    setAcks((current) => {
+      const next = pruneAcks(current, live);
+      if (next !== current) writeAcks(safeStorage(), next);
+      return next;
+    });
+  });
+  /** `key`'s own card, when it names a session with one: the join `status.ts`
+   * uses, so opening a tab acks the exact turn its glyph shows. */
+  const cardForTabKey = (key: string) => {
+    const tab = tabs().find((candidate) => candidate.key === key);
+    const target = tab?.target;
+    if (target === undefined || target.kind !== "session") return undefined;
+    const session = allSessions(sessions()).find((row) => row.id === target.id);
+    return session === undefined
+      ? undefined
+      : cardForSession(session, agentStatus()?.view?.cards ?? [], fleet()?.fleet_metadata);
+  };
+
   /**
    * Show `key`'s terminal. `byHost` says who asked: the host, answering a
    * tab open on its own schedule, or a person, by a chord or a click. Every
@@ -178,6 +235,20 @@ function Shell() {
       closeTranscript();
       closeSettings();
       focusTab(key, byHost);
+      // Opening a session acks the Done it shows, on every surface: its
+      // card's turn, or, for a Done that is only a chip, the row itself.
+      const card = cardForTabKey(key);
+      if (card !== undefined) ackSession(card.session_key, card.evidence_observed_at);
+      else {
+        const target = tabs().find((candidate) => candidate.key === key)?.target;
+        // Only a row that shows Done has a Done to ack: acking any other row
+        // would pre-ack the next Done it shows before anyone saw it.
+        const row =
+          target?.kind === "session"
+            ? allSessions(sessions()).find((session) => session.id === target.id)
+            : undefined;
+        if (row !== undefined && ringFor(row) === "Done") ackSession(rowAckKey(row.id), 0);
+      }
     }
   };
   /**
@@ -399,11 +470,7 @@ function Shell() {
         void invoke("renderer_applied", {
           sections: applied,
           sessions: allSessions(store.section(host, "sessions")).length,
-          board: boardColumns(
-            store.section(host, "agent_status"),
-            store.section(host, "fleet"),
-            store.section(host, "sessions"),
-          ).map((column) => [column.state, column.cards.length]),
+          board: agentStateCounts(store.section(host, "agent_status")?.view?.cards ?? []),
           inbox: inboxCounts(store.section(host, "inbox")),
         });
       }
@@ -477,6 +544,12 @@ function Shell() {
     ),
   );
 
+  /** The glyph a session tab shows before its title: `null` for a bare tmux
+   * tab, or a session this window has not listed yet, the same answer the
+   * sidebar row and the board card read for the very same agent. */
+  const tabStatus = (tab: Tab) =>
+    statusForTarget(tab.target, allSessions(sessions()), agentStatus()?.view?.cards ?? [], fleet()?.fleet_metadata, acks());
+
   /** A tab's title: its session's name when the sidebar knows it. */
   const title = (tab: Tab) => {
     const target = tab.target;
@@ -542,6 +615,9 @@ function Shell() {
             stale={sessionsStale()}
             loading={loading()}
             pending={composer.pending()}
+            cards={agentStatus()?.view?.cards ?? []}
+            fleetMetadata={fleet()?.fleet_metadata}
+            acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
             ref={(element) => (sidebar = element)}
@@ -624,28 +700,14 @@ function Shell() {
               </Show>
               <For each={tabs()}>
                 {(tab) => (
-                  <span
-                    class="tab"
-                    classList={{ active: showing("terminal") && tab.key === active() }}
-                    data-state={tab.state}
-                  >
-                    <button
-                      type="button"
-                      class="tab-title"
-                      aria-current={showing("terminal") && tab.key === active() ? "page" : undefined}
-                      onClick={() => choose(tab)}
-                    >
-                      {title(tab)}
-                    </button>
-                    <button
-                      type="button"
-                      class="tab-close"
-                      aria-label={`Close ${title(tab)}`}
-                      onClick={() => void invoke("terminal_close", { key: tab.key })}
-                    >
-                      ×
-                    </button>
-                  </span>
+                  <TerminalTab
+                    tab={tab}
+                    title={title(tab)}
+                    active={showing("terminal") && tab.key === active()}
+                    status={tabStatus(tab)}
+                    onChoose={() => choose(tab)}
+                    onClose={() => void invoke("terminal_close", { key: tab.key })}
+                  />
                 )}
               </For>
             </nav>
@@ -705,6 +767,8 @@ function Shell() {
                 fleet={fleet()}
                 sessions={sessions()}
                 elsewhere={elsewhere()}
+                acks={acks()}
+                onAck={ackSession}
                 onChoose={dispatch}
                 onOpenTranscript={openTranscript}
               />

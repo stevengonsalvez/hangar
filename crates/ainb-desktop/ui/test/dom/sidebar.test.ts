@@ -10,7 +10,12 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { createComponent, createSignal } from "solid-js";
 import { render } from "solid-js/web";
-import type { Session_Serialize, SessionsView_Serialize } from "../../../../ainb-app/bindings/AppState";
+import type {
+  AgentCardFrame,
+  FleetView_Serialize,
+  Session_Serialize,
+  SessionsView_Serialize,
+} from "../../../../ainb-app/bindings/AppState";
 import type { PendingWorktree } from "../../src/composer.ts";
 import { Sidebar } from "../../src/sidebar.tsx";
 
@@ -81,6 +86,7 @@ async function open(
   first: SessionsView_Serialize = frame(),
   onOpen: (id: string) => void = () => undefined,
   pending: PendingWorktree | null = null,
+  status: { cards?: readonly AgentCardFrame[]; fleetMetadata?: FleetView_Serialize["fleet_metadata"] } = {},
 ) {
   const [held, setHeld] = createSignal(first);
   const [held_pending, setPending] = createSignal(pending);
@@ -97,6 +103,8 @@ async function open(
         get pending() {
           return held_pending();
         },
+        cards: status.cards,
+        fleetMetadata: status.fleetMetadata,
         onOpen,
         onNew() {
           // The composer itself is `main.tsx`'s own test; this only proves
@@ -138,6 +146,41 @@ test("the selected session's row carries aria-current; the others do not", async
   await open(frame({ selected_session_id: "shell-1" }));
   assert.equal(document.querySelector('.session-row[data-session="shell-1"]')?.getAttribute("aria-current"), "true");
   assert.equal(document.querySelector('.session-row[data-session="claude-1"]')?.getAttribute("aria-current"), null);
+});
+
+test("a row's dot reads the same UiStatus its card would (P4)", async () => {
+  const cards: AgentCardFrame[] = [
+    {
+      session_key: "claude:p-1",
+      state: "waiting",
+      wait_kind: "approval",
+      provider: "claude",
+      lifecycle: "RUNNING",
+      transport_health: "HEALTHY",
+      has_open_request: true,
+      turn_complete: false,
+      tier: "hook",
+      evidence_observed_at: 1,
+    } as AgentCardFrame,
+  ];
+  const fleetMetadata = { "claude-1": { provider_session_id: "p-1" } } as unknown as FleetView_Serialize["fleet_metadata"];
+  await open(frame(), undefined, null, { cards, fleetMetadata });
+  const dot = document.querySelector('.session-row[data-session="claude-1"] .status-glyph');
+  assert.equal(dot?.getAttribute("data-status"), "needs-approve");
+  // Never colour alone: the row's own name carries the words.
+  assert.match(
+    document.querySelector('.session-row[data-session="claude-1"]')?.textContent ?? "",
+    /Needs you · approve/,
+  );
+});
+
+test("a row with no matching card falls back to its own ring and lifecycle", async () => {
+  await open();
+  const dot = document.querySelector('.session-row[data-session="claude-1"] .status-glyph');
+  // The fixture session is `Running` (its tmux session is alive) with no
+  // attention chips and no card: nothing says the agent is working, so it
+  // reads unverifiable, never a spinner.
+  assert.equal(dot?.getAttribute("data-status"), "unverifiable");
 });
 
 test("a pending create draws a working card ahead of its project's real cards", async () => {
