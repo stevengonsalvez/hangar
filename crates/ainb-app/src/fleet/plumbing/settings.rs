@@ -144,13 +144,29 @@ pub fn snapshot_settings(home: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 /// Put `<home>/.claude/settings.json` back exactly as [`snapshot_settings`]
-/// found it: the same bytes, or no file. Under the settings lock.
+/// found it (the same bytes, or no file), but only while the file still holds
+/// `written`, the bytes this caller put there. Anything else means another
+/// writer changed it since, and it is left alone. Under the settings lock.
 ///
 /// # Errors
-/// A write or remove error.
-pub fn restore_settings(home: &Path, snapshot: Option<&[u8]>) -> Result<()> {
+/// A read, write or remove error, or the file having changed since.
+pub fn restore_settings(
+    home: &Path,
+    snapshot: Option<&[u8]>,
+    written: Option<&[u8]>,
+) -> Result<()> {
     let _guard = lock_settings(home)?;
     let path = claude_settings_path(home);
+    let now = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    anyhow::ensure!(
+        now.as_deref() == written,
+        "{} changed since setup wrote it; left as is",
+        path.display()
+    );
     match snapshot {
         Some(bytes) => write_settings(&path, bytes),
         None => match std::fs::remove_file(&path) {
