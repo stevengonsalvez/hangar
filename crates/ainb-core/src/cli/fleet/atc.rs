@@ -2849,31 +2849,43 @@ fn install_http_hooks() -> anyhow::Result<()> {
     );
     let paths = ainb_plugin_notifyd::paths::Paths::under(hangar_home.clone());
     let script = ainb_plugin_notifyd::install::extract_http_hook_script(&paths)?;
-    let before = plumbing::settings::snapshot_settings(&home)?;
-    let prior = plumbing::settings::installed_transport(&home);
-    plumbing::settings::install_claude_hooks_for(
+    // Every marker as it is now, so a failure puts each back exactly.
+    let markers = marker_homes()?
+        .into_iter()
+        .map(|h| plumbing::settings::snapshot_transport_marker(&h).map(|m| (h, m)))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let installed = plumbing::settings::install_claude_hooks_for(
         &home,
         &script,
         plumbing::hooks::HookTransport::Http,
         &hangar_home,
     )?;
-    let written = plumbing::settings::snapshot_settings(&home)?;
     // Without the marker the plugin's notify.sh would put a second waiter on
     // every PermissionRequest beside the daemon's hold. Never leave http hooks
-    // installed without it: put the settings back exactly as they were (the
-    // same bytes, or no file) and the marker back to what those settings
-    // need (an http host keeps its marker), then report.
+    // installed without it: put settings.json and every marker back exactly
+    // as they were (an http host keeps its marker), then report, including
+    // any part that could not be put back.
     if let Err(e) = set_transport_marker(plumbing::hooks::HookTransport::Http) {
-        let restored =
-            plumbing::settings::restore_settings(&home, before.as_deref(), written.as_deref());
-        let _ = set_transport_marker(prior.unwrap_or(plumbing::hooks::HookTransport::Legacy));
-        return Err(e.context(match restored {
-            Ok(()) => {
-                "could not write the http transport marker; settings.json was restored as it was"
+        let mut failed = Vec::new();
+        if let Err(r) = plumbing::settings::restore_settings(&home, &installed) {
+            failed.push(format!("restoring settings.json failed: {r:#}"));
+        }
+        for (h, marker) in &markers {
+            if let Err(r) = plumbing::settings::restore_transport_marker(h, marker.as_deref()) {
+                failed.push(format!(
+                    "restoring the transport marker under {} failed: {r:#}",
+                    h.display()
+                ));
             }
-            Err(_) => {
-                "could not write the http transport marker, and restoring settings.json failed"
-            }
+        }
+        return Err(e.context(if failed.is_empty() {
+            "could not write the http transport marker; settings.json and the markers were restored as they were"
+                .to_string()
+        } else {
+            format!(
+                "could not write the http transport marker, and {}",
+                failed.join("; ")
+            )
         }));
     }
     Ok(())
