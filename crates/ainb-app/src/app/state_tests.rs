@@ -4053,7 +4053,13 @@ mod tests {
         );
         assert_eq!(row.recent_logs.as_deref(), Some("agent tick 1"));
         assert_eq!(row.preview_content.as_deref(), Some("agent tick 1"));
-        let new_row = &state.sessions.workspaces[0].sessions[1];
+        // By id, not by place: the list is sorted newest first, so where the
+        // new row lands is the sort's business, not this test's.
+        let new_row = state.sessions.workspaces[0]
+            .sessions
+            .iter()
+            .find(|session| session.id != id)
+            .expect("the new row is listed");
         assert!(
             new_row.live_attention.is_empty(),
             "a row the host never saw stays bare"
