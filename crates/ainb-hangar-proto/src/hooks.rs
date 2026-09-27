@@ -38,6 +38,62 @@ pub const PANE_KEY_HEADER: &str = "X-Ainb-Pane-Key";
 pub const TMUX_PANE_HEADER: &str = "X-Ainb-Tmux-Pane";
 /// Header carrying `$AINB_PARENT_SESSION`.
 pub const PARENT_HEADER: &str = "X-Ainb-Parent";
+/// Header carrying the event id the hook script mints for each call. The
+/// same id is written into a spooled line, so a spooled event that the daemon
+/// did in fact record is not recorded twice when the spool is drained.
+pub const EVENT_ID_HEADER: &str = "X-Ainb-Event-Id";
+
+/// Whether `raw` is a well-formed script-minted event id: 8 to 64 characters
+/// of `[A-Za-z0-9-]` (a UUID in either case, or a hex string).
+#[must_use]
+pub fn is_valid_event_id(raw: &str) -> bool {
+    (8..=64).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// One line of a hook spool file (`<hangar_home>/hangar/hook-spool/*.jsonl`),
+/// written by the hook script when the daemon did not record the event.
+/// Lenient: unknown fields are ignored and optional ones default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpoolLine {
+    /// Spool line format version; `1`.
+    #[serde(default)]
+    pub v: u32,
+    /// The hook source's wire spelling (`claude`, `codex`, ...).
+    pub source: String,
+    /// The hook event name the managed entry named.
+    #[serde(default)]
+    pub event: String,
+    /// `$AINB_PANE_KEY`, possibly empty.
+    #[serde(default)]
+    pub pane_key: String,
+    /// `$TMUX_PANE`, possibly empty.
+    #[serde(default)]
+    pub tmux_pane: String,
+    /// `$AINB_PARENT_SESSION`, possibly empty.
+    #[serde(default)]
+    pub parent: String,
+    /// When the script spooled it (epoch milliseconds).
+    #[serde(default)]
+    pub received_at_ms: i64,
+    /// The script-minted event id ([`EVENT_ID_HEADER`]); absent in lines
+    /// from scripts that predate it.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    /// The raw hook payload.
+    pub payload: serde_json::Value,
+}
+
+/// Whether a spooled event may be replayed. Tool events and anything that
+/// can hold are never replayed: a replayed approval would be a phantom, and a
+/// late tool event would move a session backwards. The script never spools
+/// them; the daemon refuses them anyway.
+#[must_use]
+pub fn is_replayable(event: &str) -> bool {
+    !matches!(
+        event,
+        "PermissionRequest" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+    )
+}
 
 /// The 15 managed Claude Code events: Orca's 13 plus `Notification` and
 /// `Elicitation` (both status-only).
@@ -507,5 +563,57 @@ mod tests {
             serde_json::from_str::<HookSource>("\"gemini\"").unwrap(),
             HookSource::Unknown
         );
+    }
+
+    #[test]
+    fn event_ids_are_uuids_or_hex() {
+        assert!(is_valid_event_id("5e0c8a51-3d7b-4d0e-9c1a-7b4e2f6a9d10"));
+        assert!(is_valid_event_id("5E0C8A51-3D7B-4D0E-9C1A-7B4E2F6A9D10"));
+        assert!(is_valid_event_id("0123456789abcdef0123456789abcdef"));
+        for bad in [
+            "",
+            "short",
+            "a b c d e f g h",
+            "../../etc/passwd",
+            &"a".repeat(65),
+        ] {
+            assert!(!is_valid_event_id(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_spool_line_parses_with_and_without_an_event_id() {
+        let with = r#"{"v":1,"source":"claude","event":"Stop","pane_key":"","tmux_pane":"%3","parent":"","received_at_ms":1790000000000,"event_id":"5e0c8a51-3d7b-4d0e-9c1a-7b4e2f6a9d10","payload":{"session_id":"s"}}"#;
+        let line: SpoolLine = serde_json::from_str(with).unwrap();
+        assert_eq!(line.event, "Stop");
+        assert_eq!(
+            line.event_id.as_deref(),
+            Some("5e0c8a51-3d7b-4d0e-9c1a-7b4e2f6a9d10")
+        );
+        let without = r#"{"v":1,"source":"codex","event":"Notification","payload":{}}"#;
+        let line: SpoolLine = serde_json::from_str(without).unwrap();
+        assert_eq!(line.event_id, None);
+        assert_eq!(line.received_at_ms, 0);
+    }
+
+    #[test]
+    fn tool_events_and_holds_never_replay() {
+        for event in [
+            "PermissionRequest",
+            "PreToolUse",
+            "PostToolUse",
+            "PostToolUseFailure",
+        ] {
+            assert!(!is_replayable(event), "{event}");
+        }
+        for event in [
+            "SessionStart",
+            "Notification",
+            "Stop",
+            "SessionEnd",
+            "Elicitation",
+        ] {
+            assert!(is_replayable(event), "{event}");
+        }
     }
 }

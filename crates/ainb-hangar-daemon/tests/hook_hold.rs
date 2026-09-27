@@ -25,6 +25,7 @@ struct World {
     store: Store,
     broker: EventBroker,
     running: hook_ingress::Running,
+    sink: Arc<IngestSink>,
 }
 
 impl World {
@@ -44,12 +45,14 @@ impl World {
             store.pool().clone(),
             broker.sink(),
         );
-        let running = hook_ingress::start(home.path(), Arc::new(sink)).await.unwrap();
+        let sink = Arc::new(sink);
+        let running = hook_ingress::start(home.path(), sink.clone()).await.unwrap();
         Self {
             home,
             store,
             broker,
             running,
+            sink,
         }
     }
 
@@ -471,4 +474,46 @@ async fn phones_and_pal_are_refused_approvals_over_rpc_and_desktop_is_not() {
     assert_eq!(status, 200);
     assert!(body.contains("\"allow\""), "{body}");
     ask_hold.abort();
+}
+
+/// Review of #192 (M2): a replayed Stop is history. Drained while a hold is
+/// live in the same session, it must not end that hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_stop_never_ends_a_live_hold() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let w = Arc::new(World::start().await);
+    let s = session("replayed-stop");
+    let held = w.hold(permission(&s, "call-live"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+
+    let dir = w.home.path().join("hangar/hook-spool");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let spooled = dir.join("stale.jsonl");
+    for event in ["Stop", "UserPromptSubmit", "SessionEnd"] {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&spooled).unwrap();
+        writeln!(
+            f,
+            "{}",
+            json!({"v": 1, "source": "claude", "event": event,
+                   "received_at_ms": 1_700_000_000_000_i64,
+                   "event_id": format!("0123456789abcdef-{event}"),
+                   "payload": {"hook_event_name": event, "session_id": s, "cwd": "/tmp/hold-test"}})
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(&spooled, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report = hook_ingress::drain_spool(w.home.path(), &*w.sink).await;
+    assert_eq!(report.replayed, 3, "{report:?}");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!held.is_finished(), "a replayed event ended a live hold");
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.state, "open");
+    assert!(matches!(
+        w.answer(&id, "allow").await,
+        AnswerResult::Delivered { .. }
+    ));
+    assert_eq!(held.await.unwrap().0, 200);
 }

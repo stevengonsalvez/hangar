@@ -78,7 +78,7 @@ use ainb_hangar_proto::events::HangarEvent;
 use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttention};
 use ainb_hangar_store::repo::fleet::AttentionProjection;
 use ainb_hangar_store::repo::fleet_provider_event::{
-    FleetProviderEventRepo, NewFleetProviderEvent,
+    FleetProviderEventError, FleetProviderEventRepo, NewFleetProviderEvent,
 };
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -240,6 +240,27 @@ enum LineOutcome {
     Processed,
     Raised,
     Retry,
+    /// The line's event id is already recorded, fully reduced, with
+    /// different content (timestamps): nothing more to do.
+    Permanent,
+    /// The store refuses this line for good (a CHECK or FK failure, an empty
+    /// event type): no retry can ever succeed.
+    Rejected,
+}
+
+/// What [`AttentionIngest::ingest_line`] did with one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestLine {
+    /// Recorded (or already recorded identically).
+    Recorded,
+    /// Refused for good: the event id is already recorded with different
+    /// content (a replay of an event first recorded live, whose timestamps
+    /// differ). Retrying cannot help; a replay treats it as done.
+    Permanent,
+    /// A store fault; the same line may succeed later.
+    Transient,
+    /// Refused for good as malformed; logged, never retried.
+    Rejected,
 }
 
 impl AttentionIngest {
@@ -385,6 +406,9 @@ impl AttentionIngest {
                         committed_end = line_start;
                     }
                     LineOutcome::Processed => committed_end = line_start,
+                    // A line no retry can ever take is stepped over, so one
+                    // bad line cannot stop the tail for good.
+                    LineOutcome::Permanent | LineOutcome::Rejected => committed_end = line_start,
                     LineOutcome::Retry => break,
                 }
             } else {
@@ -398,10 +422,15 @@ impl AttentionIngest {
     /// Ingest one canonical hook line that arrived outside the tail: the HTTP
     /// hook listener (hooks-and-answers). The same reduction and attention
     /// decision the tail applies, idempotent by the line's `event_id`; no
-    /// cursor moves. `false` is a store fault: the caller answers 503 so the
-    /// hook spools the event for the next daemon start.
-    pub async fn ingest_line(&self, raw: &str, now_ms: i64) -> bool {
-        !matches!(self.process_line(raw, 0, now_ms).await, LineOutcome::Retry)
+    /// cursor moves. [`IngestLine::Transient`] is a store fault: the caller
+    /// answers 503 so the hook spools the event for the next daemon start.
+    pub async fn ingest_line(&self, raw: &str, now_ms: i64) -> IngestLine {
+        match self.process_line(raw, 0, now_ms).await {
+            LineOutcome::Processed | LineOutcome::Raised => IngestLine::Recorded,
+            LineOutcome::Permanent => IngestLine::Permanent,
+            LineOutcome::Rejected => IngestLine::Rejected,
+            LineOutcome::Retry => IngestLine::Transient,
+        }
     }
 
     /// Process one hook line. Store faults return `Retry`, leaving the cursor
@@ -447,30 +476,67 @@ impl AttentionIngest {
         };
         let session_key =
             (!line.session_id.is_empty()).then(|| format!("{provider}:{}", line.session_id));
-        if FleetProviderEventRepo::append(
-            &self.pool,
-            &NewFleetProviderEvent {
-                event_id: event_id.clone(),
-                provider: provider.to_string(),
-                source: match provider {
-                    "claude" => "claude_hook",
-                    "codex" => "codex_hook",
-                    _ => "hook",
+        if line.event_type.is_empty() {
+            tracing::error!(event_id, "hook line with no event type; refused");
+            return LineOutcome::Rejected;
+        }
+        let mut observed_at = if line.ts > 0 { line.ts } else { now_ms };
+        let new_event = |observed_at: i64| NewFleetProviderEvent {
+            event_id: event_id.clone(),
+            provider: provider.to_string(),
+            source: match provider {
+                "claude" => "claude_hook",
+                "codex" => "codex_hook",
+                _ => "hook",
+            }
+            .to_string(),
+            session_key: session_key.clone(),
+            provider_session_id: (!line.session_id.is_empty()).then(|| line.session_id.clone()),
+            observed_at,
+            received_at: now_ms,
+            event_type: line.event_type.clone(),
+            raw_payload: raw_payload.clone(),
+        };
+        match FleetProviderEventRepo::append(&self.pool, &new_event(observed_at)).await {
+            Ok(_) => {}
+            Err(FleetProviderEventError::EventIdCollision { .. }) => {
+                // The same event, recorded before under another clock (a live
+                // call whose later step failed, then its spooled copy). If
+                // that earlier attempt never reduced, finish it: re-append at
+                // the stored time so the append matches, then reduce, which is
+                // idempotent by event id. If it did reduce, it is done.
+                let stored = FleetProviderEventRepo::get(&self.pool, &event_id).await;
+                let Ok(Some(stored)) = stored else {
+                    return LineOutcome::Retry;
+                };
+                if stored.projection_revision.is_some() || stored.event_type != line.event_type {
+                    return LineOutcome::Permanent;
                 }
-                .to_string(),
-                session_key,
-                provider_session_id: (!line.session_id.is_empty()).then(|| line.session_id.clone()),
-                observed_at: if line.ts > 0 { line.ts } else { now_ms },
-                received_at: now_ms,
-                event_type: line.event_type.clone(),
-                raw_payload,
-            },
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("fleet provider event persistence failed");
-            return LineOutcome::Retry;
+                match FleetProviderEventRepo::append(&self.pool, &new_event(stored.observed_at))
+                    .await
+                {
+                    Ok(_) => observed_at = stored.observed_at,
+                    Err(FleetProviderEventError::EventIdCollision { .. }) => {
+                        return LineOutcome::Permanent;
+                    }
+                    Err(error) if error.is_permanent() => {
+                        tracing::error!(error = %error, event_id, "hook line refused by the store");
+                        return LineOutcome::Rejected;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "fleet provider event persistence failed");
+                        return LineOutcome::Retry;
+                    }
+                }
+            }
+            Err(error) if error.is_permanent() => {
+                tracing::error!(error = %error, event_id, "hook line refused by the store");
+                return LineOutcome::Rejected;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "fleet provider event persistence failed");
+                return LineOutcome::Retry;
+            }
         }
         if line.cwd.is_empty() && line.session_id.is_empty() {
             return LineOutcome::Processed;
@@ -508,7 +574,7 @@ impl AttentionIngest {
                 cwd: &line.cwd,
                 event_type: semantic_event,
                 payload: &payload,
-                observed_at: if line.ts > 0 { line.ts } else { now_ms },
+                observed_at,
                 transcript_model,
             };
             let applied = match crate::fleet::apply_hook_with_attention(
