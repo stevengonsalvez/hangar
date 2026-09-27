@@ -9,7 +9,7 @@ import type {
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
-import { attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
+import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -237,4 +237,29 @@ test("a click selects the row without attaching it, then shows the pane it is ab
     { Command: ["session_list.select_tab", { tab: "Ask" }] },
   ]);
   assert.deepEqual(showIntents("u-1", false)[1], { Command: ["session_list.select_tab", { tab: "Preview" }] });
+});
+
+test("the proof line lists every agent state, zero included", () => {
+  // `scripts/proof/d2-board.sh` waits for "waiting is 0": a state with no
+  // cards must still be on the line, or that wait can never succeed.
+  assert.deepEqual(agentStateCounts([]), [
+    ["working", 0],
+    ["waiting", 0],
+    ["idle", 0],
+    ["unverifiable", 0],
+    ["exited", 0],
+  ]);
+  const counted = agentStateCounts([
+    card("a:1", { state: "working" }),
+    card("a:2", { state: "working" }),
+    card("a:3", { state: "idle" }),
+    { state: "paused" } as unknown as AgentCardFrame,
+  ]);
+  assert.deepEqual(counted, [
+    ["working", 2],
+    ["waiting", 0],
+    ["idle", 1],
+    ["unverifiable", 0],
+    ["exited", 0],
+  ], "a state this build does not know is left off, since the host could not parse it back");
 });
