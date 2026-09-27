@@ -95,6 +95,9 @@ pub enum HookReply {
     /// id is on file with different content, so replaying it can never
     /// succeed and the drain moves on.
     AlreadyRecorded,
+    /// `204` to a live hook; to a spool drain, "skip": the store refuses the
+    /// event for good (malformed), and it is logged, never retried.
+    Rejected,
 }
 
 /// Where admitted hook calls go.
@@ -352,7 +355,7 @@ async fn handle(
     });
     drop(hold_permit);
     match reply {
-        HookReply::NoContent | HookReply::AlreadyRecorded => {
+        HookReply::NoContent | HookReply::AlreadyRecorded | HookReply::Rejected => {
             write_response(stream, 204, "text/plain", b"").await
         }
         HookReply::Json(body) => write_response(stream, 200, "application/json", &body).await,

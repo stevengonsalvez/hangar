@@ -313,6 +313,9 @@ impl HookSink for IngestSink {
                 crate::attention_ingest::IngestLine::Transient => {
                     return HookReply::Unavailable;
                 }
+                crate::attention_ingest::IngestLine::Rejected => {
+                    return HookReply::Rejected;
+                }
             }
             if event.hold {
                 self.hold(&event, &event_id, now_ms).await

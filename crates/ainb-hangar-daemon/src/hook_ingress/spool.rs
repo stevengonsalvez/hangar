@@ -257,6 +257,7 @@ async fn drain_text(bytes: &[u8], sink: &dyn HookSink, report: &mut DrainReport)
             // Only a store fault stops the drain.
             HookReply::Unavailable => return Drained::StoreFault,
             HookReply::AlreadyRecorded => report.already_recorded += 1,
+            HookReply::Rejected => report.skipped += 1,
             HookReply::NoContent | HookReply::Json(_) => report.replayed += 1,
         }
     }
