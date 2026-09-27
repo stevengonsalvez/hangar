@@ -9,7 +9,7 @@ import type {
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor } from "./sessions.ts";
+import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor, rowStatus } from "./sessions.ts";
 
 function session(id: string, status: SessionStatus = "Running", marks: AttentionKind[] = []): Session_Serialize {
   return {
@@ -107,4 +107,9 @@ test("a card no session row names reads as a name, never as its raw key", () => 
   assert.equal(keyLabel("legacy:claude:tmux:"), "tmux");
   assert.equal(keyLabel("claude:5f0c9a1e-77aa-4c1d-9e4b-000000000000"), "claude 5f0c9a1e");
   assert.equal(keyLabel("bare"), "bare");
+});
+
+test("a status this build does not know is unknown, never guessed as stopped", () => {
+  assert.equal(rowStatus("Paused" as unknown as SessionStatus), "unknown");
+  assert.equal(rowStatus("Stopped"), "stopped");
 });

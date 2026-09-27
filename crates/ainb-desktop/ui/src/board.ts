@@ -142,9 +142,9 @@ function bucketOf(status: UiStatus): BoardColumnKind | null {
 
 /**
  * The board's columns, in `COLUMNS` order, from the host's own cards mapped
- * through `status.ts`. An exited agent's card never appears (`deriveStatus`
- * returns `null` for it): a process that is gone is not a status a person
- * acts on. Within a column, an agent with something open floats to the top,
+ * through `status.ts`. An exited agent's card never appears (`bucketOf`
+ * returns `null` for its `exited` status): a process that is gone is not a
+ * status a person acts on. Within a column, an agent with something open floats to the top,
  * then by title, so the row that wants a human is the first one read.
  */
 export function boardColumns(

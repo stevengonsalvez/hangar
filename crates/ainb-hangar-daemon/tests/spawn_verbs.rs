@@ -337,13 +337,47 @@ async fn a_name_field_never_reaches_ainb_run() {
     let repo = Registered::new();
     switch_on(&fake_ainb(tools.path(), true));
 
-    let _ =
+    let response =
         call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude", "name": "x" })).await;
-    let argv = std::fs::read_to_string(tools.path().join("argv.txt")).unwrap_or_default();
+    // The fake really ran (an argv that was never written would pass the
+    // check below for the wrong reason), and the create went through.
+    let argv = std::fs::read_to_string(tools.path().join("argv.txt"))
+        .unwrap_or_else(|e| panic!("the fake ainb never ran: {e}; {response}"));
+    assert!(argv.lines().any(|arg| arg == "run"), "{argv:?}");
+    assert!(response["result"]["session_id"].is_string(), "{response}");
     assert!(
         !argv
             .lines()
             .any(|arg| arg == "--name" || arg.starts_with("--name=") || arg == "x"),
         "{argv:?}"
     );
+}
+
+/// `ainb run` writes to files under the daemon's log dir rather than pipes (a
+/// pipe the daemon stops reading kills the run on its next write). The files
+/// are removed once the outcome is read, so creates do not pile up output.
+#[tokio::test]
+async fn a_create_leaves_no_run_output_behind() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let response = call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude" })).await;
+    assert_eq!(
+        response["result"]["tmux_session_name"], "app-11111111",
+        "{response}"
+    );
+    let spawn_logs = repo.home.path().join(".agents-in-a-box/hangar/logs/spawn");
+    assert!(
+        spawn_logs.is_dir(),
+        "the run's output went to {}",
+        spawn_logs.display()
+    );
+    let left: Vec<_> = std::fs::read_dir(&spawn_logs)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(left.is_empty(), "run output left behind: {left:?}");
 }
