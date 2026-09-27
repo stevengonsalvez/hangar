@@ -183,6 +183,11 @@ impl World {
             self.home.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
+        self.add_agent_on_path(tool, tree, &path_env)
+    }
+
+    /// [`Self::add_agent`] with `PATH` set to `path_env` exactly.
+    fn add_agent_on_path(&self, tool: &str, tree: &Path, path_env: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_ainb"))
             .args([
                 "--format",
@@ -194,7 +199,7 @@ impl World {
             ])
             .arg(tree)
             .env("HOME", self.home.path())
-            .env("PATH", &path_env)
+            .env("PATH", path_env)
             .env("TMUX_TMPDIR", &self.tmux_dir)
             .env_remove("TMUX")
             .env_remove("AINB_HOME")
@@ -492,5 +497,58 @@ fn run_json_existing_worktree_refuses_a_main_checkout_or_an_unmanaged_tree() {
     assert!(
         String::from_utf8_lossy(&listed.stdout).trim().is_empty(),
         "no tmux session was started"
+    );
+}
+
+/// A launch that fails after it joined the tree (here tmux cannot be run at
+/// all) takes nothing with it: the tree, its branch, the first agent and the
+/// first session's row all survive, and the failed session leaves no row.
+#[test]
+fn run_json_existing_worktree_failing_after_the_join_deletes_nothing() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let world = World::new();
+    let name = format!("run-json-keep-{}", std::process::id());
+    let first = world.run("gemini", &name, &["--create-branch", "ainb/kept"]);
+    let Some(created) = one_json_line(&first) else {
+        world.kill(&name);
+        panic!("first run must print one JSON line: {}", describe(&first));
+    };
+    let tree = PathBuf::from(created["worktree_path"].as_str().expect("worktree_path"));
+    let first_name = created["tmux_session_name"].as_str().unwrap_or_default().to_string();
+
+    // Only the fake agents on PATH: the provider check passes, the tmux start
+    // cannot.
+    let out = world.add_agent_on_path("gemini", &tree, &world.home.path().display().to_string());
+    let first_alive = world.alive_exact(&first_name);
+    let rows = world.stored_sessions();
+    world.kill_exact(&first_name);
+
+    assert!(
+        !out.status.success(),
+        "must fail without tmux: {}",
+        describe(&out)
+    );
+    assert!(
+        out.stdout.iter().all(u8::is_ascii_whitespace),
+        "nothing on stdout when it fails: {}",
+        describe(&out)
+    );
+    assert!(tree.join(".git").is_file(), "the tree is still there");
+    assert_eq!(
+        git(world.repo.path(), &["branch", "--list", "ainb/kept"])
+            .trim_start_matches(['*', '+', ' ']),
+        "ainb/kept",
+        "the branch is still there"
+    );
+    assert!(first_alive, "the first agent is untouched");
+    assert_eq!(rows.len(), 1, "only the first session's row: {rows:?}");
+    assert_eq!(rows[0]["tmux_session_name"], created["tmux_session_name"]);
+    assert_eq!(
+        world.by_session_links(),
+        1,
+        "the first session's link is kept"
     );
 }
