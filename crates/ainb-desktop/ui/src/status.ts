@@ -21,7 +21,7 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import { isAcked, rowAckKey } from "./acks.ts";
-import { providerId, ringFor, rowStatus } from "./sessions.ts";
+import { legacyTmuxSession, providerId, ringFor, rowStatus } from "./sessions.ts";
 import type { TabTarget } from "./tabs.ts";
 
 /** What a "needs you" card is blocked on. */
@@ -151,20 +151,52 @@ export function deriveStatus(card: CardStatusInput, opts: DeriveStatusOptions = 
 }
 
 /**
- * `session`'s own card, joined the way the board joins one
- * (`fleet_metadata[session.id].provider_session_id` against the provider id
- * in `session_key`, no cwd fallback), or `undefined` when no card matches.
- * Shared by `statusForSession` and by anything that needs the card itself
- * (`main.tsx` acks a tab's session on the same join when it opens it).
+ * Whether `card` is `session`'s own card: the ONE join the board, the sidebar
+ * row and the tab all use, so the same agent reads the same status on each.
+ *
+ * - By provider id: `fleet_metadata[session.id].provider_session_id` against
+ *   the provider id in `session_key`. No cwd fallback.
+ * - Else, for a legacy card (`legacy:<provider>:<target>:<fingerprint>`,
+ *   `SessionKey::legacy`), which carries no provider id: the tmux session its
+ *   target names against the row's `tmux_session_name`.
+ */
+export function cardBelongsTo(
+  card: AgentCardFrame,
+  session: Session_Serialize,
+  metadata: Readonly<Record<string, SessionFleetMetadata>> | undefined,
+): boolean {
+  const providerSessionId = metadata?.[session.id]?.provider_session_id;
+  if (providerSessionId !== null && providerSessionId !== undefined && providerId(card.session_key) === providerSessionId) {
+    return true;
+  }
+  const legacy = legacyTmuxSession(card.session_key);
+  return legacy !== null && session.tmux_session_name === legacy;
+}
+
+/**
+ * `session`'s own card by [`cardBelongsTo`], or `undefined` when none
+ * matches. A card joined by provider id wins over a legacy one: it is the
+ * exact identity, the tmux session only the place it was last seen. Shared by
+ * `statusForSession` and by anything that needs the card itself (`main.tsx`
+ * acks a tab's session on the same join when it opens it).
  */
 export function cardForSession(
   session: Session_Serialize,
   cards: readonly AgentCardFrame[],
   metadata: Readonly<Record<string, SessionFleetMetadata>> | undefined,
 ): AgentCardFrame | undefined {
-  const providerSessionId = metadata?.[session.id]?.provider_session_id;
-  if (providerSessionId === null || providerSessionId === undefined) return undefined;
-  return cards.find((candidate) => providerId(candidate.session_key) === providerSessionId);
+  const matches = cards.filter((card) => cardBelongsTo(card, session, metadata));
+  return matches.find((card) => legacyTmuxSession(card.session_key) === null) ?? matches[0];
+}
+
+/** The session row `card` belongs to by [`cardBelongsTo`], or `undefined`:
+ * the board's side of the same join. */
+export function sessionForCard(
+  card: AgentCardFrame,
+  sessions: readonly Session_Serialize[],
+  metadata: Readonly<Record<string, SessionFleetMetadata>> | undefined,
+): Session_Serialize | undefined {
+  return sessions.find((session) => cardBelongsTo(card, session, metadata));
 }
 
 /**
