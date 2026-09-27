@@ -37,10 +37,10 @@ bundled = ["app", "tauri/custom-protocol"]
 # WebDriver symbol and binds no driver port. The journey drives a window
 # serving its own frontend, so this implies `bundled`.
 wdio = ["bundled", "dep:tauri-plugin-wdio-webdriver"]
-# Derives `specta::Type` on the two shapes that cross the IPC seam and exposes
-# `bindings`, which renders `Desktop.ts`. Off in every normal build; the CI
+# Derives `specta::Type` on the shapes that cross the IPC seam (the proto's
+# `SpawnAgent` included) and exposes `bindings`, which renders `Desktop.ts`. Off in every normal build; the CI
 # desktop workflow builds with it and diffs the output.
-typescript-bindings = ["dep:specta", "dep:specta-serde", "dep:specta-typescript"]
+typescript-bindings = ["dep:specta", "dep:specta-serde", "dep:specta-typescript", "ainb-hangar-proto/typescript-bindings"]
 # The updater's test seams (`Updater::with_key`, the `Verify::Key` arm). On
 # only through this crate's own dev-dependency below, so `cargo test` has
 # them and no bundle or `cargo build` does; a release build that carries the
@@ -65,7 +65,7 @@ tempfile = "3"
 tokio = { version = "1.36", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
-uuid = { version = "1.5", features = ["serde"] }
+uuid = { version = "1.5", features = ["serde", "v4"] }
 tauri = { version = "~2.11.5", optional = true }
 # The native confirmation in front of the onboarding writes (#1175): a message
 # dialog the OS draws, which the webview's script cannot click. Rust side only;
