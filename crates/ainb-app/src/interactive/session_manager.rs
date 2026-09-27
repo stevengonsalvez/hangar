@@ -3433,7 +3433,6 @@ impl InteractiveSessionManager {
     }
 }
 
-/// Convert InteractiveSession to Session model for UI
 /// One `tmux list-sessions -F "#{session_name}\t#{session_created}"` line:
 /// the session's name, and when tmux made it, or `None` for a line that
 /// carries no readable time (an older tmux, or a plain name).
@@ -3451,6 +3450,7 @@ fn parse_session_line(line: &str) -> (&str, Option<DateTime<Utc>>) {
     }
 }
 
+/// Convert InteractiveSession to Session model for UI
 impl InteractiveSession {
     pub fn to_session_model(&self) -> Session {
         let mut session = Session::new_with_options(
