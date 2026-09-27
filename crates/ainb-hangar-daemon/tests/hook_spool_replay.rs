@@ -171,7 +171,7 @@ async fn spooled_status_replays_once_and_holds_never_do() {
 /// the store reports an id collision. The drain must count it as already
 /// recorded and go on to the next file, not stop on it forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_event_recorded_live_then_spooled_does_not_block_the_drain() {
+async fn a_fully_reduced_live_event_then_spooled_does_not_block_the_drain() {
     use ainb_hangar_daemon::hook_ingress::{HookEvent, HookReply, HookSink};
     use ainb_hangar_proto::hooks::HookSource;
     use std::os::unix::fs::PermissionsExt as _;
@@ -241,5 +241,148 @@ async fn an_event_recorded_live_then_spooled_does_not_block_the_drain() {
         provider_events(&store, &other).await,
         1,
         "the later file drained"
+    );
+}
+
+/// Review of #192 (F1): the real "recorded, then spooled" case. The live call
+/// appended the provider event, then a later step failed and the hook got a
+/// 503 and spooled it, so the stored row was never reduced. The replay must
+/// finish that row's reduction rather than call it done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_appended_but_unreduced_event_is_reduced_by_its_replay() {
+    use ainb_hangar_store::repo::fleet_provider_event::{
+        FleetProviderEventRepo, NewFleetProviderEvent,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).await.unwrap();
+    let broker = EventBroker::new();
+    let ingest = AttentionIngest::new(
+        store.pool().clone(),
+        broker.sink(),
+        home.path().join("events.jsonl"),
+        home.path().join("cursor"),
+    );
+    let sink = IngestSink::new(
+        ingest,
+        home.path().to_path_buf(),
+        store.pool().clone(),
+        broker.sink(),
+    );
+    let session = format!("unreduced-{}", std::process::id());
+    let payload = serde_json::json!({
+        "hook_event_name": "Stop", "session_id": session, "cwd": "/tmp/unreduced", "transcript_path": ""
+    });
+
+    // What the live call left behind: the append, under the daemon clock,
+    // with no projection.
+    FleetProviderEventRepo::append(
+        store.pool(),
+        &NewFleetProviderEvent {
+            event_id: "hook-feedfeed-0003".into(),
+            provider: "claude".into(),
+            source: "claude_hook".into(),
+            session_key: Some(format!("claude:{session}")),
+            provider_session_id: Some(session.clone()),
+            observed_at: 1_790_000_000_123,
+            received_at: 1_790_000_000_123,
+            event_type: "Stop".into(),
+            raw_payload: payload.to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let before = FleetRepo::get_session(store.pool(), &format!("claude:{session}"))
+        .await
+        .unwrap();
+    assert!(before.is_none(), "nothing reduced yet");
+
+    // Its spooled copy, under the script clock.
+    let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("u.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n",
+            serde_json::json!({"v": 1, "source": "claude", "event": "Stop",
+                               "received_at_ms": 1_790_000_000_000_i64,
+                               "event_id": "feedfeed-0003", "payload": payload})
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let report = hook_ingress::drain_spool(home.path(), &sink).await;
+    assert_eq!(
+        (report.replayed, report.already_recorded),
+        (1, 0),
+        "{report:?}"
+    );
+    let row = FleetProviderEventRepo::get(store.pool(), "hook-feedfeed-0003")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.projection_revision.is_some(),
+        "the replay reduced the stored event"
+    );
+    assert_eq!(
+        row.observed_at, 1_790_000_000_123,
+        "under its original time"
+    );
+    assert!(
+        FleetRepo::get_session(store.pool(), &format!("claude:{session}"))
+            .await
+            .unwrap()
+            .is_some(),
+        "the session now exists"
+    );
+    assert_eq!(
+        provider_events(&store, &session).await,
+        1,
+        "still one event"
+    );
+}
+
+/// Review of #192 (F2): a line the store refuses for good is skipped with an
+/// error, not counted as already recorded, and the drain goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_line_is_skipped_not_called_recorded() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = tempfile::tempdir().unwrap();
+    let store = Store::open_in(home.path()).await.unwrap();
+    let broker = EventBroker::new();
+    let ingest = AttentionIngest::new(
+        store.pool().clone(),
+        broker.sink(),
+        home.path().join("events.jsonl"),
+        home.path().join("cursor"),
+    );
+    let sink = IngestSink::new(
+        ingest,
+        home.path().to_path_buf(),
+        store.pool().clone(),
+        broker.sink(),
+    );
+    let dir = home.path().join("hangar").join(SPOOL_DIR_NAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join("m.jsonl");
+    let empty_event = serde_json::json!({"v": 1, "source": "claude", "event": "Notification",
+        "event_id": "badbadba-0001",
+        "payload": {"hook_event_name": "", "session_id": "m1"}});
+    let good = serde_json::json!({"v": 1, "source": "claude", "event": "Stop",
+        "event_id": "badbadba-0002",
+        "payload": {"hook_event_name": "Stop", "session_id": "m1", "cwd": "/tmp/m"}});
+    std::fs::write(&path, format!("{empty_event}\n{good}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report = hook_ingress::drain_spool(home.path(), &sink).await;
+    assert_eq!(
+        (report.skipped, report.already_recorded, report.replayed),
+        (1, 0, 1),
+        "{report:?}"
     );
 }
