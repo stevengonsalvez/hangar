@@ -491,7 +491,9 @@ fn delete_created_branch(repo: &std::path::Path, branch: Option<&str>) {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
-    if !deleted {
+    // Only a branch that is really still there is worth a note: one the run
+    // never got as far as creating (or that is already gone) needs nothing.
+    if !deleted && local_branch_exists(repo, branch) {
         eprintln!(
             "note: could not delete branch '{branch}' this run created; remove it with git branch -D"
         );
@@ -953,6 +955,62 @@ fn attach_to_session(session_name: &str) -> Result<()> {
 
     // If exec returns, it means it failed
     anyhow::bail!("Failed to attach to session: {err}")
+}
+
+#[cfg(test)]
+mod rollback_tests {
+    use super::{delete_created_branch, local_branch_exists};
+    use std::process::Command;
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn the_rollback_deletes_the_branch_the_run_created() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        git(repo.path(), &["branch", "ainb/made-by-run"]);
+        assert!(local_branch_exists(repo.path(), "ainb/made-by-run"));
+
+        delete_created_branch(repo.path(), Some("ainb/made-by-run"));
+        assert!(
+            !local_branch_exists(repo.path(), "ainb/made-by-run"),
+            "the rollback deleted it"
+        );
+        assert!(local_branch_exists(repo.path(), "main"), "and nothing else");
+    }
+
+    #[test]
+    fn a_branch_the_run_never_made_is_left_alone() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        git(
+            repo.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        delete_created_branch(repo.path(), Some("ainb/never-made"));
+        delete_created_branch(repo.path(), None);
+        assert!(local_branch_exists(repo.path(), "main"));
+    }
 }
 
 #[cfg(test)]
