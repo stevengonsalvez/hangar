@@ -1934,6 +1934,9 @@ async fn handle(
         // Dark: with the boot switch off this arm does not match and the
         // request falls through to METHOD_NOT_FOUND below.
         methods::WORKTREE_CREATE if crate::spawn::enabled() => handle_worktree_create(req).await,
+        methods::WORKTREE_AGENT_ADD if crate::spawn::enabled() => {
+            handle_worktree_agent_add(req).await
+        }
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown method: {other}"),
@@ -1948,6 +1951,18 @@ async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, R
     let params: ainb_hangar_proto::spawn::WorktreeCreateParams =
         parse_params(req, "WorktreeCreateParams")?;
     match crate::spawn::worktree_create(&params).await {
+        Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `worktree/agent_add`: one more agent in an existing worktree, by the same
+/// CLI path with `--existing-worktree` (see [`crate::spawn`]).
+async fn handle_worktree_agent_add(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::WorktreeAgentAddParams =
+        parse_params(req, "WorktreeAgentAddParams")?;
+    match crate::spawn::worktree_agent_add(&params).await {
         Ok(created) => to_value(&created),
         Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
         Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
