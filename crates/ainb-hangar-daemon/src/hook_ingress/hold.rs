@@ -487,13 +487,21 @@ impl HoldEnd {
     }
 }
 
+/// What one wait saw: a decision, a release (`Ok(None)`), or the deadline.
+type Waited = Result<Option<HoldDecision>, tokio::time::error::Elapsed>;
+
 impl Waiter {
     /// Wait up to `deadline` for a decision. On any end the hold is dropped
     /// (by `Drop`, once this was its last waiter) so a late answer finds
     /// nothing to resolve.
     pub async fn wait(mut self, deadline: Duration) -> HoldEnd {
+        let got = self.next_decision(deadline).await;
+        self.settle(got)
+    }
+
+    async fn next_decision(&mut self, deadline: Duration) -> Waited {
         let rx = &mut self.rx;
-        let got = tokio::time::timeout(deadline, async {
+        tokio::time::timeout(deadline, async {
             loop {
                 if let Some(d) = rx.borrow_and_update().clone() {
                     return Some(d);
@@ -503,12 +511,35 @@ impl Waiter {
                 }
             }
         })
-        .await;
+        .await
+    }
+
+    fn settle(self, got: Waited) -> HoldEnd {
         match got {
             Ok(Some(d)) => HoldEnd::Decided(self.request.clone(), d),
             Ok(None) => HoldEnd::Released,
-            Err(_) => HoldEnd::TimedOut,
+            Err(_) => self.time_out(),
         }
+    }
+
+    /// The deadline passed. Settled under the registry lock, which
+    /// [`HoldRegistry::resolve`] also delivers under: a decision that landed
+    /// after the timer fired is honoured, since `resolve` has already
+    /// reported it delivered. Otherwise the slot goes now, so no later
+    /// `resolve` can report a delivery this hook never prints.
+    fn time_out(&self) -> HoldEnd {
+        let mut inner = self.registry.lock();
+        if let Some(d) = self.rx.borrow().clone() {
+            return HoldEnd::Decided(self.request.clone(), d);
+        }
+        if inner
+            .slots
+            .get(&self.key)
+            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
+        {
+            inner.remove(&self.key);
+        }
+        HoldEnd::TimedOut
     }
 }
 
@@ -719,6 +750,50 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         reg.cancel(&HoldKey::new("s", "t3"));
         assert_eq!(waiting.await.unwrap(), HoldEnd::Released);
+    }
+
+    /// Review of #196: a `resolve` that lands after the deadline fired but
+    /// before the waiter settles reported DELIVERED while the hook printed
+    /// `{}`. The two now agree whichever way the race goes.
+    #[tokio::test]
+    async fn a_resolve_racing_the_deadline_is_delivered_or_refused_never_lost() {
+        let reg = leaked();
+        // The resolve lands in the window: the hook prints the decision.
+        let mut w = reg
+            .register(
+                &HoldKey::new("s", "late"),
+                "att-late",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let got = w.next_decision(Duration::from_millis(1)).await;
+        assert!(got.is_err(), "the deadline fired");
+        assert!(reg.resolve("att-late", HoldDecision::Allow { message: None }));
+        assert_eq!(
+            w.settle(got),
+            HoldEnd::Decided(HeldRequest::Permission, HoldDecision::Allow { message: None }),
+            "resolve reported a delivery, so the hook must print it"
+        );
+        // The waiter settles first: the slot is gone before it is dropped, so
+        // a later resolve delivers nothing.
+        let mut w = reg
+            .register(
+                &HoldKey::new("s", "early"),
+                "att-early",
+                None,
+                HeldRequest::Permission,
+            )
+            .unwrap();
+        let got = w.next_decision(Duration::from_millis(1)).await;
+        assert_eq!(w.time_out(), HoldEnd::TimedOut);
+        assert!(got.is_err());
+        assert!(
+            !reg.resolve("att-early", HoldDecision::Allow { message: None }),
+            "a hook that timed out takes no answer"
+        );
+        drop(w);
+        assert!(reg.is_empty());
     }
 
     #[test]
