@@ -13610,32 +13610,24 @@ async fn handle_attention_answer(
 ) -> Result<serde_json::Value, RpcError> {
     let mut params: ainb_hangar_proto::snapshots::AnswerParams =
         parse_params(req, "{ attention_id, answer, answered_by, is_answer? }")?;
-    // The kind-based scope gate (review F2): an approval, or an ask that
-    // resolves a live hook hold, takes `fleet/action` Approve's column
-    // verdict. Refused before anything is claimed.
-    if let Some(row) =
-        ainb_hangar_store::repo::attention::AttentionRepo::get(pool, &params.attention_id)
-            .await
-            .map_err(|e| store_err(&e))?
-    {
-        let resolves_hold = crate::hook_ingress::hold::registry().request_for(&row.id).is_some();
-        if !crate::answer_scope::caller_may_answer(caller, row.kind, resolves_hold) {
-            return Err(mutation::rejected(
-                ainb_hangar_proto::mutation::REASON_SCOPE,
-                format!(
-                    "this scope may not answer a {} row (an approval takes fleet/action Approve's verdict)",
-                    row.kind.as_str()
-                ),
-            ));
-        }
-    }
     if let Some(stamp) = crate::answer::answered_by_caller(caller, connection) {
         params.answered_by = stamp;
     }
-    let result = crate::answer::answer(pool, events, &params, SystemClock.now_ms())
+    // The kind-based scope gate (review F2) runs inside `answer_as`, on the
+    // same hold read that picks the delivery path.
+    match crate::answer::answer_as(pool, events, &params, SystemClock.now_ms(), caller)
         .await
-        .map_err(|e| store_err(&e))?;
-    to_value(&result)
+        .map_err(|e| store_err(&e))?
+    {
+        crate::answer::AnswerOutcome::Answered(result) => to_value(&result),
+        crate::answer::AnswerOutcome::ScopeRefused { kind } => Err(mutation::rejected(
+            ainb_hangar_proto::mutation::REASON_SCOPE,
+            format!(
+                "this scope may not answer a {} row (an approval takes fleet/action Approve's verdict)",
+                kind.as_str()
+            ),
+        )),
+    }
 }
 
 /// Dispatch `atc/register` (spec P9, D12): register (or re-register) an ATC
