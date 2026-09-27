@@ -285,10 +285,22 @@ impl HookSink for IngestSink {
         Box::pin(async move {
             let now_ms =
                 ainb_hangar_core::clock::HangarClock::now_ms(&ainb_hangar_core::clock::SystemClock);
-            let event_id = uuid::Uuid::new_v4().to_string();
+            // The script-minted id makes a spooled copy of an event the daemon
+            // already recorded a replay of the same event: the ingest is
+            // idempotent by event id.
+            let event_id = event.event_id.as_deref().map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |id| format!("hook-{id}"),
+            );
             let raw = event.payload.to_string();
             let stored = persist_sidecar(&self.hangar_home, &event_id, &raw).is_ok();
-            let line = event_line(&event, &event_id, now_ms, &raw, stored);
+            let line = event_line(
+                &event,
+                &event_id,
+                event.received_at_ms.unwrap_or(now_ms),
+                &raw,
+                stored,
+            );
             if !self.ingest.ingest_line(&line.to_string(), now_ms).await {
                 // A store fault: 503 makes a status hook spool the event, and
                 // the next daemon start replays it. A hold never spools.
@@ -470,6 +482,8 @@ mod tests {
             tmux_pane: Some("%3".into()),
             parent: Some("parent-1".into()),
             payload,
+            event_id: None,
+            received_at_ms: None,
         }
     }
 
