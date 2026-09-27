@@ -4,6 +4,8 @@
 // write is wrapped: storage can be missing or throw (private window, blocked
 // site data), and the window must still paint, in the system's theme.
 
+import { createSignal, type Accessor } from "solid-js";
+
 /** What a person can pick. */
 export type ThemePreference = "system" | "dark" | "light";
 
@@ -58,28 +60,40 @@ function safeStorage(): ThemeStorage | undefined {
   }
 }
 
+/** The window's theme: the preference a person picked, and how to change it. */
+export interface ThemeControl {
+  /** The current preference, reactive: a settings control reads it. */
+  preference: Accessor<ThemePreference>;
+  /** Pick `next`: stored, and painted at once. */
+  set(next: ThemePreference): void;
+}
+
 /**
  * Paint the stored preference now and follow the system while it is `system`.
- * Returns a setter for a settings control; transitions are held off for two
- * frames around each switch so colours do not cross-fade at different speeds.
+ * Returns the control a settings page reads and sets; transitions are held
+ * off for two frames around each switch so colours do not cross-fade at
+ * different speeds.
  */
-export function startTheme(): (preference: ThemePreference) => void {
+export function startTheme(): ThemeControl {
   const root = document.documentElement;
   const query = window.matchMedia?.("(prefers-color-scheme: dark)");
-  let preference = readPreference(safeStorage());
+  const [preference, setPreference] = createSignal(readPreference(safeStorage()));
   const paint = () => {
     root.classList.add("theme-switching");
-    applyTheme(root, resolveTheme(preference, query?.matches ?? true));
+    applyTheme(root, resolveTheme(preference(), query?.matches ?? true));
     requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
   };
   query?.addEventListener?.("change", () => {
-    if (preference === "system") paint();
+    if (preference() === "system") paint();
   });
   paint();
-  return (next) => {
-    preference = next;
-    writePreference(safeStorage(), next);
-    paint();
+  return {
+    preference,
+    set(next) {
+      setPreference(next);
+      writePreference(safeStorage(), next);
+      paint();
+    },
   };
 }
 
