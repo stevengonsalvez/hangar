@@ -186,12 +186,14 @@ pub struct RunArgs {
     // tree an earlier `run --worktree` made. Nothing git-side is created, so
     // no failure may delete the tree or its branch (another session may be
     // working in it). Hidden while the daemon verb is dark, so `run --help`
-    // and the generated CLI reference stay as they are.
+    // and the generated CLI reference stay as they are. `--name` is refused
+    // with it: starting a tmux session kills one already using the name, and
+    // that could be the first agent in this tree.
     #[arg(
         long,
         value_name = "PATH",
         hide = true,
-        conflicts_with_all = ["repo", "remote_repo", "worktree", "create_branch", "base"]
+        conflicts_with_all = ["repo", "remote_repo", "worktree", "create_branch", "base", "name"]
     )]
     pub existing_worktree: Option<PathBuf>,
 
