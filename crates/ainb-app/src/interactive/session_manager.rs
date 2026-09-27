@@ -2062,9 +2062,10 @@ impl InteractiveSessionManager {
     ) -> Result<Vec<InteractiveSession>, InteractiveSessionError> {
         info!("Discovering Interactive sessions from tmux");
 
-        // Get all tmux sessions
+        // Get all tmux sessions, each with when tmux made it: a row rebuilt
+        // without its store entry takes that as its creation time.
         let output = Command::new("tmux")
-            .args(["list-sessions", "-F", "#{session_name}"])
+            .args(["list-sessions", "-F", "#{session_name}\t#{session_created}"])
             .output()
             .await?;
 
@@ -2078,7 +2079,8 @@ impl InteractiveSessionManager {
         let mut discovered_sessions = Vec::new();
 
         // Filter for our tmux sessions (prefix: tmux_)
-        for tmux_name in tmux_sessions.lines() {
+        for line in tmux_sessions.lines() {
+            let (tmux_name, created) = parse_session_line(line);
             if !tmux_name.starts_with("tmux_") {
                 continue;
             }
@@ -2086,7 +2088,7 @@ impl InteractiveSessionManager {
             debug!("Found tmux session: {}", tmux_name);
 
             // Try to find corresponding worktree
-            if let Ok(session) = self.discover_session_from_tmux(tmux_name, store).await {
+            if let Ok(session) = self.discover_session_from_tmux(tmux_name, created, store).await {
                 discovered_sessions.push(session);
             }
         }
@@ -2103,9 +2105,13 @@ impl InteractiveSessionManager {
     /// Uses a two-phase approach:
     /// 1. First, try to find the session in sessions.json (handles branch-mismatch case)
     /// 2. If not found, fall back to reverse-engineering the branch name from tmux session name
+    ///
+    /// `created` is when tmux made the session, if it said: the only stable
+    /// creation time a phase-2 row has, since it has no store entry.
     async fn discover_session_from_tmux(
         &self,
         tmux_name: &str,
+        created: Option<DateTime<Utc>>,
         store: &SessionStore,
     ) -> Result<InteractiveSession, InteractiveSessionError> {
         // Phase 1: Try to find session in persisted sessions.json
@@ -2206,7 +2212,13 @@ impl InteractiveSessionManager {
                     tmux_session_name: tmux_name.to_string(),
                     branch_name: worktree.branch_name,
                     workspace_name,
-                    created_at: Utc::now(),
+                    // Never `now()`: the list is sorted by creation, so a time
+                    // taken per scan would move this row on every refresh,
+                    // and a store that failed to load would send every row
+                    // here and reshuffle the whole list. tmux's own time, or
+                    // the epoch (the bottom of a newest-first list) when tmux
+                    // gave none.
+                    created_at: created.unwrap_or(DateTime::UNIX_EPOCH),
                     agent_type,
                     skip_permissions: true,
                     model: None,
@@ -3418,6 +3430,23 @@ impl InteractiveSessionManager {
         let otel_prefix = crate::otel::session_otlp_exports();
 
         format!("{headroom_prefix}{otel_prefix}{base}")
+    }
+}
+
+/// One `tmux list-sessions -F "#{session_name}\t#{session_created}"` line:
+/// the session's name, and when tmux made it, or `None` for a line that
+/// carries no readable time (an older tmux, or a plain name).
+fn parse_session_line(line: &str) -> (&str, Option<DateTime<Utc>>) {
+    match line.split_once('\t') {
+        Some((name, created)) => (
+            name,
+            created
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|secs| DateTime::from_timestamp(secs, 0)),
+        ),
+        None => (line, None),
     }
 }
 
@@ -5014,7 +5043,7 @@ trust_level = "trusted"
 
         let manager = InteractiveSessionManager::new().expect("manager");
         let discovered = manager
-            .discover_session_from_tmux(tmux_name, &SessionStore::load())
+            .discover_session_from_tmux(tmux_name, None, &SessionStore::load())
             .await
             .expect("discover persisted session");
         let session = discovered.to_session_model();
@@ -6050,6 +6079,31 @@ trust_level = "trusted"
             failure.to_string().contains("Retry session in 5 seconds"),
             "the user must be told to retry, which is only safe because this is NOT \
              the wedged-store path: {failure:#}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_listed_session_carries_the_time_tmux_made_it() {
+        let (name, created) = parse_session_line("tmux_api-7f3a\t1790000000");
+        assert_eq!(name, "tmux_api-7f3a");
+        assert_eq!(created, DateTime::from_timestamp(1_790_000_000, 0));
+    }
+
+    #[test]
+    fn a_line_without_a_readable_time_keeps_its_name_and_no_time() {
+        assert_eq!(parse_session_line("tmux_api-7f3a"), ("tmux_api-7f3a", None));
+        assert_eq!(
+            parse_session_line("tmux_api-7f3a\t"),
+            ("tmux_api-7f3a", None)
+        );
+        assert_eq!(
+            parse_session_line("tmux_api-7f3a\tsoon"),
+            ("tmux_api-7f3a", None)
         );
     }
 }

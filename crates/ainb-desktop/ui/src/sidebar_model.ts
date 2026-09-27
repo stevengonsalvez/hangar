@@ -98,14 +98,13 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
  * (a card sits where its first session does). Never re-sorted: the host's
  * "Select next session" and "Select previous session" walk the frame's order,
  * so a card drawn anywhere else moves the selection somewhere the eye does not
- * expect, or nowhere at all from what looks like the first row. The frame's
- * order does not follow access time either, so opening a session never moves
- * its card under the pointer.
+ * expect, or nowhere at all from what looks like the first row.
  *
- * Folding still bends that order when one worktree's sessions are not next to
- * each other in the frame: `[a1, b, a2]` draws a1, a2, b while the host walks
- * a1, b, a2. Only a host order that keeps a worktree's sessions together
- * closes that; the renderer cannot without splitting the card.
+ * The host sorts that order recent first and keeps a worktree's sessions
+ * together (`sort_recent_first` in `ainb-app`'s `models/workspace.rs`), so
+ * folding by path never reorders it: the cards are newest first, and what the
+ * host walks is what is drawn. It sorts by creation, not access, so opening a
+ * session never moves its card under the pointer.
  *
  * `fallbackPath` is the project's own path, for a session that carries no
  * `workspace_path` of its own (an older host, a test fixture):
