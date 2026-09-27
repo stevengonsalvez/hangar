@@ -2216,4 +2216,101 @@ mod tests {
         let row = AttentionRepo::get(store.pool(), "p1").await.unwrap().unwrap();
         assert_eq!(row.state, "open");
     }
+
+    /// Review of #196: `resolve_hold_as` judges the caller itself, whatever
+    /// the RPC layer in front of it refuses first. A phone or Pal answering a
+    /// live hold directly is `ScopeRefused`: nothing is claimed, the row
+    /// stays open and the hook keeps waiting.
+    #[tokio::test]
+    async fn resolve_hold_as_refuses_phones_and_pal_on_a_live_hold() {
+        use crate::hook_ingress::hold::{HeldRequest, HoldKey, registry};
+        use crate::rpc::auth::Caller;
+        use ainb_hangar_proto::devices::DeviceScope;
+        use ainb_hangar_proto::fleet::FleetQuestionAnswer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let (_b, sink) = broker_sink();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let question = HeldRequest::from_payload(&serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{
+                "question": "Colour?",
+                "header": "C",
+                "multiSelect": false,
+                "options": [{"label": "Red"}, {"label": "Blue"}]
+            }]}
+        }))
+        .unwrap();
+        let answers = [FleetQuestionAnswer {
+            question_id: "Colour?".to_string(),
+            selected_options: vec!["Blue".to_string()],
+            text: None,
+        }];
+        let cases = [
+            (AttentionKind::Approval, HeldRequest::Permission, HoldAnswer::Allow),
+            (AttentionKind::Approval, HeldRequest::Permission, HoldAnswer::Deny),
+            (AttentionKind::AskUserQuestion, question, HoldAnswer::Answers(&answers)),
+        ];
+        let callers = [
+            Caller::Device {
+                device_id: "phone-1".to_string(),
+                scope: DeviceScope::MOBILE,
+            },
+            Caller::Device {
+                device_id: "phone-2".to_string(),
+                scope: DeviceScope::MOBILE_TYPE,
+            },
+            Caller::Pal {
+                scope_key: "pal-1".to_string(),
+            },
+        ];
+        for (n, (kind, request, answer)) in cases.into_iter().enumerate() {
+            let id = format!("scope-hold-{n}-{nonce}");
+            AttentionRepo::insert(
+                store.pool(),
+                &NewAttention {
+                    id: id.clone(),
+                    session_id: format!("scope-hold-{nonce}"),
+                    cwd: "/work/x".to_string(),
+                    workspace_id: None,
+                    kind,
+                    payload: "{}".to_string(),
+                    degraded: false,
+                    created_at: 1_000,
+                    raise_transcript: None,
+                    channels: ainb_hangar_core::channel::ChannelSet::NONE,
+                },
+            )
+            .await
+            .unwrap();
+            let key = HoldKey::new(&format!("scope-hold-{nonce}"), &format!("call-{n}"));
+            let waiter = registry().register(&key, &id, None, request).unwrap();
+            for caller in &callers {
+                let params = AnswerParams {
+                    attention_id: id.clone(),
+                    answer: String::new(),
+                    answered_by: "test".into(),
+                    is_answer: true,
+                    mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
+                };
+                let out = resolve_hold_as(store.pool(), &sink, &params, 5000, caller, answer)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(out, AnswerOutcome::ScopeRefused { .. }),
+                    "{caller:?} {kind:?}: {out:?}"
+                );
+                assert!(registry().request_for(&id).is_some(), "the hold ended");
+                let row = AttentionRepo::get(store.pool(), &id).await.unwrap().unwrap();
+                assert_eq!(row.state, "open", "{caller:?} claimed the row");
+            }
+            drop(waiter);
+        }
+    }
 }
