@@ -18,8 +18,8 @@ import {
   shellUsage,
   SUBSCRIBED,
 } from "./subscription.ts";
-import { allSessions, label, ringFor } from "./sessions.ts";
-import { ROOT_SELECTORS } from "./selectors.ts";
+import { allSessions, label, NEED_YOU, ringFor } from "./sessions.ts";
+import { ringSelector, ROOT_SELECTORS } from "./selectors.ts";
 import { AcpCard } from "./acp.tsx";
 import { transcriptIntent, transcriptView } from "./acp.ts";
 import { AnswerSlot } from "./answer.tsx";
@@ -68,14 +68,10 @@ import { startTheme } from "./theme/theme.ts";
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
-/** The selectors summed into the status bar's one "N need you" count, in the
- * order the old header drew them as separate badges (D2). */
-const ATTENTION_SELECTORS = [
-  ROOT_SELECTORS.askCount,
-  ROOT_SELECTORS.approveCount,
-  ROOT_SELECTORS.waitCount,
-  ROOT_SELECTORS.errCount,
-] as const;
+/** The selectors summed into the status bar's one "N need you" count: one
+ * per `NEED_YOU` kind, the same list `idleCount` leaves out, so a row is in
+ * one total or the other and never both. */
+const ATTENTION_SELECTORS = NEED_YOU.map(ringSelector);
 
 /** How long a toast stays up. */
 const TOAST_MS = 5000;
