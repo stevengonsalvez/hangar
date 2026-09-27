@@ -28,6 +28,25 @@ use super::attention::{AttentionOption, DaemonAttention, SessionAttention, chip_
 /// only path.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The least time between the starts of two polls, however often the poller
+/// is nudged.
+///
+/// A nudge means "the fleet moved", and a tool-heavy turn moves it several
+/// times a second, one revision per hook. Without a floor every revision would
+/// be an `attention/list` round trip; with it a busy turn costs at most four a
+/// second, and a quiet fleet still costs one per [`POLL_INTERVAL`].
+const NUDGE_FLOOR: Duration = Duration::from_millis(250);
+
+/// Wakes the poller before its interval is up.
+///
+/// The board follows the fleet revision within a frame, while this poller ran
+/// on its own five-second clock, so answering a question cleared the board at
+/// once but left the "need you" count and the Waiting panel up to ten seconds
+/// behind. The host notifies this when it observes a newer revision
+/// (`AppState::observe_agent_status_head`). A `Notify` holds one permit, so a
+/// burst of revisions while a poll is in flight collapses into one more poll.
+pub type Nudge = Arc<tokio::sync::Notify>;
+
 /// The cell the render loop reads and the worker writes.
 pub type Shared = Arc<Mutex<DaemonAttention>>;
 
@@ -58,6 +77,7 @@ pub fn spawn(
     snapshot_shared: &SnapshotShared,
     running: &Arc<AtomicBool>,
     generation: &Generation,
+    nudge: &Nudge,
 ) {
     if running.swap(true, Ordering::AcqRel) {
         return;
@@ -65,6 +85,7 @@ pub fn spawn(
     let shared = Arc::clone(shared);
     let snapshot_shared = Arc::clone(snapshot_shared);
     let generation = Arc::clone(generation);
+    let nudge = Arc::clone(nudge);
     let worker_flag = Arc::clone(running);
     let spawn_err_flag = Arc::clone(running);
     let spawned = std::thread::Builder::new().name("ainb-attention-poll".into()).spawn(move || {
@@ -92,13 +113,22 @@ pub fn spawn(
             // What the last publish carried, so a poll that found the same
             // picture publishes nothing.
             let mut published: Option<(DaemonAttention, Vec<FleetSession>)> = None;
+            let mut snapshot_polled_at: Option<tokio::time::Instant> = None;
             loop {
+                let polled_at = tokio::time::Instant::now();
                 let next = poll_once(&last_good).await;
                 if next.reachable {
                     last_good = next.clone();
                 }
-                if let Some(snapshot) = poll_snapshot_once().await {
-                    last_snapshot = snapshot;
+                // The snapshot stays on the slow clock: it is the whole roster,
+                // for metadata (model, effort, children) no answer changes, so
+                // a nudge that paid for it would turn every busy turn into four
+                // full-roster reads a second.
+                if snapshot_polled_at.is_none_or(|at| polled_at - at >= POLL_INTERVAL) {
+                    snapshot_polled_at = Some(polled_at);
+                    if let Some(snapshot) = poll_snapshot_once().await {
+                        last_snapshot = snapshot;
+                    }
                 }
                 // The generation means "the daemon's picture changed". Every
                 // host treats a bump as news (the attention merge runs at once,
@@ -117,7 +147,7 @@ pub fn spawn(
                     generation.fetch_add(1, Ordering::Release);
                     published = Some((next, last_snapshot.clone()));
                 }
-                tokio::time::sleep(POLL_INTERVAL).await;
+                wait_for_next_poll(&nudge, polled_at).await;
             }
         });
     });
@@ -125,6 +155,16 @@ pub fn spawn(
         tracing::warn!(%error, "attention poller thread spawn failed");
         spawn_err_flag.store(false, Ordering::Release);
     }
+}
+
+/// Wait until the next poll is due: [`POLL_INTERVAL`] after the last one
+/// started, or sooner when nudged, but never sooner than [`NUDGE_FLOOR`].
+async fn wait_for_next_poll(nudge: &tokio::sync::Notify, polled_at: tokio::time::Instant) {
+    tokio::select! {
+        () = tokio::time::sleep_until(polled_at + POLL_INTERVAL) => {}
+        () = nudge.notified() => {}
+    }
+    tokio::time::sleep_until(polled_at + NUDGE_FLOOR).await;
 }
 
 /// Whether a poll found a picture other than the last one published.
@@ -608,5 +648,66 @@ mod tests {
         let up = DaemonAttention::up(grouped);
         let claimed: HashSet<String> = ["a".to_string()].into_iter().collect();
         assert_eq!(up.elsewhere(&claimed), 1);
+    }
+
+    /// The poll loop's cadence alone: counts polls the way `spawn`'s loop
+    /// makes them, with no daemon behind them.
+    fn count_polls(nudge: &Nudge) -> Arc<std::sync::atomic::AtomicUsize> {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (nudge, counter) = (Arc::clone(nudge), Arc::clone(&polls));
+        tokio::spawn(async move {
+            loop {
+                let polled_at = tokio::time::Instant::now();
+                counter.fetch_add(1, Ordering::SeqCst);
+                wait_for_next_poll(&nudge, polled_at).await;
+            }
+        });
+        polls
+    }
+
+    /// Answering a question moves the fleet revision; the next attention poll
+    /// must follow it, not the five-second clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_nudge_polls_before_the_interval() {
+        let nudge = Nudge::default();
+        let polls = count_polls(&nudge);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "only the first poll, un-nudged"
+        );
+
+        nudge.notify_one();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            2,
+            "a nudge polls at once, 4s early"
+        );
+    }
+
+    /// A tool-heavy turn is a revision every few milliseconds; the poller
+    /// answers at most once per floor.
+    #[tokio::test(start_paused = true)]
+    async fn a_burst_of_nudges_polls_at_most_once_per_floor() {
+        let nudge = Nudge::default();
+        let polls = count_polls(&nudge);
+        let window = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < window {
+            nudge.notify_one();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ceiling = 1 + (window.as_millis() / NUDGE_FLOOR.as_millis()) as usize;
+        let polled = polls.load(Ordering::SeqCst);
+        assert!(
+            polled <= ceiling,
+            "{polled} polls in {window:?} exceeds {ceiling}"
+        );
+        assert!(
+            polled >= ceiling - 1,
+            "{polled} polls: the burst must still be served"
+        );
     }
 }
