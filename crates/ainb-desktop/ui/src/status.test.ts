@@ -261,3 +261,22 @@ test("an attention kind this build does not know neither throws nor outranks a r
   assert.doesNotThrow(() => statusForSession(info, [], {}, NO_ACKS));
   assert.deepEqual(statusForSession(info, [], {}, NO_ACKS), { kind: "done" }, "the Done chip still shows");
 });
+
+test("an unknown lifecycle reads unverifiable, never exited", () => {
+  // Exited would hide a live agent behind a word this build merely lacks.
+  const odd = session("s-paused", { status: "Paused" as unknown as Session_Serialize["status"] });
+  assert.deepEqual(statusForSession(odd, [], {}, NO_ACKS), { kind: "unverifiable" });
+});
+
+test("an unknown wire value is warned about once, not on every render", () => {
+  const warn = console.warn;
+  const seen: string[] = [];
+  console.warn = (message: string) => seen.push(message);
+  try {
+    const thawed = { ...input("working", null, false), state: "thawed" as unknown as AgentState };
+    for (let i = 0; i < 3; i += 1) deriveStatus(thawed);
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(seen.filter((message) => message.includes("thawed")).length, 1);
+});
