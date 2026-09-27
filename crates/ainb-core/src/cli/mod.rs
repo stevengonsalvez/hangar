@@ -180,6 +180,21 @@ pub struct RunArgs {
     #[arg(skip)]
     pub json: bool,
 
+    /// Start the session in this existing ainb worktree, on its current branch
+    //
+    // For the hangar daemon's dark `worktree/agent_add`: a second agent in a
+    // tree an earlier `run --worktree` made. Nothing git-side is created, so
+    // no failure may delete the tree or its branch (another session may be
+    // working in it). Hidden while the daemon verb is dark, so `run --help`
+    // and the generated CLI reference stay as they are.
+    #[arg(
+        long,
+        value_name = "PATH",
+        hide = true,
+        conflicts_with_all = ["repo", "remote_repo", "worktree", "create_branch", "base"]
+    )]
+    pub existing_worktree: Option<PathBuf>,
+
     /// AI tool to use
     #[arg(long, value_enum, default_value_t = Tool::Claude)]
     pub tool: Tool,
