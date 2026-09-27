@@ -238,3 +238,32 @@ test("the OpenTelemetry draft survives the page being closed and reopened", asyn
   assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="url"]')?.value, "");
   assert.equal(third.container.querySelector<HTMLInputElement>('.otel input[type="password"]')?.value, "");
 });
+
+test("the settings page draws Appearance > Theme when it is given a setter", async () => {
+  const picked: string[] = [];
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  cleanup = render(
+    () =>
+      createComponent(SettingsPage, {
+        config: frames().config,
+        hangar: frames().hangar,
+        revision: 1,
+        sidecar: { kind: "connected", daemon: "local" } as never,
+        setup: null,
+        run: () => undefined,
+        onSetupWrite: () => undefined,
+        onRefreshSetup: () => undefined,
+        onClose: () => undefined,
+        theme: "dark",
+        onTheme: (next: string) => picked.push(next),
+      }),
+    container,
+  );
+  await settle();
+  const panel = container.querySelector('section[aria-label="Appearance"]');
+  assert.ok(panel, "an Appearance panel");
+  assert.equal(panel.querySelector('[data-theme-choice="dark"]')?.getAttribute("aria-checked"), "true");
+  panel.querySelector<HTMLButtonElement>('[data-theme-choice="light"]')!.click();
+  assert.deepEqual(picked, ["light"]);
+});
