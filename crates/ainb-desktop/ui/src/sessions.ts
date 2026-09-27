@@ -44,6 +44,9 @@ export function ringFor(session: Session_Serialize): AttentionKind | null {
   let ring: AttentionKind | null = null;
   // Optional: a host at another version may not send it.
   for (const mark of session.attention ?? []) {
+    // A kind this build does not know (a host at another version) is
+    // skipped: `indexOf` would read -1 and rank it above every real kind.
+    if (!ATTENTION_ORDER.includes(mark.kind)) continue;
     if (ring === null || ATTENTION_ORDER.indexOf(mark.kind) < ATTENTION_ORDER.indexOf(ring)) ring = mark.kind;
   }
   return ring;
