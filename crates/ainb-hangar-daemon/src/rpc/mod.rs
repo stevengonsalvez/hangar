@@ -5131,6 +5131,24 @@ pub(crate) async fn execute_fleet_action_as(
     events: &EventSink,
     sender: &str,
 ) -> Result<ainb_hangar_proto::fleet::FleetActionReceipt, RpcError> {
+    use ainb_hangar_proto::fleet::ControlAction;
+    // Daemon-internal sends (retry sweep, Pal delivery, broadcast legs) carry
+    // no caller to judge, so they may never answer a request: that needs a
+    // caller's scope, through `execute_fleet_action_by`.
+    if matches!(
+        params.action,
+        ControlAction::Approve { .. }
+            | ControlAction::ApproveForSession { .. }
+            | ControlAction::Deny { .. }
+            | ControlAction::StructuredAnswer { .. }
+            | ControlAction::DismissStructured { .. }
+    ) {
+        return Err(RpcError {
+            code: ainb_hangar_proto::auth::UNAUTHORIZED,
+            message: "an internal fleet send may not answer a provider request".to_string(),
+            data: None,
+        });
+    }
     execute_fleet_action_by(
         pool,
         params,
@@ -5396,8 +5414,28 @@ pub(crate) async fn execute_fleet_action_by(
                     request_fingerprint,
                     ..
                 } if session.provider == "claude" => {
-                    execute_claude_structured_dismiss(pool, events, &session, request_fingerprint)
-                        .await
+                    match fleet_hold_action(
+                        pool,
+                        events,
+                        &session,
+                        request_fingerprint,
+                        crate::answer::HoldAnswer::Deny,
+                        sender,
+                        caller,
+                    )
+                    .await
+                    {
+                        Some(outcome) => outcome,
+                        None => {
+                            execute_claude_structured_dismiss(
+                                pool,
+                                events,
+                                &session,
+                                request_fingerprint,
+                            )
+                            .await
+                        }
+                    }
                 }
                 ControlAction::ReleaseStructured {
                     request_fingerprint,
@@ -5978,8 +6016,19 @@ async fn fleet_hold_action(
     use ainb_hangar_proto::snapshots::AnswerResult;
 
     let provider_session = session.provider_session_id.as_deref()?;
-    let attention_id = crate::hook_ingress::hold::registry()
-        .attention_for_request(provider_session, request_fingerprint)?;
+    let attention_id = match crate::hook_ingress::hold::registry()
+        .find_request(provider_session, request_fingerprint)
+    {
+        crate::hook_ingress::hold::RequestMatch::None => return None,
+        crate::hook_ingress::hold::RequestMatch::One(id) => id,
+        // Never guess, and never fall through to the broker either.
+        crate::hook_ingress::hold::RequestMatch::Ambiguous => {
+            return Some((
+                ActionReceiptStatus::Failed,
+                Some("several held requests match; answer from the inbox".to_string()),
+            ));
+        }
+    };
     let text = match answer {
         HoldAnswer::Allow => "allow".to_string(),
         HoldAnswer::Deny => "deny".to_string(),
