@@ -24,7 +24,7 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import { isAcked } from "./acks.ts";
-import { allSessions, ATTENTION_ORDER, keyLabel, label, providerId } from "./sessions.ts";
+import { allSessions, ATTENTION_ORDER, keyLabel, label, legacyTmuxSession, providerId } from "./sessions.ts";
 import { deriveStatus, elicitationDetail, unhandled, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
@@ -110,6 +110,15 @@ function rowsByProvider(
   return rows;
 }
 
+/** Session rows by the tmux session they run in, for the legacy join. */
+function rowsByTmuxSession(sessions: SessionsView_Serialize | undefined): Map<string, Session_Serialize> {
+  const rows = new Map<string, Session_Serialize>();
+  for (const session of allSessions(sessions)) {
+    if (session.tmux_session_name) rows.set(session.tmux_session_name, session);
+  }
+  return rows;
+}
+
 /** The chips a session row carries, tightest first. */
 function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
   return [...(session?.attention ?? [])]
@@ -155,9 +164,13 @@ export function boardColumns(
 ): BoardColumn[] {
   const models = new Map((fleet?.fleet_snapshot ?? []).map((row) => [row.session_key, row.model]));
   const rows = rowsByProvider(sessions, fleet);
+  const byTmux = rowsByTmuxSession(sessions);
   const cards: BoardCard[] = [];
   for (const card of agentStatus?.view?.cards ?? []) {
-    const session = rows.get(providerId(card.session_key));
+    // A legacy card carries no provider session id, only the tmux target it
+    // was seen in: joined by that, it is named and opens like any other.
+    const legacy = legacyTmuxSession(card.session_key);
+    const session = rows.get(providerId(card.session_key)) ?? (legacy === null ? undefined : byTmux.get(legacy));
     const attention = chipsOf(session);
     const status = deriveStatus(card, {
       attention,
