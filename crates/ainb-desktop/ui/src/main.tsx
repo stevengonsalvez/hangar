@@ -2,7 +2,7 @@ import { render } from "solid-js/web";
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AgentState, FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
+import type { FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, pruneAcks, readAcks, rowAckKey, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
@@ -27,6 +27,7 @@ import { phaseOf, questionFor, type Refusal, sendInOrder } from "./answer.ts";
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
+import { agentStateCounts } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -80,21 +81,6 @@ const ATTENTION_SELECTORS = [
 const TOAST_MS = 5000;
 
 const MAC = navigator.userAgent.includes("Mac");
-
-/**
- * How many cards the agent status frame carries per raw `AgentState`, for
- * the `renderer_applied` proof line only. Deliberately NOT the board's own
- * bucket counts: that Tauri command's `board` argument is typed
- * `Vec<(AgentState, usize)>` on the Rust side, and the board now draws by the
- * operator's four words (needs/working/done/idle), which that enum cannot
- * parse. The wire contract stays what it was; the UI's bucketing lives in
- * `board.ts`.
- */
-function agentStateCounts(cards: readonly { state: AgentState }[]): [AgentState, number][] {
-  const counts = new Map<AgentState, number>();
-  for (const card of cards) counts.set(card.state, (counts.get(card.state) ?? 0) + 1);
-  return [...counts.entries()];
-}
 
 /**
  * `window.localStorage`, or `undefined` when it is missing, throws (a
@@ -255,7 +241,13 @@ function Shell() {
       if (card !== undefined) ackSession(card.session_key, card.evidence_observed_at);
       else {
         const target = tabs().find((candidate) => candidate.key === key)?.target;
-        if (target?.kind === "session") ackSession(rowAckKey(target.id), 0);
+        // Only a row that shows Done has a Done to ack: acking any other row
+        // would pre-ack the next Done it shows before anyone saw it.
+        const row =
+          target?.kind === "session"
+            ? allSessions(sessions()).find((session) => session.id === target.id)
+            : undefined;
+        if (row !== undefined && ringFor(row) === "Done") ackSession(rowAckKey(row.id), 0);
       }
     }
   };
