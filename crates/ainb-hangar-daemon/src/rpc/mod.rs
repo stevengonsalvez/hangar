@@ -1937,6 +1937,7 @@ async fn handle(
         methods::WORKTREE_AGENT_ADD if crate::spawn::enabled() => {
             handle_worktree_agent_add(req).await
         }
+        methods::SHELL_CREATE if crate::spawn::enabled() => handle_shell_create(req).await,
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown method: {other}"),
@@ -1963,6 +1964,18 @@ async fn handle_worktree_agent_add(req: &RpcRequest) -> Result<serde_json::Value
     let params: ainb_hangar_proto::spawn::WorktreeAgentAddParams =
         parse_params(req, "WorktreeAgentAddParams")?;
     match crate::spawn::worktree_agent_add(&params).await {
+        Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `shell/create`: a plain shell tmux session in a repository or worktree
+/// (see [`crate::spawn::shell_create`]).
+async fn handle_shell_create(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::ShellCreateParams =
+        parse_params(req, "ShellCreateParams")?;
+    match crate::spawn::shell_create(&params).await {
         Ok(created) => to_value(&created),
         Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
         Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
