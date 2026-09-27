@@ -4066,6 +4066,55 @@ mod tests {
         );
     }
 
+    /// A session this window creates is the newest, so it lands at the top of
+    /// its workspace (not pushed to the end), selected by id; a repo with no
+    /// workspace yet gets one, at the top of the projects.
+    #[test]
+    fn a_created_session_lands_on_top_and_is_selected() {
+        use crate::models::{Session, Workspace};
+        use chrono::{TimeZone, Utc};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("api");
+        let other = dir.path().join("web");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let at = |secs: i64, name: &str, worktree: &str| {
+            let mut session = Session::new(name.to_string(), worktree.to_string());
+            session.created_at = Utc.timestamp_opt(secs, 0).unwrap();
+            session
+        };
+        let mut api = Workspace::new("api".to_string(), repo.clone());
+        api.add_session(at(100, "old", "/wt/old"));
+        api.add_session(at(200, "mid", "/wt/mid"));
+        let mut state = AppState::new();
+        state.sessions.workspaces = vec![api];
+
+        let created = at(300, "new", "/wt/new");
+        let created_id = created.id;
+        state.insert_created_session(created, &repo, "api".to_string());
+        let names: Vec<&str> = state.sessions.workspaces[0]
+            .sessions
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["new", "mid", "old"],
+            "the new session is on top, not at the end"
+        );
+        assert_eq!(state.get_selected_session_id(), Some(created_id));
+
+        let fresh = at(400, "first", "/wt/first");
+        let fresh_id = fresh.id;
+        state.insert_created_session(fresh, &other, "web".to_string());
+        assert_eq!(
+            state.sessions.workspaces[0].name, "web",
+            "the new project is on top"
+        );
+        assert_eq!(state.get_selected_session_id(), Some(fresh_id));
+    }
+
     /// A background scan lands in the one recent-first order, whatever order
     /// tmux listed the rows in, and `next_session` walks exactly that order.
     /// Rescanning the same rows is then no change at all: the scan's rows are
