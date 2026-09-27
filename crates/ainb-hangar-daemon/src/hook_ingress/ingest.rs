@@ -22,7 +22,6 @@ use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldKey, HoldRegistry};
 use super::{HookEvent, HookReply, HookSink};
 use crate::attention_ingest::AttentionIngest;
 use crate::events::EventSink;
-use ainb_hangar_store::repo::fleet::FleetRepo;
 
 /// `answered_by` on an approval row the agent moved past without an answer
 /// through the daemon (it was answered at the terminal, or the tool ran).
@@ -118,14 +117,11 @@ impl IngestSink {
             events: self.events.clone(),
             holds: self.holds,
         };
-        // The fingerprint `fleet/action` will name this request by: the one
-        // the reducer just stamped on the session, else derived the same way.
-        let fingerprint = FleetRepo::get_session(&self.pool, &format!("claude:{session}"))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|row| row.current_request_fingerprint)
-            .or_else(|| crate::fleet::claude_hold_fingerprint(&event.payload));
+        // The fingerprint `fleet/action` will name this request by, derived
+        // from THIS request's own payload exactly as the reducer derives it.
+        // Never read back from the session row: a second request in the same
+        // session can stamp its own fingerprint there first.
+        let fingerprint = crate::fleet::claude_hold_fingerprint(&event.payload);
         let Some(waiter) =
             self.holds.register(&key, &attention_id, fingerprint.as_deref(), request)
         else {
@@ -255,11 +251,18 @@ impl IngestSink {
             None => self.holds.keys_for_session(session),
         };
         // Retire first, release second: by the time a released hook answers
-        // `{}`, its row already reads resolved:agent.
+        // `{}`, its row already reads resolved:agent. The holds released are
+        // exactly those of the rows retired (one predicate for both), plus
+        // any hold the event's own key names.
+        let mut release = keys;
         if let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await {
-            self.retire_passed(this_call, p, open).await;
+            for id in self.retire_passed(this_call, p, open).await {
+                if let Some(key) = self.holds.key_for_attention(&id) {
+                    release.push(key);
+                }
+            }
         }
-        for key in keys {
+        for key in release {
             self.holds.cancel(&key);
         }
     }
@@ -271,7 +274,8 @@ impl IngestSink {
         this_call: Option<Option<&str>>,
         event: &Value,
         open: Vec<String>,
-    ) {
+    ) -> Vec<String> {
+        let mut retired = Vec::new();
         for id in open {
             let Ok(Some(row)) = AttentionRepo::get(&self.pool, &id).await else {
                 continue;
@@ -296,8 +300,10 @@ impl IngestSink {
             };
             if same_call {
                 self.retire_approval(&id, RESOLVED_BY_AGENT).await;
+                retired.push(id);
             }
         }
+        retired
     }
 }
 
