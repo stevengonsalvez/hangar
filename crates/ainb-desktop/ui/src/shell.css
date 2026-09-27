@@ -567,6 +567,26 @@ body {
   color: var(--muted-foreground);
 }
 
+/* The selected session, after its tab closed: named, with the way back in. */
+.empty-selected {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.empty-selected .empty-name {
+  margin: 0;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.empty-selected .empty-branch {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
 .tabs {
   display: flex;
   align-items: stretch;
