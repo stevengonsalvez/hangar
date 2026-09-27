@@ -408,7 +408,9 @@ body {
   text-align: left;
   cursor: pointer;
   display: grid;
-  grid-template-columns: 8px minmax(0, max-content) minmax(0, 1fr);
+  /* 12px: the glyph's shapes (a question mark, a check, a spinner) need the
+     room to read as shapes rather than as a coloured dot. */
+  grid-template-columns: 12px minmax(0, max-content) minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   padding: 3px 8px;
