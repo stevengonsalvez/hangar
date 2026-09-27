@@ -777,6 +777,7 @@ function Shell() {
                       onAccelerator={onAccelerator}
                       onLeave={() => sidebar?.focus()}
                       focusRef={(focus) => focusers.set(key, focus)}
+                      theme={theme.painted()}
                     />
                   )}
                 </Show>
