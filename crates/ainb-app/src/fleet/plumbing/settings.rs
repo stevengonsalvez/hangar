@@ -215,8 +215,9 @@ pub fn transport_marker_path(ainb_home: &Path) -> PathBuf {
 }
 
 /// The transport marker under `ainb_home` exactly as it is: its bytes, or
-/// `None` when there is none (also when `hooks` is not a directory, so no
-/// marker can be there). For [`restore_transport_marker`].
+/// `None` when there is none. A directory at the marker path, or a `hooks`
+/// that is not a directory, is no marker either. For
+/// [`restore_transport_marker`], which leaves such a path as it is.
 ///
 /// # Errors
 /// A read error other than absence.
@@ -227,7 +228,9 @@ pub fn snapshot_transport_marker(ainb_home: &Path) -> Result<Option<Vec<u8>>> {
         Err(e)
             if matches!(
                 e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
             ) =>
         {
             Ok(None)
@@ -256,7 +259,9 @@ pub fn restore_transport_marker(ainb_home: &Path, snapshot: Option<&[u8]>) -> Re
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::IsADirectory
                 ) =>
             {
                 Ok(())
@@ -643,6 +648,15 @@ mod tests {
         std::fs::write(file_home.path().join("hooks"), "not a directory").unwrap();
         assert_eq!(snapshot_transport_marker(file_home.path()).unwrap(), None);
         restore_transport_marker(file_home.path(), None).unwrap();
+
+        let dir_home = TempDir::new().unwrap();
+        std::fs::create_dir_all(transport_marker_path(dir_home.path())).unwrap();
+        assert_eq!(snapshot_transport_marker(dir_home.path()).unwrap(), None);
+        restore_transport_marker(dir_home.path(), None).unwrap();
+        assert!(
+            transport_marker_path(dir_home.path()).is_dir(),
+            "left as it is"
+        );
     }
 
     #[test]
