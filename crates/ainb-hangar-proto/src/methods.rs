@@ -1818,6 +1818,16 @@ pub const TERMINAL_FRAME: &str = "terminal/frame";
 /// Terminal notifications emitted by the daemon, never JSON-RPC request methods.
 pub const TERMINAL_NOTIFICATION_METHODS: &[&str] = &[TERMINAL_FRAME];
 
+/// `worktree/create`: a new worktree with one agent session in it.
+///
+/// Dark: the daemon answers `METHOD_NOT_FOUND` unless
+/// `AINB_HANGAR_SPAWN` is set at boot, and the method is not in the mutation
+/// registry until its flip PR.
+///
+/// Params: [`crate::spawn::WorktreeCreateParams`].
+/// Result: [`crate::spawn::WorktreeCreateResult`].
+pub const WORKTREE_CREATE: &str = "worktree/create";
+
 /// Every daemon method name, in declaration order.
 ///
 /// Single source of truth for the registry tests in this module. The
@@ -2054,6 +2064,7 @@ pub const ALL_METHODS: &[&str] = &[
     // here so they are classified in the scope table like every method.
     HANGAR_ISSUE_CREATE,
     HANGAR_ISSUE_RUN,
+    WORKTREE_CREATE,
 ];
 
 #[cfg(test)]
@@ -2396,6 +2407,7 @@ mod tests {
             TERMINAL_RESIZE,
             HANGAR_ISSUE_CREATE,
             HANGAR_ISSUE_RUN,
+            WORKTREE_CREATE,
         ];
         for m in declared {
             assert!(

@@ -581,6 +581,9 @@ pub static SCOPE_TABLE: &[ScopeRow] = &[
     row(m::TERMINAL_RESIZE, A, A, A, A, D),
     row(m::HANGAR_ISSUE_CREATE, A, A, A, D, D),
     row(m::HANGAR_ISSUE_RUN, A, A, A, D, D),
+    // Creates a worktree and starts an agent on the host: desktop and above.
+    // Phones never spawn work (a watch or type scope cannot start a process).
+    row(m::WORKTREE_CREATE, A, A, A, D, D),
 ];
 
 /// The row for `method`, when it is classified.
