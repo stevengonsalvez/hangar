@@ -56,6 +56,8 @@ enum Reply {
     Daemon,
     /// Accept, read, then say nothing for this long.
     Stall(Duration),
+    /// `503`: the daemon could not record the event.
+    Unavailable,
 }
 
 struct Fake {
@@ -124,6 +126,9 @@ fn serve(mut stream: TcpStream, reply: Reply, tx: &mpsc::Sender<Seen>) {
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{ALLOW}",
             ALLOW.len()
         ),
+        Reply::Unavailable => {
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+        }
         Reply::Stall(d) => {
             thread::sleep(d);
             return;
@@ -680,5 +685,36 @@ fn ainb_home_alone_is_not_the_hangar_home() {
         spool_lines(&home.path().join(".agents-in-a-box")).len(),
         1,
         "it spooled under the default hangar home instead"
+    );
+}
+
+#[test]
+fn every_call_carries_a_fresh_event_id_and_a_spooled_copy_keeps_it() {
+    let f = fake(Reply::Unavailable);
+    let home = home_for(f.port);
+    let (out, _) = fire(
+        home.path(),
+        "Stop",
+        r#"{"hook_event_name":"Stop","session_id":"s-e"}"#,
+        &[("AINB_PANE_KEY", "v1:e1")],
+    );
+    assert_eq!(out, "{}\n");
+    let seen = f.seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    let id = seen.header("X-Ainb-Event-Id").unwrap().to_string();
+    assert!(ainb_hangar_proto::hooks::is_valid_event_id(&id), "{id}");
+    // The daemon answered 503, so the event was spooled under the same id.
+    let lines = spool_lines(home.path());
+    assert_eq!(lines.len(), 1);
+    let v: serde_json::Value = serde_json::from_str(&lines[0].1).unwrap();
+    assert_eq!(v["event_id"], id.as_str());
+    let line: ainb_hangar_proto::hooks::SpoolLine = serde_json::from_str(&lines[0].1).unwrap();
+    assert_eq!(line.event, "Stop");
+
+    fire(home.path(), "Stop", r#"{"hook_event_name":"Stop"}"#, &[]);
+    let second = f.seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_ne!(
+        second.header("X-Ainb-Event-Id").unwrap(),
+        id,
+        "one id per call"
     );
 }
