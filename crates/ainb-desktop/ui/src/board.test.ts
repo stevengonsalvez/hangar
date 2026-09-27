@@ -173,7 +173,7 @@ test("a card takes its row's name and the fleet's model, and one with no row sti
   const stray = working.cards.find((c) => c.key === "claude:p-9");
   assert.ok(stray, "an agent the sidebar has not listed is still on the board");
   assert.equal(stray.sessionId, null);
-  assert.equal(stray.title, "claude:p-9");
+  assert.equal(stray.title, "claude p-9", "named by provider and id, not the raw key");
 });
 
 test("an agent with something open floats to the top of its column", () => {
@@ -262,4 +262,11 @@ test("the proof line lists every agent state, zero included", () => {
     ["unverifiable", 0],
     ["exited", 0],
   ], "a state this build does not know is left off, since the host could not parse it back");
+});
+
+test("a legacy card with no session row is titled by its tmux target", () => {
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const columns = boardColumns(status(card("legacy:claude:hangar-dev:1.0:4242-17", { state: "waiting" })), fleet, sessions, NO_ACKS);
+  const titles = columns.flatMap((column) => column.cards.map((c) => c.title));
+  assert.deepEqual(titles, ["hangar-dev:1.0"]);
 });
