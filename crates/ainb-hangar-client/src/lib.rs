@@ -857,6 +857,16 @@ impl DaemonClient {
         .await
     }
 
+    /// Open a plain shell tmux session in a repository or an ainb worktree
+    /// (`shell/create`). A daemon without the spawn switch answers
+    /// `METHOD_NOT_FOUND`.
+    pub async fn shell_create(
+        &self,
+        params: &ainb_hangar_proto::spawn::ShellCreateParams,
+    ) -> Result<ainb_hangar_proto::spawn::ShellCreateResult, DaemonError> {
+        self.call_typed(methods::SHELL_CREATE, params).await
+    }
+
     /// Upsert one workspace session into the daemon store.
     pub async fn workspace_session_upsert(
         &self,
