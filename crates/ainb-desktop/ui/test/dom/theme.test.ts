@@ -1,7 +1,6 @@
 // Settings > Appearance > Theme, mounted: the switch shows the preference in
-// use, a pick changes what the window paints at once, and the pick is kept
-// for the next launch. Before this, `startTheme`'s setter was dropped, so the
-// window had no way to change theme at all.
+// use, a pick changes what the window paints at once and is kept for the next
+// launch, and while the pick is System the window follows the OS live.
 
 import { settle } from "./window.ts";
 
@@ -20,6 +19,22 @@ Object.defineProperty(globalThis, "requestAnimationFrame", {
   writable: true,
 });
 
+/** A controllable `prefers-color-scheme: dark` query, as the OS would drive it. */
+function fakeSystem(dark: boolean) {
+  const listeners: (() => void)[] = [];
+  const query = {
+    matches: dark,
+    addEventListener: (_: string, listener: () => void) => listeners.push(listener),
+  };
+  Object.defineProperty(window, "matchMedia", { value: () => query, configurable: true, writable: true });
+  return {
+    set(next: boolean) {
+      query.matches = next;
+      for (const listener of listeners) listener();
+    },
+  };
+}
+
 let cleanup: (() => void) | undefined;
 afterEach(() => {
   cleanup?.();
@@ -29,8 +44,9 @@ afterEach(() => {
   document.documentElement.className = "";
 });
 
-const choice = (value: string) =>
-  document.querySelector<HTMLButtonElement>(`.theme-choice[data-theme-choice="${value}"]`)!;
+const radio = (value: string) =>
+  document.querySelector<HTMLInputElement>(`.theme-choice[data-theme-choice="${value}"] input[type="radio"]`)!;
+const painted = () => (document.documentElement.classList.contains("light") ? "light" : "dark");
 
 async function mount() {
   const theme = startTheme();
@@ -50,41 +66,46 @@ async function mount() {
   return theme;
 }
 
-test("the switch offers System, Light and Dark, with the preference in use checked", async () => {
+test("the switch is three native radios, System, Light and Dark, with the preference in use checked", async () => {
+  fakeSystem(true);
   await mount();
-  const group = document.querySelector('[role="radiogroup"][aria-label="Theme"]');
-  assert.ok(group, "one radio group named Theme");
+  const radios = [...document.querySelectorAll<HTMLInputElement>('.theme-switch input[type="radio"]')];
   assert.deepEqual(
-    [...document.querySelectorAll(".theme-choice")].map((button) => button.textContent),
-    ["System", "Light", "Dark"],
+    radios.map((input) => input.value),
+    ["system", "light", "dark"],
   );
-  assert.equal(choice("system").getAttribute("aria-checked"), "true", "nothing stored: the system's");
+  assert.equal(new Set(radios.map((input) => input.name)).size, 1, "one group, so the arrow keys move the choice");
+  assert.equal(radio("system").checked, true, "nothing stored: the system's");
 });
 
-test("picking Light paints light at once, checks it, and keeps it for the next launch", async () => {
-  await mount();
-  choice("light").click();
+test("picking Light paints light at once, the terminal follows, and the pick survives a relaunch", async () => {
+  fakeSystem(true);
+  const theme = await mount();
+  radio("light").click();
   await settle();
-  assert.equal(document.documentElement.classList.contains("light"), true);
-  assert.equal(document.documentElement.classList.contains("dark"), false);
-  assert.equal(choice("light").getAttribute("aria-checked"), "true");
-  assert.equal(choice("system").getAttribute("aria-checked"), "false");
+  assert.equal(painted(), "light");
+  assert.equal(theme.painted(), "light", "the terminals read this");
+  assert.equal(radio("light").checked, true);
   assert.equal(window.localStorage.getItem(THEME_KEY), "light");
 
-  // The next launch starts on the stored pick.
   cleanup?.();
   const again = await mount();
   assert.equal(again.preference(), "light");
-  assert.equal(document.documentElement.classList.contains("light"), true);
+  assert.equal(painted(), "light");
 });
 
-test("picking Dark then System follows the pick each time", async () => {
+test("on System the window follows the OS live; on an explicit pick it does not", async () => {
+  const os = fakeSystem(true);
   const theme = await mount();
-  choice("dark").click();
+  assert.equal(painted(), "dark");
+  os.set(false);
   await settle();
-  assert.equal(document.documentElement.classList.contains("dark"), true);
-  choice("system").click();
+  assert.equal(painted(), "light", "System follows the OS turning light");
+  assert.equal(theme.painted(), "light");
+
+  radio("dark").click();
   await settle();
-  assert.equal(theme.preference(), "system");
-  assert.equal(window.localStorage.getItem(THEME_KEY), "system");
+  os.set(false);
+  await settle();
+  assert.equal(painted(), "dark", "an explicit Dark ignores the OS");
 });
