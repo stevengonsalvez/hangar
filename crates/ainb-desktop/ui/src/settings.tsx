@@ -20,6 +20,8 @@ import {
 } from "./settings.ts";
 import { sidecarDaemonLine, type SidecarState } from "./sidecar.ts";
 import type { RendererIntent } from "./tabs.ts";
+import type { ThemePreference } from "./theme/theme.ts";
+import { ThemeSwitch } from "./theme/theme_switch.tsx";
 
 interface Props {
   /** The config frame the form draws. */
@@ -39,6 +41,10 @@ interface Props {
   /** Read the Setup panel again. */
   onRefreshSetup(): void;
   onClose(): void;
+  /** The theme preference, for the Appearance panel. */
+  theme?: ThemePreference;
+  /** Pick a theme; the Appearance panel draws only when this is given. */
+  onTheme?(next: ThemePreference): void;
 }
 
 /**
@@ -183,6 +189,17 @@ export function SettingsPage(props: Props) {
           </For>
         </div>
       </div>
+      <Show when={props.onTheme}>
+        {(onTheme) => (
+          <section class="appearance-panel" aria-label="Appearance">
+            <h3>Appearance</h3>
+            <div class="appearance-row">
+              <span class="appearance-label">Theme</span>
+              <ThemeSwitch value={props.theme ?? "system"} onChange={(next) => onTheme()(next)} />
+            </div>
+          </section>
+        )}
+      </Show>
       <section class="daemons-panel" aria-label="Daemons">
         <h3>Daemons: runtime health</h3>
         <table>

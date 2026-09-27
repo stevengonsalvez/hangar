@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -6,7 +6,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
 import { tauriTransport } from "./transport.ts";
-import { TERMINAL_COLORS } from "./theme/theme.ts";
+import { TERMINAL_THEMES, type Theme } from "./theme/theme.ts";
 
 interface Props {
   tab: Tab;
@@ -18,6 +18,8 @@ interface Props {
   onLeave(): void;
   /** Hands the parent a way to focus this tab's terminal. */
   focusRef(focus: () => void): void;
+  /** The window's painted theme: the terminal follows it, as Orca's does. */
+  theme: Theme;
 }
 
 /**
@@ -38,7 +40,11 @@ export function TerminalView(props: Props) {
       fontFamily: '"SF Mono", Menlo, "JetBrains Mono", ui-monospace, monospace',
       fontSize: 13,
       scrollback: 5000,
-      theme: TERMINAL_COLORS,
+      theme: TERMINAL_THEMES[props.theme],
+    });
+    // A theme switch repaints an open terminal at once, keeping its buffer.
+    createEffect(() => {
+      term.options.theme = TERMINAL_THEMES[props.theme];
     });
     const fit = new FitAddon();
     term.loadAddon(fit);

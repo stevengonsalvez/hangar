@@ -4,6 +4,8 @@
 // write is wrapped: storage can be missing or throw (private window, blocked
 // site data), and the window must still paint, in the system's theme.
 
+import { createSignal, type Accessor } from "solid-js";
+
 /** What a person can pick. */
 export type ThemePreference = "system" | "dark" | "light";
 
@@ -58,48 +60,117 @@ function safeStorage(): ThemeStorage | undefined {
   }
 }
 
+/** The window's theme: the preference a person picked, and how to change it. */
+export interface ThemeControl {
+  /** The current preference, reactive: a settings control reads it. */
+  preference: Accessor<ThemePreference>;
+  /** The theme actually painted (the preference resolved against the
+   * system's), reactive: the terminals follow it. */
+  painted: Accessor<Theme>;
+  /** Pick `next`: stored, and painted at once. */
+  set(next: ThemePreference): void;
+}
+
 /**
  * Paint the stored preference now and follow the system while it is `system`.
- * Returns a setter for a settings control; transitions are held off for two
- * frames around each switch so colours do not cross-fade at different speeds.
+ * Returns the control a settings page reads and sets; transitions are held
+ * off for two frames around each switch so colours do not cross-fade at
+ * different speeds.
  */
-export function startTheme(): (preference: ThemePreference) => void {
+export function startTheme(): ThemeControl {
   const root = document.documentElement;
   const query = window.matchMedia?.("(prefers-color-scheme: dark)");
-  let preference = readPreference(safeStorage());
+  const [preference, setPreference] = createSignal(readPreference(safeStorage()));
+  const [painted, setPainted] = createSignal<Theme>(resolveTheme(preference(), query?.matches ?? true));
   const paint = () => {
     root.classList.add("theme-switching");
-    applyTheme(root, resolveTheme(preference, query?.matches ?? true));
+    const theme = resolveTheme(preference(), query?.matches ?? true);
+    setPainted(theme);
+    applyTheme(root, theme);
     requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
   };
   query?.addEventListener?.("change", () => {
-    if (preference === "system") paint();
+    if (preference() === "system") paint();
   });
   paint();
-  return (next) => {
-    preference = next;
-    writePreference(safeStorage(), next);
-    paint();
+  return {
+    preference,
+    painted,
+    set(next) {
+      setPreference(next);
+      writePreference(safeStorage(), next);
+      paint();
+    },
   };
 }
 
-/** The xterm colours. */
+/** The xterm palette: the colours a terminal draws with. */
 export interface TerminalColors {
   background: string;
   foreground: string;
   cursor: string;
+  cursorAccent?: string;
   selectionBackground: string;
+  selectionForeground?: string;
+  black?: string;
+  red?: string;
+  green?: string;
+  yellow?: string;
+  blue?: string;
+  magenta?: string;
+  cyan?: string;
+  white?: string;
+  brightBlack?: string;
+  brightRed?: string;
+  brightGreen?: string;
+  brightYellow?: string;
+  brightBlue?: string;
+  brightMagenta?: string;
+  brightCyan?: string;
+  brightWhite?: string;
 }
 
 /**
- * Terminals stay on the dark palette in both themes, as Orca's do. A light
- * background under an agent CLI's own ANSI colours (white, bright yellow)
- * would leave text near 1:1 contrast, and those colours are the CLI's, not
- * ours to remap.
+ * The terminal follows the window's theme, as Orca's does: Orca resolves its
+ * terminal from the app theme and, by default, uses a separate light palette
+ * in light mode (`resolveEffectiveTerminalAppearance`, and
+ * `terminalUseSeparateLightTheme: true` in its default settings).
+ *
+ * Dark keeps this window's own cockpit terminal colours. Light is Orca's
+ * default light palette, "Builtin Tango Light" (its `terminal-themes/defaults.ts`),
+ * including the ANSI colours Orca darkened so an agent CLI's accent text stays
+ * readable on white.
  */
-export const TERMINAL_COLORS: TerminalColors = {
-  background: "#0b0e14",
-  foreground: "rgb(226, 232, 240)",
-  cursor: "rgb(96, 165, 250)",
-  selectionBackground: "#1e2636",
+export const TERMINAL_THEMES: Record<Theme, TerminalColors> = {
+  dark: {
+    background: "#0b0e14",
+    foreground: "rgb(226, 232, 240)",
+    cursor: "rgb(96, 165, 250)",
+    selectionBackground: "#1e2636",
+  },
+  light: {
+    background: "#ffffff",
+    foreground: "#2e3434",
+    cursor: "#2e3434",
+    cursorAccent: "#ffffff",
+    selectionBackground: "#accef7",
+    selectionForeground: "#2e3434",
+    black: "#2e3436",
+    red: "#cc0000",
+    green: "#4e9a06",
+    yellow: "#8e7700",
+    blue: "#3465a4",
+    magenta: "#75507b",
+    cyan: "#05727e",
+    white: "#6a6a6a",
+    brightBlack: "#555753",
+    brightRed: "#ef2929",
+    brightGreen: "#1b7a1b",
+    brightYellow: "#6d5a00",
+    brightBlue: "#204a87",
+    brightMagenta: "#ad7fa8",
+    brightCyan: "#034b50",
+    brightWhite: "#3d3d3d",
+  },
 };
+

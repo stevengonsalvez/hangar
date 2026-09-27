@@ -71,8 +71,13 @@ test("exactly one of dark and light is on the root", () => {
   assert.deepEqual([...classes], ["dark"]);
 });
 
-test("terminals keep the dark palette whatever the window theme", async () => {
-  const { TERMINAL_COLORS } = await import("./theme/theme.ts");
-  assert.equal(TERMINAL_COLORS.background, "#0b0e14");
-  assert.equal(TERMINAL_COLORS.foreground, "rgb(226, 232, 240)");
+test("the terminal palette follows the window theme, light being Orca's Tango Light", async () => {
+  const { TERMINAL_THEMES } = await import("./theme/theme.ts");
+  assert.equal(TERMINAL_THEMES.dark.background, "#0b0e14");
+  assert.equal(TERMINAL_THEMES.dark.foreground, "rgb(226, 232, 240)");
+  assert.equal(TERMINAL_THEMES.light.background, "#ffffff");
+  assert.equal(TERMINAL_THEMES.light.foreground, "#2e3434");
+  // Orca darkened the accents that sit on white, so agent CLI text stays legible.
+  assert.equal(TERMINAL_THEMES.light.yellow, "#8e7700");
+  assert.equal(TERMINAL_THEMES.light.white, "#6a6a6a");
 });
