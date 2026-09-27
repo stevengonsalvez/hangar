@@ -18,10 +18,11 @@ use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttent
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
-use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldRegistry};
+use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldKey, HoldRegistry};
 use super::{HookEvent, HookReply, HookSink};
 use crate::attention_ingest::AttentionIngest;
 use crate::events::EventSink;
+use ainb_hangar_store::repo::fleet::FleetRepo;
 
 /// `answered_by` on an approval row the agent moved past without an answer
 /// through the daemon (it was answered at the terminal, or the tool ran).
@@ -117,7 +118,17 @@ impl IngestSink {
             events: self.events.clone(),
             holds: self.holds,
         };
-        let Some(waiter) = self.holds.register(&key, &attention_id, request) else {
+        // The fingerprint `fleet/action` will name this request by: the one
+        // the reducer just stamped on the session, else derived the same way.
+        let fingerprint = FleetRepo::get_session(&self.pool, &format!("claude:{session}"))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| row.current_request_fingerprint)
+            .or_else(|| crate::fleet::claude_hold_fingerprint(&event.payload));
+        let Some(waiter) =
+            self.holds.register(&key, &attention_id, fingerprint.as_deref(), request)
+        else {
             guard.armed = false;
             tracing::warn!("hook ingress: hold not registered; the agent prompts itself");
             return HookReply::NoContent;
@@ -145,7 +156,7 @@ impl IngestSink {
         event: &HookEvent,
         session: &str,
         event_id: &str,
-        key: &str,
+        key: &HoldKey,
         now_ms: i64,
     ) -> Option<String> {
         let p = &event.payload;
@@ -173,7 +184,7 @@ impl IngestSink {
                 .map(str::to_string),
             channels,
         };
-        let request_key = format!("hold:{key}");
+        let request_key = format!("hold:{}:{}", key.session, key.call);
         match AttentionRepo::insert_if_absent(&self.pool, &row, Some(&request_key)).await {
             Ok(true) => {
                 self.events.emit_attention(HangarEvent::AttentionRaised {
@@ -409,7 +420,7 @@ impl Drop for RetireOnDrop {
 /// The stable key of one held request: the session and the tool call it is
 /// about (`tool_use_id`), so a duplicate hook for the same call joins the
 /// live hold instead of opening a second one.
-fn hold_key(session: &str, payload: &Value) -> String {
+fn hold_key(session: &str, payload: &Value) -> HoldKey {
     let call = payload.get("tool_use_id").and_then(Value::as_str).map_or_else(
         || {
             // No id: the tool and its input name the call.
@@ -419,7 +430,7 @@ fn hold_key(session: &str, payload: &Value) -> String {
         },
         str::to_string,
     );
-    format!("{session}:{call}")
+    HoldKey::new(session, &call)
 }
 
 /// The event's discriminator, read from the payload as `ainb fleet atc hook`
