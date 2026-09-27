@@ -108,22 +108,34 @@ impl IngestSink {
         let Some(attention_id) = attention_id else {
             return HookReply::NoContent;
         };
+        // Declared before the waiter so the waiter drops first: the guard
+        // then sees whether this was the last hook on the request.
+        let mut guard = RetireOnDrop {
+            armed: true,
+            attention_id: attention_id.clone(),
+            pool: self.pool.clone(),
+            events: self.events.clone(),
+            holds: self.holds,
+        };
         let Some(waiter) = self.holds.register(&key, &attention_id, request) else {
-            tracing::warn!("hook ingress: hold registry full; the agent prompts itself");
+            guard.armed = false;
+            tracing::warn!("hook ingress: hold not registered; the agent prompts itself");
             return HookReply::NoContent;
         };
         match waiter.wait(HOLD_DEADLINE).await {
             HoldEnd::Decided(request, decision) => {
+                guard.armed = false;
                 request.render(&decision).map_or(HookReply::NoContent, HookReply::Json)
             }
-            // The agent moved on: the status event that cancelled the hold
-            // retires the row as resolved:agent.
-            HoldEnd::Released => HookReply::NoContent,
-            HoldEnd::TimedOut => {
-                // No decision in time: the agent's own prompt takes over.
-                self.retire_approval(&attention_id, RESOLVED_NATIVE).await;
+            // The agent moved on: the status event that released the hold
+            // has already retired the row as resolved:agent.
+            HoldEnd::Released => {
+                guard.armed = false;
                 HookReply::NoContent
             }
+            // No decision in time: the guard retires the row as
+            // resolved:native, and the agent's own prompt takes over.
+            HoldEnd::TimedOut => HookReply::NoContent,
         }
     }
 
@@ -207,21 +219,7 @@ impl IngestSink {
 
     /// Close an approval row that ended without an answer through the daemon.
     async fn retire_approval(&self, attention_id: &str, by: &str) {
-        let now =
-            ainb_hangar_core::clock::HangarClock::now_ms(&ainb_hangar_core::clock::SystemClock);
-        if let Ok(Some(row)) = AttentionRepo::get(&self.pool, attention_id).await {
-            if row.kind == AttentionKind::Approval
-                && AttentionRepo::mark_answered_if_open(&self.pool, attention_id, by, "", now)
-                    .await
-                    .unwrap_or(0)
-                    > 0
-            {
-                self.events.emit_attention(HangarEvent::AttentionAnswered {
-                    attention_id: attention_id.to_string(),
-                    by: by.to_string(),
-                });
-            }
-        }
+        retire_approval_row(&self.pool, &self.events, attention_id, by).await;
     }
 
     /// A status event that shows the agent moved past a held request ends it:
@@ -245,13 +243,19 @@ impl IngestSink {
             Some(_) => vec![hold_key(session, p)],
             None => self.holds.keys_for_session(session),
         };
+        // Retire first, release second: by the time a released hook answers
+        // `{}`, its row already reads resolved:agent.
+        if let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await {
+            self.retire_passed(this_call, open).await;
+        }
         for key in keys {
             self.holds.cancel(&key);
         }
-        let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await
-        else {
-            return;
-        };
+    }
+
+    /// Retire the hook-hold approval rows among `open` that the moved-on
+    /// event covers: the one call, or every hold of the session.
+    async fn retire_passed(&self, this_call: Option<Option<&str>>, open: Vec<String>) {
         for id in open {
             let Ok(Some(row)) = AttentionRepo::get(&self.pool, &id).await else {
                 continue;
@@ -345,6 +349,61 @@ pub fn event_line(
         "payload": inline,
         "raw_payload_ref": raw_stored.then_some(event_id),
     })
+}
+
+/// Close a hook-hold approval row that ended without an answer through the
+/// daemon. Only an open `approval` row changes; anything else is untouched.
+async fn retire_approval_row(pool: &SqlitePool, events: &EventSink, attention_id: &str, by: &str) {
+    let now = ainb_hangar_core::clock::HangarClock::now_ms(&ainb_hangar_core::clock::SystemClock);
+    if let Ok(Some(row)) = AttentionRepo::get(pool, attention_id).await {
+        if row.kind == AttentionKind::Approval
+            && AttentionRepo::mark_answered_if_open(pool, attention_id, by, "", now)
+                .await
+                .unwrap_or(0)
+                > 0
+        {
+            events.emit_attention(HangarEvent::AttentionAnswered {
+                attention_id: attention_id.to_string(),
+                by: by.to_string(),
+            });
+        }
+    }
+}
+
+/// Retires a hold's approval row as `resolved:native` when the hold's future
+/// ends without a decision by any route: the deadline, or the listener
+/// dropping it because the hook's connection closed (a `Drop`, which no
+/// `match` arm sees). Disarmed on a decision and on a release, whose owner
+/// retires the row itself. Retires only once no other hook still holds the
+/// same request.
+struct RetireOnDrop {
+    armed: bool,
+    attention_id: String,
+    pool: SqlitePool,
+    events: EventSink,
+    holds: &'static HoldRegistry,
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (id, pool, events, holds) = (
+            std::mem::take(&mut self.attention_id),
+            self.pool.clone(),
+            self.events.clone(),
+            self.holds,
+        );
+        runtime.spawn(async move {
+            if holds.request_for(&id).is_none() {
+                retire_approval_row(&pool, &events, &id, RESOLVED_NATIVE).await;
+            }
+        });
+    }
 }
 
 /// The stable key of one held request: the session and the tool call it is
