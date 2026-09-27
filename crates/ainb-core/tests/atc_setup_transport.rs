@@ -263,6 +263,27 @@ fn a_failed_marker_restores_the_exact_settings() {
     assert!(managed_commands(&settings(home.path())).is_empty());
 }
 
+/// Review of #197: with no settings.json before setup, a failed marker
+/// leaves no settings.json and no marker behind.
+#[test]
+fn a_failed_marker_with_no_prior_settings_leaves_no_settings_file() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join(".claude/settings.json");
+    assert!(!path.exists());
+    publish_endpoint(home.path());
+    // The marker's path is a directory: writing it fails.
+    let marker = home.path().join("ainb/hooks/transport");
+    std::fs::create_dir_all(&marker).unwrap();
+    let report = setup(home.path(), "http");
+    assert_eq!(report["lifecycle_hooks_installed"], false);
+    assert!(!path.exists(), "settings.json removed again");
+    assert!(!marker.is_file(), "no marker written");
+    assert!(
+        !home.path().join(".claude/settings.json.ainb.bak").exists(),
+        "nothing to back up"
+    );
+}
+
 /// Review of #182 (N2): a plain re-run keeps the installed transport, and the
 /// one backup keeps the settings from before the first transport change.
 #[test]
