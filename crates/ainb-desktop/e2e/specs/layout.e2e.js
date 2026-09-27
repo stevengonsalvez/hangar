@@ -98,5 +98,24 @@ describe("the window at its default size", () => {
       await $(`.session-row[data-session="${session.id}"]`).isExisting(),
       "closing the tab removed the session's row: it should only have detached",
     );
+    // With no tab left, the work area names the session its row still has
+    // selected and offers the way back in, never "Choose a session" beside a
+    // chosen row (#193). The last tab is closed first when more than one was
+    // open, so the empty pane is what shows.
+    while ((await $$(".tab[data-state]")).length > 0) {
+      const count = (await $$(".tab[data-state]")).length;
+      await click(".tab[data-state] .tab-close");
+      await browser.waitUntil(async () => (await $$(".tab[data-state]")).length < count, { timeout: 15_000 });
+    }
+    const selectedId = await $(".session-row.selected").getAttribute("data-session");
+    await $(`.empty-selected[data-session="${selectedId}"]`).waitForExist({
+      timeout: 15_000,
+      timeoutMsg: "the empty pane does not name the selected session",
+    });
+    await click(".empty-selected .empty-open");
+    await browser.waitUntil(async () => (await $$(".tab[data-state]")).length === 1, {
+      timeout: 30_000,
+      timeoutMsg: "Open terminal did not open the selected session's tab",
+    });
   });
 });

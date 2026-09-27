@@ -34,6 +34,8 @@ import { SURFACES } from "./surfaces.ts";
 import { Commits } from "./commits.tsx";
 import { Review } from "./review.tsx";
 import { Palette } from "./palette.tsx";
+import { emptyPaneView } from "./pane_empty.ts";
+import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
 import { cardForSession, statusForTarget } from "./status.ts";
 import { TerminalTab } from "./terminal_tab.tsx";
@@ -759,7 +761,7 @@ function Shell() {
               />
             </Show>
             <Show when={showing("terminal") && tabs().length === 0}>
-              <p class="empty">Choose a session to open its terminal</p>
+              <EmptyPane view={emptyPaneView(sessions())} onOpen={openSession} />
             </Show>
             {/* Keyed by tab key, not by the tab object each event replaces: a
                 terminal stays mounted, and keeps its buffer, while its tab is listed. */}
