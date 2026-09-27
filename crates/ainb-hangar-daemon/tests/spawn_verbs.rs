@@ -281,3 +281,69 @@ async fn a_bad_request_is_invalid_params_and_spawns_nothing() {
         "a refused request must not run ainb"
     );
 }
+
+/// A create that times out keeps draining `ainb run`'s output. A run still
+/// working past the timeout (the prompt wait, a slow first thread) writes
+/// later; if its pipes had been closed, that write would kill it on EPIPE
+/// before its own rollback, leaving the tmux session, worktree and branch
+/// behind. The stand-in writes to both streams after the timeout and only
+/// then leaves its marker, so the marker says it lived through the writes.
+#[tokio::test]
+async fn a_timed_out_create_keeps_draining_so_a_late_write_does_not_kill_the_run() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    let marker = tools.path().join("lived.txt");
+    let bin = tools.path().join("ainb");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nsleep 1\necho 'late progress' >&2\necho 'late line'\necho 'more progress' >&2\n: > '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    switch_on(&bin);
+    ainb_hangar_daemon::spawn::set_run_timeout_for_test(Some(std::time::Duration::from_millis(
+        200,
+    )));
+
+    let response = call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude" })).await;
+    ainb_hangar_daemon::spawn::set_run_timeout_for_test(None);
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("still running")),
+        "the caller hears the create is still running: {response}"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        marker.exists(),
+        "the run died on a write after the timeout: its output was no longer drained"
+    );
+}
+
+/// A `name` from an older client is not a field any more: it never reaches
+/// `ainb run` as `--name`, which would kill a live tmux session of that name.
+#[tokio::test]
+async fn a_name_field_never_reaches_ainb_run() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let _ =
+        call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude", "name": "x" })).await;
+    let argv = std::fs::read_to_string(tools.path().join("argv.txt")).unwrap_or_default();
+    assert!(
+        !argv
+            .lines()
+            .any(|arg| arg == "--name" || arg.starts_with("--name=") || arg == "x"),
+        "{argv:?}"
+    );
+}
