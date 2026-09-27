@@ -152,7 +152,6 @@ fn publish(home: &Path, port: u16) {
         version: 1,
         // A live process owned by this user, as the daemon's own pid is.
         pid: std::process::id(),
-        headers_path: headers,
     };
     std::fs::write(dir.join(ENDPOINT_FILE_NAME), endpoint.render_env_file()).unwrap();
 }
@@ -545,12 +544,14 @@ fn the_endpoint_file_cannot_redirect_the_headers_file() {
     // A private key the user owns, named by the endpoint file.
     let secret = dir.join("id_ed25519");
     std::fs::write(&secret, "X-Secret: -----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
-    let mut endpoint = HookEndpoint::parse_env_file(
-        &std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap(),
+    // An endpoint file that still names a headers path (as earlier builds
+    // wrote) points at the key; the script must ignore it.
+    let text = std::fs::read_to_string(dir.join(ENDPOINT_FILE_NAME)).unwrap();
+    std::fs::write(
+        dir.join(ENDPOINT_FILE_NAME),
+        format!("{text}AINB_HOOK_HEADERS={}\n", secret.display()),
     )
     .unwrap();
-    endpoint.headers_path = secret;
-    std::fs::write(dir.join(ENDPOINT_FILE_NAME), endpoint.render_env_file()).unwrap();
     fire(
         home.path(),
         "Notification",
