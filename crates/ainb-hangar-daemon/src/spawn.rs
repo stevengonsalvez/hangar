@@ -14,8 +14,11 @@
 //!          ◀──── WorktreeCreateResult ◀──── parse ◀──────────────────┘
 //! ```
 //!
+//! `worktree/agent_add` is the same run with `--existing-worktree`: one more
+//! agent in a worktree a create already made, on the branch it already has.
+//!
 //! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
-//! method answers `METHOD_NOT_FOUND`, which a client cannot tell from an older
+//! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
 //! daemon. An environment variable, never a `daemon_config` key, so no
 //! connected surface can switch it on.
 
@@ -23,9 +26,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ainb_hangar_proto::spawn::{WorktreeCreateParams, WorktreeCreateResult};
+use ainb_hangar_proto::spawn::{
+    WorktreeAgentAddParams, WorktreeCreateParams, WorktreeCreateResult,
+};
 
-/// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves `worktree/create`.
+/// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves the spawn verbs.
 pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 
 /// Upper bound on one `ainb run`. It waits up to 30s for the agent's input
@@ -33,7 +38,7 @@ pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 /// more; past this the create is reported failed rather than hanging a caller.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Whether `worktree/create` is served, read once so a later `set_var` cannot
+/// Whether the spawn verbs are served, read once so a later `set_var` cannot
 /// flip a running daemon.
 #[must_use]
 pub fn enabled() -> bool {
@@ -83,6 +88,32 @@ pub fn run_argv(params: &WorktreeCreateParams) -> Vec<String> {
     }
     // Glued `--prompt=` form: a prompt starting with `-` must stay a value,
     // not be parsed by clap as the next flag.
+    if let Some(prompt) = &params.prompt {
+        argv.push(format!("--prompt={prompt}"));
+    }
+    argv
+}
+
+/// The `ainb run` argument vector for `params`, whose `worktree_path` the
+/// daemon has already resolved to a canonical linked worktree. Pure, like
+/// [`run_argv`], and glued the same way.
+#[must_use]
+pub fn agent_add_argv(params: &WorktreeAgentAddParams) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "--format".into(),
+        "json".into(),
+        "run".into(),
+        "--existing-worktree".into(),
+        params.worktree_path.clone(),
+        "--tool".into(),
+        params.agent.tool_arg().into(),
+    ];
+    if let Some(model) = &params.model {
+        argv.push(format!("--model={model}"));
+    }
+    if params.skip_permissions {
+        argv.push("--dangerously-skip-permissions".into());
+    }
     if let Some(prompt) = &params.prompt {
         argv.push(format!("--prompt={prompt}"));
     }
@@ -183,6 +214,99 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
     Ok(canonical)
 }
 
+/// The directory every managed worktree lives in:
+/// `<home>/.agents-in-a-box/worktrees/by-name`, with `$AINB_HOME` standing in
+/// for the home as it does for the CLI's own worktree manager, so the daemon
+/// and the `ainb run` it spawns agree on it.
+fn managed_worktrees(home: &Path) -> PathBuf {
+    std::env::var_os("AINB_HOME")
+        .map_or_else(|| home.to_path_buf(), PathBuf::from)
+        .join(".agents-in-a-box")
+        .join("worktrees")
+        .join("by-name")
+}
+
+/// `worktree_path` as the canonical top of a linked worktree that ainb
+/// manages, cut from a repository inside a registered root, or why not.
+///
+/// A second agent shares the tree with the first, so every check is against
+/// the disk, not the request: no `.` or `..` components, under the managed
+/// worktree directory, the top of its checkout, a LINKED worktree (its git dir
+/// differs from the common one; the main checkout is what `worktree/create`
+/// exists to keep agents out of), and a source repository that
+/// [`resolve_repo`] accepts. `managed` is [`managed_worktrees`], passed in so
+/// a test does not depend on the process's `$AINB_HOME`.
+fn resolve_worktree(
+    worktree_path: &str,
+    home: &Path,
+    managed: &Path,
+) -> Result<PathBuf, SpawnError> {
+    let path = Path::new(worktree_path);
+    if path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+        return Err(SpawnError::Invalid(
+            "worktree_path must not contain . or .. components".into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|_| {
+        SpawnError::Invalid(format!(
+            "worktree_path is not a directory on this host: {worktree_path}"
+        ))
+    })?;
+    let managed = std::fs::canonicalize(managed).ok();
+    if !managed.is_some_and(|dir| canonical.starts_with(&dir) && canonical != dir) {
+        return Err(SpawnError::Invalid(
+            "worktree_path is not a worktree ainb created: it must be under \
+             ~/.agents-in-a-box/worktrees/by-name"
+                .into(),
+        ));
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&canonical)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .ok_or_else(|| SpawnError::Invalid("worktree_path is not a git worktree".into()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // `--git-common-dir` may be relative to the directory git ran in.
+    let resolved: Vec<Option<PathBuf>> = stdout
+        .lines()
+        .map(|line| std::fs::canonicalize(canonical.join(line.trim())).ok())
+        .collect();
+    let [Some(top), Some(git_dir), Some(common_dir)] = resolved.as_slice() else {
+        return Err(SpawnError::Invalid(
+            "worktree_path is not a git worktree".into(),
+        ));
+    };
+    if *top != canonical {
+        return Err(SpawnError::Invalid(
+            "worktree_path is not the top of a git worktree".into(),
+        ));
+    }
+    if git_dir == common_dir {
+        return Err(SpawnError::Invalid(
+            "worktree_path is a repository's main checkout, not a linked worktree".into(),
+        ));
+    }
+    let source = common_dir
+        .parent()
+        .ok_or_else(|| SpawnError::Invalid("worktree_path has no source repository".into()))?;
+    resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
+        SpawnError::Invalid(why) => SpawnError::Invalid(format!(
+            "the worktree's source repository is refused: {why}"
+        )),
+        failed @ SpawnError::Failed(_) => failed,
+    })?;
+    Ok(canonical)
+}
+
 /// Whether `branch` already exists in the repository at `repo`. Checked
 /// before spawning: an existing branch is checked out as it is, which would
 /// silently ignore `base`, and a second agent on a live branch is not a new
@@ -224,6 +348,30 @@ pub async fn worktree_create(
     }
     let mut resolved = params.clone();
     resolved.repo_path = repo.to_string_lossy().into_owned();
+    run_ainb(run_argv(&resolved), "the worktree may still be creating").await
+}
+
+/// Add an agent to an existing worktree by running `ainb run
+/// --existing-worktree`. Nothing is created but the tmux session and its
+/// session row: `ainb run` never deletes a tree or a branch it did not make.
+///
+/// # Errors
+/// As [`worktree_create`].
+pub async fn worktree_agent_add(
+    params: &WorktreeAgentAddParams,
+) -> Result<WorktreeCreateResult, SpawnError> {
+    params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
+    let tree = resolve_worktree(&params.worktree_path, &home, &managed_worktrees(&home))?;
+    let mut resolved = params.clone();
+    resolved.worktree_path = tree.to_string_lossy().into_owned();
+    run_ainb(agent_add_argv(&resolved), "the agent may still be starting").await
+}
+
+/// Run `ainb` with `argv` and read its one JSON line, bounded by the run
+/// timeout. `pending` says what a timed-out run may still be doing.
+async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResult, SpawnError> {
     let bin = crate::atc::ainb_bin();
     // `ainb run` writes to files, never to pipes the daemon holds. With pipes,
     // anything that stopped the daemon reading them (a create that timed out,
@@ -233,7 +381,7 @@ pub async fn worktree_create(
     // whatever the daemon is doing.
     let logs = RunLogs::create()?;
     let child = tokio::process::Command::new(&bin)
-        .args(run_argv(&resolved))
+        .args(argv)
         .stdin(std::process::Stdio::null())
         .stdout(logs.stdout()?)
         .stderr(logs.stderr()?)
@@ -276,7 +424,7 @@ pub async fn worktree_create(
                 logs.remove();
             });
             return Err(SpawnError::Failed(format!(
-                "`ainb run` is still running after {}s: the worktree may still be creating; check the sidebar",
+                "`ainb run` is still running after {}s: {pending}; check the sidebar",
                 timeout.as_secs()
             )));
         }
@@ -558,6 +706,128 @@ mod tests {
             resolve_repo(&sub.display().to_string(), home.path()),
             Err(SpawnError::Invalid(m)) if m.contains("top of a git repository")
         ));
+    }
+
+    #[test]
+    fn an_agent_add_runs_ainb_run_in_the_existing_worktree() {
+        let p = WorktreeAgentAddParams {
+            worktree_path: "/w/app--feat--1a2b3c4d".into(),
+            agent: SpawnAgent::Gemini,
+            model: Some("-flash".into()),
+            prompt: Some("-y go".into()),
+            skip_permissions: true,
+            mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
+        };
+        let argv = agent_add_argv(&p);
+        assert_eq!(
+            &argv[..7],
+            [
+                "--format",
+                "json",
+                "run",
+                "--existing-worktree",
+                "/w/app--feat--1a2b3c4d",
+                "--tool",
+                "gemini"
+            ]
+        );
+        assert!(argv.contains(&"--model=-flash".to_string()), "{argv:?}");
+        assert!(argv.contains(&"--dangerously-skip-permissions".to_string()));
+        assert_eq!(argv.last().map(String::as_str), Some("--prompt=-y go"));
+        for create_only in [
+            "--worktree",
+            "--repo",
+            "--create-branch",
+            "--base",
+            "--name",
+        ] {
+            assert!(
+                !argv.iter().any(|a| a == create_only),
+                "{create_only} in {argv:?}"
+            );
+        }
+    }
+
+    /// `world()` plus a linked worktree of its repo under the managed
+    /// directory, as `ainb run --worktree` would have left it.
+    fn world_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let (home, repo) = world();
+        let managed = home.path().join(".agents-in-a-box/worktrees/by-name");
+        std::fs::create_dir_all(&managed).unwrap();
+        let tree = managed.join("app--feat--1a2b3c4d");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                &tree.display().to_string(),
+            ],
+        );
+        (home, repo, managed, tree)
+    }
+
+    #[test]
+    fn a_managed_linked_worktree_of_a_registered_repo_resolves() {
+        let (home, _repo, managed, tree) = world_with_worktree();
+        let resolved =
+            resolve_worktree(&tree.display().to_string(), home.path(), &managed).expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&tree).unwrap());
+    }
+
+    #[test]
+    fn a_main_checkout_a_subdir_dots_and_unmanaged_trees_are_refused() {
+        let (home, repo, managed, tree) = world_with_worktree();
+        let refused = |path: &Path, managed: &Path, why: &str| match resolve_worktree(
+            &path.display().to_string(),
+            home.path(),
+            managed,
+        ) {
+            Err(SpawnError::Invalid(message)) => {
+                assert!(message.contains(why), "{}: {message}", path.display());
+            }
+            other => panic!("{} must be refused, got {other:?}", path.display()),
+        };
+
+        refused(&tree.join("../app--feat--1a2b3c4d"), &managed, "..");
+        let sub = tree.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        refused(&sub, &managed, "top of a git worktree");
+        // The main checkout, even when it sits where a managed tree would.
+        refused(&repo, &managed, "by-name");
+        refused(&repo, repo.parent().unwrap(), "main checkout");
+        refused(&managed, &managed, "by-name");
+    }
+
+    #[test]
+    fn a_worktree_of_an_unregistered_repo_is_refused() {
+        let (home, _repo, managed, _tree) = world_with_worktree();
+        let elsewhere = tempfile::tempdir().unwrap();
+        git(elsewhere.path(), &["init", "-q", "-b", "main"]);
+        git(
+            elsewhere.path(),
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
+        let stray = managed.join("stray--x--00000000");
+        git(
+            elsewhere.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "x",
+                &stray.display().to_string(),
+            ],
+        );
+        match resolve_worktree(&stray.display().to_string(), home.path(), &managed) {
+            Err(SpawnError::Invalid(message)) => {
+                assert!(message.contains("registered"), "{message}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]
