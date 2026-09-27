@@ -102,9 +102,11 @@ pub fn install_claude_hooks_for(
         hooks::HookTransport::Http => before != Some(hooks::HookTransport::Http),
         hooks::HookTransport::Legacy => before == Some(hooks::HookTransport::Http),
     };
-    if changing && path.exists() {
-        std::fs::copy(&path, settings_backup_path(home))
-            .with_context(|| format!("backing up {}", path.display()))?;
+    // One backup, of the settings before ainb first changed transports: a
+    // later change must not overwrite it with an already-changed file.
+    let backup = settings_backup_path(home);
+    if changing && path.exists() && !backup.exists() {
+        std::fs::copy(&path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
     let script = hook_script.to_string_lossy();
     let merged = match transport {
@@ -116,6 +118,47 @@ pub fn install_claude_hooks_for(
     let bytes = serde_json::to_vec_pretty(&merged).context("serializing settings.json")?;
     write_settings(&path, &bytes)?;
     Ok(path)
+}
+
+/// The managed-hook transport `<home>/.claude/settings.json` holds now, if
+/// any. A malformed file reads as none.
+#[must_use]
+pub fn installed_transport(home: &Path) -> Option<hooks::HookTransport> {
+    read_settings(&claude_settings_path(home))
+        .ok()
+        .and_then(|settings| hooks::installed_transport(&settings))
+}
+
+/// The exact bytes of `<home>/.claude/settings.json`, or `None` when absent,
+/// for [`restore_settings`].
+///
+/// # Errors
+/// A read error other than absence.
+pub fn snapshot_settings(home: &Path) -> Result<Option<Vec<u8>>> {
+    let path = claude_settings_path(home);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Put `<home>/.claude/settings.json` back exactly as [`snapshot_settings`]
+/// found it: the same bytes, or no file. Under the settings lock.
+///
+/// # Errors
+/// A write or remove error.
+pub fn restore_settings(home: &Path, snapshot: Option<&[u8]>) -> Result<()> {
+    let _guard = lock_settings(home)?;
+    let path = claude_settings_path(home);
+    match snapshot {
+        Some(bytes) => write_settings(&path, bytes),
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        },
+    }
 }
 
 /// Record which transport the managed hooks use, in
