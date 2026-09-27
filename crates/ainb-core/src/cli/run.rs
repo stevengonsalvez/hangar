@@ -541,6 +541,12 @@ fn validate_run_flags(args: &RunArgs) -> Result<()> {
             "--format json needs --worktree or --create-branch: it reports a worktree it created"
         );
     }
+    // clap already refuses the pair; this holds for a caller that builds
+    // `RunArgs` itself. Starting a tmux session kills one already using the
+    // name, which in a shared tree could be the first agent.
+    if args.existing_worktree.is_some() && args.name.is_some() {
+        anyhow::bail!("--existing-worktree cannot take --name: it could replace a live session");
+    }
     if args.json && (args.attach || args.interactive) {
         anyhow::bail!("--format json cannot --attach or --interactive: stdout carries the result");
     }
@@ -550,7 +556,8 @@ fn validate_run_flags(args: &RunArgs) -> Result<()> {
 /// A worktree `--existing-worktree` named, checked and resolved.
 #[derive(Debug)]
 struct ExistingWorktree {
-    /// The canonical checkout directory the session runs in.
+    /// The checkout directory the session runs in, spelled the way the
+    /// worktree manager minted it (see [`resolve_existing_worktree`]).
     tree: PathBuf,
     /// The repository the tree was cut from, which names the workspace.
     source_repo: PathBuf,
@@ -558,31 +565,38 @@ struct ExistingWorktree {
 
 /// `path` as a worktree an earlier `ainb run --worktree` made, or why not.
 ///
-/// Refused: a path that does not resolve; one whose `.git` is not a FILE
-/// (a repository's own checkout, where `--worktree` exists to keep agents
-/// out, or a subdirectory of a tree); one that is not a folder directly in
-/// ainb's managed `worktrees/by-name`; and one whose source repository cannot
-/// be found. The daemon's `worktree/agent_add` checks the same tree against
-/// git before it gets here; this is the CLI's own backstop for a direct call.
+/// Refused: a path that does not resolve; one git does not call a linked
+/// worktree's top (a repository's own checkout, where `--worktree` exists to
+/// keep agents out, a subdirectory, a submodule); one that is not, once
+/// symlinks are resolved, a folder directly in ainb's managed
+/// `worktrees/by-name`; and one whose source repository cannot be found. The
+/// linked-worktree check is the daemon's own, so `worktree/agent_add` and a
+/// direct call cannot disagree.
+///
+/// Checked on the canonical path, but returned as the manager spells it
+/// (`<home>/.agents-in-a-box/worktrees/by-name/<dir>`, `$HOME` or
+/// `$AINB_HOME` as given): the first session's row holds that spelling, and
+/// the sidebar folds sessions into one card only on an equal `worktree_path`.
+/// A symlinked home, or macOS's `/var -> /private/var`, would otherwise split
+/// them.
 fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree> {
-    let tree = path
+    let canonical = path
         .canonicalize()
         .with_context(|| format!("--existing-worktree does not exist: {}", path.display()))?;
-    if !tree.join(".git").is_file() {
-        anyhow::bail!(
-            "--existing-worktree must be the top of a linked git worktree, not a repository checkout or a subdirectory: {}",
-            tree.display()
-        );
-    }
+    ainb_hangar_daemon::spawn::linked_worktree_source(&canonical)
+        .map_err(|why| anyhow::anyhow!("--existing-worktree {why}: {}", canonical.display()))?;
     let managed = WorktreeManager::for_reading()?.base_dir().join("by-name");
-    let in_managed = managed.canonicalize().is_ok_and(|dir| tree.parent() == Some(dir.as_path()));
-    if !in_managed {
+    let in_managed = managed
+        .canonicalize()
+        .is_ok_and(|dir| canonical.parent() == Some(dir.as_path()));
+    let Some(dir_name) = canonical.file_name().filter(|_| in_managed) else {
         anyhow::bail!(
             "--existing-worktree must be a worktree ainb created, a folder directly in {}: {}",
             managed.display(),
-            tree.display()
+            canonical.display()
         );
-    }
+    };
+    let tree = managed.join(dir_name);
     let source_repo =
         InteractiveSessionManager::get_source_repository(&tree).with_context(|| {
             format!(
@@ -2052,6 +2066,19 @@ mod tests {
             ..run_args()
         };
         assert!(validate_run_flags(&args).is_ok());
+    }
+
+    /// A `RunArgs` built in code, not by clap, still cannot name the session
+    /// it adds to a shared tree.
+    #[test]
+    fn a_name_with_an_existing_worktree_is_refused() {
+        let args = RunArgs {
+            existing_worktree: Some(PathBuf::from("/w/app--feat--1a2b3c4d")),
+            name: Some("tmux_first".into()),
+            ..run_args()
+        };
+        let err = validate_run_flags(&args).expect_err("--name must be refused");
+        assert!(err.to_string().contains("--name"), "got: {err}");
     }
 
     /// The JSON names a worktree this run created; in a shared checkout
