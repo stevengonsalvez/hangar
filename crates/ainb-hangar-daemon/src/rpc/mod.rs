@@ -13619,10 +13619,7 @@ async fn handle_attention_answer(
             .map_err(|e| store_err(&e))?
     {
         let resolves_hold = crate::hook_ingress::hold::registry().request_for(&row.id).is_some();
-        let allowed = crate::answer_scope::column_of(caller).is_some_and(|column| {
-            crate::answer_scope::answer_allowed(column, row.kind, resolves_hold)
-        });
-        if !allowed {
+        if !crate::answer_scope::caller_may_answer(caller, row.kind, resolves_hold) {
             return Err(mutation::rejected(
                 ainb_hangar_proto::mutation::REASON_SCOPE,
                 format!(
