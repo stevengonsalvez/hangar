@@ -247,3 +247,14 @@ test("a failure keeps the view open when shown, and toasts when it was closed", 
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(closed.effects.toasts, ["branch exists"]);
 });
+
+test("base and model are checked as they are sent: trimmed", () => {
+  // `toArgs` trims both, so padding around a value at the limit is not a
+  // reason to refuse what the daemon would accept.
+  const padded = fields({ model: `  ${"m".repeat(SPAWN_FIELD_MAX)}  `, base: "  main  " });
+  assert.deepEqual(validate(padded), []);
+  assert.equal(toArgs(padded).model, "m".repeat(SPAWN_FIELD_MAX));
+  assert.equal(toArgs(padded).base, "main");
+  // And past the limit it is still refused, trimmed or not.
+  assert.equal(validate(fields({ model: "m".repeat(SPAWN_FIELD_MAX + 1) }))[0]?.field, "model");
+});
