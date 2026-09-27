@@ -707,6 +707,78 @@ async fn two_concurrent_holds_each_answer_only_their_own_fingerprint() {
     assert!(body.contains("\"deny\""), "{body}");
 }
 
+/// Review of #196 (CRITICAL, deterministic): a hold is named by the
+/// fingerprint of its own payload, never the one on the session row. A
+/// trigger keeps the row stamped with ANOTHER request's fingerprint whenever
+/// this request's is written: the state a second request in the session
+/// leaves the row in when it stamps between this hold's reduce and its
+/// registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_is_named_by_its_own_fingerprint_whatever_the_row_says() {
+    use hook_ingress::hold::{RequestMatch, registry};
+    let w = Arc::new(World::start().await);
+    let s = session("row-fp");
+    let other = "fnv1a64:00000000deadbeef";
+    let pool = w.store.pool();
+    sqlx::query("CREATE TABLE test_seen_fp (fp TEXT NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+    for (name, event) in [
+        ("ins", "INSERT"),
+        ("upd", "UPDATE OF current_request_fingerprint"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER test_other_fp_{name} AFTER {event} ON fleet_session \
+             WHEN NEW.session_key = 'claude:{s}' \
+               AND NEW.current_request_fingerprint IS NOT NULL \
+               AND NEW.current_request_fingerprint <> '{other}' \
+             BEGIN \
+               INSERT INTO test_seen_fp (fp) VALUES (NEW.current_request_fingerprint); \
+               UPDATE fleet_session SET current_request_fingerprint = '{other}' \
+                WHERE session_key = NEW.session_key; \
+             END"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let held = w.hold(permission(&s, "call-rowfp"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    assert_eq!(
+        session_fingerprint(&w, &s).await,
+        other,
+        "the row names the other request"
+    );
+    let own: String = sqlx::query_scalar("SELECT fp FROM test_seen_fp LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_ne!(own, other);
+    for _ in 0..100 {
+        if registry().find_request(&s, &own) != RequestMatch::None {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        registry().find_request(&s, &own),
+        RequestMatch::One(id.clone()),
+        "the hold is named by its own payload's fingerprint"
+    );
+    assert_eq!(
+        registry().find_request(&s, other),
+        RequestMatch::None,
+        "the hold took another request's fingerprint from the row"
+    );
+    assert!(matches!(
+        w.answer(&id, "deny").await,
+        AnswerResult::Delivered { .. }
+    ));
+    assert_eq!(held.await.unwrap().0, 200);
+}
+
 fn refused(resp: &Value) -> bool {
     resp.get("error").is_some()
         || matches!(
