@@ -52,9 +52,18 @@ export type UiStatus =
  * reading of "something this build cannot name" at each call site.
  */
 export function unhandled<T>(value: never, fallback: T): T {
-  console.warn(`unhandled status input from the host: ${String(value)}`);
+  // Once per value: this runs on every render, and a host at another version
+  // sends the same unknown word on every frame.
+  const key = String(value);
+  if (!warned.has(key)) {
+    warned.add(key);
+    console.warn(`unhandled status input from the host: ${key}`);
+  }
   return fallback;
 }
+
+/** The unknown values `unhandled` has already warned about. */
+const warned = new Set<string>();
 
 /** The `AgentCardFrame` fields the mapping reads. A fixture only has to carry
  * these, not a whole roster row. */
@@ -263,6 +272,10 @@ export function statusForSession(
     // not a resting `idle`.
     case "stopped":
       return { kind: "exited" };
+    // A status this build does not know: nothing it can name, so the honest
+    // reading is unverifiable, never exited (which would hide a live agent).
+    case "unknown":
+      return { kind: "unverifiable" };
     default:
       return unhandled(lifecycle, { kind: "unverifiable" });
   }
