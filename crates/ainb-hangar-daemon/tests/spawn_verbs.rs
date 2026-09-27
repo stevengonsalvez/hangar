@@ -1,5 +1,6 @@
-//! `worktree/create` with the switch on, end to end through dispatch, against
-//! a stand-in `ainb` that records its argv and answers like `ainb --format json run`.
+//! `worktree/create` and `worktree/agent_add` with the switch on, end to end
+//! through dispatch, against a stand-in `ainb` that records its argv and
+//! answers like `ainb --format json run`.
 //!
 //! The real `ainb --format json run` contract (worktree from `--base`, one JSON line)
 //! is proven in `crates/ainb-core/tests/run_json_worktree.rs`. This binary
@@ -60,13 +61,17 @@ exit 3"#
 }
 
 async fn call(params: serde_json::Value) -> serde_json::Value {
+    call_method(m::WORKTREE_CREATE, params).await
+}
+
+async fn call_method(method: &str, params: serde_json::Value) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
     let request = RpcRequest {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
         id: RpcId::Number(7),
-        method: m::WORKTREE_CREATE.to_string(),
+        method: method.to_string(),
         params,
     };
     let response = rpc::dispatch_as(
@@ -127,7 +132,27 @@ impl Registered {
         )
         .unwrap();
         std::env::set_var("HOME", home.path());
+        // The managed worktree directory follows `$AINB_HOME` when it is set;
+        // these tests place their trees under `$HOME`.
+        std::env::remove_var("AINB_HOME");
         Self { home }
+    }
+
+    /// A linked worktree of `repo` (on a new branch) at `by-name/<dir>`, where
+    /// `ainb run --worktree` puts the trees it makes.
+    fn managed_worktree(&self, repo: &Path, dir: &str, branch: &str) -> String {
+        let managed = self.home.path().join(".agents-in-a-box/worktrees/by-name");
+        std::fs::create_dir_all(&managed).unwrap();
+        let tree = managed.join(dir);
+        let ok = std::process::Command::new("git")
+            .args(["worktree", "add", "-q", "-b", branch])
+            .arg(&tree)
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git worktree add {}", tree.display());
+        std::fs::canonicalize(tree).unwrap().display().to_string()
     }
 
     fn repo(&self) -> String {
@@ -380,4 +405,111 @@ async fn a_create_leaves_no_run_output_behind() {
         .map(|entry| entry.file_name())
         .collect();
     assert!(left.is_empty(), "run output left behind: {left:?}");
+}
+
+#[tokio::test]
+async fn an_agent_add_runs_ainb_run_in_the_existing_worktree() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let registered = Registered::new();
+    let tree =
+        registered.managed_worktree(Path::new(&registered.repo()), "app--feat--1a2b3c4d", "feat");
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let response = call_method(
+        m::WORKTREE_AGENT_ADD,
+        serde_json::json!({
+            "worktree_path": tree,
+            "agent": "codex",
+            "model": "-gpt",
+            "skip_permissions": true,
+            "prompt": "-y review it",
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response["result"]["tmux_session_name"], "app-11111111",
+        "{response}"
+    );
+    let argv = std::fs::read_to_string(tools.path().join("argv.txt")).unwrap();
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        &argv[..7],
+        [
+            "--format",
+            "json",
+            "run",
+            "--existing-worktree",
+            tree.as_str(),
+            "--tool",
+            "codex"
+        ],
+        "{argv:?}"
+    );
+    assert!(argv.contains(&"--model=-gpt"), "{argv:?}");
+    assert!(argv.contains(&"--dangerously-skip-permissions"), "{argv:?}");
+    assert_eq!(argv.last(), Some(&"--prompt=-y review it"));
+    for create_only in ["--worktree", "--repo", "--create-branch", "--base"] {
+        assert!(!argv.contains(&create_only), "{create_only} in {argv:?}");
+    }
+}
+
+/// An agent joins only a tree ainb made from a registered repository: the
+/// repository's own checkout, and a managed-looking tree cut from a
+/// repository outside every registered folder, are refused before `ainb`
+/// runs.
+#[tokio::test]
+async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let registered = Registered::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(elsewhere.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    }
+    let stray = registered.managed_worktree(elsewhere.path(), "stray--x--00000000", "x");
+    switch_on(&fake_ainb(tools.path(), true));
+
+    for (path, why) in [(registered.repo(), "by-name"), (stray, "registered")] {
+        let response = call_method(
+            m::WORKTREE_AGENT_ADD,
+            serde_json::json!({ "worktree_path": path, "agent": "claude" }),
+        )
+        .await;
+        assert_eq!(
+            response["error"]["code"].as_i64(),
+            Some(-32602),
+            "{path}: {response}"
+        );
+        assert!(
+            response["error"]["message"].as_str().is_some_and(|m| m.contains(why)),
+            "{path}: {response}"
+        );
+        assert!(
+            !tools.path().join("argv.txt").exists(),
+            "nothing ran for {path}"
+        );
+    }
 }
