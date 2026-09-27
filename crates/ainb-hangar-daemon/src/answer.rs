@@ -197,13 +197,78 @@ pub async fn answer(
     params: &AnswerParams,
     now_ms: i64,
 ) -> Result<AnswerResult, sqlx::Error> {
+    match answer_as(
+        pool,
+        events,
+        params,
+        now_ms,
+        &crate::rpc::auth::Caller::Operator,
+    )
+    .await?
+    {
+        AnswerOutcome::Answered(result) => Ok(result),
+        // The operator column may answer every kind; kept total regardless.
+        AnswerOutcome::ScopeRefused { .. } => Ok(AnswerResult::NoTarget {
+            reason: "this scope may not answer this row".to_string(),
+        }),
+    }
+}
+
+/// What [`answer_as`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// The answer went through the normal path (delivered, lost, refused...).
+    Answered(AnswerResult),
+    /// `caller`'s scope may not answer a row of this kind in this state
+    /// (review F2). Nothing was claimed.
+    ScopeRefused {
+        /// The row's kind.
+        kind: AttentionKind,
+    },
+}
+
+/// [`answer`] on behalf of `caller`, with the kind-based scope gate.
+///
+/// The gate and the path share ONE read of the hold registry: the live hold
+/// that decides whether this answer is approval-class is the same one the
+/// answer is then delivered to. There is no second sample a hold could
+/// appear or vanish between.
+///
+/// # Errors
+///
+/// Returns a [`sqlx::Error`] if reading the row or the conditional flip fails.
+pub async fn answer_as(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    caller: &crate::rpc::auth::Caller,
+) -> Result<AnswerOutcome, sqlx::Error> {
     // Load the row to recover the raising session's id + cwd (and to short-circuit
     // an already-answered row before any discovery I/O).
     let Some(row) = AttentionRepo::get(pool, &params.attention_id).await? else {
-        return Ok(AnswerResult::NoTarget {
+        return Ok(AnswerOutcome::Answered(AnswerResult::NoTarget {
             reason: "no such attention row (already resolved or never existed)".to_string(),
-        });
+        }));
     };
+    let hold = crate::hook_ingress::hold::registry().request_for(&row.id);
+    if !crate::answer_scope::caller_may_answer(caller, row.kind, hold.is_some()) {
+        return Ok(AnswerOutcome::ScopeRefused { kind: row.kind });
+    }
+    answer_row(pool, events, params, now_ms, row, hold)
+        .await
+        .map(AnswerOutcome::Answered)
+}
+
+/// The answer path for a loaded row, given the hold read the gate judged.
+async fn answer_row(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    row: AttentionRow,
+    hold: Option<crate::hook_ingress::hold::HeldRequest>,
+) -> Result<AnswerResult, sqlx::Error> {
     if row.state != "open" {
         return Ok(AnswerResult::AlreadyAnswered {
             by: row.answered_by.unwrap_or_else(|| "unknown".to_string()),
@@ -212,7 +277,7 @@ pub async fn answer(
 
     // A live hook hold is the one exact, structured reply path: the decision
     // goes back to the held hook, never as keystrokes (hooks-and-answers).
-    if let Some(request) = crate::hook_ingress::hold::registry().request_for(&row.id) {
+    if let Some(request) = hold {
         return answer_hold(pool, events, params, now_ms, &request).await;
     }
     // An approval raised for a hook hold that has since ended: Claude's own
