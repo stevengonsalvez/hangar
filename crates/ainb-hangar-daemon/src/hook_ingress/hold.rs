@@ -251,6 +251,17 @@ impl HoldKey {
     }
 }
 
+/// What [`HoldRegistry::find_request`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestMatch {
+    /// No live hold names this request.
+    None,
+    /// Exactly one does: its attention row.
+    One(String),
+    /// Several do; answering any of them could be the wrong one.
+    Ambiguous,
+}
+
 struct Slot {
     attention_id: String,
     /// The request fingerprint the Fleet reducer stamped for this request,
@@ -371,18 +382,26 @@ impl HoldRegistry {
         inner.slots.get(key).map(|s| s.request.clone())
     }
 
-    /// The attention row of the ONE live hold in `session` whose Fleet
-    /// request fingerprint is `fingerprint`. `None` when there is none, or
-    /// when two holds share it (ambiguous: nothing is answered).
+    /// The live holds in `session` whose Fleet request fingerprint is
+    /// `fingerprint`.
     #[must_use]
-    pub fn attention_for_request(&self, session: &str, fingerprint: &str) -> Option<String> {
+    pub fn find_request(&self, session: &str, fingerprint: &str) -> RequestMatch {
         let inner = self.lock();
         let mut matches = inner
             .slots
             .iter()
             .filter(|(k, s)| k.session == session && s.fingerprint.as_deref() == Some(fingerprint));
-        let (_, slot) = matches.next()?;
-        matches.next().is_none().then(|| slot.attention_id.clone())
+        match (matches.next(), matches.next()) {
+            (None, _) => RequestMatch::None,
+            (Some((_, slot)), None) => RequestMatch::One(slot.attention_id.clone()),
+            (Some(_), Some(_)) => RequestMatch::Ambiguous,
+        }
+    }
+
+    /// The hold key bound to an attention row.
+    #[must_use]
+    pub fn key_for_attention(&self, attention_id: &str) -> Option<HoldKey> {
+        self.lock().by_attention.get(attention_id).cloned()
     }
 
     /// Deliver `decision` to every waiter on the one hold bound to the row,
@@ -792,14 +811,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            reg.attention_for_request("s1", "fp-a").as_deref(),
-            Some("att-f1")
+            reg.find_request("s1", "fp-a"),
+            RequestMatch::One("att-f1".into())
         );
         assert_eq!(
-            reg.attention_for_request("s2", "fp-a").as_deref(),
-            Some("att-f3")
+            reg.find_request("s2", "fp-a"),
+            RequestMatch::One("att-f3".into())
         );
-        assert_eq!(reg.attention_for_request("s1", "fp-x"), None);
+        assert_eq!(reg.find_request("s1", "fp-x"), RequestMatch::None);
         let _d = reg
             .register(
                 &HoldKey::new("s1", "c3"),
@@ -809,9 +828,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            reg.attention_for_request("s1", "fp-a"),
-            None,
-            "ambiguous: answer nothing"
+            reg.find_request("s1", "fp-a"),
+            RequestMatch::Ambiguous,
+            "answer nothing"
         );
     }
 
