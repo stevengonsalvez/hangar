@@ -309,7 +309,11 @@ impl HookSink for IngestSink {
             if event.hold {
                 self.hold(&event, &event_id, now_ms).await
             } else {
-                self.release_passed(&event).await;
+                // A replayed event is history: a spooled Stop from before
+                // this daemon started must never end a hold that is live now.
+                if event.received_at_ms.is_none() {
+                    self.release_passed(&event).await;
+                }
                 HookReply::NoContent
             }
         })

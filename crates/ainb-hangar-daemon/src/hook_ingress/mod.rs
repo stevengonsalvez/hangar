@@ -76,7 +76,8 @@ pub struct HookEvent {
     /// The same id rides in a spooled copy, so a replay is recorded once.
     pub event_id: Option<String>,
     /// When the hook fired, for a replayed spool line (epoch milliseconds).
-    /// `None` for a live call: the daemon's clock stamps it.
+    /// `None` for a live call: the daemon's clock stamps it. `Some` marks the
+    /// event as a replay, which never releases a live hold.
     pub received_at_ms: Option<i64>,
 }
 
