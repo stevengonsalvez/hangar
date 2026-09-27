@@ -17,6 +17,9 @@
 //! `worktree/agent_add` is the same run with `--existing-worktree`: one more
 //! agent in a worktree a create already made, on the branch it already has.
 //!
+//! `shell/create` needs no CLI hop: a plain shell is one `tmux new-session`,
+//! which the daemon runs itself (there is no `ainb shell` to call).
+//!
 //! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
 //! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
 //! daemon. An environment variable, never a `daemon_config` key, so no
@@ -27,7 +30,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ainb_hangar_proto::spawn::{
-    WorktreeAgentAddParams, WorktreeCreateParams, WorktreeCreateResult,
+    ShellCreateParams, ShellCreateResult, WorktreeAgentAddParams, WorktreeCreateParams,
+    WorktreeCreateResult,
 };
 
 /// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves the spawn verbs.
@@ -386,6 +390,115 @@ pub async fn worktree_agent_add(
     let mut resolved = params.clone();
     resolved.worktree_path = tree.to_string_lossy().into_owned();
     run_ainb(agent_add_argv(&resolved), "the agent may still be starting").await
+}
+
+/// How many fresh names a shell create tries before giving up on a run of
+/// `duplicate session` answers. Eight hex digits collide about once in four
+/// billion, so a second failure means something else is wrong.
+const SHELL_NAME_TRIES: usize = 3;
+
+/// Upper bound on one `tmux new-session`. It returns as soon as the session
+/// exists; a tmux server that does not answer in this long is wedged.
+const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Secrets the daemon may hold in its own environment. A `tmux new-session`
+/// that starts the tmux server hands the server its environment, and every
+/// pane on that server inherits it from then on, so the create drops these.
+const SHELL_ENV_SECRETS: [&str; 2] = ["HANGAR_CLAUDE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+
+/// `worktree_path` as a directory a shell may open in: the top of a
+/// registered repository ([`resolve_repo`]) or a worktree ainb created
+/// ([`resolve_worktree`]), canonical, or why not.
+fn resolve_shell_dir(
+    worktree_path: &str,
+    home: &Path,
+    managed: &Path,
+) -> Result<PathBuf, SpawnError> {
+    if Path::new(worktree_path)
+        .components()
+        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    {
+        return Err(SpawnError::Invalid(
+            "worktree_path must not contain . or .. components".into(),
+        ));
+    }
+    let repo_why = match resolve_repo(worktree_path, home) {
+        Ok(dir) => return Ok(dir),
+        Err(SpawnError::Invalid(why)) => why,
+        Err(failed) => return Err(failed),
+    };
+    resolve_worktree(worktree_path, home, managed).map_err(|error| match error {
+        SpawnError::Invalid(tree_why) => SpawnError::Invalid(format!(
+            "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
+        )),
+        failed @ SpawnError::Failed(_) => failed,
+    })
+}
+
+/// Open a plain shell in a registered repository or an ainb worktree: a new
+/// detached tmux session named `ainb-sh-<id8>`, started in that directory.
+///
+/// The `ainb-sh-` prefix is the TUI's own shell prefix, so the TUI leaves the
+/// session alone: `AppState::load_other_tmux_sessions` skips it from the
+/// other-tmux list, `auto_detect_workspace_shells` adopts only `ainb-ws-` as
+/// a workspace's shell, and `cleanup_orphaned_tmux_shells` sweeps only
+/// `ainb-ws-` and `ainb-shell-` (all in `ainb-app/src/app/state.rs`).
+///
+/// Never `-A` (attach to a same-named session) and never a kill: a name that
+/// is taken is retried with a fresh id, so no live session is touched.
+///
+/// # Errors
+/// [`SpawnError::Invalid`] for a directory refused before tmux ran,
+/// [`SpawnError::Failed`] when tmux could not make the session.
+pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
+    params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
+    let dir = resolve_shell_dir(&params.worktree_path, &home, &managed_worktrees(&home))?;
+    for _ in 0..SHELL_NAME_TRIES {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let name = format!("ainb-sh-{}", &id[..8]);
+        let mut tmux = tokio::process::Command::new("tmux");
+        tmux.args(["new-session", "-d", "-s", &name, "-c"])
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            // An inherited $TMUX would aim this at the daemon's own client
+            // context, as for `ainb run` above.
+            .env_remove("TMUX")
+            // A wedged tmux is abandoned at the timeout, not left running.
+            .kill_on_drop(true);
+        for secret in SHELL_ENV_SECRETS {
+            tmux.env_remove(secret);
+        }
+        let out = match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
+            Err(_) => {
+                return Err(SpawnError::Failed(format!(
+                    "tmux did not answer within {}s",
+                    SHELL_TMUX_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        if out.status.success() {
+            return Ok(ShellCreateResult {
+                tmux_session_name: name,
+                worktree_path: dir.to_string_lossy().into_owned(),
+            });
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("duplicate session") {
+            return Err(SpawnError::Failed(format!(
+                "tmux could not start the shell: {}",
+                stderr_tail(&out.stderr)
+            )));
+        }
+    }
+    Err(SpawnError::Failed(format!(
+        "tmux refused {SHELL_NAME_TRIES} fresh shell names as duplicates"
+    )))
 }
 
 /// Run `ainb` with `argv` and read its one JSON line, bounded by the run
@@ -882,6 +995,31 @@ mod tests {
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_shell_opens_in_a_registered_repo_or_a_managed_worktree_only() {
+        let (home, repo, managed, tree) = world_with_worktree();
+        let ok = |path: &Path| {
+            resolve_shell_dir(&path.display().to_string(), home.path(), &managed)
+                .unwrap_or_else(|e| panic!("{} must resolve: {e:?}", path.display()))
+        };
+        assert_eq!(ok(&repo), std::fs::canonicalize(&repo).unwrap());
+        assert_eq!(ok(&tree), std::fs::canonicalize(&tree).unwrap());
+
+        let refused = |path: &Path| {
+            matches!(
+                resolve_shell_dir(&path.display().to_string(), home.path(), &managed),
+                Err(SpawnError::Invalid(_))
+            )
+        };
+        assert!(refused(&repo.join("../app")), "dot components");
+        let sub = repo.join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(refused(&sub), "a subdirectory");
+        let elsewhere = tempfile::tempdir().unwrap();
+        git(elsewhere.path(), &["init", "-q"]);
+        assert!(refused(elsewhere.path()), "an unregistered repository");
     }
 
     #[test]
