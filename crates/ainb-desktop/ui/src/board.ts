@@ -24,7 +24,7 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import { isAcked } from "./acks.ts";
-import { allSessions, ATTENTION_ORDER, label, providerId } from "./sessions.ts";
+import { allSessions, ATTENTION_ORDER, keyLabel, label, providerId } from "./sessions.ts";
 import { deriveStatus, elicitationDetail, unhandled, type UiStatus } from "./status.ts";
 import type { RendererIntent } from "./tabs.ts";
 
@@ -167,7 +167,7 @@ export function boardColumns(
     if (bucketOf(status) === null) continue; // exited: not a status anyone acts on.
     cards.push({
       key: card.session_key,
-      title: label(session?.name ?? card.session_key),
+      title: label(session?.name ?? keyLabel(card.session_key)),
       sessionId: session?.id ?? null,
       status,
       evidenceObservedAt: card.evidence_observed_at,
