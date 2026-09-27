@@ -102,6 +102,11 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
  * order does not follow access time either, so opening a session never moves
  * its card under the pointer.
  *
+ * Folding still bends that order when one worktree's sessions are not next to
+ * each other in the frame: `[a1, b, a2]` draws a1, a2, b while the host walks
+ * a1, b, a2. Only a host order that keeps a worktree's sessions together
+ * closes that; the renderer cannot without splitting the card.
+ *
  * `fallbackPath` is the project's own path, for a session that carries no
  * `workspace_path` of its own (an older host, a test fixture):
  * every such session in one project folds into the SAME card rather than
@@ -119,8 +124,8 @@ export function worktreeCards(sessions: readonly Session_Serialize[], fallbackPa
 }
 
 /**
- * The Sessions frame as the sidebar draws it: one group per project, sorted
- * recent (Orca's default), each holding the worktree cards its sessions fold
+ * The Sessions frame as the sidebar draws it: one group per project, in the
+ * frame's order, each holding the worktree cards its sessions fold
  * into. A project with no sessions is dropped, matching the frame's own rule
  * that an empty workspace draws nothing (`sidebar.test.ts`).
  */
