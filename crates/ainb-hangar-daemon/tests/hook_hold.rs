@@ -472,3 +472,167 @@ async fn phones_and_pal_are_refused_approvals_over_rpc_and_desktop_is_not() {
     assert!(body.contains("\"allow\""), "{body}");
     ask_hold.abort();
 }
+
+/// `fleet/action` over the RPC dispatcher as the operator.
+async fn rpc_fleet_action(w: &World, session: &str, request_id: &str, action: Value) -> Value {
+    let key = format!("claude:{session}");
+    let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(w.store.pool(), &key)
+        .await
+        .unwrap()
+        .expect("the hold's session was reduced");
+    let req = ainb_hangar_proto::RpcRequest {
+        jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+        id: ainb_hangar_proto::RpcId::Number(1),
+        method: ainb_hangar_proto::methods::FLEET_ACTION.to_string(),
+        params: json!({
+            "session_key": key,
+            "expected_version": row.version,
+            "request_id": request_id,
+            "action": action,
+        }),
+    };
+    let resp = ainb_hangar_daemon::rpc::dispatch_as(
+        w.store.pool(),
+        &req,
+        &health(),
+        &w.broker.sink(),
+        &ainb_hangar_daemon::rpc::auth::Caller::Operator,
+    )
+    .await;
+    serde_json::to_value(resp).unwrap()
+}
+
+/// The fingerprint the Fleet app sends: the one on the session row.
+async fn session_fingerprint(w: &World, session: &str) -> String {
+    for _ in 0..100 {
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(
+            w.store.pool(),
+            &format!("claude:{session}"),
+        )
+        .await
+        .unwrap();
+        if let Some(fp) = row.and_then(|r| r.current_request_fingerprint) {
+            return fp;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no request fingerprint on {session}");
+}
+
+/// Review of #187 (follow-up): under the http hook transport the Fleet app's
+/// Approve and StructuredAnswer must reach the daemon's hold, not the notifyd
+/// broker (which stands down) and report "no longer waiting".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_action_approve_reaches_the_daemon_hold() {
+    let w = Arc::new(World::start().await);
+    let s = session("fleet-approve");
+    let held = w.hold(permission(&s, "call-fa1"));
+    let row_id = w.open_row(&s, AttentionKind::Approval).await;
+    let fp = session_fingerprint(&w, &s).await;
+
+    // A fingerprint that names no live hold falls back to the broker path
+    // and answers nothing here.
+    let stray = rpc_fleet_action(
+        &w,
+        &s,
+        "req-stray",
+        json!({"action": "approve", "request_fingerprint": "fnv1a64:0000000000000000"}),
+    )
+    .await;
+    assert_ne!(stray["result"]["receipt"]["status"], "DELIVERED", "{stray}");
+    assert!(!held.is_finished());
+
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-approve",
+        json!({"action": "approve", "request_fingerprint": fp}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    assert_eq!(resp["result"]["receipt"]["detail"], "hook hold");
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    let row = AttentionRepo::get(w.store.pool(), &row_id).await.unwrap().unwrap();
+    assert_eq!(row.state, "answered", "the inbox row closed with the hold");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_action_deny_and_structured_answer_reach_the_daemon_hold() {
+    let w = Arc::new(World::start().await);
+    let s = session("fleet-deny");
+    let held = w.hold(permission(&s, "call-fd1"));
+    w.open_row(&s, AttentionKind::Approval).await;
+    let fp = session_fingerprint(&w, &s).await;
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-deny",
+        json!({"action": "deny", "request_fingerprint": fp}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    let (_, body) = held.await.unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
+
+    let s = session("fleet-ask");
+    let held = w.hold(ask(&s, "call-fq1"));
+    w.open_row(&s, AttentionKind::AskUserQuestion).await;
+    let fp = session_fingerprint(&w, &s).await;
+    // An answer the question does not offer is refused and claims nothing.
+    let bad = rpc_fleet_action(
+        &w,
+        &s,
+        "req-bad",
+        json!({"action": "structured_answer", "request_fingerprint": fp,
+               "answers": [{"question_id": "Which colour?", "selected_options": ["Green"]}]}),
+    )
+    .await;
+    assert_ne!(bad["result"]["receipt"]["status"], "DELIVERED", "{bad}");
+    assert!(!held.is_finished());
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-ask",
+        json!({"action": "structured_answer", "request_fingerprint": fp,
+               "answers": [{"question_id": "Which colour?", "selected_options": ["Blue"]}]}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    let (_, body) = held.await.unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["hookSpecificOutput"]["updatedInput"]["answers"]["Which colour?"],
+        "Blue"
+    );
+}
+
+/// With no `tool_use_id` on either side, the tool and its input name the
+/// call: the matching PostToolUse ends the hold, another command does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_tool_use_ids_the_tool_and_input_name_the_call() {
+    let w = Arc::new(World::start().await);
+    let s = session("no-ids");
+    let mut request = permission_for(&s, "unused", "make test");
+    request.as_object_mut().unwrap().remove("tool_use_id");
+    let held = w.hold(request);
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    let post = |command: &str| {
+        json!({"hook_event_name": "PostToolUse", "session_id": s, "cwd": "/tmp/hold-test",
+               "tool_name": "Bash", "tool_input": {"command": command}})
+    };
+    assert_eq!(w.post("/hook/claude", &post("ls")).await.0, 204);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !held.is_finished(),
+        "another command's PostToolUse ended the hold"
+    );
+    assert_eq!(w.post("/hook/claude", &post("make test")).await.0, 204);
+    let (status, _) = held.await.unwrap();
+    assert_eq!(status, 204);
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.answered_by.as_deref(), Some(RESOLVED_BY_AGENT));
+}
