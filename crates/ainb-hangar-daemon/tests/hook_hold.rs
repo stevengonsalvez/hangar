@@ -270,22 +270,32 @@ async fn the_agent_moving_on_ends_the_hold_and_retires_its_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_approval_whose_hold_ended_is_never_typed_into_a_pane() {
+async fn a_hook_that_goes_away_retires_its_row_and_nothing_is_typed() {
     let w = Arc::new(World::start().await);
     let s = session("ended");
     // Raise the row through a hold, then drop the hook's connection.
     let held = w.hold(permission(&s, "call-5"));
     let id = w.open_row(&s, AttentionKind::Approval).await;
     held.abort();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let result = w.answer(&id, "allow").await;
-    assert!(
-        matches!(
-            result,
-            AnswerResult::NoTarget { .. } | AnswerResult::DeliveryFailed { .. }
-        ),
-        "{result:?}"
+    let mut row = None;
+    for _ in 0..100 {
+        let r = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+        if r.state != "open" {
+            row = Some(r);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let row = row.expect("the row was retired when its hook went away");
+    assert_eq!(
+        row.answered_by.as_deref(),
+        Some(hook_ingress::RESOLVED_NATIVE)
     );
+    // A late answer is a loser, never keystrokes at the agent's own prompt.
+    assert!(matches!(
+        w.answer(&id, "allow").await,
+        AnswerResult::AlreadyAnswered { .. }
+    ));
 }
 
 fn permission_for(session: &str, call: &str, command: &str) -> Value {
@@ -329,16 +339,18 @@ async fn an_answer_never_reaches_another_requests_hook() {
         let harmless = permission_for(&s, "call-ls", "ls");
 
         let first = w.hold(danger.clone());
-        let danger_row = row_for_call(&w, &s, "call-danger").await;
+        let _ = row_for_call(&w, &s, "call-danger").await;
         first.abort(); // the dangerous hook's connection drops
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let held_ls = w.hold(harmless);
         let ls_row = row_for_call(&w, &s, "call-ls").await;
-        assert_ne!(danger_row, ls_row);
 
         let danger_again = w.hold(danger);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // The dropped hook's row was retired; the re-hook raised its own.
+        let danger_row = row_for_call(&w, &s, "call-danger").await;
+        assert_ne!(danger_row, ls_row);
 
         assert!(matches!(
             w.answer(&ls_row, "allow").await,
@@ -364,4 +376,99 @@ async fn an_answer_never_reaches_another_requests_hook() {
         assert_eq!(status, 200, "run {run}");
         assert!(body.contains("\"deny\""), "run {run}: {body}");
     }
+}
+
+fn health() -> ainb_hangar_daemon::rpc::DaemonHealth {
+    ainb_hangar_daemon::rpc::DaemonHealth {
+        socket_path: "/tmp/hook-hold.sock".to_string(),
+        pid: std::process::id(),
+        started_at: std::time::Instant::now(),
+        version: "0.1.0".into(),
+        stats: Arc::new(ainb_hangar_daemon::health_stats::HealthStats::default()),
+    }
+}
+
+/// `attention/answer` over the RPC dispatcher as `caller`.
+async fn rpc_answer(
+    w: &World,
+    caller: &ainb_hangar_daemon::rpc::auth::Caller,
+    attention_id: &str,
+    answer: &str,
+) -> Value {
+    let req = ainb_hangar_proto::RpcRequest {
+        jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+        id: ainb_hangar_proto::RpcId::Number(1),
+        method: ainb_hangar_proto::methods::ATTENTION_ANSWER.to_string(),
+        params: json!({"attention_id": attention_id, "answer": answer, "answered_by": "x"}),
+    };
+    let resp = ainb_hangar_daemon::rpc::dispatch_as(
+        w.store.pool(),
+        &req,
+        &health(),
+        &w.broker.sink(),
+        caller,
+    )
+    .await;
+    serde_json::to_value(resp).unwrap()
+}
+
+fn is_scope_refusal(resp: &Value) -> bool {
+    resp["error"]["code"] == ainb_hangar_proto::mutation::MUTATION_REJECTED
+        && resp["error"].to_string().contains(&format!(
+            "\"{}\"",
+            ainb_hangar_proto::mutation::REASON_SCOPE
+        ))
+}
+
+/// Review of #187 (M5): phone scopes and Pal are refused an approval row and
+/// a held ask over the real dispatcher, and nothing is claimed; a desktop
+/// device may answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phones_and_pal_are_refused_approvals_over_rpc_and_desktop_is_not() {
+    use ainb_hangar_daemon::rpc::auth::Caller;
+    use ainb_hangar_proto::devices::DeviceScope;
+    let w = Arc::new(World::start().await);
+    let s = session("rpc-scope");
+    let approval = w.hold(permission(&s, "call-r1"));
+    let approval_row = w.open_row(&s, AttentionKind::Approval).await;
+    let ask_hold = w.hold(ask(&s, "call-r2"));
+    let ask_row = w.open_row(&s, AttentionKind::AskUserQuestion).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let refused = [
+        Caller::Device {
+            device_id: "phone-1".into(),
+            scope: DeviceScope::MOBILE,
+        },
+        Caller::Device {
+            device_id: "phone-2".into(),
+            scope: DeviceScope::MOBILE_TYPE,
+        },
+        Caller::Pal {
+            scope_key: "pal-1".into(),
+        },
+    ];
+    for caller in &refused {
+        for (row, answer) in [(&approval_row, "allow"), (&ask_row, "Blue")] {
+            let resp = rpc_answer(&w, caller, row, answer).await;
+            assert!(is_scope_refusal(&resp), "{caller:?} {row}: {resp}");
+            let state = AttentionRepo::get(w.store.pool(), row).await.unwrap().unwrap();
+            assert_eq!(state.state, "open", "{caller:?} claimed {row}");
+        }
+    }
+    assert!(
+        !approval.is_finished() && !ask_hold.is_finished(),
+        "no hook was answered"
+    );
+
+    let desktop = Caller::Device {
+        device_id: "laptop".into(),
+        scope: DeviceScope::DESKTOP,
+    };
+    let resp = rpc_answer(&w, &desktop, &approval_row, "allow").await;
+    assert_eq!(resp["result"]["outcome"], "delivered", "{resp}");
+    let (status, body) = approval.await.unwrap();
+    assert_eq!(status, 200);
+    assert!(body.contains("\"allow\""), "{body}");
+    ask_hold.abort();
 }
