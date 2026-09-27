@@ -560,8 +560,10 @@ struct ExistingWorktree {
 ///
 /// Refused: a path that does not resolve; one whose `.git` is not a FILE
 /// (a repository's own checkout, where `--worktree` exists to keep agents
-/// out, or a subdirectory of a tree); one outside ainb's managed
-/// `worktrees/by-name`; and one whose source repository cannot be found.
+/// out, or a subdirectory of a tree); one that is not a folder directly in
+/// ainb's managed `worktrees/by-name`; and one whose source repository cannot
+/// be found. The daemon's `worktree/agent_add` checks the same tree against
+/// git before it gets here; this is the CLI's own backstop for a direct call.
 fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree> {
     let tree = path
         .canonicalize()
@@ -573,11 +575,10 @@ fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree>
         );
     }
     let managed = WorktreeManager::for_reading()?.base_dir().join("by-name");
-    let under_managed =
-        managed.canonicalize().is_ok_and(|dir| tree.starts_with(&dir) && tree != dir);
-    if !under_managed {
+    let in_managed = managed.canonicalize().is_ok_and(|dir| tree.parent() == Some(dir.as_path()));
+    if !in_managed {
         anyhow::bail!(
-            "--existing-worktree must be a worktree ainb created, under {}: {}",
+            "--existing-worktree must be a worktree ainb created, a folder directly in {}: {}",
             managed.display(),
             tree.display()
         );
