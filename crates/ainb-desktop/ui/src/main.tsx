@@ -731,6 +731,8 @@ function Shell() {
                 run={(intents) => void run(intents)}
                 onSetupWrite={setupWrite}
                 onRefreshSetup={refreshSetup}
+                theme={theme.preference()}
+                onTheme={theme.set}
                 onClose={() => {
                   closeSettings();
                   setPane("board");
@@ -810,5 +812,6 @@ function Shell() {
   );
 }
 
-startTheme();
+// The theme control the settings page reads and sets (Appearance > Theme).
+const theme = startTheme();
 render(() => <Shell />, document.getElementById("root")!);
