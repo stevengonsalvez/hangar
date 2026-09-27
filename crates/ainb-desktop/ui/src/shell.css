@@ -1561,6 +1561,7 @@ body {
 
 .theme-switch {
   display: inline-flex;
+  margin: 0;
   padding: 2px;
   gap: 2px;
   border: 1px solid var(--border);
@@ -1568,22 +1569,30 @@ body {
 }
 
 .theme-choice {
+  position: relative;
   padding: 3px 10px;
-  border: 0;
   border-radius: calc(var(--radius-sm) - 2px);
-  background: transparent;
   color: var(--muted-foreground);
-  font: inherit;
   font-size: var(--text-meta);
   cursor: pointer;
 }
 
-.theme-choice[aria-checked="true"] {
+/* The native radio stays in the tree (keyboard, screen reader) but is drawn
+   by its label. */
+.theme-choice input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.theme-choice:has(input:checked) {
   background: var(--accent);
   color: var(--text);
 }
 
-.theme-choice:focus-visible {
+.theme-choice:has(input:focus-visible) {
   outline: 2px solid var(--ring);
   outline-offset: 1px;
 }
