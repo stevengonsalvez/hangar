@@ -25,15 +25,29 @@ use ainb_hangar_store::repo::attention::AttentionKind;
 
 use crate::rpc::auth::Caller;
 
-/// The scope column a caller answers from: the operator column for every
-/// unix-leg caller (a Pal credential never reaches `attention/answer`, its
-/// method list excludes it), the device's own column for a paired device.
-/// `None` for a device scope with an unknown base, which is refused.
+/// The scope column a caller answers from: the operator column for the
+/// operator's own token, the device's own column for a paired device. `None`
+/// for a device scope with an unknown base (refused), and for Pal, which has
+/// no column: it is judged by [`caller_may_answer`].
 #[must_use]
 pub fn column_of(caller: &Caller) -> Option<ScopeColumn> {
     match caller {
-        Caller::Operator | Caller::Pal { .. } => Some(ScopeColumn::Operator),
+        Caller::Operator => Some(ScopeColumn::Operator),
+        Caller::Pal { .. } => None,
         Caller::Device { scope, .. } => scope.column(),
+    }
+}
+
+/// Whether `caller` may answer a row of `kind`.
+///
+/// Pal is an LLM-driven caller. It may call `attention/answer` for plain
+/// questions, but it can never call `fleet/action` at all, so it is refused
+/// every approval-class answer: an approval can run an arbitrary command.
+#[must_use]
+pub fn caller_may_answer(caller: &Caller, kind: AttentionKind, resolves_hold: bool) -> bool {
+    match caller {
+        Caller::Pal { .. } => !is_approval_class(kind, resolves_hold),
+        other => column_of(other).is_some_and(|column| answer_allowed(column, kind, resolves_hold)),
     }
 }
 
@@ -146,35 +160,52 @@ mod tests {
             column_of(&Caller::Pal {
                 scope_key: "s".into()
             }),
-            Some(ScopeColumn::Operator)
+            None
         );
         for (scope, column) in [
             (DeviceScope::MOBILE, ScopeColumn::Mobile),
             (DeviceScope::MOBILE_TYPE, ScopeColumn::MobileType),
             (DeviceScope::DESKTOP, ScopeColumn::Desktop),
         ] {
-            let phone = Caller::Device {
+            let device = Caller::Device {
                 device_id: "d1".into(),
                 scope,
             };
-            assert_eq!(column_of(&phone), Some(column));
+            assert_eq!(column_of(&device), Some(column));
         }
-        // A phone may still answer a plain question, never an approval.
+    }
+
+    /// Every caller kind against every attention kind, with and without a hold.
+    #[test]
+    fn every_caller_against_every_kind() {
+        use ainb_hangar_proto::devices::DeviceScope;
+        let pal = Caller::Pal {
+            scope_key: "s".into(),
+        };
         let phone = Caller::Device {
             device_id: "d1".into(),
             scope: DeviceScope::MOBILE,
         };
-        let column = column_of(&phone).unwrap();
-        assert!(answer_allowed(
-            column,
-            AttentionKind::AskUserQuestion,
-            false
-        ));
-        assert!(!answer_allowed(column, AttentionKind::Approval, false));
-        assert!(!answer_allowed(
-            column,
-            AttentionKind::AskUserQuestion,
-            true
-        ));
+        let desktop = Caller::Device {
+            device_id: "d2".into(),
+            scope: DeviceScope::DESKTOP,
+        };
+        for kind in KINDS {
+            for resolves_hold in [false, true] {
+                let approval = is_approval_class(kind, resolves_hold);
+                assert!(caller_may_answer(&Caller::Operator, kind, resolves_hold));
+                assert!(caller_may_answer(&desktop, kind, resolves_hold));
+                assert_eq!(
+                    caller_may_answer(&pal, kind, resolves_hold),
+                    !approval,
+                    "Pal {kind:?} hold={resolves_hold}"
+                );
+                assert_eq!(
+                    caller_may_answer(&phone, kind, resolves_hold),
+                    !approval,
+                    "phone {kind:?} hold={resolves_hold}"
+                );
+            }
+        }
     }
 }
