@@ -3037,6 +3037,47 @@ mod tests {
         );
     }
 
+    /// Answering clears the board on the fleet revision; the "need you" count
+    /// and the Waiting panel must follow that revision, not the poller's clock.
+    /// An advanced head wakes the poller, and the poll it produces merges on
+    /// the next tick without waiting out the merge cadence.
+    #[test]
+    fn an_advanced_fleet_head_wakes_the_attention_poller_and_its_result_merges_at_once() {
+        use crate::fleet::attention::{AttentionKind, SessionAttention};
+        use futures_util::FutureExt as _;
+        let mut state = state_with_session_at("/work/nudged", Some("tmux_nudged"));
+        let nudge = std::sync::Arc::clone(&state.host.attention_poll_nudge);
+
+        state.observe_agent_status_head(7);
+        assert!(
+            nudge.notified().now_or_never().is_some(),
+            "a newer revision wakes the poller"
+        );
+        state.observe_agent_status_head(7);
+        state.observe_agent_status_head(6);
+        assert!(
+            nudge.notified().now_or_never().is_none(),
+            "a revision already seen does not"
+        );
+
+        // A merge just ran; the woken poller then publishes what it found.
+        state.host.last_attention_refresh = Some(std::time::Instant::now());
+        install_daemon_row(
+            &state,
+            "/elsewhere",
+            SessionAttention::daemon(AttentionKind::Ask, 1_000, "att-nudged".into()),
+        );
+        state
+            .host
+            .daemon_attention_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        state.refresh_attention(2_000);
+        assert_eq!(
+            state.fleet.attention_elsewhere, 1,
+            "the poll's result merges inside the cadence"
+        );
+    }
+
     /// A refresh that finds nothing new bumps no section, so a mirror frames
     /// nothing: the desktop calls this from its tick.
     #[test]
