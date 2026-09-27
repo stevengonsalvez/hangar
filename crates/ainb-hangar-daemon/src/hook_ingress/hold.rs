@@ -68,6 +68,15 @@ impl HeldRequest {
     #[must_use]
     pub fn from_payload(payload: &Value) -> Option<Self> {
         match payload.get("hook_event_name").and_then(Value::as_str)? {
+            // Claude also raises a PermissionRequest for AskUserQuestion; that
+            // question is held by its own PreToolUse, and an approve decision
+            // here would dismiss it with no answer. Never hold it as a
+            // permission.
+            "PermissionRequest"
+                if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
+            {
+                None
+            }
             "PermissionRequest" => Some(Self::Permission),
             "PreToolUse"
                 if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") =>
@@ -456,6 +465,7 @@ mod tests {
         );
         assert!(ask() != HeldRequest::Permission);
         for other in [
+            json!({"hook_event_name": "PermissionRequest", "tool_name": "AskUserQuestion"}),
             json!({"hook_event_name": "PreToolUse", "tool_name": "Bash"}),
             json!({"hook_event_name": "PreToolUse", "tool_name": "AskUserQuestion", "tool_input": {}}),
             json!({"hook_event_name": "Stop"}),
