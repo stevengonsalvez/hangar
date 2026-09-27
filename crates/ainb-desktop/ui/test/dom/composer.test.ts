@@ -177,6 +177,32 @@ test("Esc while an input method is composing does not close", async () => {
   assert.ok(container.querySelector(".composer"), "the candidate is cancelled, not the form");
 });
 
+test("Mod+Enter in the prompt submits, but not while an input method is composing", async () => {
+  hostReplies.set("worktree_create", {
+    session_id: "u-1",
+    tmux_session_name: "repo-abcd1234",
+    worktree_path: "/repo/.worktrees/abcd1234",
+    branch: "ainb/fix-login",
+  });
+  const container = await open();
+  fill(container, ".composer-name", "Fix login");
+  const prompt = container.querySelector<HTMLTextAreaElement>(".composer-prompt")!;
+  fill(container, ".composer-prompt", "fix it");
+
+  // The IME's Enter confirms a candidate: nothing is sent.
+  prompt.dispatchEvent(
+    new window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, metaKey: true, isComposing: true, bubbles: true, cancelable: true }),
+  );
+  await settle();
+  assert.equal(hostCalls.get("worktree_create"), undefined, "a composing Enter never submits");
+
+  prompt.dispatchEvent(
+    new window.KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, metaKey: true, bubbles: true, cancelable: true }),
+  );
+  await settle();
+  assert.ok(hostCalls.get("worktree_create"), "the same chord, composition over, submits");
+});
+
 test("a drag that starts in a field and ends on the scrim does not close", async () => {
   const container = await open();
   const backdrop = container.querySelector<HTMLElement>(".composer-backdrop")!;
