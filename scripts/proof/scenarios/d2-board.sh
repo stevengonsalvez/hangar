@@ -13,7 +13,6 @@
 EXPECT="a question raised by a separate hook process reaches the open desktop window's board as a waiting card, from framed sections, a second surface answers it and the daemon records that surface, a third surface reads the same winner, and the window's waiting column drops the card"
 
 QUESTION="Ship the d2 board to which environment?"
-PROVIDER_ID="proof-d2-board"
 
 # attention_answered <id>: the daemon no longer lists the row in its open
 # feed, read through its own `attention/list` (#1193). A row leaves the feed
@@ -51,8 +50,11 @@ scenario() {
   check "the waiting column is empty before the question" wait_for 30 waiting_is 0
 
   # Raised through the agent's own hook command, by a process that is not the
-  # window, against the fixture session's worktree.
-  raise_ask "$QUESTION" "$PROVIDER_ID" >"$NODE_DIR/raise.txt" 2>&1
+  # window, under the id ainb minted for the fixture session's agent: exact-id
+  # routing (#153) places a request only on the row that holds its id, and
+  # refuses a made-up one as `no_target`.
+  check "ainb minted the fixture agent's session id" test -n "$FIXTURE_CLAUDE_ID"
+  raise_ask "$QUESTION" "$FIXTURE_CLAUDE_ID" >"$NODE_DIR/raise.txt" 2>&1
   CAPTURES+=("raise.txt")
   check "the board drew a waiting card within 60 s" wait_for 60 waiting_at_least 1
   observe "board columns with the question open: $(applied_board)"

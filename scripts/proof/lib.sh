@@ -373,6 +373,10 @@ fixture_session() {
   FIXTURE_ID="$(jq -r '.session_id // empty' <<<"$line" 2>/dev/null)"
   FIXTURE_TMUX="$(jq -r '.tmux_session_name // empty' <<<"$line" 2>/dev/null)"
   FIXTURE_CWD="$(jq -r '.worktree_path // empty' <<<"$line" 2>/dev/null)"
+  # The id ainb minted for the agent's own `--session-id`: a hook raised
+  # under it is routed to this row by exact id (#153), where a made-up id is
+  # refused as `no_target`. Empty for an agent ainb mints no id for.
+  FIXTURE_CLAUDE_ID="$(jq -r '.claude_session_id // empty' <<<"$line" 2>/dev/null)"
   # All three are used later (the id by the daemon reads, the worktree by the
   # hook's cwd and the diff scenarios), so a line missing any of them is a
   # session the harness cannot drive.
