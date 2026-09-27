@@ -46,11 +46,11 @@ import { CLOSE_SETTINGS, OPEN_SETTINGS } from "./settings.ts";
 import { banner as sidecarBanner, retryable, type SidecarState } from "./sidecar.ts";
 import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
-  accelerator,
   openRowIntent,
   rowOf,
   stepTab,
-  acceleratorAllowedUnderModal,
+  modalBlocks,
+  shellKeydown,
   terminalMayTakeFocus,
   type Accelerator,
   type RendererIntent,
@@ -377,7 +377,7 @@ function Shell() {
   const onAccelerator = (shell: Accelerator) => {
     // A modal owns the keyboard: no chord may switch or close a tab, or focus
     // a terminal, behind the open composer.
-    if (composer.open() && !acceleratorAllowedUnderModal(shell)) return;
+    if (modalBlocks(shell, composer.open())) return;
     switch (shell.kind) {
       case "tab": {
         const tab = tabs()[shell.index];
@@ -421,18 +421,7 @@ function Shell() {
 
   // The accelerators work outside a terminal too; a terminal marks the ones
   // it handled, so they do not run twice.
-  const onKey = (event: KeyboardEvent) => {
-    if (event.defaultPrevented) return;
-
-    const shell = accelerator(event, MAC);
-    // Under the composer, a chord the modal refuses is not the shell's to
-    // swallow: left alone it reaches the focused field, so Ctrl+Shift+C and
-    // Ctrl+Shift+V still copy and paste there off macOS.
-    if (shell && !(composer.open() && !acceleratorAllowedUnderModal(shell))) {
-      event.preventDefault();
-      onAccelerator(shell);
-    }
-  };
+  const onKey = shellKeydown({ mac: MAC, modalOpen: () => composer.open(), run: onAccelerator });
   window.addEventListener("keydown", onKey);
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
