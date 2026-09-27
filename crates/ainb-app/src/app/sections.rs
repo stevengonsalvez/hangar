@@ -1728,6 +1728,9 @@ pub struct HostOnlyState {
     /// `FleetSection::daemon_attention_seen` is the versioned copy that
     /// `refresh_daemon_attention_generation` folds it into once a frame.
     pub daemon_attention_generation: crate::fleet::attention_poll::Generation,
+    /// Wakes the attention poller early when the fleet revision moves, so the
+    /// "need you" count follows the board rather than the poll clock.
+    pub attention_poll_nudge: crate::fleet::attention_poll::Nudge,
     /// A "mark all read" sweep the host is sending now. One held key is one
     /// sweep: a second press while it is in flight emits nothing, and the
     /// report clears it.
@@ -1802,6 +1805,7 @@ impl Default for HostOnlyState {
             transcript: None,
             attention_poll_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             daemon_attention_generation: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            attention_poll_nudge: crate::fleet::attention_poll::Nudge::default(),
             inbox_mark_in_flight: false,
             attention_attached_at: HashMap::new(),
             attention_focus_pending: HashSet::new(),
