@@ -244,15 +244,31 @@ ainb_lazy_spawn() {
   return 1
 }
 
-# Try the socket first.
-if ! ainb_send; then
-  # Either no socket or send failed — try lazy spawn and retry once.
-  if ainb_lazy_spawn && ainb_send; then
-    :
-  else
-    # Last resort: append envelope to fallback file (one JSON object per line).
-    printf '%s\n' "${AINB_ENVELOPE}" >> "${AINB_FALLBACK}" 2>/dev/null || true
+ainb_deliver() {
+  # Try the socket first.
+  if ! ainb_send; then
+    # Either no socket or send failed: try lazy spawn and retry once.
+    if ainb_lazy_spawn && ainb_send; then
+      :
+    else
+      # Last resort: append envelope to fallback file (one JSON object per line).
+      printf '%s\n' "${AINB_ENVELOPE}" >> "${AINB_FALLBACK}" 2>/dev/null || true
+    fi
   fi
+}
+
+# SessionEnd writes the daemon (section 6) BEFORE the notification. Claude gives
+# a SessionEnd hook about 1.5s, and `ainb_send`'s `nc -w 1` (no `-N`) waits out
+# that full second on macOS, so delivering first let the host kill the hook
+# before the daemon heard the session end, leaving its card at Done. A lost
+# toast is cheap; a lost exit is not. Every other event keeps the notification
+# first: the Stop drain below can block, and its toast must not wait behind it.
+case "${AINB_HOOK_EVENT:-${AINB_RAW_EVENT}}" in
+  SessionEnd | SessionEnd:*) AINB_DELIVER_LAST=1 ;;
+  *) AINB_DELIVER_LAST=0 ;;
+esac
+if [ "${AINB_DELIVER_LAST}" = "0" ]; then
+  ainb_deliver
 fi
 
 # ----- 6. ATC plumbing (status files · durable inbox · Stop-drain) ------------
@@ -286,6 +302,10 @@ if { [ "${AINB_MANAGED:-}" = "atc" ] || [ "${AINB_AGENT:-}" = "claude" ] || [ "$
   if [ -n "${AINB_HOOK_OUT}" ]; then
     printf '%s\n' "${AINB_HOOK_OUT}"
   fi
+fi
+
+if [ "${AINB_DELIVER_LAST}" = "1" ]; then
+  ainb_deliver
 fi
 
 exit 0
