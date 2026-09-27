@@ -231,7 +231,8 @@ test("map keys meet their pattern, there are no prefixes, and a secret is refuse
   assert.match(editRefusal("acp.adapters.claude-agent-acp.permission_mode")!, /host runs, binds or trusts/);
   assert.match(editRefusal("acp.adapters.claude-agent-acp.command")!, /host runs, binds or trusts/);
   assert.match(editRefusal("fleet.bridge.telegram.user_id")!, /host runs, binds or trusts/);
-  assert.equal(editRefusal("ui_preferences.theme"), null);
+  // The TUI's own theme: the desktop's is Settings > Appearance, one owner.
+  assert.match(editRefusal("ui_preferences.theme")!, /terminal UI's theme/);
   assert.match(editRefusal("fleet.terminal")!, /host runs, binds or trusts/);
   assert.equal(editRefusal("fleet.idle_min"), null);
   assert.match(editRefusal("no.such.row")!, /does not edit it/);
