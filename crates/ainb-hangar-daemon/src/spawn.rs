@@ -477,8 +477,10 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
             Err(_) => {
-                // The server may still make the session after its client is
-                // gone, so name it: nothing else would ever find it.
+                // The name is fresh, so a session under it is this create's:
+                // try to take it back. The server may still make it after its
+                // client is gone, so name it too: nothing else would find it.
+                kill_own_shell(&name).await;
                 return Err(SpawnError::Failed(format!(
                     "tmux did not answer within {}s; the shell may still appear as {name}",
                     SHELL_TMUX_TIMEOUT.as_secs()
@@ -496,11 +498,7 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
             // The name was free (tmux says so as `duplicate session`), so a
             // session under it now is the one this command made before the
             // secret scrub after it failed: take it back.
-            let _ = tokio::process::Command::new("tmux")
-                .env_remove("TMUX")
-                .args(["kill-session", "-t", &format!("={name}")])
-                .output()
-                .await;
+            kill_own_shell(&name).await;
             return Err(SpawnError::Failed(format!(
                 "tmux could not start the shell {name}: {}",
                 stderr_tail(&out.stderr)
@@ -510,6 +508,19 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
     Err(SpawnError::Failed(format!(
         "tmux refused {SHELL_NAME_TRIES} fresh shell names as duplicates"
     )))
+}
+
+/// Best-effort, bounded removal of a shell this create just made under a
+/// fresh name, by its exact name (`=name`, never a prefix match).
+async fn kill_own_shell(name: &str) {
+    let mut kill = tokio::process::Command::new("tmux");
+    kill.env_remove("TMUX")
+        .args(["kill-session", "-t", &format!("={name}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let _ = tokio::time::timeout(SHELL_TMUX_TIMEOUT, kill.status()).await;
 }
 
 /// Run `ainb` with `argv` and read its one JSON line, bounded by the run
