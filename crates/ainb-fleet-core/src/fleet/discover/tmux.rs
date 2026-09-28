@@ -14,7 +14,8 @@ use crate::fleet::types::{
 const LIST_FORMAT: &str = concat!(
     "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t",
     "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t",
-    "#{pane_start_command}\t#{session_created}\t#{pane_dead}\t#{window_activity}"
+    "#{pane_start_command}\t#{session_created}\t#{pane_dead}\t#{window_activity}\t",
+    "#{pid}"
 );
 
 /// Silence after which a live pane counts as between turns rather than working.
@@ -57,6 +58,12 @@ struct TmuxPaneRow {
     /// does not report it, which keeps the lifecycle honestly `Unknown` instead
     /// of inventing an idle age from a missing value.
     window_activity: Option<i64>,
+    /// The tmux server's pid (`#{pid}`). A pane id is unique only within one
+    /// server, and unlike `session_created` it survives the pane moving to
+    /// another session (`join-pane`, `move-window`, `break-pane`). `None` when
+    /// tmux reports nothing usable, which leaves the fingerprint in its older
+    /// shape rather than inventing a server.
+    server_pid: Option<u32>,
 }
 
 impl TmuxPaneRow {
@@ -67,11 +74,18 @@ impl TmuxPaneRow {
         )
     }
 
+    /// `pane=%N;pid=N;session_started=N;server=N`, the shape the Claude hook
+    /// writes too (`ainb` `cli/fleet/atc.rs`). The daemon keys a pane on
+    /// `pane` plus `server` (`pane_identity` in `ainb-hangar-daemon`).
     fn process_start_fingerprint(&self) -> String {
-        format!(
+        let mut fingerprint = format!(
             "pane={};pid={};session_started={}",
             self.pane_id, self.pane_pid, self.session_created
-        )
+        );
+        if let Some(server) = self.server_pid {
+            fingerprint.push_str(&format!(";server={server}"));
+        }
+        fingerprint
     }
 
     /// Derive lifecycle from what tmux already knows about the pane.
@@ -185,10 +199,10 @@ fn parse_rows(stdout: &str) -> Result<Vec<TmuxPaneRow>> {
 }
 
 fn parse_row(line: &str) -> Result<TmuxPaneRow> {
-    let fields: Vec<&str> = line.splitn(11, '\t').collect();
-    if fields.len() != 11 {
+    let fields: Vec<&str> = line.splitn(12, '\t').collect();
+    if fields.len() != 12 {
         anyhow::bail!(
-            "tmux list-panes row has {} fields, expected 11",
+            "tmux list-panes row has {} fields, expected 12",
             fields.len()
         );
     }
@@ -211,6 +225,7 @@ fn parse_row(line: &str) -> Result<TmuxPaneRow> {
         // just with an `Unknown` lifecycle.
         pane_dead: fields[9].trim() == "1",
         window_activity: fields[10].trim().parse().ok(),
+        server_pid: fields[11].trim().parse().ok(),
     })
 }
 
@@ -267,8 +282,8 @@ mod tests {
     #[test]
     fn parser_preserves_same_cwd_as_distinct_exact_targets() {
         let rows = parse_rows(concat!(
-            "claude-a\t0\t0\t%1\t101\t/repo\t2.1.220\tclaude\t1700000000\t0\t1700000499\n",
-            "codex-b\t2\t1\t%2\t202\t/repo\tcodex\tcodex\t1700000001\t0\t1700000499\n"
+            "claude-a\t0\t0\t%1\t101\t/repo\t2.1.220\tclaude\t1700000000\t0\t1700000499\t4100\n",
+            "codex-b\t2\t1\t%2\t202\t/repo\tcodex\tcodex\t1700000001\t0\t1700000499\t4100\n"
         ))
         .expect("parse tmux rows");
 
@@ -293,8 +308,9 @@ mod tests {
     fn a_renamed_claude_process_is_still_detected_as_claude() {
         // Claude reports its VERSION as `pane_current_command`, so the pane
         // command string says `2.1.220` and only the process tree says claude.
-        let row = parse_row("build\t0\t0\t%1\t101\t/repo\t2.1.220\tzsh\t1700000000\t0\t1700000499")
-            .expect("parse row");
+        let row =
+            parse_row("build\t0\t0\t%1\t101\t/repo\t2.1.220\tzsh\t1700000000\t0\t1700000499\t4100")
+                .expect("parse row");
 
         let session = row.into_session(&processes(), NOW);
 
@@ -306,7 +322,7 @@ mod tests {
         // The old string heuristic matched the tmux SESSION NAME, so a branch
         // called `f/claude-resume` minted a bogus CLAUDE row.
         let row = parse_row(
-            "tmux_repo--f-claude-resume\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499",
+            "tmux_repo--f-claude-resume\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499\t4100",
         )
         .expect("parse row");
 
@@ -318,8 +334,9 @@ mod tests {
 
     #[test]
     fn a_bare_shell_pane_is_not_a_fleet_session() {
-        let row = parse_row("plain\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499")
-            .expect("parse row");
+        let row =
+            parse_row("plain\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499\t4100")
+                .expect("parse row");
 
         // `Unknown` is exactly what the roster filter drops, so a bare shell is
         // still enumerated for identity checks but never becomes a Fleet row.
@@ -332,9 +349,9 @@ mod tests {
     #[test]
     fn the_roster_filter_drops_only_the_agentless_panes() {
         let rows = parse_rows(concat!(
-            "claude-a\t0\t0\t%1\t101\t/repo\t2.1.220\tzsh\t1700000000\t0\t1700000499\n",
-            "bare\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499\n",
-            "codex-b\t2\t1\t%2\t202\t/repo\tcodex\tcodex\t1700000001\t0\t1700000499\n"
+            "claude-a\t0\t0\t%1\t101\t/repo\t2.1.220\tzsh\t1700000000\t0\t1700000499\t4100\n",
+            "bare\t0\t0\t%9\t909\t/tmp\tzsh\tzsh\t1700000000\t0\t1700000499\t4100\n",
+            "codex-b\t2\t1\t%2\t202\t/repo\tcodex\tcodex\t1700000001\t0\t1700000499\t4100\n"
         ))
         .expect("parse tmux rows");
         let table = processes();
@@ -355,8 +372,9 @@ mod tests {
 
     #[test]
     fn tmux_rows_are_degraded_and_only_allow_safe_fallbacks() {
-        let row = parse_row("plain\t0\t0\t%1\t101\t/tmp\tzsh\tclaude\t1700000000\t0\t1700000499")
-            .expect("parse row");
+        let row =
+            parse_row("plain\t0\t0\t%1\t101\t/tmp\tzsh\tclaude\t1700000000\t0\t1700000499\t4100")
+                .expect("parse row");
         let session = row.into_session(&processes(), NOW);
 
         assert_eq!(session.management, ManagementState::Degraded);
@@ -372,10 +390,33 @@ mod tests {
     }
 
     #[test]
+    fn the_fingerprint_names_the_tmux_server() {
+        let fingerprint = |server: &str| {
+            parse_row(&format!(
+                "s\t0\t0\t%95\t101\t/repo\tzsh\tclaude\t1700000000\t0\t1700000499\t{server}"
+            ))
+            .expect("parse row")
+            .into_session(&processes(), NOW)
+            .process_start_fingerprint
+        };
+
+        assert_eq!(
+            fingerprint("4100").as_deref(),
+            Some("pane=%95;pid=101;session_started=1700000000;server=4100")
+        );
+        // A tmux that reports no server pid keeps the older shape, which the
+        // daemon still keys on `session_started`.
+        assert_eq!(
+            fingerprint("").as_deref(),
+            Some("pane=%95;pid=101;session_started=1700000000")
+        );
+    }
+
+    #[test]
     fn lifecycle_follows_pane_activity_age() {
         let live = |activity: &str, dead: &str| {
             parse_row(&format!(
-                "s\t0\t0\t%1\t101\t/repo\tzsh\tclaude\t1700000000\t{dead}\t{activity}"
+                "s\t0\t0\t%1\t101\t/repo\tzsh\tclaude\t1700000000\t{dead}\t{activity}\t4100"
             ))
             .expect("parse row")
             .into_session(&processes(), NOW)
@@ -394,8 +435,8 @@ mod tests {
     fn a_tmux_without_activity_reporting_stays_unknown_not_idle() {
         // Inventing an idle age from a missing field would mark a whole fleet
         // idle on any tmux that does not report `window_activity`.
-        let row =
-            parse_row("s\t0\t0\t%1\t101\t/repo\tzsh\tclaude\t1700000000\t0\t").expect("parse row");
+        let row = parse_row("s\t0\t0\t%1\t101\t/repo\tzsh\tclaude\t1700000000\t0\t\t4100")
+            .expect("parse row");
 
         let session = row.into_session(&processes(), NOW);
 
