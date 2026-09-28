@@ -137,3 +137,15 @@ export type SpawnAgent =
 "copilot" | 
 /**  Antigravity CLI. */
 "antigravity";
+
+/**
+ *  What a person can pick. Generated into `bindings/Desktop.ts`, which the
+ *  page's theme module takes its own type from.
+ */
+export type ThemePreference = 
+/**  Follow the OS. */
+"system" | 
+/**  Always light. */
+"light" | 
+/**  Always dark. */
+"dark";

@@ -16,6 +16,8 @@
 //!   window's commands and tick.
 //! - [`sidecar`] finds or starts the bundled hangar daemon and holds this
 //!   surface's presence against it.
+//! - [`theme`] keeps the host's copy of the theme a person picked, so the
+//!   window opens in it before the page has painted.
 //!
 //! None of it needs a window: the Tauri binary (`app` feature) wires these to
 //! channels and commands, and the tests drive them headless.
@@ -33,4 +35,5 @@ pub mod setup;
 pub mod shell;
 pub mod sidecar;
 pub mod terminal;
+pub mod theme;
 pub mod updater;

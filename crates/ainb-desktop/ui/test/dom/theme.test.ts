@@ -48,8 +48,8 @@ const radio = (value: string) =>
   document.querySelector<HTMLInputElement>(`.theme-choice[data-theme-choice="${value}"] input[type="radio"]`)!;
 const painted = () => (document.documentElement.classList.contains("light") ? "light" : "dark");
 
-async function mount() {
-  const theme = startTheme();
+async function mount(tellHost?: (preference: string) => void) {
+  const theme = startTheme(tellHost);
   const container = document.createElement("div");
   document.body.appendChild(container);
   cleanup = render(
@@ -108,4 +108,18 @@ test("on System the window follows the OS live; on an explicit pick it does not"
   os.set(false);
   await settle();
   assert.equal(painted(), "dark", "an explicit Dark ignores the OS");
+});
+
+test("the host hears the stored pick at start and every pick after, for the next launch's first frame", async () => {
+  fakeSystem(true);
+  window.localStorage.setItem(THEME_KEY, "light");
+  const told: string[] = [];
+  await mount((preference) => told.push(preference));
+  assert.deepEqual(told, ["light"], "a pick made before the host kept one still reaches it");
+
+  radio("dark").click();
+  await settle();
+  radio("system").click();
+  await settle();
+  assert.deepEqual(told, ["light", "dark", "system"]);
 });
