@@ -6520,6 +6520,18 @@ mod codex_session_gate_tests {
 
     /// A Claude hook from `claude-a:1.1` at `observed_at`, from process `pid`.
     async fn hook_from(pool: &sqlx::SqlitePool, pid: u32, observed_at: i64) {
+        hook_at(pool, "claude-a:1.1", 1_785_400_000, pid, observed_at).await;
+    }
+
+    /// A Claude hook from pane `%95` on server 4100, sitting at `target` in a
+    /// session created at `session_started`, from process `pid`.
+    async fn hook_at(
+        pool: &sqlx::SqlitePool,
+        target: &str,
+        session_started: i64,
+        pid: u32,
+        observed_at: i64,
+    ) {
         let sink = crate::events::EventBroker::new().sink();
         crate::fleet::apply_hook(
             pool,
@@ -6531,9 +6543,10 @@ mod codex_session_gate_tests {
                 event_type: "UserPromptSubmit",
                 cwd: "/work/repo",
                 payload: &serde_json::json!({
-                    "tmux_target": "claude-a:1.1",
-                    "process_start_fingerprint":
-                        format!("pane=%95;pid={pid};session_started=1785400000;server=4100"),
+                    "tmux_target": target,
+                    "process_start_fingerprint": format!(
+                        "pane=%95;pid={pid};session_started={session_started};server=4100"
+                    ),
                 }),
                 observed_at,
                 transcript_model: None,
@@ -6596,6 +6609,52 @@ mod codex_session_gate_tests {
             )
             .is_none(),
             "and the old process's fingerprint is refused there"
+        );
+    }
+
+    /// Probe P1: the pane is moved into an OLDER session (`join-pane` into
+    /// `old`), then respawned there. Its `session_started` now reads earlier
+    /// than the run the row holds, which is the session's age, not the run's,
+    /// so the respawned run must still apply and take sends.
+    #[tokio::test]
+    async fn a_pane_moved_to_an_older_session_and_respawned_still_takes_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ainb_hangar_store::Store::open_in(dir.path()).await.unwrap();
+        let pool = store.pool();
+        let key = "claude:sess-respawn";
+        let respawned = "pane=%95;pid=999;session_started=1785300000;server=4100";
+
+        hook_at(pool, "claude-a:1.1", 1_785_400_000, 935, 1_000).await;
+        hook_at(pool, "old:0.3", 1_785_300_000, 935, 2_000).await;
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.tmux_target.as_deref(),
+            Some("old:0.3"),
+            "the move applied"
+        );
+
+        hook_at(pool, "old:0.3", 1_785_300_000, 999, 3_000).await;
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT applied FROM fleet_event WHERE event_id = 'respawn:999:3000'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 1, "the respawned run is not refused as older");
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.process_start_fingerprint.as_deref(), Some(respawned));
+        assert_eq!(row.bound_fingerprint.as_deref(), Some(respawned));
+        assert_eq!(row.tmux_target.as_deref(), Some("old:0.3"));
+        let live = pane("old:0.3", respawned);
+        assert!(
+            live_tmux_pane("old:0.3", respawned, std::slice::from_ref(&live)).is_some(),
+            "the send gate finds the respawned pane live"
         );
     }
 }
