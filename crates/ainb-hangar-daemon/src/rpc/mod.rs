@@ -1934,6 +1934,10 @@ async fn handle(
         // Dark: with the boot switch off this arm does not match and the
         // request falls through to METHOD_NOT_FOUND below.
         methods::WORKTREE_CREATE if crate::spawn::enabled() => handle_worktree_create(req).await,
+        methods::WORKTREE_AGENT_ADD if crate::spawn::enabled() => {
+            handle_worktree_agent_add(req).await
+        }
+        methods::SHELL_CREATE if crate::spawn::enabled() => handle_shell_create(req).await,
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown method: {other}"),
@@ -1948,6 +1952,30 @@ async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, R
     let params: ainb_hangar_proto::spawn::WorktreeCreateParams =
         parse_params(req, "WorktreeCreateParams")?;
     match crate::spawn::worktree_create(&params).await {
+        Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `worktree/agent_add`: one more agent in an existing worktree, by the same
+/// CLI path with `--existing-worktree` (see [`crate::spawn`]).
+async fn handle_worktree_agent_add(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::WorktreeAgentAddParams =
+        parse_params(req, "WorktreeAgentAddParams")?;
+    match crate::spawn::worktree_agent_add(&params).await {
+        Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `shell/create`: a plain shell tmux session in a repository or worktree
+/// (see [`crate::spawn::shell_create`]).
+async fn handle_shell_create(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::ShellCreateParams =
+        parse_params(req, "ShellCreateParams")?;
+    match crate::spawn::shell_create(&params).await {
         Ok(created) => to_value(&created),
         Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
         Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
@@ -2085,20 +2113,20 @@ async fn handle_fleet_action(
         now_ms,
     )
     .await;
-    let receipt = match execute_fleet_action_as(pool, params, None, events, &caller.sender()).await
-    {
-        Ok(receipt) => receipt,
-        Err(error) => {
-            mutation::mark_active_receipt(
-                pool,
-                ainb_hangar_proto::mutation::ReceiptState::Failed,
-                Some(&error.message),
-                now_ms,
-            )
-            .await;
-            return Err(error);
-        }
-    };
+    let receipt =
+        match execute_fleet_action_by(pool, params, None, events, &caller.sender(), caller).await {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                mutation::mark_active_receipt(
+                    pool,
+                    ainb_hangar_proto::mutation::ReceiptState::Failed,
+                    Some(&error.message),
+                    now_ms,
+                )
+                .await;
+                return Err(error);
+            }
+        };
     mutation::mark_active_receipt(
         pool,
         receipt_lifecycle(receipt.status),
@@ -5146,6 +5174,46 @@ pub(crate) async fn execute_fleet_action_as(
     events: &EventSink,
     sender: &str,
 ) -> Result<ainb_hangar_proto::fleet::FleetActionReceipt, RpcError> {
+    use ainb_hangar_proto::fleet::ControlAction;
+    // Daemon-internal sends (retry sweep, Pal delivery, broadcast legs) carry
+    // no caller to judge, so they may never answer a request: that needs a
+    // caller's scope, through `execute_fleet_action_by`.
+    if matches!(
+        params.action,
+        ControlAction::Approve { .. }
+            | ControlAction::ApproveForSession { .. }
+            | ControlAction::Deny { .. }
+            | ControlAction::StructuredAnswer { .. }
+            | ControlAction::DismissStructured { .. }
+    ) {
+        return Err(RpcError {
+            code: ainb_hangar_proto::auth::UNAUTHORIZED,
+            message: "an internal fleet send may not answer a provider request".to_string(),
+            data: None,
+        });
+    }
+    execute_fleet_action_by(
+        pool,
+        params,
+        idempotency_key,
+        events,
+        sender,
+        &auth::Caller::Operator,
+    )
+    .await
+}
+
+/// [`execute_fleet_action_as`] on behalf of `caller`, whose scope a held
+/// Claude request is judged against (the daemon's own internal sends pass
+/// the operator).
+pub(crate) async fn execute_fleet_action_by(
+    pool: &SqlitePool,
+    params: ainb_hangar_proto::fleet::FleetActionParams,
+    idempotency_key: Option<String>,
+    events: &EventSink,
+    sender: &str,
+    caller: &auth::Caller,
+) -> Result<ainb_hangar_proto::fleet::FleetActionReceipt, RpcError> {
     use ainb_hangar_proto::fleet::{ActionReceiptStatus, ControlAction};
     use ainb_hangar_store::repo::fleet::{FleetRepo, NewActionReceipt};
 
@@ -5361,15 +5429,56 @@ pub(crate) async fn execute_fleet_action_as(
                     answers,
                     ..
                 } if session.provider == "claude" => {
-                    execute_claude_structured(pool, events, &session, request_fingerprint, answers)
-                        .await
+                    match fleet_hold_action(
+                        pool,
+                        events,
+                        &session,
+                        request_fingerprint,
+                        crate::answer::HoldAnswer::Answers(answers),
+                        sender,
+                        caller,
+                    )
+                    .await
+                    {
+                        Some(outcome) => outcome,
+                        None => {
+                            execute_claude_structured(
+                                pool,
+                                events,
+                                &session,
+                                request_fingerprint,
+                                answers,
+                            )
+                            .await
+                        }
+                    }
                 }
                 ControlAction::DismissStructured {
                     request_fingerprint,
                     ..
                 } if session.provider == "claude" => {
-                    execute_claude_structured_dismiss(pool, events, &session, request_fingerprint)
-                        .await
+                    match fleet_hold_action(
+                        pool,
+                        events,
+                        &session,
+                        request_fingerprint,
+                        crate::answer::HoldAnswer::Deny,
+                        sender,
+                        caller,
+                    )
+                    .await
+                    {
+                        Some(outcome) => outcome,
+                        None => {
+                            execute_claude_structured_dismiss(
+                                pool,
+                                events,
+                                &session,
+                                request_fingerprint,
+                            )
+                            .await
+                        }
+                    }
                 }
                 ControlAction::ReleaseStructured {
                     request_fingerprint,
@@ -5398,22 +5507,44 @@ pub(crate) async fn execute_fleet_action_as(
                     ..
                 } if session.provider == "claude" => {
                     let approve = matches!(&params.action, ControlAction::Approve { .. });
-                    match claude_broker_decide(
-                        session.provider_session_id.as_deref().unwrap_or_default(),
+                    // Under the http hook transport the request is held by the
+                    // daemon itself; the notifyd broker only serves the
+                    // legacy transport.
+                    let answer = if approve {
+                        crate::answer::HoldAnswer::Allow
+                    } else {
+                        crate::answer::HoldAnswer::Deny
+                    };
+                    if let Some(outcome) = fleet_hold_action(
+                        pool,
+                        events,
+                        &session,
                         request_fingerprint,
-                        approve,
+                        answer,
+                        sender,
+                        caller,
                     )
                     .await
                     {
-                        Ok(true) => (
-                            ActionReceiptStatus::Delivered,
-                            Some("claude blocking hook broker".to_string()),
-                        ),
-                        Ok(false) => (
-                            ActionReceiptStatus::Failed,
-                            Some("Claude request no longer waiting".to_string()),
-                        ),
-                        Err(error) => (ActionReceiptStatus::Failed, Some(error.to_string())),
+                        outcome
+                    } else {
+                        match claude_broker_decide(
+                            session.provider_session_id.as_deref().unwrap_or_default(),
+                            request_fingerprint,
+                            approve,
+                        )
+                        .await
+                        {
+                            Ok(true) => (
+                                ActionReceiptStatus::Delivered,
+                                Some("claude blocking hook broker".to_string()),
+                            ),
+                            Ok(false) => (
+                                ActionReceiptStatus::Failed,
+                                Some("Claude request no longer waiting".to_string()),
+                            ),
+                            Err(error) => (ActionReceiptStatus::Failed, Some(error.to_string())),
+                        }
                     }
                 }
                 ControlAction::StructuredAnswer { .. }
@@ -5905,6 +6036,88 @@ mod fleet_launch_tests {
         let error = verify_picker_pane("claude", &picker_request(), pane).unwrap_err();
         assert!(error.contains("newer picker"), "got: {error}");
     }
+}
+
+/// Answer a Claude request the daemon itself is holding (the http hook
+/// transport), found by session and the request fingerprint `fleet/action`
+/// names. `None` when no live hold matches exactly one request, so the caller
+/// falls back to the legacy broker path.
+async fn fleet_hold_action(
+    pool: &SqlitePool,
+    events: &EventSink,
+    session: &ainb_hangar_store::repo::fleet::FleetSessionRow,
+    request_fingerprint: &str,
+    answer: crate::answer::HoldAnswer<'_>,
+    sender: &str,
+    caller: &auth::Caller,
+) -> Option<(
+    ainb_hangar_proto::fleet::ActionReceiptStatus,
+    Option<String>,
+)> {
+    use crate::answer::{AnswerOutcome, HoldAnswer};
+    use ainb_hangar_proto::fleet::ActionReceiptStatus;
+    use ainb_hangar_proto::snapshots::AnswerResult;
+
+    let provider_session = session.provider_session_id.as_deref()?;
+    let attention_id = match crate::hook_ingress::hold::registry()
+        .find_request(provider_session, request_fingerprint)
+    {
+        crate::hook_ingress::hold::RequestMatch::None => return None,
+        crate::hook_ingress::hold::RequestMatch::One(id) => id,
+        // Never guess, and never fall through to the broker either.
+        crate::hook_ingress::hold::RequestMatch::Ambiguous => {
+            return Some((
+                ActionReceiptStatus::Failed,
+                Some("several held requests match; answer from the inbox".to_string()),
+            ));
+        }
+    };
+    let text = match answer {
+        HoldAnswer::Allow => "allow".to_string(),
+        HoldAnswer::Deny => "deny".to_string(),
+        HoldAnswer::Answers(answers) => serde_json::to_string(answers).unwrap_or_default(),
+    };
+    let params = ainb_hangar_proto::snapshots::AnswerParams {
+        attention_id,
+        answer: text,
+        answered_by: sender.to_string(),
+        is_answer: true,
+        mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
+    };
+    let outcome = match crate::answer::resolve_hold_as(
+        pool,
+        events,
+        &params,
+        SystemClock.now_ms(),
+        caller,
+        answer,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Some((ActionReceiptStatus::Failed, Some(error.to_string()))),
+    };
+    Some(match outcome {
+        AnswerOutcome::Answered(AnswerResult::Delivered { via }) => {
+            (ActionReceiptStatus::Delivered, Some(via))
+        }
+        AnswerOutcome::Answered(AnswerResult::AlreadyAnswered { by }) => (
+            ActionReceiptStatus::Rejected,
+            Some(format!("already answered by {by}")),
+        ),
+        AnswerOutcome::Answered(
+            AnswerResult::NoTarget { reason }
+            | AnswerResult::Ambiguous { reason }
+            | AnswerResult::DeliveryFailed { reason },
+        ) => (ActionReceiptStatus::Failed, Some(reason)),
+        AnswerOutcome::ScopeRefused { kind } => (
+            ActionReceiptStatus::Rejected,
+            Some(format!(
+                "this scope may not answer a held {} request",
+                kind.as_str()
+            )),
+        ),
+    })
 }
 
 async fn claude_broker_decide(

@@ -49,8 +49,14 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     validate_provider_installed(&provider)?;
     validate_run_flags(&args)?;
 
-    // Step 1: Resolve repository path
-    let repo_path = resolve_repo_path(&args).await?;
+    // Step 1: Resolve repository path. For `--existing-worktree` it is the
+    // repository the tree was cut from, so the session takes that repo's
+    // workspace name and lands on the same sidebar card as the tree's first.
+    let existing = args.existing_worktree.as_deref().map(resolve_existing_worktree).transpose()?;
+    let repo_path = match &existing {
+        Some(existing) => existing.source_repo.clone(),
+        None => resolve_repo_path(&args).await?,
+    };
     info!("Using repository: {}", repo_path.display());
 
     // Step 2: Determine workspace name and working directory
@@ -79,7 +85,21 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     let mut created_branch: Option<String> = None;
 
     // Step 3: Create worktree if requested
-    if args.worktree || args.create_branch.is_some() {
+    if let Some(existing) = existing {
+        // Another session may be working in this tree, and this run created
+        // neither it nor its branch: with no manager and no created branch,
+        // every failure below rolls back `Nothing` and deletes no branch.
+        // No `by-session` link is written either, since deleting this session
+        // would follow it and remove the shared tree.
+        worktree_manager = None;
+        work_dir = existing.tree;
+        branch_name =
+            crate::git::current_branch_at(&work_dir).unwrap_or_else(|| "HEAD".to_string());
+        human(
+            args.json,
+            format_args!("Using existing worktree at: {}", work_dir.display()),
+        );
+    } else if args.worktree || args.create_branch.is_some() {
         let manager = WorktreeManager::new().context("Failed to initialize worktree manager")?;
 
         let branch = args
@@ -144,7 +164,8 @@ pub async fn execute(args: RunArgs) -> Result<()> {
 
     // `--worktree` created the tree above and nothing else did, so a failed
     // launch either removes the tree this run made or removes nothing: the
-    // no-worktree path runs in the checkout the user pointed at.
+    // no-worktree path runs in the checkout the user pointed at, and
+    // `--existing-worktree` in a tree some earlier run made.
     let rollback_worktree = || match worktree_manager.as_ref() {
         Some(manager) => WorktreeRollback::CreatedTree(manager),
         None => WorktreeRollback::Nothing,
@@ -504,7 +525,8 @@ fn delete_created_branch(repo: &std::path::Path, branch: Option<&str>) {
 ///
 /// `--base` picks where a NEW branch starts, so without a worktree it would
 /// silently run in the checkout at whatever is checked out. `--format json`
-/// reports a worktree it created, and promises one JSON object on stdout,
+/// reports the worktree the session runs in (one it created, or the
+/// `--existing-worktree` it joined), and promises one JSON object on stdout,
 /// which attaching would hand to tmux.
 fn validate_run_flags(args: &RunArgs) -> Result<()> {
     if args.base.is_some() && !args.worktree && args.create_branch.is_none() {
@@ -512,15 +534,77 @@ fn validate_run_flags(args: &RunArgs) -> Result<()> {
             "--base needs --worktree or --create-branch: it picks where the new branch starts"
         );
     }
-    if args.json && !args.worktree && args.create_branch.is_none() {
+    let isolated =
+        args.worktree || args.create_branch.is_some() || args.existing_worktree.is_some();
+    if args.json && !isolated {
         anyhow::bail!(
             "--format json needs --worktree or --create-branch: it reports a worktree it created"
         );
+    }
+    // clap already refuses the pair; this holds for a caller that builds
+    // `RunArgs` itself. Starting a tmux session kills one already using the
+    // name, which in a shared tree could be the first agent.
+    if args.existing_worktree.is_some() && args.name.is_some() {
+        anyhow::bail!("--existing-worktree cannot take --name: it could replace a live session");
     }
     if args.json && (args.attach || args.interactive) {
         anyhow::bail!("--format json cannot --attach or --interactive: stdout carries the result");
     }
     Ok(())
+}
+
+/// A worktree `--existing-worktree` named, checked and resolved.
+#[derive(Debug)]
+struct ExistingWorktree {
+    /// The checkout directory the session runs in, spelled the way the
+    /// worktree manager minted it (see [`resolve_existing_worktree`]).
+    tree: PathBuf,
+    /// The repository the tree was cut from, which names the workspace.
+    source_repo: PathBuf,
+}
+
+/// `path` as a worktree an earlier `ainb run --worktree` made, or why not.
+///
+/// Refused: a path that does not resolve; one git does not call a linked
+/// worktree's top (a repository's own checkout, where `--worktree` exists to
+/// keep agents out, a subdirectory, a submodule); one that is not, once
+/// symlinks are resolved, a folder directly in ainb's managed
+/// `worktrees/by-name`; and one whose source repository cannot be found. The
+/// linked-worktree check is the daemon's own, so `worktree/agent_add` and a
+/// direct call cannot disagree.
+///
+/// Checked on the canonical path, but returned as the manager spells it
+/// (`<home>/.agents-in-a-box/worktrees/by-name/<dir>`, `$HOME` or
+/// `$AINB_HOME` as given): the first session's row holds that spelling, and
+/// the sidebar folds sessions into one card only on an equal `worktree_path`.
+/// A symlinked home, or macOS's `/var -> /private/var`, would otherwise split
+/// them.
+fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("--existing-worktree does not exist: {}", path.display()))?;
+    ainb_hangar_daemon::spawn::linked_worktree_source(&canonical)
+        .map_err(|why| anyhow::anyhow!("--existing-worktree {why}: {}", canonical.display()))?;
+    let managed = WorktreeManager::for_reading()?.base_dir().join("by-name");
+    let in_managed = managed
+        .canonicalize()
+        .is_ok_and(|dir| canonical.parent() == Some(dir.as_path()));
+    let Some(dir_name) = canonical.file_name().filter(|_| in_managed) else {
+        anyhow::bail!(
+            "--existing-worktree must be a worktree ainb created, a folder directly in {}: {}",
+            managed.display(),
+            canonical.display()
+        );
+    };
+    let tree = managed.join(dir_name);
+    let source_repo =
+        InteractiveSessionManager::get_source_repository(&tree).with_context(|| {
+            format!(
+                "--existing-worktree has no source repository to name its workspace: {}",
+                tree.display()
+            )
+        })?;
+    Ok(ExistingWorktree { tree, source_repo })
 }
 
 /// Best-effort shared-MCP-pool setup for a new session. Pool disabled, no
@@ -1308,6 +1392,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1336,6 +1421,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
         let cmd = build_agent_command(&args, Some("11111111-2222-4333-8444-555555555555"));
         assert_eq!(
@@ -1446,6 +1532,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1472,6 +1559,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1497,6 +1585,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1525,6 +1614,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1552,6 +1642,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1586,6 +1677,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1621,6 +1713,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1651,6 +1744,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1677,6 +1771,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1713,6 +1808,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1744,6 +1840,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1771,6 +1868,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         };
 
         let cmd = build_agent_command(&args, None);
@@ -1898,6 +1996,7 @@ mod tests {
             name: None,
             interactive: false,
             parent: None,
+            existing_worktree: None,
         }
     }
 
@@ -1955,6 +2054,31 @@ mod tests {
             ..run_args()
         };
         assert!(validate_run_flags(&ok).is_ok());
+    }
+
+    /// Joining an existing worktree reports it the same way, so JSON is
+    /// accepted with `--existing-worktree` alone.
+    #[test]
+    fn json_with_an_existing_worktree_is_accepted() {
+        let args = RunArgs {
+            json: true,
+            existing_worktree: Some(PathBuf::from("/w/app--feat--1a2b3c4d")),
+            ..run_args()
+        };
+        assert!(validate_run_flags(&args).is_ok());
+    }
+
+    /// A `RunArgs` built in code, not by clap, still cannot name the session
+    /// it adds to a shared tree.
+    #[test]
+    fn a_name_with_an_existing_worktree_is_refused() {
+        let args = RunArgs {
+            existing_worktree: Some(PathBuf::from("/w/app--feat--1a2b3c4d")),
+            name: Some("tmux_first".into()),
+            ..run_args()
+        };
+        let err = validate_run_flags(&args).expect_err("--name must be refused");
+        assert!(err.to_string().contains("--name"), "got: {err}");
     }
 
     /// The JSON names a worktree this run created; in a shared checkout

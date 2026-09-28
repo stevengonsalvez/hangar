@@ -1,6 +1,7 @@
-//! `worktree/create` ships dark: with `AINB_HANGAR_SPAWN` unset at boot the
-//! daemon answers `METHOD_NOT_FOUND`, exactly as a v1.29.0 daemon does, and
-//! the method is not in the mutation registry yet.
+//! `worktree/create`, `worktree/agent_add` and `shell/create` ship dark: with
+//! `AINB_HANGAR_SPAWN` unset at boot the daemon answers `METHOD_NOT_FOUND`,
+//! exactly as a v1.29.0 daemon does, and none is in the mutation registry
+//! yet.
 //!
 //! Its own test binary: the switch is read once per process, so the enabled
 //! path lives in `spawn_verbs.rs`, a separate process that sets it.
@@ -25,6 +26,33 @@ fn health() -> DaemonHealth {
 
 #[tokio::test]
 async fn worktree_create_is_method_not_found_by_default() {
+    assert_method_not_found(
+        m::WORKTREE_CREATE,
+        serde_json::json!({"repo_path": "/tmp", "agent": "claude"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn worktree_agent_add_is_method_not_found_by_default() {
+    assert_method_not_found(
+        m::WORKTREE_AGENT_ADD,
+        serde_json::json!({"worktree_path": "/tmp", "agent": "claude"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shell_create_is_method_not_found_by_default() {
+    assert_method_not_found(
+        m::SHELL_CREATE,
+        serde_json::json!({"worktree_path": "/tmp"}),
+    )
+    .await;
+}
+
+/// A well-formed request for `method` gets `METHOD_NOT_FOUND` and no result.
+async fn assert_method_not_found(method: &str, params: serde_json::Value) {
     assert!(
         std::env::var_os(ainb_hangar_daemon::spawn::SPAWN_ENV).is_none(),
         "run with {} unset: that is the default being proven",
@@ -36,8 +64,8 @@ async fn worktree_create_is_method_not_found_by_default() {
     let request = RpcRequest {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
         id: RpcId::Number(1),
-        method: m::WORKTREE_CREATE.to_string(),
-        params: serde_json::json!({"repo_path": "/tmp", "agent": "claude"}),
+        method: method.to_string(),
+        params,
     };
     let response = rpc::dispatch_as(
         store.pool(),
@@ -61,6 +89,18 @@ fn worktree_create_is_not_in_the_mutation_registry_while_dark() {
     assert!(!ainb_hangar_proto::mutation::is_mutating(
         m::WORKTREE_CREATE
     ));
+}
+
+#[test]
+fn worktree_agent_add_is_not_in_the_mutation_registry_while_dark() {
+    assert!(!ainb_hangar_proto::mutation::is_mutating(
+        m::WORKTREE_AGENT_ADD
+    ));
+}
+
+#[test]
+fn shell_create_is_not_in_the_mutation_registry_while_dark() {
+    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
 }
 
 #[test]

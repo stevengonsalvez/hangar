@@ -3026,6 +3026,28 @@ fn degraded_capabilities() -> String {
     .unwrap_or_else(|_| "{}".to_string())
 }
 
+/// The request fingerprint the reducer stamps on a Claude session for a hook
+/// payload that holds (`PermissionRequest`, or `PreToolUse` on
+/// `AskUserQuestion`): the same value `fleet/action` names the request by.
+#[must_use]
+pub(crate) fn claude_hold_fingerprint(payload: &Value) -> Option<String> {
+    let event = payload.get("hook_event_name").and_then(Value::as_str)?;
+    let tool = payload.get("tool_name").and_then(Value::as_str);
+    match (event, tool) {
+        ("PreToolUse", Some("AskUserQuestion")) => {
+            Some(claude_request_identity(payload).map_or_else(
+                || fingerprint_value(payload),
+                |identity| ainb_plugin_notifyd::broker::request_fingerprint(&identity),
+            ))
+        }
+        ("PermissionRequest", _) => Some(claude_permission_identity(payload).map_or_else(
+            || fingerprint_value(payload),
+            |(tool, context)| ainb_plugin_notifyd::broker::permission_fingerprint(&tool, &context),
+        )),
+        _ => None,
+    }
+}
+
 fn fingerprint_value(value: &Value) -> String {
     let body = serde_json::to_vec(value).unwrap_or_default();
     fingerprint_bytes(&body)

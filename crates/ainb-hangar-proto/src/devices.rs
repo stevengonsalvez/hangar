@@ -584,6 +584,11 @@ pub static SCOPE_TABLE: &[ScopeRow] = &[
     // Creates a worktree and starts an agent on the host: desktop and above.
     // Phones never spawn work (a watch or type scope cannot start a process).
     row(m::WORKTREE_CREATE, A, A, A, D, D),
+    // Starts an agent in an existing worktree: the same grant as a create,
+    // since it launches a process on the host just the same.
+    row(m::WORKTREE_AGENT_ADD, A, A, A, D, D),
+    // Starts a shell process on the host: the same grant as the spawn verbs.
+    row(m::SHELL_CREATE, A, A, A, D, D),
 ];
 
 /// The row for `method`, when it is classified.
