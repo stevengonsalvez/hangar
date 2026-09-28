@@ -10,7 +10,7 @@
 //! environment says.
 //!
 //! ```text
-//!  daemon ──tmux_new_session──▶ tmux client (allowlisted env, no secrets)
+//!  daemon ──tmux_new_session──▶ tmux client (daemon env minus its secrets)
 //!                                 │ starts the server? it starts clean
 //!                                 ▼
 //!                               new pane ──▶ `env -u <secret>… argv`
@@ -25,18 +25,15 @@ use tokio::process::Command;
 /// The daemon's own credential env names: the override it may be started
 /// with, and the variable it hands a confined `claude` child. Neither
 /// belongs in anything else the daemon starts.
+///
+/// `CLAUDE_CODE_OAUTH_TOKEN` is removed even when the user set it
+/// themselves: the daemon cannot tell the user's own token from one it
+/// resolved, so a shell or agent the daemon opens never sees it. A user who
+/// wants it in a desktop shell sets it inside that shell.
 pub const DAEMON_SECRETS: [&str; 2] = [
     crate::claude_cred::ENV_OVERRIDE,
     crate::claude_cred::CHILD_ENV_VAR,
 ];
-
-/// What a tmux client needs beyond the runner's [`crate::runner::ENV_ALLOWLIST`]:
-/// the socket directory the server lives under, the ssh agent a shell
-/// expects, and `$TMUX`, which names the server a daemon started inside a
-/// pane talks to. It stays so the session lands on the same server the
-/// daemon's other tmux calls (existence checks, kills) reach; a caller that
-/// wants the default server removes it, as `shell/create` does.
-const TMUX_CLIENT_ENV: [&str; 3] = ["TMUX_TMPDIR", "SSH_AUTH_SOCK", "TMUX"];
 
 /// Drop [`DAEMON_SECRETS`] from `cmd`'s environment.
 pub fn strip_daemon_secrets(cmd: &mut Command) -> &mut Command {
@@ -49,10 +46,13 @@ pub fn strip_daemon_secrets(cmd: &mut Command) -> &mut Command {
 /// A `tmux new-session -d -s <name> -c <start_dir>` the daemon runs, with
 /// `extra` flags (such as `-x`/`-y`) before the pane's command.
 ///
-/// The client starts from an empty environment plus the runner's allowlist
-/// and [`TMUX_CLIENT_ENV`], so a server it starts never holds a secret (and
-/// holds only those variables for every later pane on it). `start_dir` is
-/// escaped once here ([`tmux_literal_dir`]).
+/// The client inherits the daemon's environment minus [`DAEMON_SECRETS`],
+/// the same policy as `ainb run`'s child, so a server it starts never holds
+/// a secret and keeps everything else (locale, terminal, the user's own
+/// keys) for the panes after. `$TMUX` is inherited like the rest, so the
+/// session lands on the server the daemon's other tmux calls reach.
+/// `start_dir` and every `argv` element are escaped once here
+/// ([`tmux_literal_dir`], [`tmux_literal_arg`]).
 ///
 /// Either way the session then marks the secrets removed from its own
 /// environment, so a window opened in it later starts without them too. tmux
@@ -72,12 +72,6 @@ pub fn strip_daemon_secrets(cmd: &mut Command) -> &mut Command {
 #[must_use]
 pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsString]) -> Command {
     let mut tmux = Command::new("tmux");
-    tmux.env_clear();
-    for key in crate::runner::ENV_ALLOWLIST.iter().chain(TMUX_CLIENT_ENV.iter()) {
-        if let Some(value) = std::env::var_os(key) {
-            tmux.env(key, value);
-        }
-    }
     strip_daemon_secrets(&mut tmux);
     let start_dir = tmux_literal_dir(start_dir);
     tmux.args(["new-session", "-d", "-s", name, "-c", &start_dir]).args(extra);
@@ -86,7 +80,7 @@ pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsS
         for secret in DAEMON_SECRETS {
             tmux.args(["-u", secret]);
         }
-        tmux.args(argv);
+        tmux.args(argv.iter().map(|arg| tmux_literal_arg(arg)));
     }
     let session = format!("={name}");
     for secret in DAEMON_SECRETS {
@@ -109,6 +103,23 @@ pub fn tmux_literal_dir(dir: &str) -> String {
     match escaped.strip_suffix(';') {
         Some(head) => format!("{head}\\;"),
         None => escaped,
+    }
+}
+
+/// `arg` as tmux passes it to the pane's command literally. tmux reads an
+/// argument that ends in `;` as the end of the command, even after `--`, so
+/// `x;` would reach the command as `x`; `\;` is its literal `;`.
+#[must_use]
+pub fn tmux_literal_arg(arg: &OsString) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = arg.as_bytes();
+    match bytes.strip_suffix(b";") {
+        Some(head) => {
+            let mut escaped = head.to_vec();
+            escaped.extend_from_slice(b"\\;");
+            OsString::from_vec(escaped)
+        }
+        None => arg.clone(),
     }
 }
 
@@ -191,20 +202,35 @@ mod tests {
     }
 
     #[test]
-    fn the_client_env_is_cleared_to_the_allowlist() {
+    fn the_client_inherits_everything_but_the_secrets() {
         let cmd = tmux_new_session("s", "/w", &[], &[]);
         let std = cmd.as_std();
-        // `env_clear` plus explicit sets: nothing inherited, and no secret
-        // is ever set.
-        for (key, value) in std.get_envs() {
-            let key = key.to_string_lossy();
+        // Nothing cleared: the only env edits are the two removals.
+        let edits: Vec<_> = std.get_envs().collect();
+        assert_eq!(edits.len(), DAEMON_SECRETS.len(), "{edits:?}");
+        for (key, value) in edits {
             assert!(
-                crate::runner::ENV_ALLOWLIST.contains(&key.as_ref())
-                    || TMUX_CLIENT_ENV.contains(&key.as_ref())
-                    || DAEMON_SECRETS.contains(&key.as_ref()) && value.is_none(),
-                "{key} passed to the tmux client"
+                DAEMON_SECRETS.contains(&key.to_string_lossy().as_ref()) && value.is_none(),
+                "{key:?} is edited, not just removed"
             );
         }
+    }
+
+    #[test]
+    fn an_argument_ending_in_a_semicolon_reaches_the_command_whole() {
+        let cmd = tmux_new_session(
+            "fleet-codex-t",
+            "/w",
+            &[],
+            &[
+                OsString::from("codex"),
+                OsString::from("mid;dle"),
+                OsString::from("thread;"),
+            ],
+        );
+        let args = args(&cmd);
+        let command = &args[args.iter().position(|a| a == "codex").unwrap()..];
+        assert_eq!(command[..3], ["codex", "mid;dle", "thread\\;"]);
     }
 
     #[test]
