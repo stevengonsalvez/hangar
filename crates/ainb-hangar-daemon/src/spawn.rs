@@ -19,6 +19,8 @@
 //!
 //! `shell/create` needs no CLI hop: a plain shell is one `tmux new-session`,
 //! which the daemon runs itself (there is no `ainb shell` to call).
+//! `shell/list` and `shell/close` find and end those shells by their own
+//! prefix, [`DAEMON_SHELL_PREFIX`].
 //!
 //! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
 //! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
@@ -30,8 +32,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ainb_hangar_proto::spawn::{
-    ShellCreateParams, ShellCreateResult, WorktreeAgentAddParams, WorktreeCreateParams,
-    WorktreeCreateResult,
+    DAEMON_SHELL_PREFIX, ShellCloseParams, ShellCloseResult, ShellCreateParams, ShellCreateResult,
+    ShellListResult, WorktreeAgentAddParams, WorktreeCreateParams, WorktreeCreateResult,
+    is_daemon_shell_name,
 };
 
 /// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves the spawn verbs.
@@ -401,6 +404,11 @@ const SHELL_NAME_TRIES: usize = 3;
 /// exists; a tmux server that does not answer in this long is wedged.
 const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The tmux user option a shell carries the op id of the create that made
+/// it: a label for whoever reads the session, not a lookup. Retries are the
+/// D18 ledger's (see [`shell_create`]).
+const SHELL_OP_OPTION: &str = "@ainb_op_id";
+
 /// `worktree_path` as a directory a shell may open in: the top of a
 /// registered repository ([`resolve_repo`]) or a worktree ainb created
 /// ([`resolve_worktree`]), canonical, or why not.
@@ -431,22 +439,53 @@ fn resolve_shell_dir(
 }
 
 /// Open a plain shell in a registered repository or an ainb worktree: a new
-/// detached tmux session named `ainb-sh-<id8>`, started in that directory.
+/// detached tmux session named `ainb-dsh-<id8>` ([`DAEMON_SHELL_PREFIX`]),
+/// started in that directory.
 ///
-/// The `ainb-sh-` prefix is the TUI's own shell prefix, so the TUI leaves the
-/// session alone: `AppState::load_other_tmux_sessions` skips it from the
-/// other-tmux list, `auto_detect_workspace_shells` adopts only `ainb-ws-` as
-/// a workspace's shell, and `cleanup_orphaned_tmux_shells` sweeps only
-/// `ainb-ws-` and `ainb-shell-` (all in `ainb-app/src/app/state.rs`).
+/// The prefix is the daemon's own. The TUI's shells are `ainb-sh-`, which it
+/// filters out of its tmux list, so a daemon shell under that prefix could
+/// not be told from the TUI's and nothing listed or closed it.
 ///
-/// Never `-A` (attach to a same-named session) and never a kill: a name that
-/// is taken is retried with a fresh id, so no live session is touched.
+/// The session is made by [`crate::tmux_session::tmux_new_session`], so the
+/// shell never holds the daemon's OAuth token, whoever started the server.
+///
+/// A create that carries an `op_id` is made idempotent by the D18 ledger at
+/// dispatch (`shell/create` is in `MUTATING_METHODS`): a retry with the same
+/// op id and body replays the first reply, the same shell, and runs nothing.
+/// The op id is also set on the session as [`SHELL_OP_OPTION`], a label only.
+///
+/// Never `-A` (attach to a same-named session), and the only kill is of a
+/// session this call just made under a fresh name and failed to finish: a
+/// name that is taken is retried with a fresh id, so no live session is
+/// touched.
 ///
 /// # Errors
-/// [`SpawnError::Invalid`] for a directory refused before tmux ran,
+/// [`SpawnError::Invalid`] for a directory or op id refused before tmux ran,
 /// [`SpawnError::Failed`] when tmux could not make the session.
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
+    shell_create_named(params, || {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+    })
+    .await
+}
+
+/// [`shell_create`] with the id each name attempt uses drawn from `next_id`
+/// (eight lowercase hex digits), so a test can hand it a name already taken.
+///
+/// # Errors
+/// As [`shell_create`].
+pub async fn shell_create_named(
+    params: &ShellCreateParams,
+    mut next_id: impl FnMut() -> String,
+) -> Result<ShellCreateResult, SpawnError> {
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
+    let op_id = match &params.mutation.op_id {
+        Some(op_id) => Some(
+            ainb_hangar_proto::mutation::OpId::parse(op_id.as_str())
+                .map_err(|why| SpawnError::Invalid(format!("op_id: {why}")))?,
+        ),
+        None => None,
+    };
     let home = dirs::home_dir()
         .ok_or_else(|| SpawnError::Failed("the daemon has no home directory".into()))?;
     // git and the filesystem, off the async workers.
@@ -456,15 +495,30 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
     })
     .await
     .map_err(|e| SpawnError::Failed(format!("checking the shell's folder: {e}")))??;
+    let worktree_path = dir.to_string_lossy().into_owned();
     // The helper escapes the folder for tmux and keeps the daemon's secrets
     // out of the server and the shell.
     let start_dir = dir
         .to_str()
         .ok_or_else(|| SpawnError::Invalid("worktree_path is not valid UTF-8".into()))?;
     for _ in 0..SHELL_NAME_TRIES {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let name = format!("ainb-sh-{}", &id[..8]);
+        let name = format!("{DAEMON_SHELL_PREFIX}{}", next_id());
+        if !is_daemon_shell_name(&name) {
+            return Err(SpawnError::Failed(format!("not a shell name: {name}")));
+        }
         let mut tmux = crate::tmux_session::tmux_new_session(&name, start_dir, &[], &[]);
+        if let Some(op_id) = &op_id {
+            // `=name:` is the exact session as set-option's target wants it.
+            let exact = format!("={name}:");
+            tmux.args([
+                ";",
+                "set-option",
+                "-t",
+                exact.as_str(),
+                SHELL_OP_OPTION,
+                op_id.as_str(),
+            ]);
+        }
         // An inherited $TMUX would aim this at the daemon's own client
         // context, as for `ainb run` below.
         tmux.env_remove("TMUX")
@@ -490,14 +544,14 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
         if out.status.success() {
             return Ok(ShellCreateResult {
                 tmux_session_name: name,
-                worktree_path: dir.to_string_lossy().into_owned(),
+                worktree_path,
             });
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !stderr.contains("duplicate session") {
             // The name was free (tmux says so as `duplicate session`), so a
             // session under it now is the one this command made before the
-            // secret scrub after it failed: take it back.
+            // steps after it (secret scrub, op id label) failed: take it back.
             kill_own_shell(&name).await;
             return Err(SpawnError::Failed(format!(
                 "tmux could not start the shell {name}: {}",
@@ -521,6 +575,122 @@ async fn kill_own_shell(name: &str) {
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     let _ = tokio::time::timeout(SHELL_TMUX_TIMEOUT, kill.status()).await;
+}
+
+/// Every shell the daemon opened that is still running, by name. Only
+/// [`DAEMON_SHELL_PREFIX`] sessions: the TUI's shells, agents' sessions and
+/// the user's own are never listed. No tmux server running is no shells.
+///
+/// # Errors
+/// [`SpawnError::Failed`] when tmux could not be asked.
+pub async fn shell_list() -> Result<ShellListResult, SpawnError> {
+    let mut shells = daemon_shells().await?;
+    shells.sort_by(|a, b| a.tmux_session_name.cmp(&b.tmux_session_name));
+    Ok(ShellListResult { shells })
+}
+
+/// End one shell the daemon opened, by its exact name (`=<name>`, never a
+/// prefix match). Any name that is not a daemon shell's is refused before
+/// tmux runs. A shell already gone answers `closed: false`.
+///
+/// # Errors
+/// [`SpawnError::Invalid`] for a name that is not a daemon shell's,
+/// [`SpawnError::Failed`] when tmux could not end a running one.
+pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, SpawnError> {
+    params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
+    let exact = format!("={}", params.tmux_session_name);
+    let killed = run_tmux(&["kill-session", "-t", &exact]).await.map_err(|e| e.failed())?;
+    if killed.status.success() {
+        return Ok(ShellCloseResult { closed: true });
+    }
+    if no_such_session(&killed.stderr) {
+        return Ok(ShellCloseResult { closed: false });
+    }
+    Err(SpawnError::Failed(format!(
+        "tmux could not close {}: {}",
+        params.tmux_session_name,
+        stderr_tail(&killed.stderr)
+    )))
+}
+
+/// Every running [`DAEMON_SHELL_PREFIX`] session with its start folder.
+async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
+    // The path goes last: it is the one field that could hold a tab.
+    let format = "#{session_name}\t#{session_path}";
+    let out = run_tmux(&["list-sessions", "-F", format]).await.map_err(|e| e.failed())?;
+    if !out.status.success() {
+        if no_such_session(&out.stderr) {
+            return Ok(Vec::new());
+        }
+        return Err(SpawnError::Failed(format!(
+            "tmux could not list sessions: {}",
+            stderr_tail(&out.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (name, path) = line.split_once('\t')?;
+            is_daemon_shell_name(name).then(|| ShellCreateResult {
+                tmux_session_name: name.to_string(),
+                worktree_path: path.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Whether tmux's `stderr` says the session, or the whole server, is not
+/// there: an answer, unlike a socket it may not open (which is a fault).
+fn no_such_session(stderr: &[u8]) -> bool {
+    let stderr = String::from_utf8_lossy(stderr);
+    stderr.contains("can't find session")
+        || stderr.contains("no server running")
+        || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
+}
+
+/// Why a tmux call did not return an answer.
+enum TmuxError {
+    Spawn(std::io::Error),
+    Timeout,
+}
+
+impl TmuxError {
+    fn failed(self) -> SpawnError {
+        match self {
+            Self::Spawn(e) => SpawnError::Failed(format!("could not run tmux: {e}")),
+            Self::Timeout => SpawnError::Failed(format!(
+                "tmux did not answer within {}s",
+                SHELL_TMUX_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
+/// Run one tmux command for the shell verbs, bounded by
+/// [`SHELL_TMUX_TIMEOUT`]. Any of them may start the tmux server, which keeps
+/// the environment it started with for every pane after, so the daemon's
+/// secrets are dropped from all of them.
+async fn run_tmux(args: &[&str]) -> Result<std::process::Output, TmuxError> {
+    let mut tmux = tokio::process::Command::new("tmux");
+    // `-u`: a daemon started without a UTF-8 locale (launchd sets none)
+    // would otherwise get every tab and non-ASCII byte in a format back as
+    // `_`, and no listed path would match the folder it was opened in.
+    tmux.arg("-u")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // An inherited $TMUX would aim this at the daemon's own client
+        // context, as for `ainb run` below.
+        .env_remove("TMUX")
+        // A wedged tmux is abandoned at the timeout, not left running.
+        .kill_on_drop(true);
+    crate::tmux_session::strip_daemon_secrets(&mut tmux);
+    match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(TmuxError::Spawn(e)),
+        Err(_) => Err(TmuxError::Timeout),
+    }
 }
 
 /// Run `ainb` with `argv` and read its one JSON line, bounded by the run
