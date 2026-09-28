@@ -218,11 +218,229 @@ fn the_marker_goes_where_notify_sh_reads_it_when_the_homes_differ() {
         "http\n",
         "notify.sh reads AINB_HOME"
     );
+    assert_eq!(
+        std::fs::read_to_string(default_hangar.join("hooks/transport")).unwrap(),
+        "http\n",
+        "and under the pinned hangar home"
+    );
     let pinned = format!("AINB_HANGAR_HOME='{}'", default_hangar.display());
     assert!(
         managed_commands(&settings(home.path()))
             .iter()
             .all(|(_, c)| c.starts_with(&pinned)),
         "the hooks are pinned to the daemon's home"
+    );
+}
+
+/// `setup` with no `--hooks`, as a user re-running it would type.
+fn setup_plain(home: &Path) -> serde_json::Value {
+    let ainb_home = home.join("ainb");
+    run(
+        home,
+        &[("AINB_HOME", &ainb_home), ("AINB_HANGAR_HOME", &ainb_home)],
+        &["setup", INSTANCE, "--no-spawn", "--no-heartbeat"],
+    )
+}
+
+fn settings_bytes(home: &Path) -> Vec<u8> {
+    std::fs::read(home.join(".claude").join("settings.json")).unwrap()
+}
+
+/// Review of #182 (N1): when the http marker cannot be written, settings.json
+/// is put back byte for byte, never swapped for a legacy set pointing at a
+/// script that was never extracted.
+#[test]
+fn a_failed_marker_restores_the_exact_settings() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let before = settings_bytes(home.path());
+    publish_endpoint(home.path());
+    // The marker's path is a directory: writing it fails.
+    std::fs::create_dir_all(home.path().join("ainb/hooks/transport")).unwrap();
+    let report = setup(home.path(), "http");
+    assert_eq!(report["lifecycle_hooks_installed"], false);
+    assert_eq!(settings_bytes(home.path()), before, "restored exactly");
+    assert!(managed_commands(&settings(home.path())).is_empty());
+}
+
+/// Review of #197: with no settings.json before setup, a failed marker
+/// leaves no settings.json and no marker behind.
+#[test]
+fn a_failed_marker_with_no_prior_settings_leaves_no_settings_file() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join(".claude/settings.json");
+    assert!(!path.exists());
+    publish_endpoint(home.path());
+    // The marker's path is a directory: writing it fails.
+    let marker = home.path().join("ainb/hooks/transport");
+    std::fs::create_dir_all(&marker).unwrap();
+    let report = setup(home.path(), "http");
+    assert_eq!(report["lifecycle_hooks_installed"], false);
+    assert!(!path.exists(), "settings.json removed again");
+    assert!(
+        marker.is_dir(),
+        "left as it was: no marker written in its place"
+    );
+    assert!(
+        !home.path().join(".claude/settings.json.ainb.bak").exists(),
+        "nothing to back up"
+    );
+}
+
+/// Review of #182 (N2): a plain re-run keeps the installed transport, and the
+/// one backup keeps the settings from before the first transport change.
+#[test]
+fn a_plain_rerun_keeps_http_and_the_first_backup() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let original = settings_bytes(home.path());
+    publish_endpoint(home.path());
+    setup(home.path(), "http");
+    let backup = home.path().join(".claude/settings.json.ainb.bak");
+    assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+    setup_plain(home.path());
+    let commands = managed_commands(&settings(home.path()));
+    assert!(!commands.is_empty());
+    assert!(
+        commands.iter().all(|(_, c)| c.contains("ainb-hook.sh")),
+        "still http"
+    );
+
+    setup(home.path(), "legacy");
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        original,
+        "never overwritten"
+    );
+    setup_plain(home.path());
+    assert!(
+        managed_commands(&settings(home.path()))
+            .iter()
+            .all(|(_, c)| c.contains("notify.sh")),
+        "a plain re-run keeps legacy too"
+    );
+}
+
+/// Review of #182 (N3): an endpoint left by a daemon that is gone refuses http.
+#[test]
+fn a_dead_daemons_endpoint_refuses_http() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let before = settings_bytes(home.path());
+    publish_endpoint(home.path());
+    let dead = {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    };
+    let dir = home.path().join("ainb/hangar");
+    let text = std::fs::read_to_string(dir.join("hook-endpoint.env")).unwrap();
+    let live = format!("AINB_HOOK_PID={}", std::process::id());
+    std::fs::write(
+        dir.join("hook-endpoint.env"),
+        text.replace(&live, &format!("AINB_HOOK_PID={dead}")),
+    )
+    .unwrap();
+    let report = setup(home.path(), "http");
+    assert_eq!(report["lifecycle_hooks_installed"], false);
+    assert_eq!(settings_bytes(home.path()), before);
+}
+
+/// Setup with `AINB_HANGAR_HOME` unset and `AINB_HOME` elsewhere, so the two
+/// marker homes differ: `~/.agents-in-a-box` (the daemon) and `AINB_HOME`
+/// (where notify.sh reads).
+fn setup_split(home: &Path, ainb_home: &Path, transport: &str) -> serde_json::Value {
+    run(
+        home,
+        &[("AINB_HOME", ainb_home)],
+        &[
+            "setup",
+            INSTANCE,
+            "--no-spawn",
+            "--no-heartbeat",
+            "--hooks",
+            transport,
+        ],
+    )
+}
+
+/// Review of #197 (Major): a host already on http whose re-setup fails on the
+/// second marker home keeps its http hooks AND its marker, so notify.sh keeps
+/// standing down.
+#[test]
+fn a_failed_rerun_on_an_http_host_keeps_the_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let default_hangar = home.path().join(".agents-in-a-box");
+    let ainb_home = home.path().join("elsewhere");
+    publish_endpoint_in(&default_hangar);
+    assert_eq!(
+        setup_split(home.path(), &ainb_home, "http")["lifecycle_hooks_installed"],
+        true
+    );
+    let before = settings_bytes(home.path());
+
+    // The second marker home can no longer take the marker.
+    let second = default_hangar.join("hooks/transport");
+    std::fs::remove_file(&second).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    assert_eq!(
+        setup_split(home.path(), &ainb_home, "http")["lifecycle_hooks_installed"],
+        false
+    );
+
+    assert_eq!(settings_bytes(home.path()), before, "http hooks kept");
+    assert_eq!(
+        std::fs::read_to_string(ainb_home.join("hooks/transport")).unwrap(),
+        "http\n",
+        "the marker notify.sh reads is still there"
+    );
+}
+
+/// Review of #197: on a legacy host the first marker home (where notify.sh
+/// reads) takes the http marker and the second refuses it. Setup must remove
+/// the first again, or notify.sh stands down beside legacy hooks.
+#[test]
+fn a_failed_second_marker_on_a_legacy_host_removes_the_first() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let before = settings_bytes(home.path());
+    let default_hangar = home.path().join(".agents-in-a-box");
+    let ainb_home = home.path().join("elsewhere");
+    publish_endpoint_in(&default_hangar);
+    // A directory at the second marker path: that write fails.
+    std::fs::create_dir_all(default_hangar.join("hooks/transport")).unwrap();
+    assert_eq!(
+        setup_split(home.path(), &ainb_home, "http")["lifecycle_hooks_installed"],
+        false
+    );
+    assert_eq!(settings_bytes(home.path()), before);
+    assert!(
+        !ainb_home.join("hooks/transport").exists(),
+        "the first marker was removed again"
+    );
+}
+
+/// Review of #197: `$AINB_HOME/hooks` is a regular file, so the marker where
+/// notify.sh reads cannot be written; nothing changes.
+#[test]
+fn a_regular_file_at_ainb_home_hooks_changes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let before = settings_bytes(home.path());
+    let default_hangar = home.path().join(".agents-in-a-box");
+    let ainb_home = home.path().join("elsewhere");
+    publish_endpoint_in(&default_hangar);
+    std::fs::create_dir_all(&ainb_home).unwrap();
+    std::fs::write(ainb_home.join("hooks"), "not a directory").unwrap();
+    assert_eq!(
+        setup_split(home.path(), &ainb_home, "http")["lifecycle_hooks_installed"],
+        false
+    );
+    assert_eq!(settings_bytes(home.path()), before);
+    assert!(
+        !default_hangar.join("hooks/transport").exists(),
+        "no marker left behind"
     );
 }

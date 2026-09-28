@@ -2810,9 +2810,8 @@ fn build_atc_command() -> Command {
                     clap::Arg::new("hooks")
                         .long("hooks")
                         .value_parser(["legacy", "http"])
-                        .default_value("legacy")
                         .hide(true)
-                        .help("Hook transport: legacy (notify.sh) or http (ainb-hook.sh to the daemon listener)"),
+                        .help("Hook transport: legacy (notify.sh) or http (ainb-hook.sh to the daemon listener); absent keeps the installed one"),
                 )
                 .arg(
                     clap::Arg::new("provider")

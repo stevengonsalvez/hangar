@@ -88,23 +88,29 @@ pub fn settings_backup_path(home: &Path) -> PathBuf {
 /// `hangar_home` is pinned into every HTTP command as `AINB_HANGAR_HOME`, so
 /// the hook reaches the daemon whose endpoint setup found; it is unused for
 /// `Legacy`.
+///
+/// Returns the file's bytes before and after, both read under the same lock
+/// as the write, for [`restore_settings`].
 pub fn install_claude_hooks_for(
     home: &Path,
     hook_script: &Path,
     transport: hooks::HookTransport,
     hangar_home: &Path,
-) -> Result<PathBuf> {
+) -> Result<InstalledSettings> {
     let _guard = lock_settings(home)?;
     let path = claude_settings_path(home);
+    let before_bytes = read_bytes(&path)?;
     let existing = read_settings(&path)?;
     let before = hooks::installed_transport(&existing);
     let changing = match transport {
         hooks::HookTransport::Http => before != Some(hooks::HookTransport::Http),
         hooks::HookTransport::Legacy => before == Some(hooks::HookTransport::Http),
     };
-    if changing && path.exists() {
-        std::fs::copy(&path, settings_backup_path(home))
-            .with_context(|| format!("backing up {}", path.display()))?;
+    // One backup, of the settings before ainb first changed transports: a
+    // later change must not overwrite it with an already-changed file.
+    let backup = settings_backup_path(home);
+    if changing && path.exists() && !backup.exists() {
+        std::fs::copy(&path, &backup).with_context(|| format!("backing up {}", path.display()))?;
     }
     let script = hook_script.to_string_lossy();
     let merged = match transport {
@@ -115,7 +121,62 @@ pub fn install_claude_hooks_for(
     };
     let bytes = serde_json::to_vec_pretty(&merged).context("serializing settings.json")?;
     write_settings(&path, &bytes)?;
-    Ok(path)
+    Ok(InstalledSettings {
+        before: before_bytes,
+        written: bytes,
+    })
+}
+
+/// What [`install_claude_hooks_for`] changed in `settings.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSettings {
+    /// Its exact bytes before the write; `None` when there was no file.
+    pub before: Option<Vec<u8>>,
+    /// The exact bytes written.
+    pub written: Vec<u8>,
+}
+
+/// The managed-hook transport `<home>/.claude/settings.json` holds now, if
+/// any. A malformed file reads as none.
+#[must_use]
+pub fn installed_transport(home: &Path) -> Option<hooks::HookTransport> {
+    read_settings(&claude_settings_path(home))
+        .ok()
+        .and_then(|settings| hooks::installed_transport(&settings))
+}
+
+/// The exact bytes at `path`, or `None` when there is no file.
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Undo `installed`: put `<home>/.claude/settings.json` back exactly as it
+/// was (the same bytes, or no file), but only while the file still holds the
+/// bytes that install wrote. Anything else means another writer changed it
+/// since, and it is left alone. Under the settings lock.
+///
+/// # Errors
+/// A read, write or remove error, or the file having changed since.
+pub fn restore_settings(home: &Path, installed: &InstalledSettings) -> Result<()> {
+    let _guard = lock_settings(home)?;
+    let path = claude_settings_path(home);
+    anyhow::ensure!(
+        read_bytes(&path)?.as_deref() == Some(installed.written.as_slice()),
+        "{} changed since setup wrote it; left as is",
+        path.display()
+    );
+    match &installed.before {
+        Some(bytes) => write_settings(&path, bytes),
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        },
+    }
 }
 
 /// Record which transport the managed hooks use, in
@@ -148,6 +209,63 @@ pub fn record_transport(ainb_home: &Path, transport: hooks::HookTransport) -> Re
 #[must_use]
 pub fn transport_marker_path(ainb_home: &Path) -> PathBuf {
     ainb_home.join("hooks").join("transport")
+}
+
+/// The transport marker under `ainb_home` exactly as it is: its bytes, or
+/// `None` when there is none. A directory at the marker path, or a `hooks`
+/// that is not a directory, is no marker either. For
+/// [`restore_transport_marker`], which leaves such a path as it is.
+///
+/// # Errors
+/// A read error other than absence.
+pub fn snapshot_transport_marker(ainb_home: &Path) -> Result<Option<Vec<u8>>> {
+    let path = transport_marker_path(ainb_home);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Put the transport marker under `ainb_home` back as
+/// [`snapshot_transport_marker`] found it: the same bytes, or no marker.
+///
+/// # Errors
+/// A write or remove error.
+pub fn restore_transport_marker(ainb_home: &Path, snapshot: Option<&[u8]>) -> Result<()> {
+    let path = transport_marker_path(ainb_home);
+    match snapshot {
+        Some(bytes) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            write_atomic(&path, bytes)
+        }
+        None => match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::NotADirectory
+                        | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        },
+    }
 }
 
 /// Write `settings.json` without breaking what the user set up: a symlinked
@@ -469,6 +587,73 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn install_reports_the_bytes_it_replaced_and_restore_puts_them_back() {
+        let home = TempDir::new().unwrap();
+        let path = claude_settings_path(home.path());
+        let fresh = install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/ainb-hook.sh"),
+            hooks::HookTransport::Http,
+            Path::new("/x/hangar"),
+        )
+        .unwrap();
+        assert_eq!(fresh.before, None, "there was no file");
+        assert_eq!(std::fs::read(&path).unwrap(), fresh.written);
+        restore_settings(home.path(), &fresh).unwrap();
+        assert!(!path.exists(), "no file, as before");
+
+        write_reflect_and_notifyd(home.path());
+        let original = std::fs::read(&path).unwrap();
+        let changed = install_claude_hooks_for(
+            home.path(),
+            Path::new("/x/ainb-hook.sh"),
+            hooks::HookTransport::Http,
+            Path::new("/x/hangar"),
+        )
+        .unwrap();
+        assert_eq!(changed.before.as_deref(), Some(original.as_slice()));
+        std::fs::write(&path, b"{\"theme\":\"light\"}").unwrap();
+        assert!(
+            restore_settings(home.path(), &changed).is_err(),
+            "another writer changed it"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"theme\":\"light\"}");
+        std::fs::write(&path, &changed.written).unwrap();
+        restore_settings(home.path(), &changed).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn a_transport_marker_is_restored_exactly_as_it_was() {
+        let ainb = TempDir::new().unwrap();
+        let path = transport_marker_path(ainb.path());
+        assert_eq!(snapshot_transport_marker(ainb.path()).unwrap(), None);
+        record_transport(ainb.path(), hooks::HookTransport::Http).unwrap();
+        restore_transport_marker(ainb.path(), None).unwrap();
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"http").unwrap();
+        let odd = snapshot_transport_marker(ainb.path()).unwrap();
+        record_transport(ainb.path(), hooks::HookTransport::Http).unwrap();
+        restore_transport_marker(ainb.path(), odd.as_deref()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"http", "the same bytes");
+
+        let file_home = TempDir::new().unwrap();
+        std::fs::write(file_home.path().join("hooks"), "not a directory").unwrap();
+        assert_eq!(snapshot_transport_marker(file_home.path()).unwrap(), None);
+        restore_transport_marker(file_home.path(), None).unwrap();
+
+        let dir_home = TempDir::new().unwrap();
+        std::fs::create_dir_all(transport_marker_path(dir_home.path())).unwrap();
+        assert_eq!(snapshot_transport_marker(dir_home.path()).unwrap(), None);
+        restore_transport_marker(dir_home.path(), None).unwrap();
+        assert!(
+            transport_marker_path(dir_home.path()).is_dir(),
+            "left as it is"
+        );
     }
 
     #[test]
