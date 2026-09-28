@@ -499,11 +499,20 @@ fn cleanup_single_orphan(orphan: &OrphanedSession) -> Result<()> {
     // 2. Remove the worktree if the session ID is a valid UUID, unless another
     // session still works in it. The store is read here, per orphan, so a
     // session this pass already cleaned no longer counts as a user.
+    // A store that cannot be read keeps the tree: it cannot say who else is
+    // in there.
     if let Ok(uuid) = Uuid::parse_str(&orphan.id) {
         if let Ok(wm) = crate::git::WorktreeManager::new() {
-            let store = load_session_store().context("Failed to load session store")?;
-            // Ignore other errors: the worktree may already be gone.
-            let _ = remove_session_worktree(&wm, &store, uuid);
+            match load_session_store() {
+                Ok(store) => match remove_session_worktree(&wm, &store, uuid) {
+                    Ok(_) | Err(crate::git::WorktreeError::NotFound(_)) => {}
+                    Err(e) => eprintln!("  Kept the worktree of '{}': {e}", orphan.id),
+                },
+                Err(e) => eprintln!(
+                    "  Kept the worktree of '{}': the session store is unreadable ({e})",
+                    orphan.id
+                ),
+            }
         }
     }
 
