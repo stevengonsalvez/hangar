@@ -270,6 +270,11 @@ struct Slot {
     /// Bumped per registration, so a waiter left over from an earlier hold
     /// under the same key can never remove a newer one.
     generation: u64,
+    /// Live [`Waiter`]s on this hold. Counted here, under the registry lock,
+    /// rather than read from the channel's receiver count: the last waiter
+    /// out frees the slot, and that must not depend on who else holds a
+    /// receiver.
+    waiters: usize,
     request: HeldRequest,
     tx: watch::Sender<Option<HoldDecision>>,
 }
@@ -336,10 +341,11 @@ impl HoldRegistry {
         request: HeldRequest,
     ) -> Option<Waiter> {
         let mut inner = self.lock();
-        if let Some(slot) = inner.slots.get(key) {
+        if let Some(slot) = inner.slots.get_mut(key) {
             if slot.attention_id != attention_id {
                 return None;
             }
+            slot.waiters += 1;
             return Some(Waiter {
                 registry: self,
                 key: key.clone(),
@@ -360,6 +366,7 @@ impl HoldRegistry {
                 attention_id: attention_id.to_string(),
                 fingerprint: fingerprint.map(str::to_string),
                 generation,
+                waiters: 1,
                 request: request.clone(),
                 tx,
             },
@@ -454,11 +461,14 @@ impl Drop for Waiter {
     /// only if the slot is still the one it waited on.
     fn drop(&mut self) {
         let mut inner = self.registry.lock();
-        if inner
-            .slots
-            .get(&self.key)
-            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
-        {
+        let Some(slot) = inner.slots.get_mut(&self.key) else {
+            return;
+        };
+        if slot.generation != self.generation {
+            return;
+        }
+        slot.waiters = slot.waiters.saturating_sub(1);
+        if slot.waiters == 0 {
             inner.remove(&self.key);
         }
     }
@@ -532,10 +542,12 @@ impl Waiter {
         if let Some(d) = self.rx.borrow().clone() {
             return HoldEnd::Decided(self.request.clone(), d);
         }
+        // Still counted here (this waiter drops after), so 1 means it is the
+        // last one on the hold.
         if inner
             .slots
             .get(&self.key)
-            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
+            .is_some_and(|slot| slot.generation == self.generation && slot.waiters == 1)
         {
             inner.remove(&self.key);
         }
@@ -698,6 +710,37 @@ mod tests {
             !reg.resolve("att-1", HoldDecision::Allow { message: None }),
             "one decision only"
         );
+    }
+
+    /// A duplicate hook that times out leaves the hold to the one still
+    /// waiting on it: the slot stays, the answer reaches the other hook, and
+    /// the last waiter out frees it.
+    #[tokio::test]
+    async fn a_timed_out_waiter_leaves_the_hold_to_the_one_still_waiting() {
+        let reg = leaked();
+        let key = HoldKey::new("s", "w1");
+        let mut first = reg.register(&key, "att-w1", None, HeldRequest::Permission).unwrap();
+        let second = reg.register(&key, "att-w1", None, HeldRequest::Permission).unwrap();
+        let got = first.next_decision(Duration::from_millis(1)).await;
+        assert_eq!(first.settle(got), HoldEnd::TimedOut);
+        assert_eq!(reg.len(), 1, "the other hook still waits");
+        assert!(reg.resolve("att-w1", HoldDecision::Allow { message: None }));
+        assert_eq!(
+            second.wait(Duration::from_secs(1)).await,
+            HoldEnd::Decided(
+                HeldRequest::Permission,
+                HoldDecision::Allow { message: None }
+            )
+        );
+        assert!(reg.is_empty());
+
+        // A joined waiter dropped first leaves the slot; the last one frees it.
+        let a = reg.register(&key, "att-w2", None, HeldRequest::Permission).unwrap();
+        let b = reg.register(&key, "att-w2", None, HeldRequest::Permission).unwrap();
+        drop(b);
+        assert_eq!(reg.len(), 1);
+        drop(a);
+        assert!(reg.is_empty());
     }
 
     #[tokio::test]
