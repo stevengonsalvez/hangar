@@ -2908,10 +2908,13 @@ fn states_for_hook(
 ///
 /// Without a known `source` the old `Starting` stands. Idle is this
 /// vocabulary's "finished and free", a claim `status_one_truth` bars any
-/// sequence without a terminal event from making, and a bare `SessionStart`
-/// (Codex `session_configured`, the OSC `session_start` frame) carries no
-/// evidence of an empty prompt. An unfamiliar value may equally be another
-/// mid-turn restart like `compact`. The next turn hook corrects either.
+/// sequence without a terminal event from making, and a `SessionStart`
+/// normalized from a producer that sends no source (Codex's legacy
+/// `session_configured` token, the OSC `session_start` frame) carries no
+/// evidence of an empty prompt. The reducer reads the payload, not the
+/// provider, so any hook that does send one of the sources above reads as
+/// Claude's does. An unfamiliar value may equally be another mid-turn restart
+/// like `compact`. The next turn hook corrects either.
 fn session_start_states(payload: &Value) -> (Option<LifecycleState>, Option<AttentionState>) {
     let hook = payload.get("payload").unwrap_or(payload);
     match hook.get("source").and_then(Value::as_str) {
@@ -4642,6 +4645,16 @@ mod tests {
                 "{payload}"
             );
         }
+
+        // Codex: its legacy `session_configured` token normalizes to a start
+        // with no source, and a start that does carry one reads as Claude's.
+        let bare = serde_json::json!({});
+        let configured = canonical_hook_event_type("codex", "session_configured", &bare);
+        assert_eq!(configured, "SessionStart");
+        assert_eq!(states_for_hook(configured, &bare), starting);
+        let resumed = serde_json::json!({ "payload": { "source": "resume" } });
+        let native = canonical_hook_event_type("codex", "SessionStart", &resumed);
+        assert_eq!(states_for_hook(native, &resumed), idle);
     }
 
     /// The whole first turn through the store: idle at the prompt, working once
@@ -4668,12 +4681,6 @@ mod tests {
                 "RUNNING",
             ),
             (4, "Stop", serde_json::json!({}), "TURN_COMPLETE"),
-            (
-                5,
-                "SessionStart",
-                serde_json::json!({ "source": "clear" }),
-                "IDLE",
-            ),
         ] {
             apply_hook(
                 pool,
@@ -4694,6 +4701,82 @@ mod tests {
             let row = FleetRepo::get_session(pool, "claude:sess-first").await.unwrap().unwrap();
             assert_eq!(row.lifecycle_state, lifecycle, "after {event_type} at {at}");
             assert_eq!(row.attention_state, "NONE");
+        }
+
+        // `/clear` ends this session and starts a new one under a new id: the
+        // old row reads EXITED and the new one is idle at its empty prompt.
+        for (at, session_id, event_type, source) in [
+            (5, "sess-first", "SessionEnd", None),
+            (6, "sess-cleared", "SessionStart", Some("clear")),
+        ] {
+            apply_hook(
+                pool,
+                &sink,
+                HookObservation {
+                    event_id: format!("clear:{at}"),
+                    provider: "claude",
+                    provider_session_id: session_id,
+                    event_type,
+                    cwd: "/work/repo",
+                    payload: &serde_json::json!({ "payload": { "source": source } }),
+                    observed_at: at,
+                    transcript_model: None,
+                },
+            )
+            .await
+            .expect("hook applies");
+        }
+        let old = FleetRepo::get_session(pool, "claude:sess-first").await.unwrap().unwrap();
+        assert_eq!(old.lifecycle_state, "EXITED");
+        let cleared = FleetRepo::get_session(pool, "claude:sess-cleared").await.unwrap().unwrap();
+        assert_eq!(cleared.lifecycle_state, "IDLE");
+        assert_eq!(cleared.attention_state, "NONE");
+    }
+
+    /// Hooks can land out of order. A resume stamped before the prompt that
+    /// followed it must not pull a working session back to Idle. On an equal
+    /// timestamp the later-applied event wins (`should_replace` takes `>=`),
+    /// which is pinned here as the current behaviour.
+    #[tokio::test]
+    async fn a_late_session_start_does_not_idle_a_working_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        for (session_id, start_at, expected) in
+            [("sess-late", 1, "RUNNING"), ("sess-tie", 2, "IDLE")]
+        {
+            for (at, event_type, payload) in [
+                (2, "UserPromptSubmit", serde_json::json!({})),
+                (
+                    start_at,
+                    "SessionStart",
+                    serde_json::json!({ "source": "resume" }),
+                ),
+            ] {
+                apply_hook(
+                    pool,
+                    &sink,
+                    HookObservation {
+                        event_id: format!("{session_id}:{event_type}"),
+                        provider: "claude",
+                        provider_session_id: session_id,
+                        event_type,
+                        cwd: "/work/repo",
+                        payload: &serde_json::json!({ "payload": payload }),
+                        observed_at: at,
+                        transcript_model: None,
+                    },
+                )
+                .await
+                .expect("hook applies");
+            }
+            let row = FleetRepo::get_session(pool, &format!("claude:{session_id}"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.lifecycle_state, expected, "{session_id}");
         }
     }
 
