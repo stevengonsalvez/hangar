@@ -194,6 +194,19 @@ export function boardColumns(
   }));
 }
 
+/**
+ * How many cards the board's Idle column holds: the status bar's idle count.
+ *
+ * Read off the board's own projection, never off the session list's rows: a
+ * row's `status` is projected from the Fleet snapshot, which the attention
+ * poller refreshes on its five-second clock, while the board's cards follow
+ * every Fleet revision. Counted from the session list, the footer trailed the
+ * board by up to that clock on every session start.
+ */
+export function idleOnBoard(columns: readonly BoardColumn[]): number {
+  return columns.find((column) => column.state === "idle")?.cards.length ?? 0;
+}
+
 /** What the board can say about the picture it is drawing. */
 export function boardHealth(agentStatus: AgentStatusView | undefined): BoardHealth {
   if (agentStatus === undefined) return { kind: "absent", detail: "no status frame yet" };
