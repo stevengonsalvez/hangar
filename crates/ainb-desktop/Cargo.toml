@@ -63,6 +63,9 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1.36", features = ["full"] }
+# Reads the two user-level files the daemon reads its registered folders
+# from, the same way it does (`projects.rs`).
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
 uuid = { version = "1.5", features = ["serde", "v4"] }
