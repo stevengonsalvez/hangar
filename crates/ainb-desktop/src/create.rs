@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 const METHOD_NOT_FOUND: i32 = -32601;
 /// The JSON-RPC code for params the daemon refused.
 const INVALID_PARAMS: i32 = -32602;
+/// What the daemon's `worktree/create` says of a repository outside every
+/// registered folder (`ainb-hangar-daemon/src/spawn.rs`, `resolve_repo`).
+/// `tests/create_worktree.rs` provokes it from the real daemon, so a reworded
+/// refusal fails there rather than silently losing the hint below.
+const UNREGISTERED: &str = "not under a registered workspace folder";
 
 /// What the composer sends: the fields of the new worktree session.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -104,6 +109,12 @@ pub fn refusal_text(error: &DaemonError) -> String {
     match error {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
             "This daemon does not create worktrees yet: start it with AINB_HANGAR_SPAWN=1.".into()
+        }
+        DaemonError::Rpc { code, message }
+            if *code == INVALID_PARAMS && message.contains(UNREGISTERED) =>
+        {
+            "This repository is not in a registered project folder: use Add project to pick its folder, then create again."
+                .into()
         }
         DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
             format!("The daemon refused the request: {message}")
@@ -194,6 +205,13 @@ mod tests {
             message: "base is not a valid git ref name".into(),
         };
         assert!(refusal_text(&bad).contains("base is not a valid git ref name"));
+        let unregistered = DaemonError::Rpc {
+            code: INVALID_PARAMS,
+            message: "repo_path is not under a registered workspace folder: add its folder to \
+                      workspace_defaults.workspace_scan_paths"
+                .into(),
+        };
+        assert!(refusal_text(&unregistered).contains("use Add project"));
         let failed = DaemonError::Rpc {
             code: -32603,
             message: "`ainb run` failed: branch exists".into(),
