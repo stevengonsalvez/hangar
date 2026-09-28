@@ -867,6 +867,27 @@ impl DaemonClient {
         self.call_typed(methods::SHELL_CREATE, params).await
     }
 
+    /// The shells the daemon opened that are still running (`shell/list`).
+    /// A daemon without the spawn switch answers `METHOD_NOT_FOUND`.
+    pub async fn shell_list(
+        &self,
+    ) -> Result<ainb_hangar_proto::spawn::ShellListResult, DaemonError> {
+        self.call_typed(
+            methods::SHELL_LIST,
+            &ainb_hangar_proto::spawn::ShellListParams::default(),
+        )
+        .await
+    }
+
+    /// End one shell the daemon opened, by its exact name (`shell/close`).
+    /// A daemon without the spawn switch answers `METHOD_NOT_FOUND`.
+    pub async fn shell_close(
+        &self,
+        params: &ainb_hangar_proto::spawn::ShellCloseParams,
+    ) -> Result<ainb_hangar_proto::spawn::ShellCloseResult, DaemonError> {
+        self.call_typed(methods::SHELL_CLOSE, params).await
+    }
+
     /// Upsert one workspace session into the daemon store.
     pub async fn workspace_session_upsert(
         &self,
