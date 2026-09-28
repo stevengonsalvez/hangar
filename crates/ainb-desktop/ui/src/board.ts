@@ -30,7 +30,9 @@ import type { RendererIntent } from "./tabs.ts";
 
 /** Orca's own board buckets, left to right. Idle also holds a card whose
  * status is `unverifiable`: the vocabulary has no fifth column for it, so it
- * falls in with idle and carries its own badge (`BoardCard.unverifiable`). */
+ * falls in with idle and carries its own badge. An exited agent is kept the
+ * way Orca retains a finished one: Done until opened, then Idle, until the
+ * daemon archives it. */
 export type BoardColumnKind = "needs" | "working" | "done" | "idle";
 
 /** What each column is called, in the operator's own words. */
@@ -54,6 +56,9 @@ export interface BoardCard {
   sessionId: string | null;
   /** The operator vocabulary this card reads (`status.ts`). */
   status: UiStatus;
+  /** The column it draws in, decided once (`columnOf`): the column's count
+   * and its cards are the one list of cards carrying it. */
+  column: BoardColumnKind;
   /** This card's own turn marker, for acking it (`acks.ts`). */
   evidenceObservedAt: number;
   /** The line under the title: provider, model, lifecycle, transport. */
@@ -117,12 +122,20 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
     .sort((a, b) => ATTENTION_ORDER.indexOf(a) - ATTENTION_ORDER.indexOf(b));
 }
 
-/** `status.kind`, onto the column it draws in, or `null` for one the board
- * leaves out. `unverifiable` has no column of its own in Orca's four-bucket
- * vocabulary, so it falls in with `idle` (`BoardCard.unverifiable` carries
- * the badge that tells the two apart); `exited` is not a status anyone acts
- * on. Exhaustive: a new status fails to compile here. */
-function bucketOf(status: UiStatus): BoardColumnKind | null {
+/**
+ * `status`, onto the column it draws in. Every status has one, so every card
+ * the board counts is a card it draws.
+ *
+ * `unverifiable` has no column of its own in Orca's four-bucket vocabulary,
+ * so it falls in with `idle` and carries a badge that tells the two apart.
+ * `exited` follows Orca's retained agents (`orca:src/renderer/src/components/
+ * sidebar/worktree-agent-rows.ts:242-267` keeps a closed agent as `done`;
+ * `orca:src/shared/dashboard-snapshot.ts:44-50` settles an acknowledged one
+ * into idle): Done until this viewer opens it, then Idle. It leaves the
+ * board when the daemon archives the row. Exhaustive: a new status fails to
+ * compile here.
+ */
+function columnOf(status: UiStatus, acked: boolean): BoardColumnKind {
   switch (status.kind) {
     case "needs":
       return "needs";
@@ -134,7 +147,7 @@ function bucketOf(status: UiStatus): BoardColumnKind | null {
     case "unverifiable":
       return "idle";
     case "exited":
-      return null;
+      return acked ? "idle" : "done";
     default:
       return unhandled(status, "idle");
   }
@@ -142,10 +155,9 @@ function bucketOf(status: UiStatus): BoardColumnKind | null {
 
 /**
  * The board's columns, in `COLUMNS` order, from the host's own cards mapped
- * through `status.ts`. An exited agent's card never appears (`bucketOf`
- * returns `null` for its `exited` status): a process that is gone is not a
- * status a person acts on. Within a column, an agent with something open floats to the top,
- * then by title, so the row that wants a human is the first one read.
+ * through `status.ts`, every card in exactly one (`columnOf`). Within a
+ * column, an agent with something open floats to the top, then by title, so
+ * the row that wants a human is the first one read.
  */
 export function boardColumns(
   agentStatus: AgentStatusView | undefined,
@@ -161,17 +173,18 @@ export function boardColumns(
     // legacy card's tmux session included, so all three read one status.
     const session = sessionForCard(card, rows, fleet?.fleet_metadata);
     const attention = chipsOf(session);
+    const acked = isAcked(acks, card.session_key, card.evidence_observed_at);
     const status = deriveStatus(card, {
       attention,
       elicitation: elicitationDetail(session?.attention ?? []),
-      acked: isAcked(acks, card.session_key, card.evidence_observed_at),
+      acked,
     });
-    if (bucketOf(status) === null) continue; // exited: not a status anyone acts on.
     cards.push({
       key: card.session_key,
       title: label(session?.name ?? keyLabel(card.session_key)),
       sessionId: session?.id ?? null,
       status,
+      column: columnOf(status, acked),
       evidenceObservedAt: card.evidence_observed_at,
       provider: card.provider,
       model: models.get(card.session_key) ?? null,
@@ -186,7 +199,7 @@ export function boardColumns(
   return COLUMNS.map((state) => ({
     state,
     cards: cards
-      .filter((card) => bucketOf(card.status) === state)
+      .filter((card) => card.column === state)
       .sort(
         (a, b) =>
           Number(b.hasOpenRequest) - Number(a.hasOpenRequest) || a.title.localeCompare(b.title),
