@@ -5907,10 +5907,14 @@ impl AppState {
                 // Session name may contain colons, so reconstruct from all parts except last two
                 let name = parts[..parts.len() - 2].join(":");
 
-                // Skip shell sessions (ainb-ws-*, ainb-sh-*, ainb-shell-*)
+                // Skip shell sessions (ainb-ws-*, ainb-sh-*, ainb-shell-*),
+                // and the daemon's own shells: those are listed and closed
+                // through its shell/list and shell/close, not as tmux the
+                // TUI did not start.
                 if name.starts_with("ainb-ws-")
                     || name.starts_with("ainb-sh-")
                     || name.starts_with("ainb-shell-")
+                    || name.starts_with(ainb_hangar_proto::spawn::DAEMON_SHELL_PREFIX)
                 {
                     continue;
                 }
