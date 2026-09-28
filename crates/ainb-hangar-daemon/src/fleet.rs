@@ -344,27 +344,6 @@ pub async fn apply_hook(
         .map(|outcome| outcome.fleet)
 }
 
-/// The incarnation a hook with this pane `fingerprint` reports for `session_key`.
-///
-/// The row's own incarnation when it names the same process
-/// ([`same_pane_process`]), else the fingerprint. The store's fence (D14)
-/// compares incarnations as strings and orders two by `session_started`, so a
-/// fingerprint that only gained `server=` (the first hook after an upgrade,
-/// when its binding adopts the server) would otherwise read as an OLDER
-/// incarnation of the same run and have every hook refused. A different
-/// process still reports its own fingerprint and meets the fence as before.
-async fn stable_incarnation(
-    pool: &SqlitePool,
-    session_key: &str,
-    fingerprint: &str,
-) -> Result<String, FleetRepoError> {
-    let current = FleetRepo::get_session(pool, session_key)
-        .await?
-        .and_then(|row| row.session_incarnation)
-        .filter(|incarnation| same_pane_process(incarnation, fingerprint));
-    Ok(current.unwrap_or_else(|| fingerprint.to_string()))
-}
-
 /// Apply one exact provider hook together with the attention projection it
 /// implies, in ONE transaction (D14 status store).
 ///
@@ -444,12 +423,6 @@ pub async fn apply_hook_with_attention(
     }
     let tmux_target = binding.target().map(str::to_string);
     let process_start_fingerprint = binding.fingerprint().map(str::to_string);
-    let session_incarnation = match process_start_fingerprint.as_deref() {
-        Some(fingerprint) => {
-            Some(stable_incarnation(pool, session_key.as_str(), fingerprint).await?)
-        }
-        None => None,
-    };
     // The decision itself, so a later pass has something to re-confirm against
     // (#961). `bound` records what was chosen; `invalidate_binding` clears both
     // the decision and the live route when the pane it chose has been taken
@@ -518,7 +491,10 @@ pub async fn apply_hook_with_attention(
             // The pane's process IS the incarnation for a tmux-hosted session:
             // the same session id in a pane whose process has been replaced is
             // a different run of the agent, which is what the fence is for.
-            session_incarnation,
+            // The store's fence treats a fingerprint that only gained
+            // `server=` as the same run, and a same-session pid change as a
+            // new one ordered by the clock (`fence` in the fleet repo).
+            session_incarnation: process_start_fingerprint.clone(),
             cwd: Some(observation.cwd.to_string()),
             display_name: display_name_for_cwd(observation.cwd),
             management_state: (provider == Provider::Claude).then(|| "MANAGED".to_string()),
@@ -7281,6 +7257,14 @@ mod tests {
         }
         let rows = FleetRepo::snapshot(pool).await.unwrap().sessions;
         assert_eq!(rows.len(), 1, "the pane stays owned: no second row for it");
+        // The server, not the pane id alone, is what kept it: the same `%95`
+        // at the same new target on another server is not this row's pane.
+        let elsewhere = scanned_pane(
+            "s_b:0.1",
+            "pane=%95;pid=935;session_started=1785400900;server=4200",
+            Provider::Claude,
+        );
+        assert!(pane_owner(&rows, &elsewhere).is_none());
 
         stop_hook_from(pool, &sink, "sess-moved", "s_b:0.1", moved, 160_000).await;
         let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
@@ -7334,6 +7318,23 @@ mod tests {
         assert!(
             pane_owner(&registered, &other_server).is_none(),
             "another server's %95 is another pane"
+        );
+
+        // A row that names no server cannot compare servers, so it falls back
+        // to `session_started`, and only that.
+        let old = vec![FleetSessionRow {
+            process_start_fingerprint: Some(
+                "pane=%95;pid=935;session_started=1785400000".to_string(),
+            ),
+            ..registered[0].clone()
+        }];
+        assert!(
+            pane_owner(&old, &other_server).is_some(),
+            "an old row keeps its unmoved pane, whichever server the scan names"
+        );
+        assert!(
+            pane_owner(&old, &same_server).is_none(),
+            "an old row cannot follow a move"
         );
     }
 
@@ -7422,6 +7423,16 @@ mod tests {
             row.bound_fingerprint.as_deref(),
             Some(upgraded),
             "the binding adopts the server"
+        );
+        let rows = FleetRepo::snapshot(pool).await.unwrap().sessions;
+        let other_server = scanned_pane(
+            "s_new:0.1",
+            "pane=%96;pid=936;session_started=1785400900;server=4200",
+            Provider::Claude,
+        );
+        assert!(
+            pane_owner(&rows, &other_server).is_none(),
+            "once it names its server, only that server's %96 is its pane"
         );
         assert_eq!(row.process_start_fingerprint.as_deref(), Some(upgraded));
 
