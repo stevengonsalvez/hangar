@@ -2100,8 +2100,9 @@ const MAX_MANAGED_EXITS_PER_SWEEP: usize = 8;
 /// The registry row that owns each discovered pane, positionally aligned with
 /// `sessions`.
 ///
-/// `None` means no MANAGED row claims the pane, so it belongs to its own scanned
-/// key. Computed once and shared by every pass in a tick.
+/// `None` means the pane's owner (see [`pane_owner`]) is not a MANAGED row, or
+/// there is none, so the pane belongs to its own scanned key. Computed once and
+/// shared by every pass in a tick.
 fn pane_owners<'a>(
     registered: &'a [FleetSessionRow],
     sessions: &[FleetSession],
@@ -2109,12 +2110,7 @@ fn pane_owners<'a>(
     sessions
         .iter()
         .map(|session| {
-            exact_managed_row(registered, session)
-                // The exact match misses whenever the fingerprint's `pid` field
-                // drifted between the hook's read and this scan, which would
-                // leave the pane keyed under `SessionKey::legacy` in a second
-                // row that can never carry interview actions.
-                .or_else(|| correlated_managed_row(registered, session))
+            pane_owner(registered, session).filter(|row| row.management_state == "MANAGED")
         })
         .collect()
 }
@@ -2188,25 +2184,48 @@ fn pane_claim_rank(row: &FleetSessionRow) -> (bool, bool, i64, i64, &str) {
     )
 }
 
-/// The MANAGED row whose fingerprint is byte-identical to this pane's, on the
-/// same [`PaneKey`].
+/// The one registry row that owns a discovered pane, of any management state.
 ///
-/// Ranked by [`pane_claim_rank`], the same order [`correlated_managed_row`] and
-/// [`restore_tmux_transport`] use. A pane holds a succession of provider
-/// sessions over time, so two MANAGED rows can carry the identical binding;
-/// taking the first in snapshot order would let this pass and the restore pass
-/// name different owners, and the sweep consults the union of both, so the loser
-/// would be shielded from retirement forever.
-fn exact_managed_row<'a>(
+/// The single owner decision: [`pane_owners`] (which keeps only a MANAGED
+/// winner) and [`restore_tmux_transport`] both call it, so the two passes can
+/// never name different owners for one pane. They used to choose separately,
+/// and the sweep consults the union of both, so a loser one of them named was
+/// shielded from retirement forever.
+///
+/// A candidate sits on the pane's [`PaneKey`] and either carries the scan's
+/// exact fingerprint, or only its `pid` has drifted and its provider is
+/// compatible. `process_start_fingerprint` is
+/// `pane=<pane-id>;pid=<pid>;session_started=<ts>`, and `pid` is the pane's
+/// foreground process, which drifts between a hook's read and the scan:
+/// observed live, a hook wrote `pane=%4257;pid=69099;session_started=1785436252`
+/// for the pane the scanner reported as `pane=%4257;pid=68868;...`. Without
+/// that allowance the scanner keys the pane under `SessionKey::legacy(...)` in a
+/// second row that can never carry interview actions. The scanner often
+/// yields an `unknown` provider, which is compatible with any row; a
+/// confidently different provider is not.
+///
+/// Only a MANAGED row follows its pane to a new target (a renumber or rename;
+/// see [`PaneKey`]). Any other row must still sit at the pane's target, so a
+/// renumbered scanner row retires and the scan finds the pane again under its
+/// new key, as it did before panes were keyed by identity.
+///
+/// Among candidates the highest [`pane_claim_rank`] wins: one pane holds a
+/// succession of provider sessions over time, and the live one must win.
+fn pane_owner<'a>(
     registered: &'a [FleetSessionRow],
     session: &FleetSession,
 ) -> Option<&'a FleetSessionRow> {
+    let pane = session_pane_key(session)?;
+    let provider = session.provider.as_str();
     registered
         .iter()
         .filter(|row| {
-            row.management_state == "MANAGED"
-                && row.process_start_fingerprint == session.process_start_fingerprint
-                && row_pane_key(row) == session_pane_key(session)
+            row_pane_key(row).as_ref() == Some(&pane)
+                && (row.management_state == "MANAGED"
+                    || row.tmux_target == session.exact_tmux_target)
+                && (row.process_start_fingerprint == session.process_start_fingerprint
+                    || provider == Provider::Unknown.as_str()
+                    || row.provider == provider)
         })
         .max_by_key(|row| pane_claim_rank(row))
 }
@@ -2318,52 +2337,11 @@ fn tmux_missing_event(row: &FleetSessionRow, observed_at: i64) -> NewFleetEvent 
     }
 }
 
-/// Correlate a discovered pane to the MANAGED row a provider hook already wrote
-/// for it, when only the volatile part of the fingerprint has drifted.
-///
-/// `process_start_fingerprint` is `pane=<pane-id>;pid=<pid>;session_started=<ts>`.
-/// A tmux pane id is unique for the life of its server and `session_started`
-/// pins that server instance, so the pair identifies the physical pane exactly.
-/// `pid` is the pane's foreground process and does drift between the hook's
-/// read and this scan: observed live, where a hook wrote
-/// `pane=%4257;pid=69099;session_started=1785436252` for the same pane the
-/// scanner reported as `pane=%4257;pid=68868;session_started=1785436252`.
-///
-/// Without this the scanner keys that pane under `SessionKey::legacy(...)` and
-/// creates a second row, which by construction never receives `attention_state`
-/// or `current_request_fingerprint` and so cannot carry interview actions.
-///
-/// The scanner infers the provider from the pane's process tree and often
-/// yields `unknown`, so an unknown provider correlates to any managed row for
-/// the pane; a confidently different provider does not.
-///
-/// Opt-in: only a fingerprint [`pane_identity`] can parse correlates at all.
-fn correlated_managed_row<'a>(
-    registered: &'a [FleetSessionRow],
-    session: &FleetSession,
-) -> Option<&'a FleetSessionRow> {
-    pane_identity(session.process_start_fingerprint.as_deref()?)?;
-    let pane = session_pane_key(session)?;
-    let provider = session.provider.as_str();
-    registered
-        .iter()
-        .filter(|row| {
-            row.management_state == "MANAGED"
-                && row_pane_key(row).as_ref() == Some(&pane)
-                && (provider == Provider::Unknown.as_str() || row.provider == provider)
-        })
-        // One pane holds a succession of provider sessions over time (a resumed
-        // Claude writes a fresh row under the same pane). The live one is the
-        // one observed most recently. See `pane_claim_rank` for why "most
-        // recently observed" cannot be `last_observed_at` alone.
-        .max_by_key(|row| pane_claim_rank(row))
-}
-
 /// The stable half of a `process_start_fingerprint`: pane id and session start.
 ///
 /// `None` for any fingerprint not in the `pane=…;pid=…;session_started=…` shape,
 /// which keeps correlation opt-in rather than guessing at unfamiliar formats.
-fn pane_identity(fingerprint: &str) -> Option<(&str, &str)> {
+pub(crate) fn pane_identity(fingerprint: &str) -> Option<(&str, &str)> {
     let mut fields = fingerprint.split(';');
     let pane = fields.next()?.strip_prefix("pane=")?;
     let _pid = fields.next()?;
@@ -2380,15 +2358,14 @@ fn pane_identity(fingerprint: &str) -> Option<(&str, &str)> {
 /// `s:1.1` stopped matching the moment the shell in `s:1.0` closed, and the
 /// missing sweep then retired a live session to EXITED, which `restore` never
 /// undoes. The identity is also what survives `pid` drift between the hook's
-/// read and the scan (see [`correlated_managed_row`]).
+/// read and the scan (see [`pane_owner`]).
 ///
 /// A fingerprint in any other shape falls back to target plus the raw string.
 /// A missing and an empty fingerprint then share a key, which is safe because
 /// the target alone is already pane-unique at one instant.
 ///
-/// Exact matching, correlation and restore all key through [`pane_key`], so
-/// they rank owners identically: two passes naming different owners for one
-/// pane is the shielded-forever bug `pane_claim_rank` documents.
+/// Every pass resolves a pane's owner through [`pane_owner`], which keys
+/// through here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum PaneKey {
     /// The tmux pane id and its server session's start time.
@@ -2819,49 +2796,29 @@ async fn restore_tmux_transport(
     // pane that belongs to a different session. Claiming liveness for the winner
     // only lets every loser fall through to the missing-sweep and retire, which
     // is the behaviour that existed before the flip-flop fix and must survive it.
-    // Each live pane with the target it has NOW, which a renumber or rename
-    // may have moved away from the one its owner row recorded.
-    let live_panes: std::collections::HashMap<PaneKey, &str> = discovered
+    //
+    // The owner is `pane_owner`'s, the same decision `pane_owners` makes, paired
+    // with the target the pane has NOW: a renumber or rename may have moved it
+    // away from the one a MANAGED owner recorded.
+    let owners: std::collections::HashMap<&str, &str> = discovered
         .iter()
         .filter_map(|session| {
             Some((
-                session_pane_key(session)?,
+                pane_owner(registered, session)?.session_key.as_str(),
                 session.exact_tmux_target.as_deref()?,
             ))
         })
         .collect();
-    let mut owner_of_pane: std::collections::HashMap<PaneKey, &FleetSessionRow> =
-        std::collections::HashMap::new();
-    for row in registered {
-        let Some(pane) = row_pane_key(row) else {
-            continue;
-        };
-        if !live_panes.contains_key(&pane) {
-            continue;
-        }
-        match owner_of_pane.get(&pane) {
-            Some(best) if pane_claim_rank(best) >= pane_claim_rank(row) => {}
-            _ => {
-                owner_of_pane.insert(pane, row);
-            }
-        }
-    }
-    let owners: std::collections::HashSet<&str> =
-        owner_of_pane.into_values().map(|row| row.session_key.as_str()).collect();
 
     for row in registered {
-        let Some(pane) = row_pane_key(row) else {
+        let Some(&current_target) = owners.get(row.session_key.as_str()) else {
             continue;
         };
-        let current_target = live_panes.get(&pane).copied();
-        let live = owners.contains(row.session_key.as_str()) && current_target.is_some();
         // Report liveness BEFORE the emit guards below. A row can be live and
         // still not need an event (already HEALTHY, or EXITED); it is just as
         // not-missing in those cases, and reporting only the rows that emitted
         // would leave exactly the steady state uncovered.
-        if live {
-            live_bindings.insert(row.session_key.clone());
-        }
+        live_bindings.insert(row.session_key.clone());
         // An EXITED row is never restored, even when a pane still matches its
         // pane key. Matching here is by pane (`PaneKey`),
         // deliberately, so a MANAGED row whose key is provider-qualified is still
@@ -2881,15 +2838,22 @@ async fn restore_tmux_transport(
         // transport-only guard that row is HEALTHY forever and never gets those
         // flags back, so a live managed Codex session loses Attach and every
         // lifecycle control after its first app-server event.
-        // The pane is matched by identity, so its target may have moved under
-        // it; attach and send go by target, so the binding follows the pane.
-        let retarget = current_target.filter(|target| row.tmux_target.as_deref() != Some(target));
-        if !live
-            || (tmux_transport_settled(row, true) && retarget.is_none())
+        // A MANAGED owner is matched by identity, so its target may have moved
+        // under it; attach and send go by target, so the route follows the
+        // pane. So does the binding decision when it named the same target: a
+        // hook re-confirms `bound_target` (`pane_binding::resolve`) and writes
+        // it back as the route, so leaving it behind would put the stale target
+        // back on every hook and this pass would move it again every tick.
+        let retarget =
+            (row.tmux_target.as_deref() != Some(current_target)).then_some(current_target);
+        if (tmux_transport_settled(row, true) && retarget.is_none())
             || row.lifecycle_state == "EXITED"
         {
             continue;
         }
+        let rebind = retarget
+            .filter(|_| row.bound_target.is_some() && row.bound_target == row.tmux_target)
+            .map(|target| (target.to_string(), row.bound_fingerprint.clone()));
         let event = NewFleetEvent {
             event_id: format!("tmux:available:{}:{observed_at}", row.session_key),
             session_key: row.session_key.clone(),
@@ -2901,6 +2865,7 @@ async fn restore_tmux_transport(
                 capabilities: Some(capabilities_for_tmux_state(row, true)),
                 transport_health: Some("HEALTHY".to_string()),
                 tmux_target: retarget.map(str::to_string),
+                bound: rebind,
                 ..FleetSessionPatch::default()
             },
         };
@@ -6260,7 +6225,7 @@ mod tests {
             Provider::Unknown,
         );
         assert_eq!(
-            correlated_managed_row(&registered, &drifted_pid).map(|row| row.session_key.as_str()),
+            pane_owner(&registered, &drifted_pid).map(|row| row.session_key.as_str()),
             Some("claude:sess-1"),
             "a drifted pid on the same pane is the same session"
         );
@@ -6271,7 +6236,7 @@ mod tests {
             Provider::Unknown,
         );
         assert!(
-            correlated_managed_row(&registered, &other_pane).is_none(),
+            pane_owner(&registered, &other_pane).is_none(),
             "a recycled tmux target on a different pane is a different session"
         );
 
@@ -6281,7 +6246,7 @@ mod tests {
             Provider::Codex,
         );
         assert!(
-            correlated_managed_row(&registered, &other_provider).is_none(),
+            pane_owner(&registered, &other_provider).is_none(),
             "a confidently different provider must not be absorbed"
         );
     }
@@ -6716,6 +6681,146 @@ mod tests {
         }
         let rows = FleetRepo::snapshot(pool).await.unwrap().sessions;
         assert_eq!(rows.len(), 1, "the pane stays owned: no second row for it");
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(
+            row.bound_target.as_deref(),
+            Some("s_renum:1.0"),
+            "the binding decision follows the pane with the route"
+        );
+
+        // The next hooks must not put the old target back: one that names its
+        // own pane, and one (a shared provider daemon's) that names none and
+        // replays the binding decision.
+        let available = |pool: &SqlitePool| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM fleet_event WHERE event_type = 'tmux_available'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        for (at, payload) in [
+            (
+                130_000,
+                serde_json::json!({
+                    "tmux_target": "s_renum:1.0",
+                    "process_start_fingerprint": fingerprint,
+                }),
+            ),
+            (140_000, serde_json::json!({})),
+        ] {
+            apply_hook(
+                pool,
+                &sink,
+                HookObservation {
+                    event_id: format!("renum-hook:{at}"),
+                    provider: "claude",
+                    provider_session_id: "sess-renum",
+                    event_type: "UserPromptSubmit",
+                    cwd: "/work/repo",
+                    payload: &payload,
+                    observed_at: at,
+                    transcript_model: None,
+                },
+            )
+            .await
+            .expect("hook applies");
+            let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            assert_eq!(
+                row.tmux_target.as_deref(),
+                Some("s_renum:1.0"),
+                "hook at {at}"
+            );
+
+            let settled = available(pool).await;
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![after.clone()]), at + 5_000).await;
+            assert_eq!(
+                available(pool).await,
+                settled,
+                "no re-target after the hook at {at}"
+            );
+        }
+    }
+
+    /// A hook can report a renumbered pane before any sweep has seen it. The
+    /// hook names its own pane, so when it is the same pane (same identity) its
+    /// target wins over the recorded binding and the binding moves with it.
+    #[tokio::test]
+    async fn a_hook_from_a_renumbered_pane_rebinds_to_its_new_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let fingerprint = "pane=%94;pid=934;session_started=1785400000";
+        let key = hooked_session(
+            pool,
+            &sink,
+            "sess-hookmove",
+            "s_hook:2.1",
+            fingerprint,
+            1_000,
+        )
+        .await;
+        apply_hook(
+            pool,
+            &sink,
+            HookObservation {
+                event_id: "hookmove:2".to_string(),
+                provider: "claude",
+                provider_session_id: "sess-hookmove",
+                event_type: "PreToolUse",
+                cwd: "/work/repo",
+                payload: &serde_json::json!({
+                    "tmux_target": "s_hook:2.0",
+                    "process_start_fingerprint": fingerprint,
+                }),
+                observed_at: 2_000,
+                transcript_model: None,
+            },
+        )
+        .await
+        .expect("hook applies");
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(row.tmux_target.as_deref(), Some("s_hook:2.0"));
+        assert_eq!(row.bound_target.as_deref(), Some("s_hook:2.0"));
+    }
+
+    /// Only a MANAGED row follows its pane to a new target. A scanner-only row
+    /// renumbered under it retires as it did before panes were keyed by
+    /// identity, and the scan carries on under the pane's new key.
+    #[tokio::test]
+    async fn a_renumbered_scanner_row_retires_instead_of_following_the_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let fingerprint = "pane=%93;pid=933;session_started=1785400000";
+        let before = scanned_pane("s_scan:1.1", fingerprint, Provider::Claude);
+        let old_key = before.session_key.to_string();
+        let mut guard = SweepGuard::default();
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![before]), 30_000).await;
+        assert!(FleetRepo::get_session(pool, &old_key).await.unwrap().is_some());
+
+        let after = scanned_pane("s_scan:1.0", fingerprint, Provider::Claude);
+        let new_key = after.session_key.to_string();
+        for at in [60_000, 90_000] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![after.clone()]), at).await;
+        }
+        let old = FleetRepo::get_session(pool, &old_key).await.unwrap().unwrap();
+        assert_eq!(
+            old.tmux_target.as_deref(),
+            Some("s_scan:1.1"),
+            "never re-targeted"
+        );
+        assert_eq!(old.lifecycle_state, "EXITED", "retired, as before");
+        let new = FleetRepo::get_session(pool, &new_key).await.unwrap().unwrap();
+        assert_eq!(new.tmux_target.as_deref(), Some("s_scan:1.0"));
+        assert_eq!(new.transport_health, "HEALTHY");
     }
 
     /// The termination contract, class by class: whatever a row is, applying
