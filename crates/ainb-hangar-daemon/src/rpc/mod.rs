@@ -6398,12 +6398,29 @@ async fn exact_live_tmux_session_name(
     let discovered = ainb_fleet_core::discover::discover_all_tmux_panes()
         .await
         .map_err(|error| crate::fleet_provider::ProviderError::Transport(error.to_string()))?;
+    live_tmux_session_name(target, fingerprint, &discovered)
+}
+
+/// The tmux session a managed Codex row's destructive action may kill.
+///
+/// Every caller runs `kill-session` on the result, so this is session-scoped
+/// and strict: the pane must be live at the target, running the recorded
+/// process, AND still in the session it was recorded in
+/// ([`crate::fleet::same_pane_in_session`]). The sweep retargets a MANAGED row
+/// to wherever its pane went, so a Codex pane moved into someone's `work`
+/// session sits at `work:0.1`; a pane-only check would pass there and the
+/// action would kill every other pane in `work`.
+fn live_tmux_session_name(
+    target: &str,
+    fingerprint: &str,
+    discovered: &[ainb_fleet_core::types::FleetSession],
+) -> Result<String, crate::fleet_provider::ProviderError> {
     if !discovered.iter().any(|candidate| {
         candidate.exact_tmux_target.as_deref() == Some(target)
             && candidate
                 .process_start_fingerprint
                 .as_deref()
-                .is_some_and(|observed| crate::fleet::same_pane_process(fingerprint, observed))
+                .is_some_and(|observed| crate::fleet::same_pane_in_session(fingerprint, observed))
     }) {
         return Err(crate::fleet_provider::ProviderError::Stale(
             DETAIL_TMUX_IDENTITY_CHANGED.to_string(),
@@ -6419,6 +6436,70 @@ async fn exact_live_tmux_session_name(
                 "exact tmux target has no session name".to_string(),
             )
         })
+}
+
+#[cfg(test)]
+mod codex_session_gate_tests {
+    use super::live_tmux_session_name;
+    use ainb_fleet_core::types::{
+        AttentionState, Capabilities, Confidence, FleetSession, LifecycleState, ManagementState,
+        Provenance, Provider, SessionKey, TransportHealth,
+    };
+
+    fn pane(target: &str, fingerprint: &str) -> FleetSession {
+        FleetSession {
+            session_key: SessionKey::legacy(Provider::Codex, target, fingerprint),
+            provider: Provider::Codex,
+            provider_session_id: None,
+            cwd: "/work".to_string(),
+            exact_tmux_target: Some(target.to_string()),
+            pane_pid: Some(935),
+            process_start_fingerprint: Some(fingerprint.to_string()),
+            lifecycle: LifecycleState::Running,
+            attention: AttentionState::None,
+            management: ManagementState::Degraded,
+            capabilities: Capabilities::degraded_tmux(),
+            provenance: std::collections::BTreeSet::from([Provenance::Tmux]),
+            confidence: Confidence::Inferred,
+            transport_health: TransportHealth::Healthy,
+            first_seen_ms: Some(0),
+            last_seen_ms: None,
+            version: 0,
+        }
+    }
+
+    /// Stop, Kill, Restart and Archive all `kill-session` the name this
+    /// returns. A managed Codex pane `join-pane`d into the user's `work`
+    /// session is retargeted there by the sweep, and must be refused rather
+    /// than hand `work` to `kill-session`.
+    #[test]
+    fn a_codex_pane_moved_into_another_session_is_not_killed_with_it() {
+        let recorded = "pane=%95;pid=935;session_started=1785400000;server=4100";
+        let moved = pane(
+            "work:0.1",
+            "pane=%95;pid=935;session_started=1785300000;server=4100",
+        );
+        let refused = live_tmux_session_name("work:0.1", recorded, &[moved]);
+        assert!(
+            matches!(refused, Err(crate::fleet_provider::ProviderError::Stale(_))),
+            "a moved pane must not name its new session for kill-session: {refused:?}"
+        );
+
+        let home = pane("fleet-codex-t-1:0.0", recorded);
+        assert_eq!(
+            live_tmux_session_name("fleet-codex-t-1:0.0", recorded, &[home]).ok(),
+            Some("fleet-codex-t-1".to_string()),
+            "the pane still in its own session is the one to stop"
+        );
+
+        let before_upgrade = "pane=%95;pid=935;session_started=1785400000";
+        let upgraded = pane("fleet-codex-t-1:0.0", recorded);
+        assert_eq!(
+            live_tmux_session_name("fleet-codex-t-1:0.0", before_upgrade, &[upgraded]).ok(),
+            Some("fleet-codex-t-1".to_string()),
+            "a row recorded before `server=` still reaches its own session"
+        );
+    }
 }
 
 async fn persist_codex_exit(
