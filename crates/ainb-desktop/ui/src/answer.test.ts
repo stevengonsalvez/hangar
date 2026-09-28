@@ -18,6 +18,7 @@ import {
   pickIntents,
   type Question,
   questionFor,
+  questionOver,
   type Refusal,
   selectedSession,
   sendInOrder,
@@ -379,4 +380,13 @@ test("the window mounts the banner through AnswerSlot, never AnswerBanner direct
     .replace(/^\s*\/\/.*$/gm, "");
   assert.match(source, /<AnswerSlot\b/, "AnswerSlot is mounted");
   assert.doesNotMatch(source, /<AnswerBanner\b/, "AnswerBanner is not mounted directly");
+});
+
+test("the banner draws over a terminal only when it is the selected session's own", () => {
+  const question = questionFor(sessions(mark()))!;
+  assert.equal(questionOver(question, undefined), question, "no terminal shown: the board carries the banner");
+  assert.equal(questionOver(question, question.sessionId), question, "its own terminal");
+  assert.equal(questionOver(question, "another-session"), null, "never over another session's pane");
+  assert.equal(questionOver(question, null), null, "nor over a bare tmux tab");
+  assert.equal(questionOver(null, question.sessionId), null);
 });
