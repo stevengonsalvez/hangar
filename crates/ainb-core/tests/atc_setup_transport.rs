@@ -277,7 +277,10 @@ fn a_failed_marker_with_no_prior_settings_leaves_no_settings_file() {
     let report = setup(home.path(), "http");
     assert_eq!(report["lifecycle_hooks_installed"], false);
     assert!(!path.exists(), "settings.json removed again");
-    assert!(!marker.is_file(), "no marker written");
+    assert!(
+        marker.is_dir(),
+        "left as it was: no marker written in its place"
+    );
     assert!(
         !home.path().join(".claude/settings.json.ainb.bak").exists(),
         "nothing to back up"
@@ -392,6 +395,30 @@ fn a_failed_rerun_on_an_http_host_keeps_the_marker() {
         std::fs::read_to_string(ainb_home.join("hooks/transport")).unwrap(),
         "http\n",
         "the marker notify.sh reads is still there"
+    );
+}
+
+/// Review of #197: on a legacy host the first marker home (where notify.sh
+/// reads) takes the http marker and the second refuses it. Setup must remove
+/// the first again, or notify.sh stands down beside legacy hooks.
+#[test]
+fn a_failed_second_marker_on_a_legacy_host_removes_the_first() {
+    let home = tempfile::tempdir().unwrap();
+    user_hook(home.path());
+    let before = settings_bytes(home.path());
+    let default_hangar = home.path().join(".agents-in-a-box");
+    let ainb_home = home.path().join("elsewhere");
+    publish_endpoint_in(&default_hangar);
+    // A directory at the second marker path: that write fails.
+    std::fs::create_dir_all(default_hangar.join("hooks/transport")).unwrap();
+    assert_eq!(
+        setup_split(home.path(), &ainb_home, "http")["lifecycle_hooks_installed"],
+        false
+    );
+    assert_eq!(settings_bytes(home.path()), before);
+    assert!(
+        !ainb_home.join("hooks/transport").exists(),
+        "the first marker was removed again"
     );
 }
 
