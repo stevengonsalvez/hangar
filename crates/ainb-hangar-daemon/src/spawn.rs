@@ -401,11 +401,6 @@ const SHELL_NAME_TRIES: usize = 3;
 /// exists; a tmux server that does not answer in this long is wedged.
 const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Secrets the daemon may hold in its own environment. A `tmux new-session`
-/// that starts the tmux server hands the server its environment, and every
-/// pane on that server inherits it from then on, so the create drops these.
-const SHELL_ENV_SECRETS: [&str; 2] = ["HANGAR_CLAUDE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
-
 /// `worktree_path` as a directory a shell may open in: the top of a
 /// registered repository ([`resolve_repo`]) or a worktree ainb created
 /// ([`resolve_worktree`]), canonical, or why not.
@@ -461,29 +456,23 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
     })
     .await
     .map_err(|e| SpawnError::Failed(format!("checking the shell's folder: {e}")))??;
-    // tmux expands formats in `-c`, so a `#` in a folder name would be read
-    // as one (`#S` renames the directory, `#(cmd)` runs a command). `##` is
-    // tmux's literal `#`.
+    // The helper escapes the folder for tmux and keeps the daemon's secrets
+    // out of the server and the shell.
     let start_dir = dir
         .to_str()
-        .ok_or_else(|| SpawnError::Invalid("worktree_path is not valid UTF-8".into()))?
-        .replace('#', "##");
+        .ok_or_else(|| SpawnError::Invalid("worktree_path is not valid UTF-8".into()))?;
     for _ in 0..SHELL_NAME_TRIES {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let name = format!("ainb-sh-{}", &id[..8]);
-        let mut tmux = tokio::process::Command::new("tmux");
-        tmux.args(["new-session", "-d", "-s", &name, "-c", &start_dir])
+        let mut tmux = crate::tmux_session::tmux_new_session(&name, start_dir, &[], &[]);
+        // An inherited $TMUX would aim this at the daemon's own client
+        // context, as for `ainb run` below.
+        tmux.env_remove("TMUX")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            // An inherited $TMUX would aim this at the daemon's own client
-            // context, as for `ainb run` above.
-            .env_remove("TMUX")
             // A wedged tmux is abandoned at the timeout, not left running.
             .kill_on_drop(true);
-        for secret in SHELL_ENV_SECRETS {
-            tmux.env_remove(secret);
-        }
         let out = match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
@@ -504,8 +493,16 @@ pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResul
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !stderr.contains("duplicate session") {
+            // The name was free (tmux says so as `duplicate session`), so a
+            // session under it now is the one this command made before the
+            // secret scrub after it failed: take it back.
+            let _ = tokio::process::Command::new("tmux")
+                .env_remove("TMUX")
+                .args(["kill-session", "-t", &format!("={name}")])
+                .output()
+                .await;
             return Err(SpawnError::Failed(format!(
-                "tmux could not start the shell: {}",
+                "tmux could not start the shell {name}: {}",
                 stderr_tail(&out.stderr)
             )));
         }
@@ -526,7 +523,8 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     // the tmux session, the worktree and the branch. A file takes every write
     // whatever the daemon is doing.
     let logs = RunLogs::create()?;
-    let child = tokio::process::Command::new(&bin)
+    let mut child = tokio::process::Command::new(&bin);
+    child
         .args(argv)
         .stdin(std::process::Stdio::null())
         .stdout(logs.stdout()?)
@@ -534,7 +532,11 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
         // The daemon may itself run inside a tmux pane; an inherited $TMUX
         // would point `ainb run`'s tmux calls at that client's server
         // context instead of the default one sessions live on.
-        .env_remove("TMUX")
+        .env_remove("TMUX");
+    // `ainb run` starts tmux itself; a server it starts keeps this
+    // environment for every pane after, so the daemon's secrets stay out.
+    crate::tmux_session::strip_daemon_secrets(&mut child);
+    let child = child
         .spawn()
         .map_err(|e| SpawnError::Failed(format!("could not run {bin}: {e}")))?;
     // The wait runs in its own task, so it outlives both a timeout here and a
