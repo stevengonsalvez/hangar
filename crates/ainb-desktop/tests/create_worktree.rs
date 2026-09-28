@@ -116,6 +116,18 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
     )
     .unwrap();
     let repo = std::fs::canonicalize(repo).unwrap();
+    // The composer offers this repository before it has any session, and what
+    // it offers is what the daemon accepts: the create below uses the listed
+    // path, not one built by hand.
+    let listed = ainb_desktop::projects::list(
+        user_home.path(),
+        &ainb_app::config::WorkspaceDefaults::default(),
+    );
+    assert_eq!(
+        listed.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+        [repo.display().to_string()],
+        "the registered repository is listed with no session"
+    );
     // Inherited by the daemon the sidecar spawns. Edition 2021: safe.
     std::env::set_var("HOME", user_home.path());
     std::env::set_var("AINB_CODEX_MANAGED", "0");
@@ -147,7 +159,7 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
     let created = request(
         &client,
         CreateWorktreeArgs {
-            repo_path: repo.display().to_string(),
+            repo_path: listed[0].path.clone(),
             branch: Some("feat/window".into()),
             base: Some("main".into()),
             agent: SpawnAgent::Claude,
