@@ -27,6 +27,10 @@ const SECRETS: [(&str, &str); 2] = [
     ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-tmux-session-child"),
 ];
 
+/// A variable that is not a secret, and so must survive into a server the
+/// helper starts.
+const SENTINEL: (&str, &str) = ("AINB_TSE_SENTINEL", "kept-not-secret");
+
 /// Missing under CI is a failure, not a skip; only a local run skips.
 fn tmux_available() -> bool {
     let here = Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success());
@@ -139,6 +143,7 @@ impl Drop for UnsetOnDrop {
         for (name, _) in SECRETS {
             std::env::remove_var(name);
         }
+        std::env::remove_var(SENTINEL.0);
     }
 }
 
@@ -213,10 +218,15 @@ async fn a_command_on_a_server_holding_the_secrets_gets_neither() {
     world.start_server_with_secrets();
     let name = format!("tse-cmd-{}", std::process::id());
     let dump = world.env_file(&name);
+    // `$0` is an argument ending in `;`: tmux would end the command there.
     let argv = [
         OsString::from("/bin/sh"),
         OsString::from("-c"),
-        OsString::from(format!("env > '{}'; sleep 30", dump.display())),
+        OsString::from(format!(
+            "env > '{0}'; printf '%s' \"$0\" > '{0}.arg'; sleep 30",
+            dump.display()
+        )),
+        OsString::from("thread;"),
     ];
     let dir = world.dir.path().display().to_string();
 
@@ -228,6 +238,11 @@ async fn a_command_on_a_server_holding_the_secrets_gets_neither() {
         .await;
 
     assert_no_secret(&read_env(&dump), "the command's pane");
+    let arg = std::fs::read_to_string(format!("{}.arg", dump.display())).unwrap();
+    assert_eq!(
+        arg, "thread;",
+        "the last argument reached the command whole"
+    );
     let later = world.tmux(&["show-environment", "-t", &format!("={name}")]);
     let later = String::from_utf8_lossy(&later.stdout);
     for (secret, _) in SECRETS {
@@ -252,6 +267,9 @@ async fn a_server_the_helper_starts_holds_neither() {
     for (name, value) in SECRETS {
         std::env::set_var(name, value);
     }
+    // Not a secret: the server keeps the rest of the daemon's environment
+    // for every pane after (a locale, a terminal, the user's own keys).
+    std::env::set_var(SENTINEL.0, SENTINEL.1);
     let name = format!("tse-first-{}", std::process::id());
     let dir = world.dir.path().display().to_string();
     // Still set while the client runs: an inherited environment would carry
@@ -260,6 +278,7 @@ async fn a_server_the_helper_starts_holds_neither() {
     for (secret, _) in SECRETS {
         std::env::remove_var(secret);
     }
+    std::env::remove_var(SENTINEL.0);
 
     let global = world.tmux(&["show-environment", "-g"]);
     assert!(
@@ -272,6 +291,10 @@ async fn a_server_the_helper_starts_holds_neither() {
         "{global}"
     );
     assert_no_secret(&global, "the tmux server");
+    assert!(
+        global.lines().any(|line| line == format!("{}={}", SENTINEL.0, SENTINEL.1)),
+        "the rest of the daemon's environment reaches the server: {global}"
+    );
 }
 
 /// An interactive run starts through the helper and finishes: the wrapper
