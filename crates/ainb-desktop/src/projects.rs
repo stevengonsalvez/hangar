@@ -8,18 +8,18 @@
 //!                          repositories found under them, canonical ──▶ Project select
 //! ```
 //!
-//! The roots are read the way the daemon reads them
-//! (`ainb-hangar-daemon/src/spawn.rs`, `registered_roots`): the user-level
-//! files only, never a project's own `.ainb/config.toml`, so the list names
-//! exactly the repositories a create is accepted from. The daemon stays the
-//! gate; this is only what the window offers. `tests/create_worktree.rs`
-//! creates from a listed project against the real daemon, so the two cannot
-//! drift apart unnoticed.
+//! The roots are the daemon's own `spawn::registered_roots`, called rather
+//! than copied: the user-level files only, never a project's own
+//! `.ainb/config.toml`, so the list names exactly the repositories a create is
+//! accepted from. The daemon stays the gate; this is only what the window
+//! offers. `tests/create_worktree.rs` creates from a listed project against
+//! the real daemon.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ainb_app::config::WorkspaceDefaults;
 use ainb_app::git::WorkspaceScanner;
+use ainb_hangar_daemon::spawn::registered_roots;
 use serde::Serialize;
 
 /// One repository the composer may create into.
@@ -30,47 +30,6 @@ pub struct RegisteredProject {
     pub name: String,
     /// Canonical absolute path: the form the daemon compares against.
     pub path: String,
-}
-
-/// The folders a repository may be created from, canonicalized: the user's
-/// `workspace_defaults.workspace_scan_paths` and onboarding
-/// `git_directories`, with a leading `~/` meaning `home`. A missing or
-/// unreadable file, or a folder that does not exist, adds none.
-#[must_use]
-pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
-    let config = home.join(".agents-in-a-box").join("config");
-    let read = |file: &str| {
-        std::fs::read_to_string(config.join(file))
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok())
-    };
-    let mut roots: Vec<PathBuf> = Vec::new();
-    let mut push_all = |value: Option<&toml::Value>| {
-        for path in value
-            .and_then(toml::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(toml::Value::as_str)
-        {
-            let expanded = path
-                .strip_prefix("~/")
-                .map_or_else(|| PathBuf::from(path), |rest| home.join(rest));
-            if let Ok(canonical) = std::fs::canonicalize(expanded) {
-                roots.push(canonical);
-            }
-        }
-    };
-    if let Some(table) = read("config.toml") {
-        push_all(
-            table
-                .get("workspace_defaults")
-                .and_then(|defaults| defaults.get("workspace_scan_paths")),
-        );
-    }
-    if let Some(table) = read("onboarding.toml") {
-        push_all(table.get("git_directories"));
-    }
-    roots
 }
 
 /// The repositories under `home`'s registered roots, by name, at most
