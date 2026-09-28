@@ -172,6 +172,11 @@ const SINKS: &[(&str, Reach, &str)] = &[
         "starts a tmux session to resume an orphaned ainb worktree",
     ),
     (
+        "git/worktree_manager.rs::remove_session_link",
+        Reach::Owned,
+        "removes a session's by-session link under ~/.agents-in-a-box/worktrees",
+    ),
+    (
         "git/worktree_manager.rs::remove_worktree",
         Reach::Owned,
         "removes the worktree of a session ainb created",

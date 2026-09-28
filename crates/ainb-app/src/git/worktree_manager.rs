@@ -221,18 +221,7 @@ impl WorktreeManager {
             WorktreeError::NotFound(format!("Session {session_id} worktree not found"))
         })?;
 
-        // Get the original repository path to remove worktree properly
-        if let Ok(repo) = Repository::open(&worktree_path) {
-            if repo.workdir().is_some() {
-                let main_repo_path = self.find_main_repository(&repo)?;
-
-                // Use git command to remove worktree
-                self.remove_worktree_command(&main_repo_path, &worktree_path)?;
-            }
-        } else {
-            // If we can't open as repo, just remove the directory
-            std::fs::remove_dir_all(&worktree_path)?;
-        }
+        self.remove_tree(&worktree_path)?;
 
         // Remove the session symlink if it exists
         if session_path.is_symlink() || session_path.exists() {
@@ -240,6 +229,71 @@ impl WorktreeManager {
         }
 
         info!("Successfully removed worktree: {}", worktree_path.display());
+        Ok(())
+    }
+
+    /// `path`, resolved, when it is a tree this manager made: a folder directly
+    /// in `by-name`. `None` for anything else, including a path that no longer
+    /// exists.
+    pub fn managed_tree(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let by_name = self.base_worktree_dir.join("by-name");
+        ainb_hangar_daemon::spawn::is_managed_tree(&canonical, &by_name).then_some(canonical)
+    }
+
+    /// Whether a `by-session` link other than `except`'s resolves to `tree`.
+    /// A Boss session keeps no session-store row, so its link is the only
+    /// sign that it works in a tree. Compared resolved; an unreadable link
+    /// counts as a user, since what it points at is unknown.
+    pub fn tree_linked_by_another(&self, tree: &Path, except: Option<Uuid>) -> bool {
+        let by_session = self.base_worktree_dir.join("by-session");
+        let Ok(entries) = std::fs::read_dir(&by_session) else {
+            return false;
+        };
+        let resolved =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let tree = resolved(tree);
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let id = name.to_str().and_then(|n| Uuid::parse_str(n).ok());
+            if id.is_some() && id == except {
+                return false;
+            }
+            match std::fs::read_link(entry.path()) {
+                Ok(target) => resolved(&by_session.join(target)) == tree,
+                Err(_) => entry.path().is_symlink(),
+            }
+        })
+    }
+
+    /// Remove a tree this manager made that no `by-session` link names: the
+    /// tree a session joined with `ainb run --existing-worktree` is left
+    /// holding once the session that made it is gone.
+    ///
+    /// Refused as `NotFound` unless `path` is a [`Self::managed_tree`], so a
+    /// session row that points at the user's own checkout can never reach
+    /// the delete.
+    pub fn remove_managed_tree(&self, path: &Path) -> Result<(), WorktreeError> {
+        let tree = self.managed_tree(path).ok_or_else(|| {
+            WorktreeError::NotFound(format!("not a worktree ainb created: {}", path.display()))
+        })?;
+        self.remove_tree(&tree)?;
+        info!("Removed worktree: {}", tree.display());
+        Ok(())
+    }
+
+    /// Remove the checkout at `worktree_path`: through `git worktree remove`
+    /// when git can open it, so its repository forgets it too, else the
+    /// directory itself.
+    fn remove_tree(&self, worktree_path: &Path) -> Result<(), WorktreeError> {
+        if let Ok(repo) = Repository::open(worktree_path) {
+            if repo.workdir().is_some() {
+                let main_repo_path = self.find_main_repository(&repo)?;
+                self.remove_worktree_command(&main_repo_path, worktree_path)?;
+            }
+        } else {
+            std::fs::remove_dir_all(worktree_path)?;
+        }
         Ok(())
     }
 
@@ -357,7 +411,9 @@ impl WorktreeManager {
             match std::fs::read_link(&session_path) {
                 Ok(resolved) => {
                     tracing::debug!("Resolved symlink to: {:?}", resolved);
-                    resolved
+                    // A relative target is relative to the link, not to
+                    // wherever this process happens to run.
+                    self.base_worktree_dir.join("by-session").join(resolved)
                 }
                 Err(e) => {
                     tracing::debug!("Failed to read symlink {:?}: {}", session_path, e);

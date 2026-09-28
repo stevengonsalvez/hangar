@@ -586,9 +586,7 @@ fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree>
     ainb_hangar_daemon::spawn::linked_worktree_source(&canonical)
         .map_err(|why| anyhow::anyhow!("--existing-worktree {why}: {}", canonical.display()))?;
     let managed = WorktreeManager::for_reading()?.base_dir().join("by-name");
-    let in_managed = managed
-        .canonicalize()
-        .is_ok_and(|dir| canonical.parent() == Some(dir.as_path()));
+    let in_managed = ainb_hangar_daemon::spawn::is_managed_tree(&canonical, &managed);
     let Some(dir_name) = canonical.file_name().filter(|_| in_managed) else {
         anyhow::bail!(
             "--existing-worktree must be a worktree ainb created, a folder directly in {}: {}",

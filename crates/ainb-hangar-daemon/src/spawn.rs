@@ -183,7 +183,7 @@ fn registered_roots(home: &Path) -> Vec<PathBuf> {
 /// anything, so a path cannot walk out of the root it names.
 fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
     let path = Path::new(repo_path);
-    if path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+    if !no_dot_components(path) {
         return Err(SpawnError::Invalid(
             "repo_path must not contain . or .. components".into(),
         ));
@@ -230,6 +230,22 @@ pub fn managed_worktrees(home: &Path) -> PathBuf {
         .join(".agents-in-a-box")
         .join("worktrees")
         .join("by-name")
+}
+
+/// Whether `path` has no `.` or `..` component. Checked before a path is
+/// resolved, so it cannot walk out of the directory it names.
+#[must_use]
+pub fn no_dot_components(path: &Path) -> bool {
+    !path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+/// Whether `canonical`, already resolved, is a folder directly in `managed`
+/// ([`managed_worktrees`]) once `managed` is resolved too: the only place
+/// `ainb run --worktree` puts a tree. A nested folder, or a link out to a tree
+/// elsewhere, is not one.
+#[must_use]
+pub fn is_managed_tree(canonical: &Path, managed: &Path) -> bool {
+    std::fs::canonicalize(managed).is_ok_and(|dir| canonical.parent() == Some(dir.as_path()))
 }
 
 /// The source repository of the linked worktree whose top is `canonical`, or
@@ -296,7 +312,7 @@ fn resolve_worktree(
     managed: &Path,
 ) -> Result<PathBuf, SpawnError> {
     let path = Path::new(worktree_path);
-    if path.components().any(|c| matches!(c, Component::CurDir | Component::ParentDir)) {
+    if !no_dot_components(path) {
         return Err(SpawnError::Invalid(
             "worktree_path must not contain . or .. components".into(),
         ));
@@ -306,8 +322,7 @@ fn resolve_worktree(
             "worktree_path is not a directory on this host: {worktree_path}"
         ))
     })?;
-    let managed_dir = std::fs::canonicalize(managed).ok();
-    if managed_dir.is_none() || canonical.parent() != managed_dir.as_deref() {
+    if !is_managed_tree(&canonical, managed) {
         return Err(SpawnError::Invalid(format!(
             "worktree_path is not a worktree ainb created: it must be a folder directly in {}",
             managed.display()
@@ -414,10 +429,7 @@ fn resolve_shell_dir(
     home: &Path,
     managed: &Path,
 ) -> Result<PathBuf, SpawnError> {
-    if Path::new(worktree_path)
-        .components()
-        .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-    {
+    if !no_dot_components(Path::new(worktree_path)) {
         return Err(SpawnError::Invalid(
             "worktree_path must not contain . or .. components".into(),
         ));
