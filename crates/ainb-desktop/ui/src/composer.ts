@@ -11,7 +11,7 @@
 // agents are written once, in Rust.
 
 import { invoke } from "@tauri-apps/api/core";
-import { createSignal, type Accessor } from "solid-js";
+import { createEffect, createSignal, type Accessor } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent } from "../../bindings/Desktop.ts";
 
@@ -277,6 +277,26 @@ export interface ComposerFlowDeps {
   toast(message: string): void;
   /** Where the keyboard goes when the view closes. */
   restoreFocus(): void;
+  /** The session list as the window last drew it. */
+  sessions(): SessionsView_Serialize | undefined;
+  /** Select `sessionId`'s row in the session list, without attaching it: the
+   * host already opened its tab. */
+  select(sessionId: string): void;
+  /** The clock the follow deadline reads. Absent: `Date.now`. */
+  now?(): number;
+}
+
+/** How long a created session may take to be listed before the flow stops
+ * waiting to select it: past this a late row would yank the selection from
+ * whatever the person has moved on to. */
+export const FOLLOW_MS = 10_000;
+
+/** A created session waiting for its row: which, since when, and what the
+ * session list had selected when the create finished. */
+interface Following {
+  id: string;
+  since: number;
+  selectedAtCreate: string | null;
 }
 
 /** The composer's open state, its request's progress, and the sidebar's
@@ -296,12 +316,35 @@ export interface ComposerFlow {
  * Cancel (or Esc) closing the view never stops a create already on the
  * host, the pending card draws until the host answers, a success closes the
  * view, and a failure the view is no longer open to show becomes a toast.
+ *
+ * A success also selects the new session, as Orca activates and reveals a
+ * worktree it just created: the host opens the new tab, and this moves the
+ * session list's selection (the sidebar row and the answer banner's scope)
+ * onto it too. The daemon lists the session on its own schedule, so the
+ * selection waits until the list carries the row, for at most `FOLLOW_MS`,
+ * and gives up the moment the list's selection moves off the row it had
+ * when the create finished: a pick from the sidebar, a tab, the board or the
+ * palette all move that one selection, so any of them wins over a late row.
  */
 export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
   const create = deps.create ?? ((args: CreateWorktreeArgs) => invoke<CreatedWorktree>("worktree_create", { args }));
   const [open, setOpen] = createSignal(false);
   const [state, setState] = createSignal<CreateState>({ kind: "idle" });
   const [pending, setPending] = createSignal<PendingWorktree | null>(null);
+  const now = deps.now ?? Date.now;
+  // The created session waiting for its row, selected once, when it lands.
+  const [following, setFollowing] = createSignal<Following | null>(null);
+  createEffect(() => {
+    const wait = following();
+    if (wait === null) return;
+    const view = deps.sessions();
+    const selected = view?.selected_session_id ?? null;
+    if (selected === wait.id) return setFollowing(null);
+    if (selected !== wait.selectedAtCreate || now() - wait.since > FOLLOW_MS) return setFollowing(null);
+    if (!listed(view, wait.id)) return;
+    setFollowing(null);
+    deps.select(wait.id);
+  });
 
   const closeComposer = () => {
     if (!open()) return;
@@ -329,6 +372,11 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
         (result) => {
           setPending(null);
           setState({ kind: "done", result });
+          setFollowing({
+            id: result.session_id,
+            since: now(),
+            selectedAtCreate: deps.sessions()?.selected_session_id ?? null,
+          });
           closeComposer();
         },
         (error: unknown) => {
@@ -340,4 +388,9 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
       );
     },
   };
+}
+
+/** Whether the session list carries a row for `sessionId`. */
+function listed(view: SessionsView_Serialize | undefined, sessionId: string): boolean {
+  return view?.workspaces.some((workspace) => workspace.sessions.some((row) => row.id === sessionId)) ?? false;
 }

@@ -108,6 +108,21 @@ export function questionFor(sessions: SessionsView_Serialize | undefined): Quest
 }
 
 /**
+ * The question to draw over what the work area shows.
+ *
+ * The banner answers the selected session, so over a terminal it may only
+ * draw when that terminal IS the selected session's: otherwise a person reads
+ * one agent's question on top of another agent's pane. `shownSession` is the
+ * session whose terminal is shown, `null` for a terminal of no session (a
+ * bare tmux tab), and `undefined` when no terminal is shown (the board and
+ * the other pages), where the banner stands on its own.
+ */
+export function questionOver(question: Question | null, shownSession: string | null | undefined): Question | null {
+  if (question === null || shownSession === undefined) return question;
+  return shownSession === question.sessionId ? question : null;
+}
+
+/**
  * How long the banner keeps a question after the last frame that carried it.
  * Long enough to bridge one bare frame between a scan apply and the next
  * attention merge; short enough that a row with no chip does not keep the

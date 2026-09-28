@@ -8,6 +8,9 @@ import {
   keyboardTaken,
   openRowIntent,
   rowOf,
+  selectIntentFor,
+  selectRowIntent,
+  shownSessionOf,
   stepTab,
   acceleratorAllowedUnderModal,
   type Accelerator,
@@ -92,6 +95,9 @@ test("a tab reopens through its session-list row", () => {
   assert.deepEqual(openRowIntent({ session: "u-1" }), {
     Command: ["session_list.select_row", { target: { session: "u-1" }, open: true }],
   });
+  assert.deepEqual(selectRowIntent({ session: "u-1" }), {
+    Command: ["session_list.select_row", { target: { session: "u-1" }, open: false }],
+  });
 });
 
 test("a terminal stands down while a text field that is not its own has the keyboard", () => {
@@ -137,4 +143,18 @@ test("under the open composer no chord reaches the shell but new", () => {
   ];
   for (const chord of chords) assert.equal(acceleratorAllowedUnderModal(chord), false, chord.kind);
   assert.equal(acceleratorAllowedUnderModal({ kind: "new" }), true);
+});
+
+test("the shown session is the active tab's, only while a terminal is shown", () => {
+  const tabs: Tab[] = [
+    { key: "k-1", target: { kind: "session", id: "u-1", tmux: "t1" }, state: "attached" },
+    { key: "k-2", target: { kind: "tmux", tmux: "bare" }, state: "attached" },
+  ] as Tab[];
+  assert.equal(shownSessionOf(false, tabs, "k-1"), undefined, "the board: no terminal shown");
+  assert.equal(shownSessionOf(true, tabs, "k-1"), "u-1");
+  assert.equal(shownSessionOf(true, tabs, "k-2"), null, "a bare tmux tab has no session");
+  assert.equal(shownSessionOf(true, tabs, null), null, "no active tab");
+  assert.deepEqual(selectIntentFor(tabs, "k-1"), selectRowIntent({ session: "u-1" }));
+  assert.deepEqual(selectIntentFor(tabs, "k-2"), selectRowIntent({ other_tmux: "bare" }));
+  assert.equal(selectIntentFor(tabs, "gone"), null);
 });

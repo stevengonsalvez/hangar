@@ -8,10 +8,10 @@ import { hostCalls, hostReplies, settle } from "./window.ts";
 
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { createComponent, Show } from "solid-js";
+import { createComponent, createSignal, Show } from "solid-js";
 import { render } from "solid-js/web";
 import type { Session_Serialize, SessionsView_Serialize, Workspace_Serialize } from "../../../../ainb-app/bindings/AppState";
-import { createComposerFlow } from "../../src/composer.ts";
+import { createComposerFlow, FOLLOW_MS } from "../../src/composer.ts";
 import { Composer } from "../../src/composer.tsx";
 
 function session(id: string, workspacePath: string): Session_Serialize {
@@ -29,8 +29,15 @@ function frame(): SessionsView_Serialize {
   } as unknown as SessionsView_Serialize;
 }
 
-/** What the flow did outside the view: toasts raised, focus restores. */
-const effects = { toasts: [] as string[], restored: 0 };
+/** What the flow did outside the view: toasts raised, focus restores, rows
+ * selected. */
+const effects = { toasts: [] as string[], restored: 0, selected: [] as string[] };
+
+/** The session list the window draws; a test pushes the next frame. */
+const [listed, setListed] = createSignal<SessionsView_Serialize>(frame());
+
+/** The flow's clock, moved by hand. */
+const clock = { now: 1_000 };
 
 /**
  * The window's own flow (`createComposerFlow`, the code `main.tsx` runs),
@@ -43,6 +50,9 @@ function Harness(props: { sessions: SessionsView_Serialize }) {
     restoreFocus: () => {
       effects.restored += 1;
     },
+    sessions: listed,
+    select: (sessionId) => effects.selected.push(sessionId),
+    now: () => clock.now,
   });
   const button = document.createElement("button");
   button.type = "button";
@@ -80,6 +90,9 @@ afterEach(() => {
   hostCalls.clear();
   effects.toasts = [];
   effects.restored = 0;
+  effects.selected = [];
+  setListed(frame());
+  clock.now = 1_000;
 });
 
 async function open() {
@@ -278,4 +291,76 @@ test("an invalid base ref marks the field invalid and disables Create", async ()
   await settle();
   assert.equal(base?.getAttribute("aria-invalid"), null);
   assert.equal(submitButton(container).disabled, false);
+});
+
+/** The frame after the daemon listed the created session `u-2`, with
+ * `selected` the session list's selection. */
+function withCreated(selected = "s-1"): SessionsView_Serialize {
+  return {
+    workspaces: [workspace("repo", "/repo", [session("s-1", "/repo"), session("s-3", "/repo"), session("u-2", "/repo")])],
+    selected_session_id: selected,
+  } as unknown as SessionsView_Serialize;
+}
+
+/** The frame before `u-2` is listed, with `selected` selected. */
+function beforeCreated(selected: string): SessionsView_Serialize {
+  return {
+    workspaces: [workspace("repo", "/repo", [session("s-1", "/repo"), session("s-3", "/repo")])],
+    selected_session_id: selected,
+  } as unknown as SessionsView_Serialize;
+}
+
+const createdReply = {
+  session_id: "u-2",
+  tmux_session_name: "repo-u2",
+  worktree_path: "/repo/.worktrees/u2",
+  branch: "ainb/fix-login",
+};
+
+/** Open the composer, create `u-2`, and let the host answer. */
+async function create() {
+  hostReplies.set("worktree_create", createdReply);
+  const container = await open();
+  fill(container, ".composer-name", "Fix login");
+  submitButton(container).click();
+  await settle();
+}
+
+test("a created session is selected once the session list carries it, and only once", async () => {
+  await create();
+  assert.deepEqual(effects.selected, [], "not listed yet: nothing to select, and the old row is not reselected");
+
+  setListed(withCreated());
+  await settle();
+  assert.deepEqual(effects.selected, ["u-2"], "the new session takes the selection");
+
+  setListed({ ...withCreated() });
+  await settle();
+  assert.deepEqual(effects.selected, ["u-2"], "a later frame does not select it again over a person's pick");
+});
+
+test("a created row that lands after the deadline does not take the selection", async () => {
+  await create();
+  clock.now += FOLLOW_MS + 1;
+  setListed(withCreated());
+  await settle();
+  assert.deepEqual(effects.selected, []);
+});
+
+// A board card and a palette row both select through `session_list.select_row`
+// (`showIntents`, `palette.ts`), so either reaches the flow only as the list's
+// selection moving. Each must beat a created row that lands later.
+test("a selection that moves before the created row lands keeps it, from the board or the palette", async () => {
+  for (const source of ["board card", "palette row"]) {
+    effects.selected = [];
+    cleanup?.();
+    document.body.innerHTML = "";
+    setListed(frame());
+    await create();
+    setListed(beforeCreated("s-3"));
+    await settle();
+    setListed(withCreated("s-3"));
+    await settle();
+    assert.deepEqual(effects.selected, [], `a ${source} pick wins`);
+  }
 });

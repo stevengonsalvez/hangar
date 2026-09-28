@@ -23,7 +23,7 @@ import { ringSelector, ROOT_SELECTORS } from "./selectors.ts";
 import { AcpCard } from "./acp.tsx";
 import { transcriptIntent, transcriptView } from "./acp.ts";
 import { AnswerSlot } from "./answer.tsx";
-import { phaseOf, questionFor, type Refusal, sendInOrder } from "./answer.ts";
+import { phaseOf, questionFor, questionOver, type Refusal, sendInOrder } from "./answer.ts";
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
@@ -50,6 +50,9 @@ import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
   openRowIntent,
   rowOf,
+  selectIntentFor,
+  selectRowIntent,
+  shownSessionOf,
   stepTab,
   modalBlocks,
   shellKeydown,
@@ -229,6 +232,10 @@ function Shell() {
   const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
+      // The session list follows the shown terminal, whoever showed it, so
+      // the sidebar row and the answer banner are that session's.
+      const select = selectIntentFor(tabs(), key);
+      if (select !== null) dispatch(select);
       setPane("terminal");
       closeTranscript();
       closeSettings();
@@ -374,6 +381,8 @@ function Shell() {
       if (key !== null) focusers.get(key)?.();
       else sidebar?.focus();
     },
+    sessions: () => sessions(),
+    select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
   });
 
   const onAccelerator = (shell: Accelerator) => {
@@ -387,9 +396,12 @@ function Shell() {
         return;
       }
       case "prev":
-      case "next":
-        activate(stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1), false);
+      case "next": {
+        const key = stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1);
+        const tab = tabs().find((candidate) => candidate.key === key);
+        if (tab) choose(tab);
         return;
+      }
       case "close": {
         const key = active();
         if (key !== null) void invoke("terminal_close", { key });
@@ -501,6 +513,9 @@ function Shell() {
   const inboxUnread = createMemo(() => ROOT_SELECTORS.inboxUnread(store, host()));
   const ask = () => fleet()?.ask_state;
   const question = createMemo(() => questionFor(sessions()));
+  /** The session whose terminal the work area shows: `undefined` when no
+   * terminal is shown, `null` for a tab of no session (`questionOver`). */
+  const shownSession = createMemo(() => shownSessionOf(showing("terminal"), tabs(), active()));
 
   // The reducer speaks through its notices: a refused send says why in the
   // reducer's own words (a daemon that is gone, a native picker, nothing typed),
@@ -700,7 +715,12 @@ function Shell() {
             </nav>
             {/* One banner per open request, latched for a short grace across
                 frames that carry none (#1266): `AnswerSlot`. */}
-            <AnswerSlot question={question()} ask={ask()} run={answer} />
+            {/* Keyed by the shown terminal's session, so switching terminals
+                drops a latched banner at once instead of holding the last
+                session's question over the next one's pane for the grace. */}
+            <For each={[shownSession()]}>
+              {() => <AnswerSlot question={questionOver(question(), shownSession())} ask={ask()} run={answer} />}
+            </For>
             <Show when={transcriptKey()}>
               {(key) => (
                 <AcpCard
