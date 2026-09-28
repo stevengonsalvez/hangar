@@ -1938,6 +1938,8 @@ async fn handle(
             handle_worktree_agent_add(req).await
         }
         methods::SHELL_CREATE if crate::spawn::enabled() => handle_shell_create(req).await,
+        methods::SHELL_LIST if crate::spawn::enabled() => handle_shell_list(req).await,
+        methods::SHELL_CLOSE if crate::spawn::enabled() => handle_shell_close(req).await,
         other => Err(RpcError {
             code: METHOD_NOT_FOUND,
             message: format!("unknown method: {other}"),
@@ -1977,6 +1979,28 @@ async fn handle_shell_create(req: &RpcRequest) -> Result<serde_json::Value, RpcE
         parse_params(req, "ShellCreateParams")?;
     match crate::spawn::shell_create(&params).await {
         Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `shell/list`: the shells the daemon opened that are still running (see
+/// [`crate::spawn::shell_list`]).
+async fn handle_shell_list(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let _: ainb_hangar_proto::spawn::ShellListParams = parse_params(req, "ShellListParams")?;
+    match crate::spawn::shell_list().await {
+        Ok(listed) => to_value(&listed),
+        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
+        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    }
+}
+
+/// `shell/close`: end one daemon shell by its exact name (see
+/// [`crate::spawn::shell_close`]).
+async fn handle_shell_close(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
+    let params: ainb_hangar_proto::spawn::ShellCloseParams = parse_params(req, "ShellCloseParams")?;
+    match crate::spawn::shell_close(&params).await {
+        Ok(closed) => to_value(&closed),
         Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
         Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
     }
