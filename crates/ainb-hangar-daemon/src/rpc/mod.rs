@@ -6400,7 +6400,10 @@ async fn exact_live_tmux_session_name(
         .map_err(|error| crate::fleet_provider::ProviderError::Transport(error.to_string()))?;
     if !discovered.iter().any(|candidate| {
         candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
+            && candidate
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|observed| crate::fleet::same_pane_process(fingerprint, observed))
     }) {
         return Err(crate::fleet_provider::ProviderError::Stale(
             DETAIL_TMUX_IDENTITY_CHANGED.to_string(),
@@ -7132,7 +7135,10 @@ async fn verified_tmux_send(
     };
     let live = discovered.iter().any(|candidate| {
         candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
+            && candidate
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|observed| crate::fleet::same_pane_process(fingerprint, observed))
     });
     if !live {
         return (
@@ -7175,7 +7181,10 @@ async fn verified_tmux_picker(
     };
     let live = discovered.iter().any(|candidate| {
         candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
+            && candidate
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|observed| crate::fleet::same_pane_process(fingerprint, observed))
             && candidate.provider.as_str() == session.provider
     });
     if !live {
