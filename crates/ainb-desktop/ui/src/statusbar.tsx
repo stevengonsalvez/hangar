@@ -10,7 +10,7 @@ interface Props {
    * summed by the caller from `ROOT_SELECTORS` (`main.tsx`), which already
    * owns which kinds count. */
   needsYou: number;
-  /** `ROOT_SELECTORS.idleCount`. */
+  /** The board's Idle column (`idleOnBoard`). */
   idle: number;
   /** Frames the store refused (#1132): a development build only. */
   framesIgnored?: number;
