@@ -5,6 +5,7 @@ import {
   initialFields,
   loadRegisteredProjects,
   projectChoices,
+  REGISTER_FOLDER_COMMAND,
   SPAWN_AGENTS,
   validate,
   type ComposerFields,
@@ -162,6 +163,13 @@ export function Composer(props: Props) {
             <For each={projects()}>{(project) => <option value={project.path}>{project.name}</option>}</For>
           </select>
           <Show when={errorFor("projectPath")}>{(message) => <p class="composer-error">{message()}</p>}</Show>
+          {/* Nothing to pick, once the host has answered: say how to register
+              a folder rather than leaving only "Choose a project." */}
+          <Show when={projects().length === 0 && !registered.loading}>
+            <p class="composer-hint composer-empty-projects">
+              No projects yet. Register a folder of repositories, then reopen: <code>{REGISTER_FOLDER_COMMAND}</code>
+            </p>
+          </Show>
         </label>
 
         <label class="composer-field">
