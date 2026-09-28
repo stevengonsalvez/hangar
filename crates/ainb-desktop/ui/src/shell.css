@@ -884,6 +884,7 @@ body {
 .composer textarea:focus-visible,
 .composer-agent:focus-visible,
 .composer-add-project:focus-visible,
+.composer-add-folder:focus-visible,
 .composer-cancel:focus-visible,
 .composer-create:focus-visible,
 .composer-advanced summary:focus-visible {
@@ -895,7 +896,8 @@ body {
 .composer select:disabled,
 .composer textarea:disabled,
 .composer-agent:disabled,
-.composer-add-project:disabled {
+.composer-add-project:disabled,
+.composer-add-folder:disabled {
   opacity: 0.6;
 }
 
@@ -940,7 +942,8 @@ body {
   color: var(--primary);
 }
 
-.composer-add-project {
+.composer-add-project,
+.composer-add-folder {
   align-self: flex-start;
   padding: 4px 10px;
   border: 1px solid var(--border);
@@ -949,6 +952,17 @@ body {
   color: var(--text);
   font-size: var(--text-sub);
   cursor: pointer;
+}
+
+.composer-empty-projects {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.composer-empty-projects p {
+  margin: 0;
 }
 
 .composer-advanced {
