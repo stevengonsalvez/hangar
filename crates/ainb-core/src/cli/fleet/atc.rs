@@ -2573,7 +2573,7 @@ fn current_tmux_identity() -> Option<(String, String)> {
             pane.as_os_str(),
             std::ffi::OsStr::new("-F"),
             std::ffi::OsStr::new(
-                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{session_created}",
+                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{session_created}\t#{pid}",
             ),
         ])
         .output()
@@ -2582,15 +2582,19 @@ fn current_tmux_identity() -> Option<(String, String)> {
     parse_hook_tmux_identity(std::str::from_utf8(&output.stdout).ok()?)
 }
 
+/// The hook's own pane as `(target, fingerprint)`, in the shape the tmux scan
+/// mints (`ainb-fleet-core` `discover/tmux.rs`): the trailing `server=` is the
+/// tmux server pid, which keeps a pane's identity across a move to another
+/// session, where `session_started` changes.
 fn parse_hook_tmux_identity(row: &str) -> Option<(String, String)> {
     let fields = row.trim().split('\t').collect::<Vec<_>>();
-    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+    if fields.len() != 7 || fields.iter().any(|field| field.is_empty()) {
         return None;
     }
     let target = format!("{}:{}.{}", fields[0], fields[1], fields[2]);
     let fingerprint = format!(
-        "pane={};pid={};session_started={}",
-        fields[3], fields[4], fields[5]
+        "pane={};pid={};session_started={};server={}",
+        fields[3], fields[4], fields[5], fields[6]
     );
     Some((target, fingerprint))
 }
@@ -3429,11 +3433,18 @@ mod tests {
 
     #[test]
     fn hook_tmux_identity_matches_discovery_fingerprint_shape() {
-        let identity = parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\n")
+        let identity = parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t4100\n")
             .expect("exact tmux identity");
         assert_eq!(identity.0, "claude-a:2.1");
-        assert_eq!(identity.1, "pane=%9;pid=4242;session_started=1700000000");
+        assert_eq!(
+            identity.1,
+            "pane=%9;pid=4242;session_started=1700000000;server=4100"
+        );
         assert!(parse_hook_tmux_identity("claude-a\t2\t1").is_none());
+        assert!(
+            parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t\n").is_none(),
+            "a row with no server is not an exact identity"
+        );
     }
 
     // --- H-A1: the hook NEVER returns Err (always exit 0) --------------------
