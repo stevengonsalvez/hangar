@@ -380,11 +380,90 @@ async fn answer_hold(
     now_ms: i64,
     request: &crate::hook_ingress::hold::HeldRequest,
 ) -> Result<AnswerResult, sqlx::Error> {
-    let decision = match request.decide_label(&params.answer) {
-        Ok(decision) => decision,
+    match request.decide_label(&params.answer) {
+        Ok(decision) => deliver_hold_decision(pool, events, params, now_ms, decision).await,
         // Refused before any claim: the row stays open for a valid answer.
-        Err(reason) => return Ok(AnswerResult::NoTarget { reason }),
+        Err(reason) => Ok(AnswerResult::NoTarget { reason }),
+    }
+}
+
+/// What a surface answers a held request with.
+#[derive(Debug, Clone, Copy)]
+pub enum HoldAnswer<'a> {
+    /// Approve a held permission.
+    Allow,
+    /// Deny a held permission, or decline a held question.
+    Deny,
+    /// Structured answers to a held question, checked against what it asked.
+    Answers(&'a [ainb_hangar_proto::fleet::FleetQuestionAnswer]),
+}
+
+/// Resolve the live hook hold on `params.attention_id` on behalf of `caller`,
+/// for `fleet/action` (Approve, Deny, StructuredAnswer, DismissStructured).
+/// `attention/answer` reaches the same claim-and-deliver step
+/// (`deliver_hold_decision`) through [`answer_as`], with a label answer.
+///
+/// Same rules as [`answer_as`]: the scope gate judges the same hold read the
+/// answer is delivered to, an answer that does not fit the question claims
+/// nothing, and the first answer wins. `NoTarget` when no hold is live.
+///
+/// # Errors
+///
+/// Returns a [`sqlx::Error`] if reading the row or the conditional flip fails.
+pub async fn resolve_hold_as(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    caller: &crate::rpc::auth::Caller,
+    answer: HoldAnswer<'_>,
+) -> Result<AnswerOutcome, sqlx::Error> {
+    use crate::hook_ingress::hold::{HeldRequest, HoldDecision};
+    let Some(row) = AttentionRepo::get(pool, &params.attention_id).await? else {
+        return Ok(AnswerOutcome::Answered(AnswerResult::NoTarget {
+            reason: "no such attention row".to_string(),
+        }));
     };
+    let Some(request) = crate::hook_ingress::hold::registry().request_for(&row.id) else {
+        return Ok(AnswerOutcome::Answered(AnswerResult::NoTarget {
+            reason: "no live hook hold for this request".to_string(),
+        }));
+    };
+    if !crate::answer_scope::caller_may_answer(caller, row.kind, true) {
+        return Ok(AnswerOutcome::ScopeRefused { kind: row.kind });
+    }
+    if row.state != "open" {
+        return Ok(AnswerOutcome::Answered(AnswerResult::AlreadyAnswered {
+            by: row.answered_by.unwrap_or_else(|| "unknown".to_string()),
+        }));
+    }
+    let decision = match (answer, &request) {
+        (HoldAnswer::Allow, HeldRequest::Permission) => Ok(HoldDecision::Allow { message: None }),
+        (HoldAnswer::Deny, _) => Ok(HoldDecision::Deny { message: None }),
+        (HoldAnswer::Answers(answers), HeldRequest::Ask { .. }) => request.decide_answers(answers),
+        (HoldAnswer::Allow, HeldRequest::Ask { .. }) => {
+            Err("a question needs answers, not an approval".to_string())
+        }
+        (HoldAnswer::Answers(_), HeldRequest::Permission) => {
+            Err("a permission needs allow or deny, not answers".to_string())
+        }
+    };
+    match decision {
+        Ok(decision) => deliver_hold_decision(pool, events, params, now_ms, decision)
+            .await
+            .map(AnswerOutcome::Answered),
+        Err(reason) => Ok(AnswerOutcome::Answered(AnswerResult::NoTarget { reason })),
+    }
+}
+
+/// Claim the row (first answer wins) and hand `decision` to the live hold.
+async fn deliver_hold_decision(
+    pool: &SqlitePool,
+    events: &EventSink,
+    params: &AnswerParams,
+    now_ms: i64,
+    decision: crate::hook_ingress::hold::HoldDecision,
+) -> Result<AnswerResult, sqlx::Error> {
     if let Some(lost) = claim(pool, params, now_ms).await? {
         return Ok(lost);
     }
@@ -2136,5 +2215,114 @@ mod tests {
         }
         let row = AttentionRepo::get(store.pool(), "p1").await.unwrap().unwrap();
         assert_eq!(row.state, "open");
+    }
+
+    /// Review of #196: `resolve_hold_as` judges the caller itself, whatever
+    /// the RPC layer in front of it refuses first. A phone or Pal answering a
+    /// live hold directly is `ScopeRefused`: nothing is claimed, the row
+    /// stays open and the hook keeps waiting.
+    #[tokio::test]
+    async fn resolve_hold_as_refuses_phones_and_pal_on_a_live_hold() {
+        use crate::hook_ingress::hold::{HeldRequest, HoldKey, registry};
+        use crate::rpc::auth::Caller;
+        use ainb_hangar_proto::devices::DeviceScope;
+        use ainb_hangar_proto::fleet::FleetQuestionAnswer;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let (_b, sink) = broker_sink();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
+        let question = HeldRequest::from_payload(&serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [{
+                "question": "Colour?",
+                "header": "C",
+                "multiSelect": false,
+                "options": [{"label": "Red"}, {"label": "Blue"}]
+            }]}
+        }))
+        .unwrap();
+        let answers = [FleetQuestionAnswer {
+            question_id: "Colour?".to_string(),
+            selected_options: vec!["Blue".to_string()],
+            text: None,
+        }];
+        let cases = [
+            (
+                AttentionKind::Approval,
+                HeldRequest::Permission,
+                HoldAnswer::Allow,
+            ),
+            (
+                AttentionKind::Approval,
+                HeldRequest::Permission,
+                HoldAnswer::Deny,
+            ),
+            (
+                AttentionKind::AskUserQuestion,
+                question,
+                HoldAnswer::Answers(&answers),
+            ),
+        ];
+        let callers = [
+            Caller::Device {
+                device_id: "phone-1".to_string(),
+                scope: DeviceScope::MOBILE,
+            },
+            Caller::Device {
+                device_id: "phone-2".to_string(),
+                scope: DeviceScope::MOBILE_TYPE,
+            },
+            Caller::Pal {
+                scope_key: "pal-1".to_string(),
+            },
+        ];
+        for (n, (kind, request, answer)) in cases.into_iter().enumerate() {
+            let id = format!("scope-hold-{n}-{nonce}");
+            AttentionRepo::insert(
+                store.pool(),
+                &NewAttention {
+                    id: id.clone(),
+                    session_id: format!("scope-hold-{nonce}"),
+                    cwd: "/work/x".to_string(),
+                    workspace_id: None,
+                    kind,
+                    payload: "{}".to_string(),
+                    degraded: false,
+                    created_at: 1_000,
+                    raise_transcript: None,
+                    channels: ainb_hangar_core::channel::ChannelSet::NONE,
+                },
+            )
+            .await
+            .unwrap();
+            let key = HoldKey::new(&format!("scope-hold-{nonce}"), &format!("call-{n}"));
+            let waiter = registry().register(&key, &id, None, request).unwrap();
+            for caller in &callers {
+                let params = AnswerParams {
+                    attention_id: id.clone(),
+                    answer: String::new(),
+                    answered_by: "test".into(),
+                    is_answer: true,
+                    mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
+                };
+                let out = resolve_hold_as(store.pool(), &sink, &params, 5000, caller, answer)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(out, AnswerOutcome::ScopeRefused { .. }),
+                    "{caller:?} {kind:?}: {out:?}"
+                );
+                assert!(registry().request_for(&id).is_some(), "the hold ended");
+                let row = AttentionRepo::get(store.pool(), &id).await.unwrap().unwrap();
+                assert_eq!(row.state, "open", "{caller:?} claimed the row");
+            }
+            drop(waiter);
+        }
     }
 }

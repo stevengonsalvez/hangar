@@ -18,7 +18,7 @@ use ainb_hangar_store::repo::attention::{AttentionKind, AttentionRepo, NewAttent
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
 
-use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldRegistry};
+use super::hold::{HOLD_DEADLINE, HeldRequest, HoldEnd, HoldKey, HoldRegistry};
 use super::{HookEvent, HookReply, HookSink};
 use crate::attention_ingest::AttentionIngest;
 use crate::events::EventSink;
@@ -117,7 +117,14 @@ impl IngestSink {
             events: self.events.clone(),
             holds: self.holds,
         };
-        let Some(waiter) = self.holds.register(&key, &attention_id, request) else {
+        // The fingerprint `fleet/action` will name this request by, derived
+        // from THIS request's own payload exactly as the reducer derives it.
+        // Never read back from the session row: a second request in the same
+        // session can stamp its own fingerprint there first.
+        let fingerprint = crate::fleet::claude_hold_fingerprint(&event.payload);
+        let Some(waiter) =
+            self.holds.register(&key, &attention_id, fingerprint.as_deref(), request)
+        else {
             guard.armed = false;
             tracing::warn!("hook ingress: hold not registered; the agent prompts itself");
             return HookReply::NoContent;
@@ -145,7 +152,7 @@ impl IngestSink {
         event: &HookEvent,
         session: &str,
         event_id: &str,
-        key: &str,
+        key: &HoldKey,
         now_ms: i64,
     ) -> Option<String> {
         let p = &event.payload;
@@ -173,7 +180,7 @@ impl IngestSink {
                 .map(str::to_string),
             channels,
         };
-        let request_key = format!("hold:{key}");
+        let request_key = format!("hold:{}:{}", key.session, key.call);
         match AttentionRepo::insert_if_absent(&self.pool, &row, Some(&request_key)).await {
             Ok(true) => {
                 self.events.emit_attention(HangarEvent::AttentionRaised {
@@ -244,18 +251,31 @@ impl IngestSink {
             None => self.holds.keys_for_session(session),
         };
         // Retire first, release second: by the time a released hook answers
-        // `{}`, its row already reads resolved:agent.
+        // `{}`, its row already reads resolved:agent. The holds released are
+        // exactly those of the rows retired (one predicate for both), plus
+        // any hold the event's own key names.
+        let mut release = keys;
         if let Ok(open) = AttentionRepo::open_approval_ids_for_session(&self.pool, session).await {
-            self.retire_passed(this_call, open).await;
+            for id in self.retire_passed(this_call, p, open).await {
+                if let Some(key) = self.holds.key_for_attention(&id) {
+                    release.push(key);
+                }
+            }
         }
-        for key in keys {
+        for key in release {
             self.holds.cancel(&key);
         }
     }
 
     /// Retire the hook-hold approval rows among `open` that the moved-on
     /// event covers: the one call, or every hold of the session.
-    async fn retire_passed(&self, this_call: Option<Option<&str>>, open: Vec<String>) {
+    async fn retire_passed(
+        &self,
+        this_call: Option<Option<&str>>,
+        event: &Value,
+        open: Vec<String>,
+    ) -> Vec<String> {
+        let mut retired = Vec::new();
         for id in open {
             let Ok(Some(row)) = AttentionRepo::get(&self.pool, &id).await else {
                 continue;
@@ -266,14 +286,24 @@ impl IngestSink {
             if payload.get("source").and_then(Value::as_str) != Some("hook_hold") {
                 continue;
             }
+            let held_id = payload.get("tool_use_id").and_then(Value::as_str);
             let same_call = match this_call {
                 None => true,
-                Some(call) => payload.get("tool_use_id").and_then(Value::as_str) == call,
+                // Both carry an id: it names the call.
+                Some(Some(call)) if held_id.is_some() => held_id == Some(call),
+                // No id on one side: the tool and its input name the call, as
+                // they do in the hold key.
+                Some(_) => {
+                    payload.get("tool_name") == event.get("tool_name")
+                        && payload.get("tool_input") == event.get("tool_input")
+                }
             };
             if same_call {
                 self.retire_approval(&id, RESOLVED_BY_AGENT).await;
+                retired.push(id);
             }
         }
+        retired
     }
 }
 
@@ -436,7 +466,7 @@ impl Drop for RetireOnDrop {
 /// The stable key of one held request: the session and the tool call it is
 /// about (`tool_use_id`), so a duplicate hook for the same call joins the
 /// live hold instead of opening a second one.
-fn hold_key(session: &str, payload: &Value) -> String {
+fn hold_key(session: &str, payload: &Value) -> HoldKey {
     let call = payload.get("tool_use_id").and_then(Value::as_str).map_or_else(
         || {
             // No id: the tool and its input name the call.
@@ -446,7 +476,7 @@ fn hold_key(session: &str, payload: &Value) -> String {
         },
         str::to_string,
     );
-    format!("{session}:{call}")
+    HoldKey::new(session, &call)
 }
 
 /// The event's discriminator, read from the payload as `ainb fleet atc hook`

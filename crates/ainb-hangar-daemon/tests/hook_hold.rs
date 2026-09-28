@@ -476,6 +476,425 @@ async fn phones_and_pal_are_refused_approvals_over_rpc_and_desktop_is_not() {
     ask_hold.abort();
 }
 
+/// `fleet/action` over the RPC dispatcher as the operator.
+async fn rpc_fleet_action(w: &World, session: &str, request_id: &str, action: Value) -> Value {
+    rpc_fleet_action_as(
+        w,
+        &ainb_hangar_daemon::rpc::auth::Caller::Operator,
+        session,
+        request_id,
+        action,
+    )
+    .await
+}
+
+/// `fleet/action` over the RPC dispatcher as `caller`.
+async fn rpc_fleet_action_as(
+    w: &World,
+    caller: &ainb_hangar_daemon::rpc::auth::Caller,
+    session: &str,
+    request_id: &str,
+    action: Value,
+) -> Value {
+    let key = format!("claude:{session}");
+    let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(w.store.pool(), &key)
+        .await
+        .unwrap()
+        .expect("the hold's session was reduced");
+    let req = ainb_hangar_proto::RpcRequest {
+        jsonrpc: ainb_hangar_proto::jsonrpc_version(),
+        id: ainb_hangar_proto::RpcId::Number(1),
+        method: ainb_hangar_proto::methods::FLEET_ACTION.to_string(),
+        params: json!({
+            "session_key": key,
+            "expected_version": row.version,
+            "request_id": request_id,
+            "action": action,
+        }),
+    };
+    let resp = ainb_hangar_daemon::rpc::dispatch_as(
+        w.store.pool(),
+        &req,
+        &health(),
+        &w.broker.sink(),
+        caller,
+    )
+    .await;
+    serde_json::to_value(resp).unwrap()
+}
+
+/// The fingerprint the Fleet app sends: the one on the session row.
+async fn session_fingerprint(w: &World, session: &str) -> String {
+    for _ in 0..100 {
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(
+            w.store.pool(),
+            &format!("claude:{session}"),
+        )
+        .await
+        .unwrap();
+        if let Some(fp) = row.and_then(|r| r.current_request_fingerprint) {
+            return fp;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no request fingerprint on {session}");
+}
+
+/// Review of #187 (follow-up): under the http hook transport the Fleet app's
+/// Approve and StructuredAnswer must reach the daemon's hold, not the notifyd
+/// broker (which stands down) and report "no longer waiting".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_action_approve_reaches_the_daemon_hold() {
+    let w = Arc::new(World::start().await);
+    let s = session("fleet-approve");
+    let held = w.hold(permission(&s, "call-fa1"));
+    let row_id = w.open_row(&s, AttentionKind::Approval).await;
+    let fp = session_fingerprint(&w, &s).await;
+
+    // A fingerprint that names no live hold falls back to the broker path
+    // and answers nothing here.
+    let stray = rpc_fleet_action(
+        &w,
+        &s,
+        "req-stray",
+        json!({"action": "approve", "request_fingerprint": "fnv1a64:0000000000000000"}),
+    )
+    .await;
+    assert_ne!(stray["result"]["receipt"]["status"], "DELIVERED", "{stray}");
+    assert!(!held.is_finished());
+
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-approve",
+        json!({"action": "approve", "request_fingerprint": fp}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    assert_eq!(resp["result"]["receipt"]["detail"], "hook hold");
+    let (status, body) = held.await.unwrap();
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "allow");
+    let row = AttentionRepo::get(w.store.pool(), &row_id).await.unwrap().unwrap();
+    assert_eq!(row.state, "answered", "the inbox row closed with the hold");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_action_deny_and_structured_answer_reach_the_daemon_hold() {
+    let w = Arc::new(World::start().await);
+    let s = session("fleet-deny");
+    let held = w.hold(permission(&s, "call-fd1"));
+    w.open_row(&s, AttentionKind::Approval).await;
+    let fp = session_fingerprint(&w, &s).await;
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-deny",
+        json!({"action": "deny", "request_fingerprint": fp}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    let (_, body) = held.await.unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
+
+    let s = session("fleet-ask");
+    let held = w.hold(ask(&s, "call-fq1"));
+    w.open_row(&s, AttentionKind::AskUserQuestion).await;
+    let fp = session_fingerprint(&w, &s).await;
+    // An answer the question does not offer is refused and claims nothing.
+    let bad = rpc_fleet_action(
+        &w,
+        &s,
+        "req-bad",
+        json!({"action": "structured_answer", "request_fingerprint": fp,
+               "answers": [{"question_id": "Which colour?", "selected_options": ["Green"]}]}),
+    )
+    .await;
+    assert_ne!(bad["result"]["receipt"]["status"], "DELIVERED", "{bad}");
+    assert!(!held.is_finished());
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-ask",
+        json!({"action": "structured_answer", "request_fingerprint": fp,
+               "answers": [{"question_id": "Which colour?", "selected_options": ["Blue"]}]}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    let (_, body) = held.await.unwrap();
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        v["hookSpecificOutput"]["updatedInput"]["answers"]["Which colour?"],
+        "Blue"
+    );
+}
+
+/// With no `tool_use_id` on either side, the tool and its input name the
+/// call: the matching PostToolUse ends the hold, another command does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_tool_use_ids_the_tool_and_input_name_the_call() {
+    let w = Arc::new(World::start().await);
+    let s = session("no-ids");
+    let mut request = permission_for(&s, "unused", "make test");
+    request.as_object_mut().unwrap().remove("tool_use_id");
+    let held = w.hold(request);
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    let post = |command: &str| {
+        json!({"hook_event_name": "PostToolUse", "session_id": s, "cwd": "/tmp/hold-test",
+               "tool_name": "Bash", "tool_input": {"command": command}})
+    };
+    assert_eq!(w.post("/hook/claude", &post("ls")).await.0, 204);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !held.is_finished(),
+        "another command's PostToolUse ended the hold"
+    );
+    assert_eq!(w.post("/hook/claude", &post("make test")).await.0, 204);
+    let (status, _) = held.await.unwrap();
+    assert_eq!(status, 204);
+    let row = AttentionRepo::get(w.store.pool(), &id).await.unwrap().unwrap();
+    assert_eq!(row.answered_by.as_deref(), Some(RESOLVED_BY_AGENT));
+}
+
+/// Poll until the session's request fingerprint is something other than `not`.
+async fn next_fingerprint(w: &World, session: &str, not: &str) -> String {
+    for _ in 0..100 {
+        let fp = session_fingerprint(w, session).await;
+        if fp != not {
+            return fp;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the fingerprint never moved past {not}");
+}
+
+/// Review of #196 (CRITICAL): two requests held at once in one session. The
+/// Fleet card shows the latest fingerprint; approving it must reach only that
+/// request's hook, never the earlier one's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_holds_each_answer_only_their_own_fingerprint() {
+    let w = Arc::new(World::start().await);
+    let s = session("two-fp");
+    let a = w.hold(permission_for(&s, "call-a", "rm -rf /important"));
+    let fp_a = session_fingerprint(&w, &s).await;
+    let b = w.hold(permission_for(&s, "call-b", "ls"));
+    let fp_b = next_fingerprint(&w, &s, &fp_a).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = rpc_fleet_action(
+        &w,
+        &s,
+        "req-b",
+        json!({"action": "approve", "request_fingerprint": fp_b}),
+    )
+    .await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    let (_, body) = b.await.unwrap();
+    assert!(body.contains("\"allow\""), "{body}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!a.is_finished(), "approving B reached A's rm -rf");
+
+    // fleet/action only names the session's current request; the earlier
+    // one is still answerable, exactly, from its own inbox row.
+    let row_a = row_for_call(&w, &s, "call-a").await;
+    assert!(matches!(
+        w.answer(&row_a, "deny").await,
+        AnswerResult::Delivered { .. }
+    ));
+    let (_, body) = a.await.unwrap();
+    assert!(body.contains("\"deny\""), "{body}");
+}
+
+/// Review of #196 (CRITICAL, deterministic): a hold is named by the
+/// fingerprint of its own payload, never the one on the session row. A
+/// trigger keeps the row stamped with ANOTHER request's fingerprint whenever
+/// this request's is written: the state a second request in the session
+/// leaves the row in when it stamps between this hold's reduce and its
+/// registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_is_named_by_its_own_fingerprint_whatever_the_row_says() {
+    use hook_ingress::hold::{RequestMatch, registry};
+    let w = Arc::new(World::start().await);
+    let s = session("row-fp");
+    let other = "fnv1a64:00000000deadbeef";
+    let pool = w.store.pool();
+    sqlx::query("CREATE TABLE test_seen_fp (fp TEXT NOT NULL)")
+        .execute(pool)
+        .await
+        .unwrap();
+    for (name, event) in [
+        ("ins", "INSERT"),
+        ("upd", "UPDATE OF current_request_fingerprint"),
+    ] {
+        sqlx::query(&format!(
+            "CREATE TRIGGER test_other_fp_{name} AFTER {event} ON fleet_session \
+             WHEN NEW.session_key = 'claude:{s}' \
+               AND NEW.current_request_fingerprint IS NOT NULL \
+               AND NEW.current_request_fingerprint <> '{other}' \
+             BEGIN \
+               INSERT INTO test_seen_fp (fp) VALUES (NEW.current_request_fingerprint); \
+               UPDATE fleet_session SET current_request_fingerprint = '{other}' \
+                WHERE session_key = NEW.session_key; \
+             END"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let held = w.hold(permission(&s, "call-rowfp"));
+    let id = w.open_row(&s, AttentionKind::Approval).await;
+    assert_eq!(
+        session_fingerprint(&w, &s).await,
+        other,
+        "the row names the other request"
+    );
+    let own: String = sqlx::query_scalar("SELECT fp FROM test_seen_fp LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_ne!(own, other);
+    for _ in 0..100 {
+        if registry().find_request(&s, &own) != RequestMatch::None {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        registry().find_request(&s, &own),
+        RequestMatch::One(id.clone()),
+        "the hold is named by its own payload's fingerprint"
+    );
+    assert_eq!(
+        registry().find_request(&s, other),
+        RequestMatch::None,
+        "the hold took another request's fingerprint from the row"
+    );
+    assert!(matches!(
+        w.answer(&id, "deny").await,
+        AnswerResult::Delivered { .. }
+    ));
+    assert_eq!(held.await.unwrap().0, 200);
+}
+
+fn refused(resp: &Value) -> bool {
+    resp.get("error").is_some()
+        || matches!(
+            resp["result"]["receipt"]["status"].as_str(),
+            Some("REJECTED")
+        )
+}
+
+/// Review of #196 (MAJOR): fleet/action on a held request is judged by the
+/// caller's scope. Phones and Pal are refused Approve, Deny and a structured
+/// answer and the hook keeps waiting; a desktop device is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fleet_action_on_a_hold_follows_the_callers_scope() {
+    use ainb_hangar_daemon::rpc::auth::Caller;
+    use ainb_hangar_proto::devices::DeviceScope;
+    let w = Arc::new(World::start().await);
+    let refused_callers = [
+        Caller::Device {
+            device_id: "phone-1".into(),
+            scope: DeviceScope::MOBILE,
+        },
+        Caller::Device {
+            device_id: "phone-2".into(),
+            scope: DeviceScope::MOBILE_TYPE,
+        },
+        Caller::Pal {
+            scope_key: "pal-1".into(),
+        },
+    ];
+    let desktop = Caller::Device {
+        device_id: "laptop".into(),
+        scope: DeviceScope::DESKTOP,
+    };
+
+    for (n, verb) in ["approve", "deny"].iter().enumerate() {
+        let s = session(&format!("scope-{verb}"));
+        let held = w.hold(permission(&s, &format!("call-s{n}")));
+        w.open_row(&s, AttentionKind::Approval).await;
+        let fp = session_fingerprint(&w, &s).await;
+        for (i, caller) in refused_callers.iter().enumerate() {
+            let resp = rpc_fleet_action_as(
+                &w,
+                caller,
+                &s,
+                &format!("req-{verb}-{i}"),
+                json!({"action": verb, "request_fingerprint": fp}),
+            )
+            .await;
+            assert!(refused(&resp), "{caller:?} {verb}: {resp}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !held.is_finished(),
+            "a refused caller answered the {verb} hold"
+        );
+        let resp = rpc_fleet_action_as(
+            &w,
+            &desktop,
+            &s,
+            &format!("req-{verb}-desk"),
+            json!({"action": verb, "request_fingerprint": fp}),
+        )
+        .await;
+        assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+        assert_eq!(held.await.unwrap().0, 200);
+    }
+
+    let s = session("scope-ask");
+    let held = w.hold(ask(&s, "call-sq"));
+    w.open_row(&s, AttentionKind::AskUserQuestion).await;
+    let fp = session_fingerprint(&w, &s).await;
+    let action = json!({"action": "structured_answer", "request_fingerprint": fp,
+        "answers": [{"question_id": "Which colour?", "selected_options": ["Blue"]}]});
+    for (i, caller) in refused_callers.iter().enumerate() {
+        let resp =
+            rpc_fleet_action_as(&w, caller, &s, &format!("req-ask-{i}"), action.clone()).await;
+        assert!(refused(&resp), "{caller:?} structured_answer: {resp}");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !held.is_finished(),
+        "a refused caller answered the held question"
+    );
+    let resp = rpc_fleet_action_as(&w, &desktop, &s, "req-ask-desk", action).await;
+    assert_eq!(resp["result"]["receipt"]["status"], "DELIVERED", "{resp}");
+    assert_eq!(held.await.unwrap().0, 200);
+}
+
+/// Review of #196: attention/answer and fleet/action race on one hold; the
+/// claim lets exactly one through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbox_answer_and_a_fleet_action_racing_deliver_once() {
+    for run in 0..5 {
+        let w = Arc::new(World::start().await);
+        let s = session(&format!("race{run}"));
+        let held = w.hold(permission(&s, "call-race"));
+        let id = w.open_row(&s, AttentionKind::Approval).await;
+        let fp = session_fingerprint(&w, &s).await;
+        let (inbox, fleet) = tokio::join!(
+            w.answer(&id, "allow"),
+            rpc_fleet_action(
+                &w,
+                &s,
+                "req-race",
+                json!({"action": "deny", "request_fingerprint": fp})
+            )
+        );
+        let inbox_won = matches!(inbox, AnswerResult::Delivered { .. });
+        let fleet_won = fleet["result"]["receipt"]["status"] == "DELIVERED";
+        assert!(inbox_won ^ fleet_won, "run {run}: {inbox:?} / {fleet}");
+        let (_, body) = held.await.unwrap();
+        let want = if inbox_won { "allow" } else { "deny" };
+        assert!(body.contains(&format!("\"{want}\"")), "run {run}: {body}");
+    }
+}
+
 /// Review of #192 (M2): a replayed Stop is history. Drained while a hold is
 /// live in the same session, it must not end that hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
