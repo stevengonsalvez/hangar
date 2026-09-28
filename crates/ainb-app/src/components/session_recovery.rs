@@ -1152,6 +1152,7 @@ impl SessionRecoveryState {
     /// Delete the selected worktree and its symlink
     pub fn cleanup_worktree(&mut self) -> Result<(), String> {
         let worktree = self.selected_worktree().ok_or("No worktree selected")?.clone();
+        Self::refuse_if_shared(&worktree)?;
 
         let worktrees_base = dirs::home_dir()
             .ok_or("Could not find home directory")?
@@ -1398,8 +1399,27 @@ impl SessionRecoveryState {
         Ok(())
     }
 
+    /// Refuse to clean up `worktree` while a session other than the one it
+    /// is an orphan of still has it as its worktree. A second agent joins a
+    /// tree without a `by-session` link, so the tree reads as orphaned here
+    /// once the session that made it is gone, while the agent is still in it.
+    /// A store that cannot be read refuses too: it cannot say who is in there.
+    fn refuse_if_shared(worktree: &OrphanedWorktree) -> Result<(), String> {
+        let store = crate::cli::util::load_session_store()
+            .map_err(|e| format!("Cannot check whether another session uses the worktree: {e}"))?;
+        let own = worktree.id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+        if store.tree_used_by_another(&worktree.path, own) {
+            return Err(format!(
+                "{} is still used by another session: delete that session first",
+                worktree.name
+            ));
+        }
+        Ok(())
+    }
+
     /// Cleanup a single worktree (static, no &mut self)
     fn cleanup_single_worktree(worktree: &OrphanedWorktree) -> Result<(), String> {
+        Self::refuse_if_shared(worktree)?;
         let worktrees_base = dirs::home_dir()
             .ok_or("Could not find home directory")?
             .join(".agents-in-a-box")
@@ -1446,5 +1466,98 @@ impl SessionRecoveryState {
         });
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_worktree_tests {
+    use super::*;
+    use crate::test_home::ScopedHome;
+    use chrono::Utc;
+
+    fn row(session_id: Uuid, tmux: &str, worktree_path: &std::path::Path) -> SessionMetadata {
+        SessionMetadata {
+            session_id,
+            tmux_session_name: tmux.to_string(),
+            worktree_path: worktree_path.to_path_buf(),
+            workspace_name: "repo".to_string(),
+            created_at: Utc::now(),
+            agent_type: SessionAgentType::Claude,
+            headroom_enabled: false,
+            rtk_enabled: false,
+            skip_permissions: Some(false),
+            model: None,
+            model_source: Default::default(),
+            codex_model: None,
+            codex_thread_id: None,
+            claude_session_id: None,
+        }
+    }
+
+    /// A tree under `by-name`, with a `by-session` link for `maker` only, as
+    /// `ainb run --worktree` and then `--existing-worktree` leave it.
+    fn tree(home: &ScopedHome, maker: Uuid) -> PathBuf {
+        let base = home.path().join(".agents-in-a-box").join("worktrees");
+        let tree = base.join("by-name").join("repo--feat--1a2b3c4d");
+        std::fs::create_dir_all(&tree).expect("tree");
+        std::fs::write(tree.join("work.txt"), "in progress").expect("agent work");
+        let by_session = base.join("by-session");
+        std::fs::create_dir_all(&by_session).expect("by-session");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&tree, by_session.join(maker.to_string())).expect("link");
+        tree
+    }
+
+    fn orphan(
+        tree: &std::path::Path,
+        id: Option<Uuid>,
+        orphan_type: OrphanType,
+    ) -> OrphanedWorktree {
+        OrphanedWorktree {
+            id: id.map(|id| id.to_string()),
+            path: tree.to_path_buf(),
+            name: "repo--feat--1a2b3c4d".to_string(),
+            orphan_type,
+            ..Default::default()
+        }
+    }
+
+    /// The maker's tmux died and the tree reads as its orphan, but a second
+    /// agent joined the tree and is still in it: cleanup must refuse.
+    #[test]
+    fn an_orphan_tree_another_session_uses_is_not_cleaned_up() {
+        let home = ScopedHome::new();
+        let (maker, joined) = (Uuid::new_v4(), Uuid::new_v4());
+        let tree = tree(&home, maker);
+        let mut store = SessionStore::default();
+        store.upsert(row(maker, "ainb-maker", &tree));
+        store.upsert(row(joined, "ainb-joined", &tree));
+        store.save().expect("seed store");
+
+        for orphan in [
+            orphan(&tree, Some(maker), OrphanType::NoTmux),
+            orphan(&tree, None, OrphanType::NoMetadata),
+        ] {
+            let refused = SessionRecoveryState::cleanup_single_worktree(&orphan);
+            assert!(refused.is_err_and(|why| why.contains("another session")));
+            assert!(
+                tree.join("work.txt").is_file(),
+                "{:?} removed a tree in use",
+                orphan.orphan_type
+            );
+        }
+        assert!(SessionStore::load().find_by_tmux_name("ainb-joined").is_some());
+
+        // Once the joined session is gone, the maker's orphan cleans up.
+        let mut store = SessionStore::load();
+        store.remove_by_session_id(joined);
+        store.save().expect("drop joined");
+        SessionRecoveryState::cleanup_single_worktree(&orphan(
+            &tree,
+            Some(maker),
+            OrphanType::NoTmux,
+        ))
+        .expect("cleanup");
+        assert!(!tree.exists());
     }
 }
