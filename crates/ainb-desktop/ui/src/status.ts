@@ -29,9 +29,10 @@ export type Need = "ask" | "approve" | "wait" | "elicitation" | "error";
 
 /**
  * The vocabulary itself: the spec table's five words, plus `exited` for a
- * session whose process is gone. The board hides an exited agent (nobody
- * acts on it), but a sidebar row or a tab for one still exists and must not
- * look idle: idle is a live agent at rest, exited is nothing running.
+ * session whose process is gone. The board keeps an exited agent in Done
+ * until it is opened, then in Idle (`board.ts columnOf`), marked Exited; a
+ * sidebar row or a tab for one must not look idle either: idle is a live
+ * agent at rest, exited is nothing running.
  */
 export type UiStatus =
   | { kind: "needs"; need: Need }
@@ -120,7 +121,7 @@ export function elicitationDetail(attention: readonly Pick<AttentionMark_Seriali
 /**
  * The vocabulary for one card, from the host's own `state`/`wait_kind`/
  * `turn_complete` plus its row's attention chips. An exited agent reads
- * `exited`; the board leaves it out, the sidebar and tabs mark it.
+ * `exited`, which every surface marks.
  *
  * `has_open_request` and `tier` ride on `card` (the shape a caller
  * destructures straight off `AgentCardFrame`) but never change the kind
