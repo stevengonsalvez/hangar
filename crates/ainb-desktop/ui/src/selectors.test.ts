@@ -14,6 +14,19 @@ function frame(section: SectionName, version: number, body: unknown): Frame_Seri
   return { section, version, epoch: 1, host_id: "local", body };
 }
 
+/** A sessions body whose rows ring Ask where `asks` says so. */
+function asking(...asks: boolean[]) {
+  return {
+    workspaces: [
+      {
+        name: "repo",
+        path: "/repo",
+        sessions: asks.map((ask, i) => ({ id: `s${i}`, name: `s${i}`, status: "Idle", attention: ask ? [{ kind: "Ask" }] : [] })),
+      },
+    ],
+  };
+}
+
 function sessions(...statuses: string[]) {
   return {
     workspaces: [
@@ -40,7 +53,6 @@ test("every root selector returns a scalar, with and without a host", () => {
         assert.ok(typeof value === "number" || typeof value === "boolean", `${name} for ${host} gave ${typeof value}`);
       }
     }
-    assert.equal(ROOT_SELECTORS.idleCount(store, "local"), 1);
     assert.equal(ROOT_SELECTORS.workspacesLoading(store, "local"), true);
     assert.equal(ROOT_SELECTORS.attentionElsewhere(store, "local"), 2, "read off a populated Fleet frame");
     dispose();
@@ -50,22 +62,22 @@ test("every root selector returns a scalar, with and without a host", () => {
 test("a memo over a root selector stays quiet when a drain keeps its value", () => {
   const { store, runs, dispose } = createRoot((dispose) => {
     const store = createFrameStore(SECTIONS);
-    const runs = { idle: 0 };
-    const idle = createMemo(() => ROOT_SELECTORS.idleCount(store, "local"));
+    const runs = { ask: 0 };
+    const ask = createMemo(() => ROOT_SELECTORS.askCount(store, "local"));
     createEffect(() => {
-      idle();
-      runs.idle += 1;
+      ask();
+      runs.ask += 1;
     });
     return { store, runs, dispose };
   });
 
-  store.applyDrain("local", [{ frames: [frame("sessions", 1, sessions("Idle", "Running"))] }]);
-  const afterFirst = runs.idle;
-  // A different session changes, the idle count does not.
-  store.applyDrain("local", [{ frames: [frame("sessions", 2, sessions("Idle", "Stopped"))] }]);
-  assert.equal(runs.idle, afterFirst, "the idle count's readers did not re-run");
-  store.applyDrain("local", [{ frames: [frame("sessions", 3, sessions("Idle", "Idle"))] }]);
-  assert.equal(runs.idle, afterFirst + 1);
+  store.applyDrain("local", [{ frames: [frame("sessions", 1, asking(true, false))] }]);
+  const afterFirst = runs.ask;
+  // A different session asks now, the Ask count does not move.
+  store.applyDrain("local", [{ frames: [frame("sessions", 2, asking(false, true))] }]);
+  assert.equal(runs.ask, afterFirst, "the Ask count's readers did not re-run");
+  store.applyDrain("local", [{ frames: [frame("sessions", 3, asking(true, true))] }]);
+  assert.equal(runs.ask, afterFirst + 1);
   dispose();
 });
 
