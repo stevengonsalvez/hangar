@@ -316,8 +316,11 @@ impl WorkspaceScanner {
         self.scan()
     }
 
-    /// Scan without using cache (the actual filesystem scan)
-    fn scan_uncached(&self) -> Result<ScanResult> {
+    /// Scan without reading or writing the cache (the actual filesystem scan).
+    /// For a caller whose search paths are not the TUI picker's: the cache
+    /// holds one set of paths, so scanning another through it would evict
+    /// the picker's list on every call.
+    pub fn scan_uncached(&self) -> Result<ScanResult> {
         info!(
             "Starting workspace scan with {} search paths",
             self.search_paths.len()
