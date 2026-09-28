@@ -27,7 +27,7 @@ import { phaseOf, questionFor, type Refusal, sendInOrder } from "./answer.ts";
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
-import { agentStateCounts } from "./board.ts";
+import { agentStateCounts, boardColumns, idleOnBoard } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -71,8 +71,8 @@ import { startTheme } from "./theme/theme.ts";
 const DRAIN_MS = 16;
 
 /** The selectors summed into the status bar's one "N need you" count: one
- * per `NEED_YOU` kind, the same list `idleCount` leaves out, so a row is in
- * one total or the other and never both. */
+ * per `NEED_YOU` kind. A row ringing one draws in the board's Needs column,
+ * so it is never in the idle count as well (`idleOnBoard`). */
 const ATTENTION_SELECTORS = NEED_YOU.map(ringSelector);
 
 /** How long a toast stays up. */
@@ -485,7 +485,9 @@ function Shell() {
    * one of the four still wakes just that one before the sum recomputes. */
   const attentionCounts = ATTENTION_SELECTORS.map((select) => createMemo(() => select(store, host())));
   const needsYou = createMemo(() => attentionCounts.reduce((sum, count) => sum + count(), 0));
-  const idle = createMemo(() => ROOT_SELECTORS.idleCount(store, host()));
+  // The board's own Idle column, from the same frames and the same projection
+  // the board draws, so the footer moves on the frame the board does.
+  const idle = createMemo(() => idleOnBoard(boardColumns(agentStatus(), fleet(), sessions(), acks())));
   const sessionsStale = createMemo(() => ROOT_SELECTORS.sessionsStale(store, host()));
   const gitViewStale = createMemo(() => ROOT_SELECTORS.gitViewStale(store, host()));
   const loading = createMemo(() => ROOT_SELECTORS.workspacesLoading(store, host()));
