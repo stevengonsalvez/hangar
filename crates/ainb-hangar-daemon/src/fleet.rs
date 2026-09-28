@@ -344,6 +344,27 @@ pub async fn apply_hook(
         .map(|outcome| outcome.fleet)
 }
 
+/// The incarnation a hook with this pane `fingerprint` reports for `session_key`.
+///
+/// The row's own incarnation when it names the same process
+/// ([`same_pane_process`]), else the fingerprint. The store's fence (D14)
+/// compares incarnations as strings and orders two by `session_started`, so a
+/// fingerprint that only gained `server=` (the first hook after an upgrade,
+/// when its binding adopts the server) would otherwise read as an OLDER
+/// incarnation of the same run and have every hook refused. A different
+/// process still reports its own fingerprint and meets the fence as before.
+async fn stable_incarnation(
+    pool: &SqlitePool,
+    session_key: &str,
+    fingerprint: &str,
+) -> Result<String, FleetRepoError> {
+    let current = FleetRepo::get_session(pool, session_key)
+        .await?
+        .and_then(|row| row.session_incarnation)
+        .filter(|incarnation| same_pane_process(incarnation, fingerprint));
+    Ok(current.unwrap_or_else(|| fingerprint.to_string()))
+}
+
 /// Apply one exact provider hook together with the attention projection it
 /// implies, in ONE transaction (D14 status store).
 ///
@@ -423,6 +444,12 @@ pub async fn apply_hook_with_attention(
     }
     let tmux_target = binding.target().map(str::to_string);
     let process_start_fingerprint = binding.fingerprint().map(str::to_string);
+    let session_incarnation = match process_start_fingerprint.as_deref() {
+        Some(fingerprint) => {
+            Some(stable_incarnation(pool, session_key.as_str(), fingerprint).await?)
+        }
+        None => None,
+    };
     // The decision itself, so a later pass has something to re-confirm against
     // (#961). `bound` records what was chosen; `invalidate_binding` clears both
     // the decision and the live route when the pane it chose has been taken
@@ -491,7 +518,7 @@ pub async fn apply_hook_with_attention(
             // The pane's process IS the incarnation for a tmux-hosted session:
             // the same session id in a pane whose process has been replaced is
             // a different run of the agent, which is what the fence is for.
-            session_incarnation: process_start_fingerprint.clone(),
+            session_incarnation,
             cwd: Some(observation.cwd.to_string()),
             display_name: display_name_for_cwd(observation.cwd),
             management_state: (provider == Provider::Claude).then(|| "MANAGED".to_string()),
@@ -2200,9 +2227,9 @@ fn pane_claim_rank(row: &FleetSessionRow) -> (bool, bool, i64, i64, &str) {
 /// exact fingerprint, or only its `pid` has drifted and its provider is
 /// compatible. `process_start_fingerprint` is
 /// `pane=<pane-id>;pid=<pid>;session_started=<ts>;server=<tmux-pid>` (rows
-/// written before `server` existed lack it), and `pid` is the pane's
-/// foreground process, which drifts between a hook's read and the scan:
-/// observed live, a hook wrote `pane=%4257;pid=69099;session_started=1785436252`
+/// written before `server` existed lack it), and `pid` is `#{pane_pid}`, the
+/// process the pane was started with (not its foreground process). It has
+/// still been seen to differ between a hook's read and the scan: observed live, a hook wrote `pane=%4257;pid=69099;session_started=1785436252`
 /// for the pane the scanner reported as `pane=%4257;pid=68868;...`. Without
 /// that allowance the scanner keys the pane under `SessionKey::legacy(...)` in a
 /// second row that can never carry interview actions. The scanner often
@@ -2356,9 +2383,10 @@ fn tmux_missing_event(row: &FleetSessionRow, observed_at: i64) -> NewFleetEvent 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PaneIdentity<'a> {
     pane: &'a str,
-    /// The pane's process. Not part of which pane this is: it drifts between a
-    /// hook's read and a scan (see [`pane_owner`]). [`same_pane_process`] is
-    /// the check that also wants it.
+    /// `#{pane_pid}`, the process the pane was started with. Not part of which
+    /// pane this is: it has been seen to differ between a hook's read and a
+    /// scan (see [`pane_owner`]), and `respawn-pane` replaces it in place.
+    /// [`same_pane_process`] is the check that also wants it.
     pid: &'a str,
     session_started: &'a str,
     server: Option<&'a str>,
@@ -2379,12 +2407,23 @@ impl PaneIdentity<'_> {
     /// sides can still agree on. An upgraded daemon therefore keeps every old
     /// row whose pane has not moved, and a pane that moved before its row was
     /// rewritten is judged exactly as it was before this key existed.
+    ///
+    /// Not transitive across old and new rows: an old identity matches two new
+    /// ones with the same pane and `session_started` on different servers,
+    /// which do not match each other. That is safe only because every caller
+    /// compares one recorded fingerprint against one observation; nothing
+    /// groups, hashes or dedups by it, and nothing may start to.
     pub(crate) fn same_pane(&self, other: &PaneIdentity<'_>) -> bool {
         self.pane == other.pane
             && match (self.server, other.server) {
                 (Some(server), Some(other_server)) => server == other_server,
                 _ => self.session_started == other.session_started,
             }
+    }
+
+    /// Whether the fingerprint named its tmux server.
+    pub(crate) fn names_server(&self) -> bool {
+        self.server.is_some()
     }
 }
 
@@ -2419,10 +2458,31 @@ pub(crate) fn pane_identity(fingerprint: &str) -> Option<PaneIdentity<'_>> {
 /// row written before that never equals a scan of its own live pane, and a
 /// pane moved to another session changes `session_started`, yet both are the
 /// same process. A fingerprint with no identity in it is still compared whole.
+///
+/// Pane-scoped only. A check that gates an action on the pane's whole SESSION
+/// uses [`same_pane_in_session`] instead.
 pub(crate) fn same_pane_process(recorded: &str, observed: &str) -> bool {
     match (pane_identity(recorded), pane_identity(observed)) {
         (Some(recorded), Some(observed)) => {
             recorded.same_pane(&observed) && recorded.pid == observed.pid
+        }
+        _ => recorded == observed,
+    }
+}
+
+/// [`same_pane_process`], and still in the tmux session it was recorded in.
+///
+/// For the checks that gate an action on the pane's whole session (a managed
+/// Codex Stop, Kill, Restart or Archive runs `kill-session` on the target's
+/// session). The sweep retargets a MANAGED row to wherever its pane went, so a
+/// pane moved into someone else's session would otherwise pass as live, and
+/// the action would kill every other pane in that session. `session_started`
+/// is the session's creation time, so a move refuses here.
+pub(crate) fn same_pane_in_session(recorded: &str, observed: &str) -> bool {
+    match (pane_identity(recorded), pane_identity(observed)) {
+        (Some(recorded_identity), Some(observed_identity)) => {
+            same_pane_process(recorded, observed)
+                && recorded_identity.session_started == observed_identity.session_started
         }
         _ => recorded == observed,
     }
@@ -7319,11 +7379,11 @@ mod tests {
     /// After an upgrade the registry still holds rows whose fingerprint names
     /// no server, while every new scan and hook names one. Those rows are keyed
     /// on (pane, `session_started`), which both sides still carry, so a live
-    /// pane that has not moved keeps its row, its binding and its hooks. The
-    /// fence must not refuse the upgraded hook either: the binding holds, so the
-    /// row's incarnation is still the bound fingerprint.
+    /// pane that has not moved keeps its row and its binding. The first hook
+    /// from the same process then hands the row its server, and the fence
+    /// still applies that hook, so from then on the row survives a move too.
     #[tokio::test]
-    async fn a_row_written_before_fingerprints_named_the_server_keeps_its_pane() {
+    async fn a_row_written_before_fingerprints_named_the_server_adopts_it_and_survives_a_move() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_in(dir.path()).await.unwrap();
         let sink = EventBroker::new().sink();
@@ -7331,7 +7391,14 @@ mod tests {
 
         let old = "pane=%96;pid=936;session_started=1785400000";
         let upgraded = "pane=%96;pid=936;session_started=1785400000;server=4100";
+        let moved = "pane=%96;pid=936;session_started=1785400900;server=4100";
         let key = hooked_session(pool, &sink, "sess-old", "s_old:1.1", old, 1_000).await;
+
+        // Until a hook hands it the server, a move is judged as before server
+        // keys existed: a different `session_started` is a different pane.
+        let registered = FleetRepo::snapshot(pool).await.unwrap().sessions;
+        let moved_scan = scanned_pane("s_new:0.1", moved, Provider::Claude);
+        assert!(pane_owner(&registered, &moved_scan).is_none());
 
         let mut guard = SweepGuard::default();
         let scan = scanned_pane("s_old:1.1", upgraded, Provider::Claude);
@@ -7351,18 +7418,69 @@ mod tests {
             "the upgraded hook applied"
         );
         assert_eq!(row.tmux_target.as_deref(), Some("s_old:1.1"));
-        assert_eq!(row.bound_fingerprint.as_deref(), Some(old), "binding kept");
-
-        // The fallback cannot see a move that happened before the row named its
-        // server: with no server on one side, a different `session_started` is
-        // a different pane, exactly as before server keys existed.
-        let registered = FleetRepo::snapshot(pool).await.unwrap().sessions;
-        let moved = scanned_pane(
-            "s_new:0.1",
-            "pane=%96;pid=936;session_started=1785400900;server=4100",
-            Provider::Unknown,
+        assert_eq!(
+            row.bound_fingerprint.as_deref(),
+            Some(upgraded),
+            "the binding adopts the server"
         );
-        assert!(pane_owner(&registered, &moved).is_none());
+        assert_eq!(row.process_start_fingerprint.as_deref(), Some(upgraded));
+
+        for at in [120_000, 150_000, 180_000] {
+            guarded_sweep(pool, &sink, &mut guard, Ok(vec![moved_scan.clone()]), at).await;
+            let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            assert_eq!(row.lifecycle_state, "TURN_COMPLETE", "sweep at {at}");
+            assert_eq!(row.transport_health, "HEALTHY", "sweep at {at}");
+            assert_eq!(
+                row.tmux_target.as_deref(),
+                Some("s_new:0.1"),
+                "sweep at {at}"
+            );
+        }
+
+        // A hook from the moved pane is the same run, not a restart.
+        apply_hook(
+            pool,
+            &sink,
+            HookObservation {
+                event_id: "old-moved:prompt".to_string(),
+                provider: "claude",
+                provider_session_id: "sess-old",
+                event_type: "UserPromptSubmit",
+                cwd: "/work/repo",
+                payload: &serde_json::json!({
+                    "tmux_target": "s_new:0.1",
+                    "process_start_fingerprint": moved,
+                }),
+                observed_at: 190_000,
+                transcript_model: None,
+            },
+        )
+        .await
+        .expect("hook applies");
+        let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+        assert_eq!(row.lifecycle_state, "RUNNING");
+        assert_eq!(row.tmux_target.as_deref(), Some("s_new:0.1"));
+        assert_eq!(row.bound_fingerprint.as_deref(), Some(upgraded));
+    }
+
+    /// A Codex Stop or Kill runs `kill-session`, so its gate is strict about
+    /// the session: a pane moved elsewhere is the same process, not the same
+    /// session. Send-keys only needs the pane.
+    #[test]
+    fn a_session_scoped_check_refuses_a_pane_that_moved_session() {
+        let recorded = "pane=%95;pid=935;session_started=1785400000;server=4100";
+        let moved = "pane=%95;pid=935;session_started=1785400900;server=4100";
+        assert!(same_pane_process(recorded, moved));
+        assert!(!same_pane_in_session(recorded, moved));
+        assert!(same_pane_in_session(recorded, recorded));
+        assert!(same_pane_in_session(
+            "pane=%95;pid=935;session_started=1785400000",
+            recorded
+        ));
+        assert!(!same_pane_in_session(
+            recorded,
+            "pane=%95;pid=936;session_started=1785400000;server=4100"
+        ));
     }
 
     /// The termination contract, class by class: whatever a row is, applying
