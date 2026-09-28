@@ -89,7 +89,7 @@ pub enum PaneBinding {
     FromHook {
         /// `session:window.pane`.
         target: String,
-        /// `pane=…;pid=…;session_started=…`, when the hook carried one.
+        /// `pane=…;pid=…;session_started=…;server=…`, when the hook carried one.
         fingerprint: Option<String>,
     },
     /// Exactly one discovered pane matched `(provider, cwd)`.
@@ -186,10 +186,8 @@ pub async fn resolve(
                 let same_pane = hook_fingerprint
                     .as_deref()
                     .and_then(crate::fleet::pane_identity)
-                    .is_some_and(|observed| {
-                        decision.fingerprint.as_deref().and_then(crate::fleet::pane_identity)
-                            == Some(observed)
-                    });
+                    .zip(decision.fingerprint.as_deref().and_then(crate::fleet::pane_identity))
+                    .is_some_and(|(observed, bound)| observed.same_pane(&bound));
                 let target = hook_target.filter(|_| same_pane).unwrap_or(decision.target);
                 return Ok(PaneBinding::Correlated {
                     target,
@@ -274,6 +272,14 @@ async fn bound_decision(
 
 /// Compare the bound pane against what is in it now.
 ///
+/// By pane identity ([`crate::fleet::PaneIdentity::same_pane`]), the key the
+/// sweep uses, not by the raw fingerprint: the raw string also changes when the
+/// pane moves to another session (`session_started`) and when a row written
+/// before fingerprints named the tmux server meets one that does, and neither
+/// is a different pane. Nor is a `pid` read at a different instant (see
+/// `pane_owner` in `fleet.rs`). Only a fingerprint with no identity in it is
+/// compared whole.
+///
 /// The hook's own fingerprint is preferred when the hook named the same pane:
 /// it is this agent reporting its own process, which is better evidence than a
 /// scan. Otherwise the tier-5 scan for `(provider, cwd)` is consulted, and a
@@ -290,7 +296,7 @@ async fn confirm(
         return Ok(Confirmation::Unobserved);
     };
     if let Some(observed) = hook_fingerprint {
-        return Ok(if observed == bound {
+        return Ok(if holds(bound, observed) {
             Confirmation::Holds
         } else {
             Confirmation::Broken(
@@ -315,7 +321,7 @@ async fn confirm(
     let Some((_, Some(observed))) = live else {
         return Ok(Confirmation::Unobserved);
     };
-    if observed == bound {
+    if holds(bound, &observed) {
         return Ok(Confirmation::Holds);
     }
     Ok(Confirmation::Broken(
@@ -325,6 +331,17 @@ async fn confirm(
             .map(|candidate| candidate.tmux_target)
             .collect(),
     ))
+}
+
+/// Whether the `observed` fingerprint is still the `bound` pane.
+fn holds(bound: &str, observed: &str) -> bool {
+    match (
+        crate::fleet::pane_identity(bound),
+        crate::fleet::pane_identity(observed),
+    ) {
+        (Some(bound), Some(observed)) => bound.same_pane(&observed),
+        _ => bound == observed,
+    }
 }
 
 /// Choose a binding from the candidate set. Split from the query so the
