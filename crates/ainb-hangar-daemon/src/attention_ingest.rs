@@ -515,8 +515,8 @@ impl AttentionIngest {
                     tracing::warn!(
                         event_id,
                         reduced = stored.projection_revision.is_some(),
-                        stored_type = %stored.event_type,
-                        line_type = %line.event_type,
+                        stored_type = ?stored.event_type,
+                        line_type = ?line.event_type,
                         "hook event id already recorded differently; skipping"
                     );
                     return LineOutcome::Permanent;
