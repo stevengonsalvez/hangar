@@ -33,8 +33,16 @@ fn health() -> DaemonHealth {
     }
 }
 
+/// Whether tmux is here to test against. Missing under CI (`CI` set) is a
+/// failure, not a skip: a job that cannot run these must not report them
+/// green. Only a local run without tmux skips.
 fn tmux_available() -> bool {
-    Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success())
+    let here = Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success());
+    assert!(
+        here || std::env::var_os("CI").is_none(),
+        "tmux is missing under CI, so these tests cannot run"
+    );
+    here
 }
 
 async fn call(params: serde_json::Value) -> serde_json::Value {
@@ -352,9 +360,11 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
         .to_string();
     let session = world.tmux(&["show-environment", "-t", &format!("={name}")]);
     let session = String::from_utf8_lossy(&session.stdout);
+    // `-NAME` is tmux marking the variable removed from the session, which
+    // is the scrub itself; only a `NAME=value` line would carry it.
     for secret in [
-        "HANGAR_CLAUDE_OAUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        "HANGAR_CLAUDE_OAUTH_TOKEN=",
+        "CLAUDE_CODE_OAUTH_TOKEN=",
         "sk-ant-oat",
     ] {
         assert!(!session.contains(secret), "{secret} reached the session");
