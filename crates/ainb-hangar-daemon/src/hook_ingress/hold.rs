@@ -47,8 +47,6 @@ pub enum HoldDecision {
     },
     /// Answers to the held `AskUserQuestion`, one per question, as labels.
     Answers(Vec<(String, String)>),
-    /// Hand the request back to the agent's own prompt.
-    Release,
 }
 
 /// What the held request asked.
@@ -169,7 +167,6 @@ impl HeldRequest {
     #[must_use]
     pub fn render(&self, decision: &HoldDecision) -> Option<Vec<u8>> {
         let out = match (self, decision) {
-            (_, HoldDecision::Release) => return None,
             (Self::Permission, HoldDecision::Allow { message }) => json!({
                 "hookSpecificOutput": {
                     "hookEventName": "PermissionRequest",
@@ -600,7 +597,6 @@ mod tests {
         let v: Value = serde_json::from_slice(&deny).unwrap();
         assert_eq!(v["hookSpecificOutput"]["decision"]["behavior"], "deny");
         assert_eq!(v["hookSpecificOutput"]["decision"]["message"], "no");
-        assert_eq!(HeldRequest::Permission.render(&HoldDecision::Release), None);
     }
 
     #[test]
