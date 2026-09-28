@@ -178,8 +178,21 @@ pub async fn resolve(
         .await?
         {
             Confirmation::Holds => {
+                // A pane's target moves under it (a sibling pane closes,
+                // windows renumber, the session is renamed) while its identity
+                // does not. A hook names its own pane from `$TMUX_PANE`, so when
+                // it reports the same pane its target is the current one, and
+                // replaying the recorded target would put a stale route back.
+                let same_pane = hook_fingerprint
+                    .as_deref()
+                    .and_then(crate::fleet::pane_identity)
+                    .is_some_and(|observed| {
+                        decision.fingerprint.as_deref().and_then(crate::fleet::pane_identity)
+                            == Some(observed)
+                    });
+                let target = hook_target.filter(|_| same_pane).unwrap_or(decision.target);
                 return Ok(PaneBinding::Correlated {
-                    target: decision.target,
+                    target,
                     fingerprint: decision.fingerprint,
                     // Nothing to retire: the legacy row was retired when this
                     // binding was first made.
