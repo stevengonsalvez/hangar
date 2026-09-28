@@ -156,6 +156,51 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
         ainb_hangar_client::socket_path_in(&home.path()),
         token.trim().to_string(),
     );
+    // A repository outside every registered folder is refused, and the
+    // sentence says how to fix it from the window.
+    let stray = user_home.path().join("stray");
+    std::fs::create_dir_all(&stray).unwrap();
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&stray)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(ok, "git init stray");
+    let refused = request(
+        &client,
+        CreateWorktreeArgs {
+            repo_path: std::fs::canonicalize(&stray).unwrap().display().to_string(),
+            branch: None,
+            base: None,
+            agent: SpawnAgent::Claude,
+            model: None,
+            prompt: None,
+        },
+    )
+    .await
+    .expect_err("an unregistered repository is refused");
+    assert!(
+        refused.contains("Add project"),
+        "the refusal names the fix: {refused}"
+    );
+    // The fix it names: Add project registers the folder, and the daemon,
+    // which reads the registered folders per call, now creates from it.
+    let added = ainb_desktop::projects::register(user_home.path(), &stray).expect("registered");
+    request(
+        &client,
+        CreateWorktreeArgs {
+            repo_path: added.path,
+            branch: None,
+            base: None,
+            agent: SpawnAgent::Claude,
+            model: None,
+            prompt: None,
+        },
+    )
+    .await
+    .expect("a registered project is created from");
+
     let created = request(
         &client,
         CreateWorktreeArgs {
