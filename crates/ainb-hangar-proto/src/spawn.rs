@@ -2,7 +2,7 @@
 //! sessions in them, so every surface (desktop, TUI, a paired device later)
 //! creates work through one owner.
 //!
-//! `worktree/create`, `worktree/agent_add` and `shell/create` are dark until
+//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are dark until
 //! their flip PR: the daemon answers `METHOD_NOT_FOUND` unless
 //! `AINB_HANGAR_SPAWN` is set at boot, so a daemon built from main behaves
 //! exactly as v1.29.0 does. None is in the mutation registry while dark; their
@@ -15,6 +15,8 @@
 //!          ◀── WorktreeCreateResult ──┘
 //!  desktop ──shell/create──▶ daemon ──`tmux new-session -d`──▶ a plain shell
 //!          ◀── ShellCreateResult ──┘
+//!  desktop ──shell/list──▶ daemon ──`tmux list-sessions`──▶ its own shells
+//!  desktop ──shell/close──▶ daemon ──`tmux kill-session -t =ainb-dsh-…`──▶ one of them
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -138,6 +140,56 @@ pub struct ShellCreateResult {
     pub worktree_path: String,
 }
 
+/// The tmux session prefix of every shell the daemon opens: `ainb-dsh-`
+/// and eight lowercase hex digits.
+///
+/// Its own prefix, not the TUI's `ainb-sh-`: the TUI filters and sweeps its
+/// own shells by that one, so a daemon shell under it was neither listed nor
+/// closed by anything. `shell/list` and `shell/close` act on this prefix
+/// alone.
+pub const DAEMON_SHELL_PREFIX: &str = "ainb-dsh-";
+
+/// Whether `name` is a shell the daemon opened: [`DAEMON_SHELL_PREFIX`]
+/// followed by exactly eight lowercase hex digits.
+#[must_use]
+pub fn is_daemon_shell_name(name: &str) -> bool {
+    name.strip_prefix(DAEMON_SHELL_PREFIX).is_some_and(|id| {
+        id.len() == 8 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Parameters for `shell/list`: none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellListParams {}
+
+/// Result for `shell/list`: every shell the daemon opened that is still
+/// running, each as `shell/create` returned it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellListResult {
+    /// The running daemon shells, by session name.
+    pub shells: Vec<ShellCreateResult>,
+}
+
+/// Parameters for `shell/close`: one shell the daemon opened, by its exact
+/// session name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCloseParams {
+    /// The shell's tmux session, as `shell/create` or `shell/list` named it.
+    pub tmux_session_name: String,
+    /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
+    /// Unused while the method is dark.
+    #[serde(flatten)]
+    pub mutation: crate::mutation::MutationEnvelope,
+}
+
+/// Result for `shell/close`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCloseResult {
+    /// `true` when this call ended the session, `false` when it was already
+    /// gone, so a retried close answers the same as the first.
+    pub closed: bool,
+}
+
 /// Why a spawn request was refused before anything was created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnParamsError {
@@ -150,6 +202,8 @@ pub enum SpawnParamsError {
     /// A ref-like field (`branch`, `base`) would be read as a flag or is not a
     /// valid git ref name.
     BadRef(&'static str),
+    /// `tmux_session_name` is not a shell the daemon opened.
+    NotADaemonShell,
 }
 
 impl std::fmt::Display for SpawnParamsError {
@@ -161,6 +215,10 @@ impl std::fmt::Display for SpawnParamsError {
                 write!(f, "{field} is empty, too long, or has control characters")
             }
             Self::BadRef(field) => write!(f, "{field} is not a valid git ref name"),
+            Self::NotADaemonShell => write!(
+                f,
+                "tmux_session_name is not a shell the daemon opened ({DAEMON_SHELL_PREFIX}<8 hex>)"
+            ),
         }
     }
 }
@@ -218,6 +276,22 @@ impl ShellCreateParams {
             return Err(SpawnParamsError::WorktreePathNotAbsolute);
         }
         text_ok("worktree_path", &self.worktree_path, 4096)
+    }
+}
+
+impl ShellCloseParams {
+    /// Only a daemon shell's exact name ([`is_daemon_shell_name`]), so a
+    /// close can never reach the TUI's shells, an agent's session or a
+    /// session the user made.
+    ///
+    /// # Errors
+    /// [`SpawnParamsError::NotADaemonShell`].
+    pub fn validate(&self) -> Result<(), SpawnParamsError> {
+        if is_daemon_shell_name(&self.tmux_session_name) {
+            Ok(())
+        } else {
+            Err(SpawnParamsError::NotADaemonShell)
+        }
     }
 }
 
@@ -453,6 +527,49 @@ mod tests {
             serde_json::from_value(serde_json::json!({"worktree_path": "/w", "op_id": "op-1"}))
                 .expect("decode");
         assert!(decoded.mutation.op_id.is_some());
+    }
+
+    #[test]
+    fn a_close_names_exactly_one_daemon_shell() {
+        let close = |name: &str| ShellCloseParams {
+            tmux_session_name: name.into(),
+            mutation: crate::mutation::MutationEnvelope::default(),
+        };
+        assert_eq!(close("ainb-dsh-0a1b2c3d").validate(), Ok(()));
+        for refused in [
+            "ainb-sh-0a1b2c3d",
+            "ainb-ws-0a1b2c3d",
+            "ainb-dsh-",
+            "ainb-dsh-0a1b2c3",
+            "ainb-dsh-0a1b2c3d4",
+            "ainb-dsh-0A1B2C3D",
+            "ainb-dsh-0a1b2c3g",
+            "ainb-dsh-0a1b2c3d:1",
+            "=ainb-dsh-0a1b2c3d",
+            "main",
+            "",
+        ] {
+            assert_eq!(
+                close(refused).validate(),
+                Err(SpawnParamsError::NotADaemonShell),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shell_list_and_close_wire_shapes() {
+        let list: ShellListParams = serde_json::from_value(serde_json::json!({})).expect("list");
+        assert_eq!(list, ShellListParams::default());
+        let close: ShellCloseParams = serde_json::from_value(
+            serde_json::json!({"tmux_session_name": "ainb-dsh-0a1b2c3d", "op_id": "op-1"}),
+        )
+        .expect("close");
+        assert!(close.mutation.op_id.is_some());
+        assert_eq!(
+            serde_json::to_value(ShellCloseResult { closed: false }).expect("encode"),
+            serde_json::json!({"closed": false})
+        );
     }
 
     #[test]
