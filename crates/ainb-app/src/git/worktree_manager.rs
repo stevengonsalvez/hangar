@@ -241,6 +241,31 @@ impl WorktreeManager {
         ainb_hangar_daemon::spawn::is_managed_tree(&canonical, &by_name).then_some(canonical)
     }
 
+    /// Whether a `by-session` link other than `except`'s resolves to `tree`.
+    /// A Boss session keeps no session-store row, so its link is the only
+    /// sign that it works in a tree. Compared resolved; an unreadable link
+    /// counts as a user, since what it points at is unknown.
+    pub fn tree_linked_by_another(&self, tree: &Path, except: Option<Uuid>) -> bool {
+        let by_session = self.base_worktree_dir.join("by-session");
+        let Ok(entries) = std::fs::read_dir(&by_session) else {
+            return false;
+        };
+        let resolved =
+            |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let tree = resolved(tree);
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let id = name.to_str().and_then(|n| Uuid::parse_str(n).ok());
+            if id.is_some() && id == except {
+                return false;
+            }
+            match std::fs::read_link(entry.path()) {
+                Ok(target) => resolved(&by_session.join(target)) == tree,
+                Err(_) => entry.path().is_symlink(),
+            }
+        })
+    }
+
     /// Remove a tree this manager made that no `by-session` link names: the
     /// tree a session joined with `ainb run --existing-worktree` is left
     /// holding once the session that made it is gone.
@@ -386,7 +411,9 @@ impl WorktreeManager {
             match std::fs::read_link(&session_path) {
                 Ok(resolved) => {
                     tracing::debug!("Resolved symlink to: {:?}", resolved);
-                    resolved
+                    // A relative target is relative to the link, not to
+                    // wherever this process happens to run.
+                    self.base_worktree_dir.join("by-session").join(resolved)
                 }
                 Err(e) => {
                     tracing::debug!("Failed to read symlink {:?}: {}", session_path, e);
