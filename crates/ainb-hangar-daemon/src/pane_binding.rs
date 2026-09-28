@@ -273,25 +273,32 @@ async fn bound_decision(
     }))
 }
 
-/// The hook's fingerprint, when a binding written before fingerprints named the
-/// tmux server should take it on.
+/// The hook's fingerprint, when the binding should take it on.
 ///
-/// The decision is otherwise written once, so a pre-upgrade binding would key
-/// its pane on `session_started` for its whole life and a later move would
-/// still retire it. Adopted only when the hook is the same pane running the
-/// same process ([`crate::fleet::same_pane_process`]), names its server, and
-/// the binding does not. A binding that already names its server keeps its
-/// fingerprint: adopting a moved pane's later `session_started` would read to
-/// the store's fence as a restart of the agent.
+/// Only called once the hook has confirmed the binding, so the hook names the
+/// bound pane. The decision is otherwise written once, and two cases would
+/// wedge on the recorded fingerprint:
+///
+/// - The pane was respawned in place (`respawn-pane -k`, then `claude --resume`
+///   under the same session id): same pane, new `pid`. Kept, the route would
+///   name a process that is gone, and every send would refuse it as a changed
+///   identity with nothing to rebind it.
+/// - The binding was written before fingerprints named the tmux server: it
+///   would key its pane on `session_started` for its whole life, and a later
+///   move would still retire it.
+///
+/// A binding that already names its server and the same `pid` keeps its
+/// fingerprint even when the hook's `session_started` differs (a move): the
+/// store's fence orders runs by `session_started`, and a moved pane is not a
+/// new run.
 fn adopted_fingerprint(bound: Option<&str>, hook: Option<String>) -> Option<String> {
     let bound = bound?;
     let hook = hook?;
-    let bound_names_server =
-        crate::fleet::pane_identity(bound).is_some_and(|identity| identity.names_server());
-    let hook_names_server =
-        crate::fleet::pane_identity(&hook).is_some_and(|identity| identity.names_server());
-    (!bound_names_server && hook_names_server && crate::fleet::same_pane_process(bound, &hook))
-        .then_some(hook)
+    let bound_identity = crate::fleet::pane_identity(bound)?;
+    let hook_identity = crate::fleet::pane_identity(&hook)?;
+    let respawned = !crate::fleet::same_pane_process(bound, &hook);
+    let gains_server = !bound_identity.names_server() && hook_identity.names_server();
+    (respawned || gains_server).then_some(hook)
 }
 
 /// Compare the bound pane against what is in it now.
