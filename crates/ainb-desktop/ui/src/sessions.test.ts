@@ -9,7 +9,7 @@ import type {
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
-import { idleCount, isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor, rowStatus } from "./sessions.ts";
+import { isSelected, keyLabel, label, LABEL_CHARS, legacyTmuxSession, NEED_YOU, ringCount, ringFor, rowStatus } from "./sessions.ts";
 
 function session(id: string, status: SessionStatus = "Running", marks: AttentionKind[] = []): Session_Serialize {
   return {
@@ -45,32 +45,14 @@ test("header counts are per ring kind and idle status", () => {
   assert.equal(ringCount(sessions, "Ask"), 2);
   assert.equal(ringCount(sessions, "Err"), 1);
   assert.equal(ringCount(sessions, "Wait"), 0);
-  // "c" is Idle but rings Ask: it needs a person, so it is not idle as well.
-  assert.equal(idleCount(sessions), 1);
 });
 
-test("a waiting session is counted once, in need-you, never also as idle", () => {
-  // The driven run's two readings: one waiting session read "1 need you 1
-  // idle", and with a second, idle session "1 need you 2 idle".
-  const one = { workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"])] }] } as unknown as SessionsView_Serialize;
-  assert.equal(ringCount(one, "Ask"), 1);
-  assert.equal(idleCount(one), 0);
-  const two = {
-    workspaces: [{ name: "r", sessions: [session("w", "Idle", ["Ask"]), session("i", "Idle")] }],
-  } as unknown as SessionsView_Serialize;
-  assert.equal(ringCount(two, "Ask"), 1);
-  assert.equal(idleCount(two), 1);
-});
-
-test("an idle session that only rings Done is idle, not left out of both counts", () => {
-  // A finished turn is for reading: it is not a need-you kind, so the row
-  // is counted idle rather than in neither total.
+test("a row that only rings Done is in no need-you count", () => {
   const done = { workspaces: [{ name: "r", sessions: [session("d", "Idle", ["Done"])] }] } as unknown as SessionsView_Serialize;
   assert.deepEqual(
     NEED_YOU.map((kind) => ringCount(done, kind)),
     [0, 0, 0, 0],
   );
-  assert.equal(idleCount(done), 1);
 });
 
 test("a label drops control and format characters and stops at the cap", () => {
