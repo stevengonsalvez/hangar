@@ -2211,9 +2211,16 @@ enum Fence {
 /// later" instead refused every event of the new run, while its binding had
 /// already moved to the new pid.
 ///
-/// Only when `session_started` cannot order the two (absent on either side, or
-/// equal) does this fall back to comparing `event.observed_at` against
-/// `last_observed_at`, and that
+/// Nor can it order two runs in ONE pane on one tmux server: a pane moved with
+/// `join-pane` or `move-window` carries its id to another session, so there
+/// `session_started` only says which session the pane sits in now. A pane
+/// moved into an older session and then respawned read as the older run, and
+/// every event of the live one was refused. Fingerprints of different panes,
+/// or without `server=` on either side, are still ordered by it.
+///
+/// Only when `session_started` cannot order the two (absent on either side,
+/// equal, or one pane on one server) does this fall back to comparing
+/// `event.observed_at` against `last_observed_at`, and that
 /// fallback is weaker in a way worth naming: `last_observed_at` is a monotonic
 /// maximum across every tier, so it mixes provider-stamped hook clocks with
 /// daemon-stamped scan clocks. A genuine restart whose first event trails a
@@ -2234,7 +2241,7 @@ fn fence(row: &FleetSessionRow, event: &NewFleetEvent) -> Fence {
     if let (Some(started), Some(current_started)) =
         (session_started(incoming), session_started(current))
     {
-        if started != current_started {
+        if started != current_started && !same_pane_on_same_server(incoming, current) {
             return if started > current_started {
                 Fence::Restart
             } else {
@@ -2268,20 +2275,7 @@ fn session_started(fingerprint: &str) -> Option<i64> {
 /// `pane=%N;pid=N;session_started=N[;server=N]`. Anything that does not parse
 /// is not the same run here; the caller has already compared the strings.
 fn same_run(incoming: &str, current: &str) -> bool {
-    fn fields(fingerprint: &str) -> Option<(&str, &str, &str, Option<&str>)> {
-        let mut fields = fingerprint.split(';');
-        let pane = fields.next()?.strip_prefix("pane=")?;
-        let pid = fields.next()?.strip_prefix("pid=")?;
-        let started = fields.next()?.strip_prefix("session_started=")?;
-        let server = fields.next().and_then(|field| field.strip_prefix("server="));
-        Some((
-            pane,
-            pid,
-            started,
-            server.filter(|server| !server.is_empty()),
-        ))
-    }
-    let (Some(incoming), Some(current)) = (fields(incoming), fields(current)) else {
+    let (Some(incoming), Some(current)) = (tmux_fields(incoming), tmux_fields(current)) else {
         return false;
     };
     let servers_agree = match (incoming.3, current.3) {
@@ -2289,6 +2283,32 @@ fn same_run(incoming: &str, current: &str) -> bool {
         _ => true,
     };
     incoming.0 == current.0 && incoming.1 == current.1 && incoming.2 == current.2 && servers_agree
+}
+
+/// Whether two tmux fingerprints name one pane on one server, both naming it.
+fn same_pane_on_same_server(incoming: &str, current: &str) -> bool {
+    match (tmux_fields(incoming), tmux_fields(current)) {
+        (Some((pane, _, _, Some(server))), Some((current_pane, _, _, Some(current_server)))) => {
+            pane == current_pane && server == current_server
+        }
+        _ => false,
+    }
+}
+
+/// `(pane, pid, session_started, server)` from
+/// `pane=%N;pid=N;session_started=N[;server=N]`, or `None` for another shape.
+fn tmux_fields(fingerprint: &str) -> Option<(&str, &str, &str, Option<&str>)> {
+    let mut fields = fingerprint.split(';');
+    let pane = fields.next()?.strip_prefix("pane=")?;
+    let pid = fields.next()?.strip_prefix("pid=")?;
+    let started = fields.next()?.strip_prefix("session_started=")?;
+    let server = fields.next().and_then(|field| field.strip_prefix("server="));
+    Some((
+        pane,
+        pid,
+        started,
+        server.filter(|server| !server.is_empty()),
+    ))
 }
 
 /// Reset a row for a new incarnation of the same session key.
@@ -3245,6 +3265,61 @@ mod tests {
         assert!(!late.applied, "the old run's late event is refused");
         let row = FleetRepo::get_session(store.pool(), key).await.unwrap().unwrap();
         assert_eq!(row.session_incarnation.as_deref(), Some(respawned));
+    }
+
+    /// Probe P1: a pane moved into an OLDER session and then respawned. Same
+    /// pane, same server, so `session_started` names only the session the pane
+    /// sits in, and the clock orders the runs: the respawned run applies, the
+    /// old run's late event is refused. Other panes, and fingerprints without
+    /// a server, are still ordered by `session_started`.
+    #[tokio::test]
+    async fn a_pane_moved_to_an_older_session_and_respawned_is_ordered_by_the_clock() {
+        let (_dir, store) = store().await;
+        let key = "claude:s-moved-respawn";
+        let before_move = "pane=%95;pid=935;session_started=1785400000;server=4100";
+        let respawned = "pane=%95;pid=999;session_started=1785300000;server=4100";
+        seed_incarnation(&store, key, before_move, 1_000).await;
+
+        let result =
+            FleetRepo::apply_event(store.pool(), &stop_at(key, "e-respawn", respawned, 2_000))
+                .await
+                .unwrap();
+        assert!(result.applied, "the respawned run applies");
+        let row = FleetRepo::get_session(store.pool(), key).await.unwrap().unwrap();
+        assert_eq!(row.session_incarnation.as_deref(), Some(respawned));
+
+        let late =
+            FleetRepo::apply_event(store.pool(), &stop_at(key, "e-late", before_move, 1_500))
+                .await
+                .unwrap();
+        assert!(!late.applied, "the old run's late event is refused");
+
+        // Still ordered by `session_started`: another server, even though its
+        // clock is later.
+        let other_key = "claude:s-other-server";
+        seed_incarnation(&store, other_key, before_move, 1_000).await;
+        let other = "pane=%95;pid=999;session_started=1785300000;server=4200";
+        assert!(
+            !FleetRepo::apply_event(store.pool(), &stop_at(other_key, "e-other", other, 2_000))
+                .await
+                .unwrap()
+                .applied
+        );
+        // And a row that names no server.
+        let old_key = "claude:s-no-server";
+        seed_incarnation(
+            &store,
+            old_key,
+            "pane=%95;pid=935;session_started=1785400000",
+            1_000,
+        )
+        .await;
+        assert!(
+            !FleetRepo::apply_event(store.pool(), &stop_at(old_key, "e-old", respawned, 2_000))
+                .await
+                .unwrap()
+                .applied
+        );
     }
 
     /// A fingerprint that only gained `;server=` is the same run: it passes
