@@ -109,6 +109,14 @@ export function loadRegisteredProjects(): Promise<RegisteredProject[]> {
  * repositories from a terminal. The value is JSON, quoted for the shell. */
 export const REGISTER_FOLDER_COMMAND = `ainb config set workspace_defaults.workspace_scan_paths '["~/code"]'`;
 
+/** Add a project through the host's native folder picker (`project_add`).
+ * The folder is the person's pick in a dialog the OS draws, never a path
+ * this page supplies. `null` is a cancelled picker; a refusal rejects with
+ * the host's sentence. */
+export function addProject(): Promise<RegisteredProject | null> {
+  return invoke<RegisteredProject | null>("project_add");
+}
+
 /** The fresh composer, opened on `view`'s default project. */
 export function initialFields(view: SessionsView_Serialize | undefined): ComposerFields {
   return {
