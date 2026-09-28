@@ -10,7 +10,7 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
 import { cardForSession, statusForSession } from "./status.ts";
-import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, showIntents } from "./board.ts";
+import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, idleOnBoard, showIntents } from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -305,4 +305,41 @@ test("the board, the sidebar row and the tab ack share one join, a legacy card i
   // With both, the exact provider id wins over where the pane was seen.
   const exact = card("claude:p-other", { state: "idle" });
   assert.equal(cardForSession(session, [legacy, exact], fleet.fleet_metadata), exact);
+});
+
+test("the footer's idle count is the board's Idle column, even while the session rows lag it", () => {
+  // Frames in the order a session start delivers them, no clock involved:
+  // the status read lands on the Fleet revision with the agent idle, while
+  // the session row still says Running until the attention poller's
+  // five-second snapshot. The footer used to count those rows, so it read 0
+  // for up to that long while the board already drew the card as idle.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"], ["u-2", "web", "p-2"]);
+  for (const row of sessions.workspaces[0].sessions) (row as { status: string }).status = "Running";
+  const columns = boardColumns(
+    status(card("claude:p-1", { state: "idle" }), card("claude:p-2", { state: "working" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  const idleColumn = columns.find((column) => column.state === "idle")!;
+  assert.equal(idleOnBoard(columns), 1);
+  assert.equal(idleOnBoard(columns), idleColumn.cards.length, "one list for the board and the footer");
+});
+
+test("a waiting agent is counted in Needs, never also as idle", () => {
+  // An agent blocked on a question sits at an idle prompt; the host calls it
+  // waiting, the board draws it in Needs, and the footer's idle count, being
+  // the Idle column, leaves it out.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"], ["u-2", "web", "p-2"]);
+  const columns = boardColumns(
+    status(card("claude:p-1", { state: "waiting" }), card("claude:p-2", { state: "idle" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  assert.deepEqual(
+    columns.find((column) => column.state === "needs")!.cards.map((c) => c.key),
+    ["claude:p-1"],
+  );
+  assert.equal(idleOnBoard(columns), 1);
 });
