@@ -4,7 +4,7 @@
 //! SQLite owns canonical state and revision order. Live broadcasts only wake
 //! subscribers after the matching revision commits.
 
-use ainb_fleet_core::discover::discover_all_tmux_panes;
+use ainb_fleet_core::discover::{TmuxRoster, discover_all_tmux_panes, discover_tmux_roster};
 use ainb_fleet_core::read::{ModelInfo, capture_pane};
 use ainb_fleet_core::types::{
     AttentionState, Confidence, FleetSession, LifecycleState, ManagementState, Provider,
@@ -1698,13 +1698,12 @@ fn parse_attention(value: &str) -> ainb_hangar_proto::fleet::AttentionState {
     }
 }
 
-/// Which passes one reconcile tick runs.
+/// Which passes one reconcile call runs.
 ///
-/// A cost split, not a correctness one. Correlating the discovered panes reads
-/// one snapshot and writes only where a pane resolved; the missing sweep walks
-/// every registered row. On the measured registry (1,587 rows against 63 live
-/// panes) running the sweep on the 3s tick is tens of millions of row decodes
-/// a day to re-notice panes that are already gone.
+/// The reconciler runs both on every 3s tick (see [`reconcile_tick`]), so a
+/// closed session is noticed within one tick. `Panes` alone correlates the
+/// discovered panes without judging any row missing, for callers that only
+/// want a sample folded in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReconcilePass {
     /// Correlate the discovered panes only.
@@ -1716,20 +1715,28 @@ pub enum ReconcilePass {
 /// How long discovery may keep reporting nothing before the sweep believes it.
 ///
 /// See [`SweepGuard`]. Long enough to ride out a slow or restarting tmux server,
-/// short enough that a server whose panes really all closed is still noticed:
-/// its rows reach UNAVAILABLE within about 90s and EXITED 30s later. Without the
-/// bound they never would, because the stale reaper only retires a tmux-bound
-/// row once it is UNAVAILABLE (`reap_stale_sessions`), so a sample this guard
-/// kept distrusting forever would strand the row at its last hook state.
+/// short enough that a server that stays up with every pane closed is still
+/// noticed: its rows reach UNAVAILABLE about 60s after the first empty sample
+/// and EXITED one 3s tick later. A server that exited is not waited out at all
+/// ([`TmuxRoster::NoServer`]). Without the bound they never would, because the
+/// stale reaper only retires a tmux-bound row once it is UNAVAILABLE
+/// (`reap_stale_sessions`), so a sample this guard kept distrusting forever
+/// would strand the row at its last hook state.
 const SWEEP_BLIP_TOLERANCE_MS: i64 = 60_000;
 
 /// Decides whether one discovery sample may count a pane as missing.
 ///
 /// A missing pane is news the sweep writes (UNAVAILABLE, then EXITED for a
 /// managed Claude row), so a sample that cannot be trusted to list every live
-/// pane must not count: a discovery that errored or timed out, or one that
-/// found no panes at all when the last trusted sample found some. Nothing is
-/// written for such a sample, not even the `mark_tmux_unavailable` downgrade.
+/// pane must not count: a discovery that errored or timed out, or one where a
+/// running server listed no panes at all when the last trusted sample found
+/// some. Nothing is written for such a sample, not even the
+/// `mark_tmux_unavailable` downgrade.
+///
+/// "No server running" is different and always trusted. The last session
+/// closing (`/exit` in its only pane, `kill-session`) makes the tmux server
+/// exit, and tmux then says so outright: that is an answer, not a failure to
+/// answer, and every pane the server had is gone.
 ///
 /// "No panes" means no tmux pane of any kind, not no agent pane. Closing the
 /// last Claude session leaves its shell panes behind, and that is exactly the
@@ -1771,12 +1778,16 @@ impl Default for SweepGuard {
 }
 
 impl SweepGuard {
-    /// Whether this sample may count a miss. `pane_count` is every tmux pane
-    /// discovery listed, agent or not, and `None` when discovery failed.
-    pub fn admits(&mut self, pane_count: Option<usize>, observed_at: i64) -> bool {
-        let trusted = pane_count.is_some_and(|count| count > 0 || !self.saw_panes);
+    /// Whether this sample may count a miss. `sample` lists every tmux pane
+    /// discovery saw, agent or not, and is `None` when discovery failed.
+    pub fn admits(&mut self, sample: Option<&TmuxRoster>, observed_at: i64) -> bool {
+        let trusted = match sample {
+            None => false,
+            Some(TmuxRoster::NoServer) => true,
+            Some(TmuxRoster::Panes(panes)) => !panes.is_empty() || !self.saw_panes,
+        };
         if trusted {
-            self.saw_panes = pane_count.is_some_and(|count| count > 0);
+            self.saw_panes = matches!(sample, Some(TmuxRoster::Panes(panes)) if !panes.is_empty());
             self.distrusted_since = None;
             return true;
         }
@@ -1789,7 +1800,7 @@ impl SweepGuard {
 ///
 /// What the reconciler loop runs, and the only production entry point into
 /// pane reconciliation. `discovery` is EVERY tmux pane
-/// (`discover_all_tmux_panes`), because the guard judges the whole roster; only
+/// (`discover_tmux_roster`), because the guard judges the whole roster; only
 /// the agent panes are reconciled, the same set `discover_from_tmux` returns.
 /// A distrusted successful sample is always empty, so skipping it skips no
 /// pane that needed correlating.
@@ -1800,13 +1811,14 @@ pub async fn reconcile_tmux_sample(
     pool: &SqlitePool,
     events: &EventSink,
     guard: &mut SweepGuard,
-    discovery: anyhow::Result<Vec<FleetSession>>,
+    discovery: anyhow::Result<TmuxRoster>,
     observed_at: i64,
     pass: ReconcilePass,
 ) -> anyhow::Result<usize> {
-    let admitted = guard.admits(discovery.as_ref().ok().map(Vec::len), observed_at);
+    let admitted = guard.admits(discovery.as_ref().ok(), observed_at);
     let panes = match discovery {
-        Ok(panes) => panes,
+        Ok(TmuxRoster::Panes(panes)) => panes,
+        Ok(TmuxRoster::NoServer) => Vec::new(),
         Err(error) => {
             tracing::debug!(error = %error, admitted, "fleet tmux discovery unavailable");
             if !admitted {
@@ -2070,6 +2082,13 @@ async fn reconcile_panes(
                 }
                 if result.applied {
                     applied += 1;
+                    if managed_claude_row_exits(&row) {
+                        tracing::info!(
+                            session_key = %row.session_key,
+                            tmux_target = row.tmux_target.as_deref().unwrap_or_default(),
+                            "fleet tmux sweep retired a managed claude session whose pane is gone"
+                        );
+                    }
                 }
             }
             Err(error) => tracing::warn!(error = %error, "fleet tmux exit reconcile failed"),
@@ -2087,12 +2106,12 @@ async fn reconcile_panes(
 
 /// The most managed Claude sessions one missing sweep may retire to EXITED.
 ///
-/// A person closes sessions one or two at a time, and the sweep runs every 30s,
-/// so 8 per sweep (16 a minute) never delays a real `/exit`. What it bounds is
-/// the failure the two-sweep gate cannot see: discovery wrongly omitting many
-/// live panes twice in a row. On the measured fleet (63 live panes) that would
-/// take eight sweeps, four minutes, to empty the board instead of one, and any
-/// pane that shows up again in the meantime is restored to HEALTHY and never
+/// A person closes sessions one or two at a time, and the sweep runs every 3s
+/// tick, so 8 per sweep never delays a real `/exit`. What it bounds is the
+/// failure the two-sweep gate cannot see: discovery wrongly omitting many live
+/// panes twice in a row. On the measured fleet (63 live panes) that would take
+/// eight sweeps, about 24s, to empty the board instead of one, and any pane
+/// that shows up again in the meantime is restored to HEALTHY and never
 /// retired. Deferred rows stay UNAVAILABLE, which the guard still admits, so
 /// the next sweep finishes them and the loop still terminates.
 const MAX_MANAGED_EXITS_PER_SWEEP: usize = 8;
@@ -2453,13 +2472,41 @@ fn tmux_row_matches(row: &FleetSessionRow, session: &FleetSession) -> bool {
         && transport_settled
 }
 
-/// How many 3s discovery ticks pass between full missing sweeps.
+/// Everything one reconciler tick does with its discovery sample.
 ///
-/// A pane that has gone away is then noticed within 30s rather than 3s. Nothing
-/// routes on a sub-minute `transport_health` deadline (it gates capability
-/// flags and a banner, not a control path), and the tenfold cut applies to a
-/// full walk of every registered row, which is the whole cost of the pass.
-const MISSING_SWEEP_EVERY_N_TICKS: u32 = 10;
+/// The missing sweep runs on every tick, not every tenth: a managed Claude row
+/// is retired on the second consecutive miss, so the tick period IS the exit
+/// latency, twice over. At one sweep per 30s a closed session read Done for
+/// 30 to 60s. The sweep adds one registry snapshot and an in-memory walk to
+/// the tick, and no tmux or `ps` call: discovery ran once per tick either
+/// way. Measured in release against 60 live panes: about 3ms a tick on 150
+/// visible rows, about 45ms on 1,600 (the pre-archiver registry).
+async fn reconcile_tick(
+    pool: &SqlitePool,
+    events: &EventSink,
+    guard: &mut SweepGuard,
+    discovery: anyhow::Result<TmuxRoster>,
+    observed_at: i64,
+) {
+    if let Err(error) = reconcile_tmux_sample(
+        pool,
+        events,
+        guard,
+        discovery,
+        observed_at,
+        ReconcilePass::PanesAndMissing,
+    )
+    .await
+    {
+        tracing::warn!(error = %error, "fleet tmux reconcile failed");
+    }
+    // Runs whether or not discovery succeeded: the rows it retires are
+    // precisely the ones discovery can no longer see.
+    crate::observability::note_phase("fleet:stale-reap");
+    if let Err(error) = reap_stale_sessions(pool, events, observed_at).await {
+        tracing::warn!(error = %error, "fleet stale reap failed");
+    }
+}
 
 /// Keep unmanaged tmux sessions visible even when hooks are absent.
 #[must_use]
@@ -2477,7 +2524,6 @@ pub fn spawn_tmux_reconciler(pool: SqlitePool, events: EventSink) -> tokio::task
         // catch-up ticks with no sleep at all — a hot loop that then makes its own
         // queries slower. `Delay` re-bases the schedule on completion instead.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut tick: u32 = 0;
         let mut guard = SweepGuard::default();
         loop {
             // The breadcrumb keeps one coarse phase for the process, so a death
@@ -2486,27 +2532,10 @@ pub fn spawn_tmux_reconciler(pool: SqlitePool, events: EventSink) -> tokio::task
             crate::observability::note_phase("fleet:tmux-idle");
             ticker.tick().await;
             let observed_at = clock.now_ms();
-            let pass = if tick % MISSING_SWEEP_EVERY_N_TICKS == 0 {
-                ReconcilePass::PanesAndMissing
-            } else {
-                ReconcilePass::Panes
-            };
-            tick = tick.wrapping_add(1);
 
             crate::observability::note_phase("fleet:tmux-reconcile");
-            let discovery = discover_all_tmux_panes().await;
-            if let Err(error) =
-                reconcile_tmux_sample(&pool, &events, &mut guard, discovery, observed_at, pass)
-                    .await
-            {
-                tracing::warn!(error = %error, "fleet tmux reconcile failed");
-            }
-            // Runs whether or not discovery succeeded: the rows it retires are
-            // precisely the ones discovery can no longer see.
-            crate::observability::note_phase("fleet:stale-reap");
-            if let Err(error) = reap_stale_sessions(&pool, &events, observed_at).await {
-                tracing::warn!(error = %error, "fleet stale reap failed");
-            }
+            let discovery = discover_tmux_roster().await;
+            reconcile_tick(&pool, &events, &mut guard, discovery, observed_at).await;
         }
     })
 }
@@ -7221,7 +7250,7 @@ mod tests {
             pool,
             sink,
             guard,
-            discovery,
+            discovery.map(TmuxRoster::Panes),
             observed_at,
             ReconcilePass::PanesAndMissing,
         )
@@ -7337,6 +7366,87 @@ mod tests {
         }
         let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
         assert_eq!(row.lifecycle_state, "EXITED");
+    }
+
+    /// The last session closing makes the tmux server exit, and discovery then
+    /// hears "no server running". That is tmux answering, not a blip: the row
+    /// is UNAVAILABLE on the next sweep and EXITED on the one after, with no
+    /// `SWEEP_BLIP_TOLERANCE_MS` wait in between.
+    #[tokio::test]
+    async fn a_server_that_exited_is_believed_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_gone:1.1";
+        let fingerprint = "pane=%88;pid=918;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-gone", target, fingerprint, 1_000).await;
+        let pane = scanned_pane(target, fingerprint, Provider::Claude);
+        let mut guard = SweepGuard::default();
+        guarded_sweep(pool, &sink, &mut guard, Ok(vec![pane]), 30_000).await;
+
+        let mut after = Vec::new();
+        for at in [33_000, 36_000] {
+            reconcile_tmux_sample(
+                pool,
+                &sink,
+                &mut guard,
+                Ok(TmuxRoster::NoServer),
+                at,
+                ReconcilePass::PanesAndMissing,
+            )
+            .await
+            .expect("sweep after the exit");
+            after.push(FleetRepo::get_session(pool, &key).await.unwrap().unwrap());
+        }
+        let first = &after[0];
+        assert_eq!(first.transport_health, "UNAVAILABLE", "the first miss");
+        assert_eq!(first.lifecycle_state, "RUNNING");
+
+        let second = &after[1];
+        assert_eq!(second.lifecycle_state, "EXITED", "the second miss");
+        assert_eq!(transition_count(pool, &key).await, 2);
+    }
+
+    /// Missing-pane detection follows the reconciler's 3s tick. A managed
+    /// Claude session whose pane went back to its shell is UNAVAILABLE on the
+    /// next tick and EXITED on the tick after, not after the next of a sweep
+    /// that ran on every tenth tick.
+    #[tokio::test]
+    async fn every_reconciler_tick_sweeps_for_missing_panes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let sink = EventBroker::new().sink();
+        let pool = store.pool();
+
+        let target = "tmux_tick:1.1";
+        let fingerprint = "pane=%89;pid=919;session_started=1785400000";
+        let key = hooked_session(pool, &sink, "sess-tick", target, fingerprint, 1_000).await;
+        let agent = scanned_pane(target, fingerprint, Provider::Claude);
+        let shell = scanned_pane(target, fingerprint, Provider::Unknown);
+        let mut guard = SweepGuard::default();
+
+        // Three consecutive ticks, 3s apart on the injected clock.
+        let mut state_after = Vec::new();
+        for (at, panes) in [
+            (3_000, vec![agent]),
+            (6_000, vec![shell.clone()]),
+            (9_000, vec![shell]),
+        ] {
+            reconcile_tick(pool, &sink, &mut guard, Ok(TmuxRoster::Panes(panes)), at).await;
+            let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            state_after.push((row.transport_health, row.lifecycle_state));
+        }
+        let state = |health: &str, lifecycle: &str| (health.to_string(), lifecycle.to_string());
+        assert_eq!(
+            state_after,
+            [
+                state("HEALTHY", "RUNNING"),
+                state("UNAVAILABLE", "RUNNING"),
+                state("UNAVAILABLE", "EXITED"),
+            ]
+        );
     }
 
     /// A sweep retires at most `MAX_MANAGED_EXITS_PER_SWEEP` managed sessions.
