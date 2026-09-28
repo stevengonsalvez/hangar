@@ -7382,7 +7382,8 @@ mod tests {
     /// on (pane, `session_started`), which both sides still carry, so a live
     /// pane that has not moved keeps its row and its binding. The first hook
     /// from the same process then hands the row its server, and the fence
-    /// still applies that hook, so from then on the row survives a move too.
+    /// treats it as the same run: an open question and its lifecycle survive
+    /// it (a restart would drop both). From then on the row survives a move.
     #[tokio::test]
     async fn a_row_written_before_fingerprints_named_the_server_adopts_it_and_survives_a_move() {
         let dir = tempfile::tempdir().unwrap();
@@ -7412,12 +7413,42 @@ mod tests {
         let rows = FleetRepo::snapshot(pool).await.unwrap().sessions;
         assert_eq!(rows.len(), 1, "the old row still owns its pane");
 
-        stop_hook_from(pool, &sink, "sess-old", "s_old:1.1", upgraded, 100_000).await;
+        // The agent asks a question, still on the pre-upgrade fingerprint.
+        for (at, event_type, fingerprint) in [
+            (95_000, "PermissionRequest", old),
+            // Then its first hook naming the server. It asserts no state of
+            // its own, so whatever the row says after it, the fence decided.
+            (100_000, "PreCompact", upgraded),
+        ] {
+            apply_hook(
+                pool,
+                &sink,
+                HookObservation {
+                    event_id: format!("old-upgrade:{at}"),
+                    provider: "claude",
+                    provider_session_id: "sess-old",
+                    event_type,
+                    cwd: "/work/repo",
+                    payload: &serde_json::json!({
+                        "tmux_target": "s_old:1.1",
+                        "process_start_fingerprint": fingerprint,
+                        "tool_name": "AskUserQuestion",
+                    }),
+                    observed_at: at,
+                    transcript_model: None,
+                },
+            )
+            .await
+            .expect("hook applies");
+            let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
+            assert_eq!(row.attention_state, "ASK", "{event_type} at {at}");
+            assert!(
+                row.current_request_fingerprint.is_some(),
+                "{event_type} at {at}"
+            );
+            assert_eq!(row.lifecycle_state, "IDLE", "{event_type} at {at}");
+        }
         let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
-        assert_eq!(
-            row.lifecycle_state, "TURN_COMPLETE",
-            "the upgraded hook applied"
-        );
         assert_eq!(row.tmux_target.as_deref(), Some("s_old:1.1"));
         assert_eq!(
             row.bound_fingerprint.as_deref(),
@@ -7439,7 +7470,8 @@ mod tests {
         for at in [120_000, 150_000, 180_000] {
             guarded_sweep(pool, &sink, &mut guard, Ok(vec![moved_scan.clone()]), at).await;
             let row = FleetRepo::get_session(pool, &key).await.unwrap().unwrap();
-            assert_eq!(row.lifecycle_state, "TURN_COMPLETE", "sweep at {at}");
+            assert_eq!(row.lifecycle_state, "IDLE", "sweep at {at}");
+            assert_eq!(row.attention_state, "ASK", "sweep at {at}");
             assert_eq!(row.transport_health, "HEALTHY", "sweep at {at}");
             assert_eq!(
                 row.tmux_target.as_deref(),
