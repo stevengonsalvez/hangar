@@ -150,8 +150,31 @@ pub async fn discover_from_tmux() -> Result<Vec<FleetSession>> {
 ///
 /// This is the roster for identity and liveness checks — "is pane X with
 /// fingerprint Y still there" — which must stay true to tmux rather than to
-/// Fleet's view of what deserves a row.
+/// Fleet's view of what deserves a row. No server running is no panes.
 pub async fn discover_all_tmux_panes() -> Result<Vec<FleetSession>> {
+    Ok(match discover_tmux_roster().await? {
+        TmuxRoster::NoServer => Vec::new(),
+        TmuxRoster::Panes(panes) => panes,
+    })
+}
+
+/// What one `tmux list-panes -a` said about the tmux server.
+#[derive(Debug)]
+pub enum TmuxRoster {
+    /// Nothing is listening on the socket: no server was ever started, or the
+    /// last session closed and the server exited with it. tmux answered, so
+    /// this is definitive: every pane that server had is gone.
+    NoServer,
+    /// The server answered with these panes, agent-bearing or not. An empty
+    /// list here comes from a server that is running, which is not the same
+    /// news as [`TmuxRoster::NoServer`].
+    Panes(Vec<FleetSession>),
+}
+
+/// [`discover_all_tmux_panes`], keeping "no server running" apart from "the
+/// server listed nothing", for callers that must judge whether an empty
+/// answer can be trusted.
+pub async fn discover_tmux_roster() -> Result<TmuxRoster> {
     let output = Command::new("tmux")
         .args(["list-panes", "-a", "-F", LIST_FORMAT])
         .output()
@@ -160,8 +183,11 @@ pub async fn discover_all_tmux_panes() -> Result<Vec<FleetSession>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if tmux_server_absent(&stderr) {
+            return Ok(TmuxRoster::NoServer);
+        }
         if tmux_has_no_sessions(&stderr) {
-            return Ok(Vec::new());
+            return Ok(TmuxRoster::Panes(Vec::new()));
         }
         anyhow::bail!("tmux list-panes exited non-zero: {stderr}");
     }
@@ -169,7 +195,7 @@ pub async fn discover_all_tmux_panes() -> Result<Vec<FleetSession>> {
     let stdout = String::from_utf8(output.stdout).context("tmux list-panes returned non-UTF8")?;
     let rows = parse_rows(&stdout)?;
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(TmuxRoster::Panes(Vec::new()));
     }
 
     // A `ps` failure is discovery being unavailable, not proof that no pane
@@ -177,7 +203,9 @@ pub async fn discover_all_tmux_panes() -> Result<Vec<FleetSession>> {
     // instead of retiring every session.
     let processes = ProcessTable::snapshot().await?;
     let now_secs = chrono::Utc::now().timestamp();
-    Ok(rows.into_iter().map(|row| row.into_session(&processes, now_secs)).collect())
+    Ok(TmuxRoster::Panes(
+        rows.into_iter().map(|row| row.into_session(&processes, now_secs)).collect(),
+    ))
 }
 
 fn parse_rows(stdout: &str) -> Result<Vec<TmuxPaneRow>> {
@@ -231,9 +259,21 @@ fn agent_provider(processes: &ProcessTable, pane_pid: u32) -> Option<Provider> {
     })
 }
 
-fn tmux_has_no_sessions(stderr: &str) -> bool {
+/// Did tmux fail because no server is listening on its socket?
+///
+/// tmux 3.4 says `no server running on <socket>` when the socket file is left
+/// behind by an exited server, and `error connecting to <socket> (No such file
+/// or directory)` when there is no socket file at all. Both are tmux answering,
+/// not tmux failing to answer: any other connect error (permission denied, a
+/// path too long for a socket) says nothing about the panes and stays an error.
+fn tmux_server_absent(stderr: &str) -> bool {
     let text = stderr.to_ascii_lowercase();
-    text.contains("no server running") || text.contains("no sessions")
+    text.contains("no server running")
+        || (text.contains("error connecting to") && text.contains("no such file or directory"))
+}
+
+fn tmux_has_no_sessions(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("no sessions")
 }
 
 #[cfg(test)]
@@ -404,8 +444,32 @@ mod tests {
 
     #[test]
     fn no_server_errors_are_empty_fleet_not_failure() {
-        assert!(tmux_has_no_sessions("no server running on /tmp/tmux.sock"));
         assert!(tmux_has_no_sessions("no sessions"));
         assert!(!tmux_has_no_sessions("permission denied"));
+    }
+
+    /// Verbatim tmux 3.4 stderr, captured against a private `-S` socket: first
+    /// after the server's last session was killed (the socket file stays), then
+    /// with no socket file at all.
+    #[test]
+    fn a_missing_server_is_told_apart_from_a_failed_discovery() {
+        assert!(tmux_server_absent(
+            "no server running on /tmp/mxa.RHlX/sock\n"
+        ));
+        assert!(tmux_server_absent(
+            "error connecting to /tmp/mxa.RHlX/sock (No such file or directory)\n"
+        ));
+
+        assert!(!tmux_server_absent(
+            "error connecting to /tmp/tmux-501/default (Permission denied)\n"
+        ));
+        assert!(!tmux_server_absent(
+            "error connecting to /very/long/path/sock (File name too long)\n"
+        ));
+        assert!(!tmux_server_absent("server exited unexpectedly\n"));
+        assert!(
+            !tmux_server_absent("no sessions"),
+            "a running server said that"
+        );
     }
 }
