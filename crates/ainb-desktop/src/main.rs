@@ -358,6 +358,59 @@ async fn projects_list() -> Vec<ainb_desktop::projects::RegisteredProject> {
     })
 }
 
+/// Whether the Add project folder picker is on screen.
+static PROJECT_PICKER_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Add a project: the OS folder picker, then register what the person picked
+/// so the daemon creates from it (`ainb_desktop::projects::register`).
+///
+/// The path never comes from the webview. A script in the page can call this
+/// and can only open the picker; which folder is registered is the person's
+/// answer to a dialog the OS draws. That is why the renderer's own config
+/// edits still refuse `workspace_scan_paths`: this is the one way in, and it
+/// registers one repository, never an arbitrary root. `Ok(None)` is a
+/// cancelled picker; `Err` is the sentence the composer shows.
+#[tauri::command]
+async fn project_add(
+    app: tauri::AppHandle,
+) -> Result<Option<ainb_desktop::projects::RegisteredProject>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("The home folder is not known, so no project can be registered.")?;
+    // One picker at a time: a script that calls this in a loop must not
+    // stack dialogs on the person.
+    if PROJECT_PICKER_OPEN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("The Add project picker is already open.".into());
+    }
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Add project: choose a repository folder")
+        .set_directory(&home)
+        .blocking_pick_folder();
+    PROJECT_PICKER_OPEN.store(false, Ordering::Release);
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let folder = picked
+        .into_path()
+        .map_err(|error| format!("The picked folder has no local path: {error}"))?;
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        ainb_desktop::projects::register(&home, &folder)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("Registering the folder did not run: {error}")));
+    match &outcome {
+        Ok(project) => tracing::info!(project = %project.path, "project registered"),
+        Err(why) => tracing::info!(%why, "project not registered"),
+    }
+    outcome.map(Some)
+}
+
 /// The most of the sidecar log "show log" returns.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
@@ -1013,6 +1066,7 @@ fn main() {
             terminal_close,
             worktree_create,
             projects_list,
+            project_add,
             update_check,
             update_apply,
             update_settings,
