@@ -8,6 +8,7 @@ import {
   keyboardTaken,
   openRowIntent,
   rowOf,
+  selectRowIntent,
   stepTab,
   acceleratorAllowedUnderModal,
   type Accelerator,
@@ -91,6 +92,9 @@ test("a tab reopens through its session-list row", () => {
   assert.deepEqual(rowOf({ kind: "tmux", tmux: "other" }), { other_tmux: "other" });
   assert.deepEqual(openRowIntent({ session: "u-1" }), {
     Command: ["session_list.select_row", { target: { session: "u-1" }, open: true }],
+  });
+  assert.deepEqual(selectRowIntent({ session: "u-1" }), {
+    Command: ["session_list.select_row", { target: { session: "u-1" }, open: false }],
   });
 });
 
