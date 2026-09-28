@@ -630,6 +630,27 @@ pub(crate) fn ainb_bin() -> String {
     "ainb".to_string()
 }
 
+/// The `ainb fleet atc heartbeat` child for one instance. It runs without
+/// the daemon's OAuth token: the beat has no use for it, and it may reach
+/// tmux, whose server keeps the environment of whoever started it.
+fn heartbeat_command(bin: &str, name: &str, exhausted: &[String]) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args([
+        "--format",
+        "json",
+        "fleet",
+        "atc",
+        "heartbeat",
+        name,
+        // ALWAYS passed, empty set included: its presence is what tells the
+        // beat the daemon owns the ledger and it must not count locally.
+        "--exhausted",
+    ])
+    .arg(exhausted.join(","));
+    crate::tmux_session::strip_daemon_secrets(&mut cmd);
+    cmd
+}
+
 /// Run one delegated beat and parse what it saw.
 ///
 /// Non-fatal end to end, like everything else on this tick: a missing binary, a
@@ -638,20 +659,7 @@ pub(crate) fn ainb_bin() -> String {
 /// normally. Returning an empty report instead would read as "nothing is
 /// erroring" and wrongly clear every session's budget.
 async fn run_cli_heartbeat(bin: &str, name: &str, exhausted: &[String]) -> Option<HeartbeatReport> {
-    let spawn = tokio::process::Command::new(bin)
-        .args([
-            "--format",
-            "json",
-            "fleet",
-            "atc",
-            "heartbeat",
-            name,
-            // ALWAYS passed, empty set included: its presence is what tells the
-            // beat the daemon owns the ledger and it must not count locally.
-            "--exhausted",
-        ])
-        .arg(exhausted.join(","))
-        .output();
+    let spawn = heartbeat_command(bin, name, exhausted).output();
     let out = match tokio::time::timeout(BEAT_TIMEOUT, spawn).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -840,6 +848,24 @@ mod tests {
         );
         assert_eq!(got.err_sessions.len(), 1);
         assert!(got.delivered && got.roster_valid);
+    }
+
+    /// The beat child never gets the daemon's OAuth token.
+    #[test]
+    fn the_beat_child_runs_without_the_daemon_oauth_token() {
+        let cmd = heartbeat_command("/bin/ainb", "main", &[]);
+        let removed: Vec<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for secret in crate::tmux_session::DAEMON_SECRETS {
+            assert!(
+                removed.iter().any(|k| k == secret),
+                "{secret} reaches the beat: {removed:?}"
+            );
+        }
     }
 
     /// An empty spent set must still pass the flag: its PRESENCE is what tells the

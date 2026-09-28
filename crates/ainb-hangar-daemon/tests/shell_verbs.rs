@@ -33,8 +33,16 @@ fn health() -> DaemonHealth {
     }
 }
 
+/// Whether tmux is here to test against. Missing under CI (`CI` set) is a
+/// failure, not a skip: a job that cannot run these must not report them
+/// green. Only a local run without tmux skips.
 fn tmux_available() -> bool {
-    Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success())
+    let here = Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success());
+    assert!(
+        here || std::env::var_os("CI").is_none(),
+        "tmux is missing under CI, so these tests cannot run"
+    );
+    here
 }
 
 async fn call(params: serde_json::Value) -> serde_json::Value {
@@ -338,6 +346,16 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
     }
     let mut world = World::new();
     assert!(world.sessions().is_empty(), "this shell starts the server");
+    // Taken back out on the way out, panic or not, so no later test in this
+    // process inherits them.
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var("HANGAR_CLAUDE_OAUTH_TOKEN");
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+    }
+    let _unset = Unset;
     std::env::set_var("HANGAR_CLAUDE_OAUTH_TOKEN", "sk-ant-oat-shell-verbs-test");
     std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-shell-verbs-test");
 
@@ -352,9 +370,11 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
         .to_string();
     let session = world.tmux(&["show-environment", "-t", &format!("={name}")]);
     let session = String::from_utf8_lossy(&session.stdout);
+    // `-NAME` is tmux marking the variable removed from the session, which
+    // is the scrub itself; only a `NAME=value` line would carry it.
     for secret in [
-        "HANGAR_CLAUDE_OAUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
+        "HANGAR_CLAUDE_OAUTH_TOKEN=",
+        "CLAUDE_CODE_OAUTH_TOKEN=",
         "sk-ant-oat",
     ] {
         assert!(!session.contains(secret), "{secret} reached the session");
@@ -372,5 +392,72 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
         "sk-ant-oat",
     ] {
         assert!(!global.contains(secret), "{secret} reached the tmux server");
+    }
+}
+
+/// A tmux server some other process started WITH the daemon's token in its
+/// environment, then shell/create on it: the shell's pane holds neither
+/// token, and the session marks both removed for later windows.
+#[tokio::test]
+async fn a_shell_on_a_server_already_holding_the_token_gets_neither() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        return;
+    }
+    let mut world = World::new();
+    const SECRETS: [(&str, &str); 2] = [
+        ("HANGAR_CLAUDE_OAUTH_TOKEN", "sk-ant-oat-r2-override"),
+        ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-r2-child"),
+    ];
+    let base = format!("r2-base-{}", std::process::id());
+    world.made.push(base.clone());
+    let started = Command::new("tmux")
+        .env("TMUX_TMPDIR", &world.tmux_dir)
+        .env_remove("TMUX")
+        .envs(SECRETS)
+        .args(["new-session", "-d", "-s", &base])
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let global = world.tmux(&["show-environment", "-g"]);
+    assert!(
+        String::from_utf8_lossy(&global.stdout).contains(SECRETS[0].1),
+        "the server holds the token"
+    );
+
+    let tree = world.worktree();
+    let response = world.shell(&tree).await;
+    let name = response["result"]["tmux_session_name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a shell was made: {response}"))
+        .to_string();
+
+    let dump = world.home.path().join("r2.env");
+    let keys = format!("env > '{}'", dump.display());
+    let target = format!("={name}:");
+    assert!(world.tmux(&["send-keys", "-t", &target, "-l", &keys]).status.success());
+    assert!(world.tmux(&["send-keys", "-t", &target, "Enter"]).status.success());
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    let env = loop {
+        let env = std::fs::read_to_string(&dump).unwrap_or_default();
+        if env.contains("PATH=") {
+            break env;
+        }
+        assert!(Instant::now() < deadline, "the shell never ran the dump");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    for (secret, value) in SECRETS {
+        assert!(
+            !env.contains(secret) && !env.contains(value),
+            "{secret} reached the shell's pane"
+        );
+    }
+    let marked = world.tmux(&["show-environment", "-t", &format!("={name}")]);
+    let marked = String::from_utf8_lossy(&marked.stdout);
+    for (secret, _) in SECRETS {
+        assert!(
+            marked.contains(&format!("-{secret}")),
+            "the session keeps {secret}: {marked}"
+        );
     }
 }

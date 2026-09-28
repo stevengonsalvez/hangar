@@ -5792,7 +5792,6 @@ async fn launch_managed_codex_tui(
 ) -> Result<(String, ainb_fleet_core::types::FleetSession), String> {
     let tmux_name = managed_codex_tmux_name(thread_id, SystemClock.now_ms());
     let codex_binary = std::env::var_os("AINB_CODEX_BIN").unwrap_or_else(|| "codex".into());
-    let tmux_binary = std::ffi::OsString::from("tmux");
     let command = manager.managed_tui_command(
         &codex_binary,
         [
@@ -5800,9 +5799,7 @@ async fn launch_managed_codex_tui(
             std::ffi::OsString::from(thread_id),
         ],
     );
-    let tmux_args = managed_codex_tmux_args(&tmux_name, cwd, &command);
-    let output = tokio::process::Command::new(&tmux_binary)
-        .args(tmux_args)
+    let output = managed_codex_tmux_command(&tmux_name, cwd, &command)
         .output()
         .await
         .map_err(|error| format!("tmux managed Codex launch failed: {error}"))?;
@@ -5844,18 +5841,14 @@ async fn launch_managed_codex_tui(
     }
 }
 
-fn managed_codex_tmux_args(
+fn managed_codex_tmux_command(
     session_name: &str,
     cwd: &str,
     command: &crate::fleet_provider::codex::CommandSpec,
-) -> Vec<std::ffi::OsString> {
-    let mut args = ["new-session", "-d", "-s", session_name, "-c", cwd, "--"]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect::<Vec<_>>();
-    args.push(command.program.clone());
-    args.extend(command.args.iter().cloned());
-    args
+) -> tokio::process::Command {
+    let mut argv = vec![command.program.clone()];
+    argv.extend(command.args.iter().cloned());
+    crate::tmux_session::tmux_new_session(session_name, cwd, &[], &argv)
 }
 
 fn managed_codex_tmux_name(thread_id: &str, now_ms: i64) -> String {
@@ -5890,7 +5883,8 @@ async fn kill_tmux_session_exact(session_name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod fleet_launch_tests {
     use super::{
-        managed_codex_tmux_args, managed_codex_tmux_name, normalize_picker_text, verify_picker_pane,
+        managed_codex_tmux_command, managed_codex_tmux_name, normalize_picker_text,
+        verify_picker_pane,
     };
     use std::ffi::{OsStr, OsString};
     use std::path::Path;
@@ -5915,7 +5909,8 @@ mod fleet_launch_tests {
             Path::new("/tmp/codex.sock"),
             [OsString::from("resume"), OsString::from("thread-1")],
         );
-        let args = managed_codex_tmux_args("fleet-codex-thread-1", "/repo", &command);
+        let tmux = managed_codex_tmux_command("fleet-codex-thread-1", "/repo", &command);
+        let args = tmux.as_std().get_args().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(
             args,
             [
@@ -5926,6 +5921,11 @@ mod fleet_launch_tests {
                 "-c",
                 "/repo",
                 "--",
+                "env",
+                "-u",
+                "HANGAR_CLAUDE_OAUTH_TOKEN",
+                "-u",
+                "CLAUDE_CODE_OAUTH_TOKEN",
                 "codex",
                 "-c",
                 "check_for_update_on_startup=false",
@@ -5935,6 +5935,18 @@ mod fleet_launch_tests {
                 "unix:///tmp/codex.sock",
                 "resume",
                 "thread-1",
+                ";",
+                "set-environment",
+                "-t",
+                "=fleet-codex-thread-1",
+                "-r",
+                "HANGAR_CLAUDE_OAUTH_TOKEN",
+                ";",
+                "set-environment",
+                "-t",
+                "=fleet-codex-thread-1",
+                "-r",
+                "CLAUDE_CODE_OAUTH_TOKEN",
             ]
             .into_iter()
             .map(OsString::from)

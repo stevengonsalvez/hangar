@@ -35,7 +35,8 @@ fn health() -> DaemonHealth {
     }
 }
 
-/// A fake `ainb`: writes its argv (one per line) to `argv.txt`, then either
+/// A fake `ainb`: writes its environment to `env.txt` and its argv (one per
+/// line) to `argv.txt`, then either
 /// prints one JSON line and exits 0, or prints to stderr and exits 3.
 fn fake_ainb(dir: &Path, succeed: bool) -> std::path::PathBuf {
     let bin = dir.join("ainb");
@@ -51,8 +52,9 @@ exit 3"#
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\n: > '{argv}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n{body}\n",
-            argv = argv_file.display()
+            "#!/bin/sh\nenv > '{env}'\n: > '{argv}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n{body}\n",
+            argv = argv_file.display(),
+            env = dir.join("env.txt").display()
         ),
     )
     .unwrap();
@@ -210,6 +212,51 @@ async fn a_create_runs_ainb_run_with_the_request_and_returns_its_session() {
     }
     assert!(argv.contains(&"--model=opus"), "{argv:?}");
     assert_eq!(argv.last(), Some(&"--prompt=-y fix it"));
+}
+
+/// `ainb run` starts tmux itself, and a tmux server keeps the environment it
+/// started with for every pane after, so the daemon's OAuth token must not
+/// reach `ainb run` at all.
+#[tokio::test]
+async fn ainb_run_gets_no_daemon_oauth_token() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    switch_on(&fake_ainb(tools.path(), true));
+    // Taken back out on the way out, panic or not, so no later test in this
+    // process inherits them.
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var("HANGAR_CLAUDE_OAUTH_TOKEN");
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+    }
+    let _unset = Unset;
+    std::env::set_var(
+        "HANGAR_CLAUDE_OAUTH_TOKEN",
+        "sk-ant-oat-spawn-verbs-override",
+    );
+    std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-spawn-verbs-child");
+
+    let response = call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude" })).await;
+
+    assert_eq!(
+        response["result"]["tmux_session_name"], "app-11111111",
+        "{response}"
+    );
+    let env = std::fs::read_to_string(tools.path().join("env.txt")).unwrap();
+    assert!(
+        env.lines().any(|line| line.starts_with("PATH=")),
+        "the env was read: {env}"
+    );
+    for secret in [
+        "HANGAR_CLAUDE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "sk-ant-oat",
+    ] {
+        assert!(!env.contains(secret), "{secret} reached `ainb run`");
+    }
 }
 
 #[tokio::test]
