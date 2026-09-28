@@ -167,6 +167,40 @@ test("the register hint is gone once there is a project", async () => {
   assert.equal(container.querySelector(".composer-empty-projects"), null);
 });
 
+test("Add project registers the picked folder and selects it", async () => {
+  hostReplies.set("project_add", { name: "fresh", path: "/code/fresh" });
+  const container = await open();
+  container.querySelector<HTMLButtonElement>(".composer-add-project")!.click();
+  await settle();
+
+  assert.ok(hostCalls.has("project_add"), "the host's picker was asked for");
+  const select = container.querySelector<HTMLSelectElement>(".composer-project")!;
+  assert.deepEqual(
+    [...select.options].map((option) => option.value),
+    ["/repo", "/code/fresh"],
+  );
+  assert.equal(select.value, "/code/fresh", "the new project is the one picked");
+});
+
+test("a cancelled picker changes nothing, a refused folder says why", async () => {
+  hostReplies.set("project_add", null);
+  const container = await open();
+  const add = container.querySelector<HTMLButtonElement>(".composer-add-project")!;
+  add.click();
+  await settle();
+  assert.equal(container.querySelector<HTMLSelectElement>(".composer-project")?.value, "/repo");
+  assert.equal(container.querySelector(".composer-add-error"), null);
+
+  hostReplies.set("project_add", new Error("/tmp/x is not the top folder of a git repository: pick the repository's own folder."));
+  add.click();
+  await settle();
+  assert.equal(
+    container.querySelector(".composer-add-error")?.textContent,
+    "/tmp/x is not the top folder of a git repository: pick the repository's own folder.",
+  );
+  assert.equal(container.querySelector<HTMLSelectElement>(".composer-project")?.value, "/repo", "the pick is kept");
+});
+
 test("a host without the projects command still offers the frame's projects", async () => {
   hostReplies.set("projects_list", new Error("command projects_list not found"));
   const container = await open();
