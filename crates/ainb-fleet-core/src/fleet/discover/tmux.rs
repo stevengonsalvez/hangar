@@ -261,15 +261,16 @@ fn agent_provider(processes: &ProcessTable, pane_pid: u32) -> Option<Provider> {
 
 /// Did tmux fail because no server is listening on its socket?
 ///
-/// tmux 3.4 says `no server running on <socket>` when the socket file is left
-/// behind by an exited server, and `error connecting to <socket> (No such file
-/// or directory)` when there is no socket file at all. Both are tmux answering,
-/// not tmux failing to answer: any other connect error (permission denied, a
-/// path too long for a socket) says nothing about the panes and stays an error.
+/// tmux 3.4 says `no server running on <socket>` when the socket file is there
+/// and nothing listens on it: an exited server leaves its socket behind, both
+/// after its last session is killed and after `kill-server`. That is tmux
+/// answering, not tmux failing to answer.
+///
+/// Every other connect error stays an error, including `error connecting to
+/// <socket> (No such file or directory)`: a live server whose socket file was
+/// deleted prints exactly that while its panes keep running.
 fn tmux_server_absent(stderr: &str) -> bool {
-    let text = stderr.to_ascii_lowercase();
-    text.contains("no server running")
-        || (text.contains("error connecting to") && text.contains("no such file or directory"))
+    stderr.to_ascii_lowercase().contains("no server running")
 }
 
 fn tmux_has_no_sessions(stderr: &str) -> bool {
@@ -448,15 +449,19 @@ mod tests {
         assert!(!tmux_has_no_sessions("permission denied"));
     }
 
-    /// Verbatim tmux 3.4 stderr, captured against a private `-S` socket: first
-    /// after the server's last session was killed (the socket file stays), then
-    /// with no socket file at all.
+    /// Verbatim tmux 3.4 stderr, captured against a private `-S` socket after
+    /// the server's last session was killed: the socket file stays, and tmux
+    /// says no server is running on it.
     #[test]
     fn a_missing_server_is_told_apart_from_a_failed_discovery() {
         assert!(tmux_server_absent(
             "no server running on /tmp/mxa.RHlX/sock\n"
         ));
-        assert!(tmux_server_absent(
+        // No socket file is NOT proof the server is gone: a live server whose
+        // socket was deleted (a /tmp cleaner) prints exactly this while its
+        // panes keep running, and SIGUSR1 makes it recreate the socket. It
+        // stays an error, which the sweep's blip guard distrusts.
+        assert!(!tmux_server_absent(
             "error connecting to /tmp/mxa.RHlX/sock (No such file or directory)\n"
         ));
 
