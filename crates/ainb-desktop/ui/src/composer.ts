@@ -105,6 +105,10 @@ export function loadRegisteredProjects(): Promise<RegisteredProject[]> {
   );
 }
 
+/** The command the empty Project field shows: registering a folder of
+ * repositories from a terminal. The value is JSON, quoted for the shell. */
+export const REGISTER_FOLDER_COMMAND = `ainb config set workspace_defaults.workspace_scan_paths '["~/code"]'`;
+
 /** The fresh composer, opened on `view`'s default project. */
 export function initialFields(view: SessionsView_Serialize | undefined): ComposerFields {
   return {
