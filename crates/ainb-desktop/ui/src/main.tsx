@@ -816,5 +816,7 @@ function Shell() {
 }
 
 // The theme control the settings page reads and sets (Appearance > Theme).
-const theme = startTheme();
+// The host keeps a copy so the next launch's window opens in the pick; a copy
+// that fails to land costs that launch's first frame, nothing else.
+const theme = startTheme((preference) => void invoke("theme_set", { preference }).catch(() => {}));
 render(() => <Shell />, document.getElementById("root")!);
