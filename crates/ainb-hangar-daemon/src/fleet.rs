@@ -5093,6 +5093,13 @@ mod tests {
         let sink = EventBroker::new().sink();
         let pool = store.pool();
 
+        // KNOWN BUG, pinned rather than endorsed: `sess-tie` reads IDLE while
+        // its prompt is still running. The tie exists because hook timestamps
+        // are whole seconds (the spool in `plugins/ainb-hooks/hooks/ainb-hook.sh`
+        // stamps `received_at_ms` as `date +%s` followed by `000`), so a late
+        // resume and the prompt that followed it can share one, and the resume
+        // applied last wins. Follow-up: millisecond hook timestamps, after
+        // which this row should expect RUNNING.
         for (session_id, start_at, expected) in
             [("sess-late", 1, "RUNNING"), ("sess-tie", 2, "IDLE")]
         {
