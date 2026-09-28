@@ -29,11 +29,37 @@ use tokio::process::Command;
 /// `CLAUDE_CODE_OAUTH_TOKEN` is removed even when the user set it
 /// themselves: the daemon cannot tell the user's own token from one it
 /// resolved, so a shell or agent the daemon opens never sees it. A user who
-/// wants it in a desktop shell sets it inside that shell.
+/// wants it in a desktop shell sets it inside that shell. So a claude login
+/// that exists only as an exported `CLAUDE_CODE_OAUTH_TOKEN` in the user's
+/// shell no longer reaches an agent ainb or the daemon starts in tmux; a
+/// keychain or `~/.claude` login is unaffected. The daemon's own headless
+/// `claude` child still gets its token: the runner hands it over explicitly
+/// in that child's environment, not through tmux.
 pub const DAEMON_SECRETS: [&str; 2] = [
     crate::claude_cred::ENV_OVERRIDE,
     crate::claude_cred::CHILD_ENV_VAR,
 ];
+
+/// `program`, a shell command line, run by `/bin/sh` without
+/// [`DAEMON_SECRETS`]: `env -u <secret>… /bin/sh -c '<program>'`.
+///
+/// For a tmux pane command given as one string, which tmux hands to its
+/// default shell. `env -u` cannot simply be put in front, since the line may
+/// start with a shell builtin (`export … && claude`); a POSIX shell under
+/// `env` runs any such line. A pane on a server that already holds a secret
+/// then does not pass it on.
+#[must_use]
+pub fn without_daemon_secrets(program: &str) -> String {
+    let mut line = String::from("env");
+    for secret in DAEMON_SECRETS {
+        line.push_str(" -u ");
+        line.push_str(secret);
+    }
+    line.push_str(" /bin/sh -c '");
+    line.push_str(&program.replace('\'', "'\\''"));
+    line.push('\'');
+    line
+}
 
 /// Drop [`DAEMON_SECRETS`] from `cmd`'s environment.
 pub fn strip_daemon_secrets(cmd: &mut Command) -> &mut Command {
@@ -231,6 +257,15 @@ mod tests {
         let args = args(&cmd);
         let command = &args[args.iter().position(|a| a == "codex").unwrap()..];
         assert_eq!(command[..3], ["codex", "mid;dle", "thread\\;"]);
+    }
+
+    #[test]
+    fn a_shell_line_runs_under_sh_without_the_secrets() {
+        assert_eq!(
+            without_daemon_secrets("export A='x' && claude --model opus"),
+            "env -u HANGAR_CLAUDE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN /bin/sh -c \
+             'export A='\\''x'\\'' && claude --model opus'"
+        );
     }
 
     #[test]
