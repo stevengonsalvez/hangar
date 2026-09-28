@@ -142,10 +142,13 @@ pub fn parse_run_output(stdout: &str) -> Result<WorktreeCreateResult, String> {
 }
 
 /// The folders a repository may be created from: the user's configured
-/// workspace scan paths and onboarding git directories, the same roots the
-/// desktop's project list comes from, canonicalized. Read fresh per call (a
-/// person may add one at any time); a missing or unreadable file adds none.
-fn registered_roots(home: &Path) -> Vec<PathBuf> {
+/// workspace scan paths and onboarding git directories, canonicalized. Read
+/// fresh per call (a person may add one at any time); a missing or unreadable
+/// file adds none. Public so the desktop's project list
+/// (`ainb-desktop/src/projects.rs`) offers exactly what this accepts, from
+/// this one definition.
+#[must_use]
+pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
     let config = home.join(".agents-in-a-box").join("config");
     let read = |file: &str| {
         std::fs::read_to_string(config.join(file))
