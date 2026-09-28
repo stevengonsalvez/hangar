@@ -11,7 +11,7 @@
 // agents are written once, in Rust.
 
 import { invoke } from "@tauri-apps/api/core";
-import { createSignal, type Accessor } from "solid-js";
+import { createEffect, createSignal, type Accessor } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent } from "../../bindings/Desktop.ts";
 
@@ -277,6 +277,11 @@ export interface ComposerFlowDeps {
   toast(message: string): void;
   /** Where the keyboard goes when the view closes. */
   restoreFocus(): void;
+  /** The session list as the window last drew it. */
+  sessions(): SessionsView_Serialize | undefined;
+  /** Select `sessionId`'s row in the session list, without attaching it: the
+   * host already opened its tab. */
+  select(sessionId: string): void;
 }
 
 /** The composer's open state, its request's progress, and the sidebar's
@@ -288,6 +293,9 @@ export interface ComposerFlow {
   openComposer(): void;
   closeComposer(): void;
   submit(fields: ComposerFields): void;
+  /** A person picked a session themselves: a created one still waiting to
+   * be listed must not take the selection back when it arrives. */
+  release(): void;
 }
 
 /**
@@ -296,12 +304,26 @@ export interface ComposerFlow {
  * Cancel (or Esc) closing the view never stops a create already on the
  * host, the pending card draws until the host answers, a success closes the
  * view, and a failure the view is no longer open to show becomes a toast.
+ *
+ * A success also selects the new session, as Orca activates and reveals a
+ * worktree it just created: the host opens the new tab, and this moves the
+ * session list's selection (the sidebar row and the answer banner's scope)
+ * onto it too. The daemon lists the session on its own schedule, so the
+ * selection waits until the list carries the row.
  */
 export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
   const create = deps.create ?? ((args: CreateWorktreeArgs) => invoke<CreatedWorktree>("worktree_create", { args }));
   const [open, setOpen] = createSignal(false);
   const [state, setState] = createSignal<CreateState>({ kind: "idle" });
   const [pending, setPending] = createSignal<PendingWorktree | null>(null);
+  // The created session waiting for its row, selected once, when it lands.
+  const [following, setFollowing] = createSignal<string | null>(null);
+  createEffect(() => {
+    const id = following();
+    if (id === null || !listed(deps.sessions(), id)) return;
+    setFollowing(null);
+    deps.select(id);
+  });
 
   const closeComposer = () => {
     if (!open()) return;
@@ -329,6 +351,7 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
         (result) => {
           setPending(null);
           setState({ kind: "done", result });
+          setFollowing(result.session_id);
           closeComposer();
         },
         (error: unknown) => {
@@ -339,5 +362,11 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
         },
       );
     },
+    release: () => setFollowing(null),
   };
+}
+
+/** Whether the session list carries a row for `sessionId`. */
+function listed(view: SessionsView_Serialize | undefined, sessionId: string): boolean {
+  return view?.workspaces.some((workspace) => workspace.sessions.some((row) => row.id === sessionId)) ?? false;
 }
