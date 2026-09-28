@@ -346,6 +346,16 @@ async fn a_shell_that_starts_the_tmux_server_does_not_hand_it_the_daemon_secrets
     }
     let mut world = World::new();
     assert!(world.sessions().is_empty(), "this shell starts the server");
+    // Taken back out on the way out, panic or not, so no later test in this
+    // process inherits them.
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var("HANGAR_CLAUDE_OAUTH_TOKEN");
+            std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN");
+        }
+    }
+    let _unset = Unset;
     std::env::set_var("HANGAR_CLAUDE_OAUTH_TOKEN", "sk-ant-oat-shell-verbs-test");
     std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-shell-verbs-test");
 
