@@ -399,6 +399,9 @@ pub mod templates;
 /// Terminal streams (R2), served only when [`term::STREAM_ENV`] is set at boot
 /// in a build with the `terminal-stream` feature. Nothing serves in this tree.
 pub mod term;
+/// The one way the daemon starts a tmux session, keeping its OAuth token out
+/// of the tmux server and the pane (see [`tmux_session::tmux_new_session`]).
+pub mod tmux_session;
 /// Danger-full-access warning emission at provider invocation (P5.6).
 pub mod warnings;
 /// The local HTTP webhook ingress for webhook-triggered autopilots (e38.18).
