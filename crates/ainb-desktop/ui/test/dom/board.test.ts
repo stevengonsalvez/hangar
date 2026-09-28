@@ -216,7 +216,7 @@ test("the columns are Orca's own words, and a needs-you card carries its need", 
 function idleWorld() {
   const sessions = {
     workspaces: [
-      { name: "repo", sessions: [session("idle-row"), session("unv-row"), session("done-row")] },
+      { name: "repo", sessions: [session("idle-row"), session("unv-row"), session("done-row"), session("gone-row")] },
     ],
     selected_session_id: null,
   } as unknown as SessionsView_Serialize;
@@ -225,6 +225,7 @@ function idleWorld() {
       "idle-row": { provider_session_id: "p-idle" },
       "unv-row": { provider_session_id: "p-unv" },
       "done-row": { provider_session_id: "p-done" },
+      "gone-row": { provider_session_id: "p-gone" },
     },
     fleet_snapshot: [],
     daemon_attention: { by_session_id: {} },
@@ -271,27 +272,54 @@ function idleWorld() {
           tier: "hook",
           evidence_observed_at: 42,
         },
+        {
+          session_key: "claude:p-gone",
+          state: "exited",
+          provider: "claude",
+          lifecycle: "exited",
+          transport_health: "unavailable",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 7,
+        },
       ],
     },
   } as unknown as AgentStatusView;
   return { sessions, fleet, agentStatus };
 }
 
-test("idle is hidden behind a native disclosure, closed by default", async () => {
+test("every column draws exactly the cards its count says, Idle and exited agents included", async () => {
   const board = await open(idleWorld());
-  const idle = board.column("idle")!;
-  const details = idle.querySelector("details.board-idle-toggle") as HTMLDetailsElement;
-  assert.ok(details, "the idle column is a <details>");
-  assert.equal(details.open, false, "closed by default");
-  // The unverifiable card falls in with idle and carries its own badge.
+  assert.equal(board.container.querySelector("details"), null, "no column hides its cards behind a disclosure");
+  const drawn: Record<string, string[]> = {};
+  for (const column of board.container.querySelectorAll<HTMLElement>(".board-column")) {
+    const cards = [...column.querySelectorAll<HTMLElement>(".board-card")].map((card) => card.dataset.card!);
+    const count = Number(column.querySelector(".board-count")?.textContent);
+    assert.equal(count, cards.length, `the ${column.dataset.state} column's count is its own cards`);
+    drawn[column.dataset.state!] = cards;
+  }
+  assert.deepEqual(drawn.idle, ["claude:p-idle", "claude:p-unv"]);
+  assert.deepEqual(drawn.done, ["claude:p-done", "claude:p-gone"], "an exited agent is kept, in Done");
   const unverifiable = board.card("claude:p-unv")!;
-  assert.ok(details.contains(unverifiable), "an unverifiable card lives in the idle disclosure");
   assert.equal(unverifiable.dataset.status, "unverifiable");
   assert.ok(unverifiable.querySelector(".badge-unverifiable"), "the card carries the unverifiable badge");
+});
 
-  details.open = true;
+test("an exited agent reads Exited in Done, and once opened settles into Idle", async () => {
+  const board = await open(idleWorld());
+  const gone = board.card("claude:p-gone")!;
+  assert.equal(gone.dataset.status, "exited");
+  assert.equal(gone.querySelector(".badge-exited")?.textContent, "Exited");
+  assert.ok(board.column("done")!.contains(gone));
+
+  gone.click();
+  assert.deepEqual(board.acked, [["claude:p-gone", 7]]);
   await settle();
-  assert.ok(details.contains(board.card("claude:p-idle")), "opening it still shows the plain idle card");
+  const after = board.card("claude:p-gone")!;
+  assert.ok(board.column("idle")!.contains(after), "opened: it settles into Idle, still drawn");
+  assert.ok(after.querySelector(".badge-exited"), "and still says it exited");
 });
 
 test("a Done card says click to open, and clicking it acks the turn and moves it to Idle", async () => {
@@ -307,6 +335,5 @@ test("a Done card says click to open, and clicking it acks the turn and moves it
   const afterAck = board.card("claude:p-done");
   assert.ok(afterAck, "the same agent's card still draws");
   assert.equal(afterAck.dataset.status, "idle", "acked: no longer Done");
-  const idleDetails = board.column("idle")!.querySelector("details.board-idle-toggle")!;
-  assert.ok(idleDetails.contains(afterAck), "and it moved into the idle disclosure");
+  assert.ok(board.column("idle")!.contains(afterAck), "and it moved into the Idle column");
 });
