@@ -2585,17 +2585,32 @@ fn current_tmux_identity() -> Option<(String, String)> {
 /// The hook's own pane as `(target, fingerprint)`, in the shape the tmux scan
 /// mints (`ainb-fleet-core` `discover/tmux.rs`): the trailing `server=` is the
 /// tmux server pid, which keeps a pane's identity across a move to another
-/// session, where `session_started` changes.
+/// session, where `session_started` changes. A tmux that reports no server
+/// pid keeps the older shape, as the scan does, rather than losing the pane.
 fn parse_hook_tmux_identity(row: &str) -> Option<(String, String)> {
-    let fields = row.trim().split('\t').collect::<Vec<_>>();
-    if fields.len() != 7 || fields.iter().any(|field| field.is_empty()) {
+    let fields = row.trim_end_matches(['\r', '\n']).split('\t').collect::<Vec<_>>();
+    let [
+        session,
+        window,
+        pane_index,
+        pane,
+        pid,
+        session_started,
+        server,
+    ] = fields[..]
+    else {
+        return None;
+    };
+    let identity = [session, window, pane_index, pane, pid, session_started];
+    if identity.iter().any(|field| field.trim().is_empty()) {
         return None;
     }
-    let target = format!("{}:{}.{}", fields[0], fields[1], fields[2]);
-    let fingerprint = format!(
-        "pane={};pid={};session_started={};server={}",
-        fields[3], fields[4], fields[5], fields[6]
-    );
+    let target = format!("{session}:{window}.{pane_index}");
+    let mut fingerprint = format!("pane={pane};pid={pid};session_started={session_started}");
+    let server = server.trim();
+    if !server.is_empty() {
+        fingerprint.push_str(&format!(";server={server}"));
+    }
     Some((target, fingerprint))
 }
 
@@ -3441,9 +3456,12 @@ mod tests {
             "pane=%9;pid=4242;session_started=1700000000;server=4100"
         );
         assert!(parse_hook_tmux_identity("claude-a\t2\t1").is_none());
-        assert!(
-            parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t\n").is_none(),
-            "a row with no server is not an exact identity"
+        assert_eq!(
+            parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t\n")
+                .map(|identity| identity.1)
+                .as_deref(),
+            Some("pane=%9;pid=4242;session_started=1700000000"),
+            "a tmux with no server pid keeps the older shape, as the scan does"
         );
     }
 
