@@ -13,9 +13,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createEffect, createSignal, type Accessor } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
-import type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent } from "../../bindings/Desktop.ts";
+import type { CreatedWorktree, CreateWorktreeArgs, RegisteredProject, SpawnAgent } from "../../bindings/Desktop.ts";
 
-export type { CreatedWorktree, CreateWorktreeArgs, SpawnAgent };
+export type { CreatedWorktree, CreateWorktreeArgs, RegisteredProject, SpawnAgent };
 
 /** The agent segmented control's labels, in the order Orca lists them. A
  * `Record` over the generated `SpawnAgent`, so an agent added in Rust fails
@@ -61,24 +61,48 @@ export interface ProjectChoice {
 }
 
 /** The Project select's rows: one per workspace the Sessions frame knows,
- * in the frame's own order. */
-export function projectChoices(view: SessionsView_Serialize | undefined): ProjectChoice[] {
-  return (view?.workspaces ?? []).map((workspace) => ({ name: workspace.name, path: workspace.path }));
+ * in the frame's own order, then each registered project (`projects_list`,
+ * Orca's "a project is listed before it has a worktree") the frame does not
+ * already name. */
+export function projectChoices(
+  view: SessionsView_Serialize | undefined,
+  registered: readonly RegisteredProject[] = [],
+): ProjectChoice[] {
+  const choices = (view?.workspaces ?? []).map((workspace) => ({ name: workspace.name, path: workspace.path }));
+  const listed = new Set(choices.map((choice) => choice.path));
+  for (const project of registered) {
+    if (listed.has(project.path)) continue;
+    listed.add(project.path);
+    choices.push({ name: project.name, path: project.path });
+  }
+  return choices;
 }
 
 /**
  * The project the composer opens on: the sidebar's selected session's own
- * workspace, or the first project the frame lists, or `""` when there are
- * none yet (a person can still pick one once a project loads).
+ * workspace, or the first project listed, or `""` when there are none yet
+ * (a person can still pick one once a project loads).
  */
-export function defaultProjectPath(view: SessionsView_Serialize | undefined): string {
+export function defaultProjectPath(
+  view: SessionsView_Serialize | undefined,
+  registered: readonly RegisteredProject[] = [],
+): string {
   const workspaces = view?.workspaces ?? [];
   const selectedId = view?.selected_session_id ?? null;
   if (selectedId !== null) {
     const owner = workspaces.find((workspace) => workspace.sessions.some((session) => session.id === selectedId));
     if (owner) return owner.path;
   }
-  return workspaces[0]?.path ?? "";
+  return projectChoices(view, registered)[0]?.path ?? "";
+}
+
+/** The registered projects, from the host. A host without the command, or
+ * one that fails, answers none: the frame's own projects still show. */
+export function loadRegisteredProjects(): Promise<RegisteredProject[]> {
+  return invoke<RegisteredProject[] | null>("projects_list").then(
+    (projects) => projects ?? [],
+    () => [],
+  );
 }
 
 /** The fresh composer, opened on `view`'s default project. */
