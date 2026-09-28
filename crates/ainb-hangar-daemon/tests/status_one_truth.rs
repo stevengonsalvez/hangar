@@ -75,7 +75,26 @@ async fn hook(
     observed_at: i64,
     projection: Option<AttentionProjection>,
 ) {
-    let payload = envelope(event_type, tool);
+    hook_with_payload(
+        store,
+        event_id,
+        event_type,
+        &envelope(event_type, tool),
+        observed_at,
+        projection,
+    )
+    .await;
+}
+
+/// [`hook`] with a payload the caller built, for a field `envelope` does not set.
+async fn hook_with_payload(
+    store: &Store,
+    event_id: &str,
+    event_type: &str,
+    payload: &serde_json::Value,
+    observed_at: i64,
+    projection: Option<AttentionProjection>,
+) {
     apply_hook_with_attention(
         store.pool(),
         &EventBroker::new().sink(),
@@ -85,7 +104,7 @@ async fn hook(
             provider_session_id: SESSION_ID,
             cwd: CWD,
             event_type,
-            payload: &payload,
+            payload,
             observed_at,
             transcript_model: None,
         },
@@ -389,13 +408,21 @@ async fn a_row_stamped_by_the_old_authoritative_scan_can_still_be_advanced() {
 /// `Idle` and `Exited` are both barred: `idle` is this vocabulary's "finished
 /// its turn and is free", which is the false claim, and `exited` asserts the
 /// process is gone on process evidence no hook line carries.
+///
+/// `SessionStart` with a `startup`, `resume` or `clear` source is left out on
+/// purpose. Those are prompt-boundary events, a new process at an empty prompt,
+/// so reading Idle on them is the truth rather than a claim of completion. A
+/// `compact` start happens mid-session and stays in the pool, as does a bare
+/// `SessionStart` with no source to show where it came from.
 #[tokio::test]
 async fn no_sequence_without_a_terminal_event_ever_claims_completion() {
     // Every event a session emits while it is still going. Deliberately no
     // `Stop`, no `StopFailure`, and no `agent-turn-complete`: if one were in
-    // this pool the test would be asserting nothing.
-    const ALIVE: [(&str, Option<&str>); 6] = [
+    // this pool the test would be asserting nothing. `SessionStart:compact`
+    // carries its source in the payload, not a tool.
+    const ALIVE: [(&str, Option<&str>); 7] = [
         ("SessionStart", None),
+        ("SessionStart:compact", None),
         ("UserPromptSubmit", None),
         ("PreToolUse", Some("Bash")),
         ("PostToolUse", Some("Bash")),
@@ -418,11 +445,16 @@ async fn no_sequence_without_a_terminal_event_ever_claims_completion() {
             // window a pane heuristic would call finished.
             now += 1_000 + (seed as i64 * 37 + step as i64 * 101) % 1_200_000;
             let projection = (event == "AskUserQuestion").then(|| raise(step, now));
-            hook(
+            let (event, source) = event.split_once(':').unwrap_or((event, ""));
+            let mut payload = envelope(event, tool);
+            if !source.is_empty() {
+                payload["payload"]["source"] = serde_json::Value::String(source.to_string());
+            }
+            hook_with_payload(
                 &store,
                 &format!("e-{seed}-{step}"),
                 event,
-                tool,
+                &payload,
                 now,
                 projection,
             )
