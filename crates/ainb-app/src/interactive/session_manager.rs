@@ -1466,8 +1466,20 @@ pub enum SessionTreeRemoval {
     KeptShared(PathBuf),
 }
 
-/// Remove the worktree `session_id` ran in, unless another session in
-/// `store` still uses it.
+/// Whether a session other than `except` still uses `tree`: by its row in
+/// `store`, or by its `by-session` link (a Boss session keeps no row). The
+/// one check every path that may remove a session's tree asks.
+pub fn tree_in_use_by_another(
+    manager: &WorktreeManager,
+    store: &SessionStore,
+    tree: &Path,
+    except: Option<Uuid>,
+) -> bool {
+    store.tree_used_by_another(tree, except) || manager.tree_linked_by_another(tree, except)
+}
+
+/// Remove the worktree `session_id` ran in, unless another session still
+/// uses it ([`tree_in_use_by_another`]).
 ///
 /// A second agent joins a tree with `ainb run --existing-worktree` and gets
 /// no `by-session` link, so the tree is found by the link when the session
@@ -1477,27 +1489,30 @@ pub enum SessionTreeRemoval {
 /// leaves it for the other.
 ///
 /// `store` must be read after any earlier removal in the same pass, or a
-/// session removed a moment ago still counts as a user.
+/// session removed a moment ago still counts as a user;
+/// [`remove_session_worktree_now`] reads it at the call.
 pub fn remove_session_worktree(
     manager: &WorktreeManager,
     store: &SessionStore,
     session_id: Uuid,
 ) -> Result<SessionTreeRemoval, crate::git::WorktreeError> {
     let linked = manager.session_dir(session_id)?;
+    let own_row = || store.sessions().values().find(|row| row.session_id == session_id);
     let tree = match &linked {
         Some(tree) => tree.clone(),
-        None => store
-            .sessions()
-            .values()
-            .find(|row| row.session_id == session_id)
-            .and_then(|row| manager.managed_tree(&row.worktree_path))
-            .ok_or_else(|| {
-                crate::git::WorktreeError::NotFound(format!(
+        None => match own_row().and_then(|row| manager.managed_tree(&row.worktree_path)) {
+            Some(tree) => tree,
+            None => {
+                // A link whose tree is gone still names the session: take it
+                // back, or it dangles for good.
+                manager.remove_session_link(session_id)?;
+                return Err(crate::git::WorktreeError::NotFound(format!(
                     "Session {session_id} worktree not found"
-                ))
-            })?,
+                )));
+            }
+        },
     };
-    if store.tree_used_by_another(&tree, Some(session_id)) {
+    if tree_in_use_by_another(manager, store, &tree, Some(session_id)) {
         manager.remove_session_link(session_id)?;
         return Ok(SessionTreeRemoval::KeptShared(tree));
     }
@@ -1507,6 +1522,21 @@ pub fn remove_session_worktree(
         manager.remove_managed_tree(&tree)?;
     }
     Ok(SessionTreeRemoval::Removed(tree))
+}
+
+/// [`remove_session_worktree`] against the session store as it is now. A
+/// store that cannot be read cannot say who else is in the tree, so the
+/// tree is kept (an error) rather than risk a live one.
+pub async fn remove_session_worktree_now(
+    manager: &WorktreeManager,
+    session_id: Uuid,
+) -> Result<SessionTreeRemoval, crate::git::WorktreeError> {
+    let store = crate::cli::util::load_session_store_async().await.map_err(|e| {
+        crate::git::WorktreeError::CommandFailed(format!(
+            "session store unavailable, so another session may share the tree: {e}"
+        ))
+    })?;
+    remove_session_worktree(manager, &store, session_id)
 }
 
 /// Default port for the ainb-managed Headroom compression proxy.
@@ -2723,13 +2753,7 @@ impl InteractiveSessionManager {
         // A store that cannot be read cannot say who else is in the tree, so
         // the tree stays for the recovery sweep rather than risk a live one.
         info!("Attempting to remove worktree for session {}", session_id);
-        let tree_removal = match crate::cli::util::load_session_store_async().await {
-            Ok(store) => remove_session_worktree(&self.worktree_manager, &store, session_id),
-            Err(e) => Err(crate::git::WorktreeError::CommandFailed(format!(
-                "session store unavailable, so another session may share the tree: {e}"
-            ))),
-        };
-        match tree_removal {
+        match remove_session_worktree_now(&self.worktree_manager, session_id).await {
             Ok(SessionTreeRemoval::Removed(path)) => info!(
                 "Successfully removed worktree for session {} ({})",
                 session_id,
@@ -6352,27 +6376,77 @@ mod shared_worktree_tests {
         assert!(!git_knows_tree(&fx));
     }
 
-    /// The row fallback reaches only a tree ainb made: a session that ran in
-    /// the user's own checkout has a row naming that checkout, and no link.
+    /// The row fallback reaches only a tree ainb made: a session whose row
+    /// names a linked worktree the user made elsewhere, and no link, must
+    /// never reach the delete.
     #[test]
-    fn a_row_naming_the_users_checkout_never_reaches_the_delete() {
+    fn a_row_naming_a_tree_ainb_did_not_make_never_reaches_the_delete() {
         if !git_available() {
             return;
         }
         let mut fx = shared_tree();
-        let in_checkout = Uuid::new_v4();
-        let repo = fx.repo.clone();
-        fx.store.upsert(row(in_checkout, "ainb-in-checkout", &repo));
+        let users = fx.home.path().join("users-own-tree");
+        assert!(git_ok(
+            &fx.repo,
+            &["worktree", "add", "-b", "mine", users.to_str().unwrap()]
+        ));
+        let in_it = Uuid::new_v4();
+        fx.store.upsert(row(in_it, "ainb-in-users-tree", &users));
 
-        let refused = remove_session_worktree(&fx.manager, &fx.store, in_checkout);
+        let refused = remove_session_worktree(&fx.manager, &fx.store, in_it);
         assert!(
             matches!(refused, Err(crate::git::WorktreeError::NotFound(_))),
             "{refused:?}"
         );
         assert!(
-            fx.repo.join("README.md").is_file(),
-            "the user's checkout was touched"
+            users.join("README.md").is_file(),
+            "the user's own tree was removed"
         );
+    }
+
+    /// A Boss session keeps no session-store row, only its link. The joined
+    /// session going must leave the tree to that link.
+    #[test]
+    fn a_link_without_a_row_still_keeps_the_tree() {
+        if !git_available() {
+            return;
+        }
+        let mut fx = shared_tree();
+        fx.store.remove_by_session_id(fx.first);
+
+        let joined = remove_session_worktree(&fx.manager, &fx.store, fx.second).expect("second");
+        assert_eq!(joined, SessionTreeRemoval::KeptShared(fx.resolved.clone()));
+        assert!(fx.resolved.join(".git").is_file());
+    }
+
+    /// A link written relative to `by-session` resolves there, not against
+    /// the process's working directory: it still counts as a user of the
+    /// tree, and it still leads its own session's delete to the tree.
+    #[test]
+    fn a_relative_link_names_the_same_tree() {
+        if !git_available() {
+            return;
+        }
+        let mut fx = shared_tree();
+        let link = session_link(&fx, fx.first);
+        std::fs::remove_file(&link).expect("drop absolute link");
+        let dir = fx.minted.file_name().expect("tree dir");
+        std::os::unix::fs::symlink(Path::new("../by-name").join(dir), &link)
+            .expect("relative link");
+        // Only the link says the maker is in the tree.
+        fx.store.remove_by_session_id(fx.first);
+
+        let joined = remove_session_worktree(&fx.manager, &fx.store, fx.second).expect("second");
+        assert!(
+            matches!(joined, SessionTreeRemoval::KeptShared(_)),
+            "{joined:?}"
+        );
+        assert!(fx.resolved.join(".git").is_file());
+
+        fx.store.remove_by_session_id(fx.second);
+        let maker = remove_session_worktree(&fx.manager, &fx.store, fx.first).expect("first");
+        assert!(matches!(maker, SessionTreeRemoval::Removed(_)), "{maker:?}");
+        assert!(!fx.resolved.exists());
     }
 
     /// The same, through `remove_session`, with both agents running in tmux
