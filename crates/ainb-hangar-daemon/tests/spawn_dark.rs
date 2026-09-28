@@ -1,4 +1,4 @@
-//! `worktree/create`, `worktree/agent_add` and `shell/create` ship dark: with
+//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs ship dark: with
 //! `AINB_HANGAR_SPAWN` unset at boot the daemon answers `METHOD_NOT_FOUND`,
 //! exactly as a v1.29.0 daemon does, and none is in the mutation registry
 //! yet.
@@ -47,6 +47,20 @@ async fn shell_create_is_method_not_found_by_default() {
     assert_method_not_found(
         m::SHELL_CREATE,
         serde_json::json!({"worktree_path": "/tmp"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn shell_list_is_method_not_found_by_default() {
+    assert_method_not_found(m::SHELL_LIST, serde_json::json!({})).await;
+}
+
+#[tokio::test]
+async fn shell_close_is_method_not_found_by_default() {
+    assert_method_not_found(
+        m::SHELL_CLOSE,
+        serde_json::json!({"tmux_session_name": "ainb-dsh-0a1b2c3d"}),
     )
     .await;
 }
@@ -101,6 +115,12 @@ fn worktree_agent_add_is_not_in_the_mutation_registry_while_dark() {
 #[test]
 fn shell_create_is_not_in_the_mutation_registry_while_dark() {
     assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
+}
+
+#[test]
+fn shell_list_and_close_are_not_in_the_mutation_registry_while_dark() {
+    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_LIST));
+    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CLOSE));
 }
 
 #[test]
