@@ -198,6 +198,8 @@ function flowWith(create: (args: unknown) => Promise<CreatedWorktree>) {
     restoreFocus: () => {
       effects.restored += 1;
     },
+    sessions: () => undefined,
+    select: () => {},
   });
   return { flow, effects };
 }
