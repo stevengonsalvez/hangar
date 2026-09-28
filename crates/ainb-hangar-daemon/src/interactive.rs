@@ -257,32 +257,18 @@ pub async fn spawn(
     let workdir_str = workdir
         .to_str()
         .ok_or_else(|| std::io::Error::other("workdir path is not valid UTF-8"))?;
-    let wrapper_str = wrapper
-        .to_str()
-        .ok_or_else(|| std::io::Error::other("wrapper path is not valid UTF-8"))?;
-
-    // tmux runs a single trailing shell-command argument through `/bin/sh -c`,
-    // which word-splits it — so a wrapper path containing a space (a `$HOME` with
-    // a space) would break or mis-exec. Pass an explicit, single-quoted `exec`
-    // command so the path is handed to the pane shell literally.
-    let pane_command = format!("exec {}", sh_quote(wrapper_str));
-
-    let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            session_name,
-            "-c",
-            workdir_str,
-            "-x",
-            SESSION_WIDTH,
-            "-y",
-            SESSION_HEIGHT,
-            &pane_command,
-        ])
-        .status()
-        .await?;
+    // The wrapper is handed to tmux as its own argument and executed
+    // directly, not through a shell, so a path with a space (a `$HOME` with
+    // one) needs no quoting. The helper keeps the daemon's secrets out of the
+    // tmux server and the pane.
+    let status = crate::tmux_session::tmux_new_session(
+        session_name,
+        workdir_str,
+        &["-x", SESSION_WIDTH, "-y", SESSION_HEIGHT],
+        &[wrapper.clone().into_os_string()],
+    )
+    .status()
+    .await?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "tmux new-session failed for {session_name}"
