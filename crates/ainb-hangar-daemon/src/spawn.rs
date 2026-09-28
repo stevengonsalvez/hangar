@@ -181,8 +181,36 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// The file [`registered_projects`] reads, under `~/.agents-in-a-box/config`.
+/// Its own file, not a `config.toml` key: a settings save prunes keys it does
+/// not model under `[workspace_defaults]`, and onboarding replaces
+/// `workspace_scan_paths` wholesale; neither touches this.
+pub const PROJECTS_FILE: &str = "projects.toml";
+
+/// Repositories a person added one at a time (the desktop's Add project),
+/// canonicalized: `projects = [...]` in [`PROJECTS_FILE`]. Unlike a
+/// [`registered_roots`] entry each is matched EXACTLY, never as a root, so
+/// adding one repository admits no repository nested inside it. A missing or
+/// unreadable file adds none.
+#[must_use]
+pub fn registered_projects(home: &Path) -> Vec<PathBuf> {
+    let file = home.join(".agents-in-a-box").join("config").join(PROJECTS_FILE);
+    let table = std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .unwrap_or_default();
+    table
+        .get("projects")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect()
+}
+
 /// `repo_path` as the canonical top of a git repository inside a registered
-/// root, or why not. Refuses `.` and `..` components before resolving
+/// root, or exactly a registered project, or why not. Refuses `.` and `..` components before resolving
 /// anything, so a path cannot walk out of the root it names.
 fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
     let path = Path::new(repo_path);
@@ -197,7 +225,9 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
         ))
     })?;
     let roots = registered_roots(home);
-    if !roots.iter().any(|root| canonical.starts_with(root)) {
+    if !roots.iter().any(|root| canonical.starts_with(root))
+        && !registered_projects(home).contains(&canonical)
+    {
         return Err(SpawnError::Invalid(
             "repo_path is not under a registered workspace folder: add its folder to \
              workspace_defaults.workspace_scan_paths"
@@ -208,6 +238,10 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
         .arg("-C")
         .arg(&canonical)
         .args(["rev-parse", "--show-toplevel"])
+        // An inherited GIT_DIR or GIT_WORK_TREE would answer for that
+        // repository instead of the one at `canonical`.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .stdin(std::process::Stdio::null())
         .output()
         .ok()
@@ -879,6 +913,32 @@ mod tests {
         assert!(matches!(
             resolve_repo(&sub.display().to_string(), home.path()),
             Err(SpawnError::Invalid(m)) if m.contains("top of a git repository")
+        ));
+    }
+
+    /// An added project is matched exactly: it resolves, a repository nested
+    /// inside it (vendored, a submodule) does not.
+    #[test]
+    fn a_registered_project_admits_itself_and_no_nested_repository() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("elsewhere/app");
+        let nested = project.join("vendor/lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&project, &["init", "-q", "-b", "main"]);
+        git(&nested, &["init", "-q", "-b", "main"]);
+        let config = home.path().join(".agents-in-a-box/config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(
+            config.join(PROJECTS_FILE),
+            format!("projects = [\"{}\"]\n", project.display()),
+        )
+        .unwrap();
+
+        let resolved = resolve_repo(&project.display().to_string(), home.path()).expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&project).unwrap());
+        assert!(matches!(
+            resolve_repo(&nested.display().to_string(), home.path()),
+            Err(SpawnError::Invalid(m)) if m.contains("registered")
         ));
     }
 
