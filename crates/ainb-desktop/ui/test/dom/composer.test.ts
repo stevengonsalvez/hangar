@@ -148,6 +148,23 @@ test("with no session anywhere, the registered projects fill the Project select 
   assert.equal((hostCalls.get("worktree_create") as { args: { repo_path: string } }).args.repo_path, "/code/api");
 });
 
+test("with no project at all, the composer says how to register a folder", async () => {
+  hostReplies.set("projects_list", []);
+  const container = await open({ workspaces: [], selected_session_id: null } as unknown as SessionsView_Serialize);
+  const hint = container.querySelector(".composer-empty-projects");
+  assert.ok(hint, "an empty state, not only 'Choose a project.'");
+  assert.equal(
+    hint.querySelector("code")?.textContent,
+    `ainb config set workspace_defaults.workspace_scan_paths '["~/code"]'`,
+  );
+  assert.equal(submitButton(container).disabled, true);
+});
+
+test("the register hint is gone once there is a project", async () => {
+  const container = await open();
+  assert.equal(container.querySelector(".composer-empty-projects"), null);
+});
+
 test("a host without the projects command still offers the frame's projects", async () => {
   hostReplies.set("projects_list", new Error("command projects_list not found"));
   const container = await open();
