@@ -12,6 +12,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Agents in a Box",
         "width": 1280,
         "height": 800,
