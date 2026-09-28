@@ -130,7 +130,7 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
  * so it falls in with `idle` and carries a badge that tells the two apart.
  * `exited` follows Orca's retained agents (`orca:src/renderer/src/components/
  * sidebar/worktree-agent-rows.ts:242-267` keeps a closed agent as `done`;
- * `orca:src/shared/dashboard-snapshot.ts:44-50` settles an acknowledged one
+ * `orca:src/shared/dashboard-snapshot.ts:40-47` settles an acknowledged one
  * into idle): Done until this viewer opens it, then Idle. It leaves the
  * board when the daemon archives the row. Exhaustive: a new status fails to
  * compile here.
