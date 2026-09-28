@@ -1,25 +1,21 @@
-//! The projects the composer offers: every git repository inside a folder the
-//! daemon's `worktree/create` accepts, whether or not it has a session yet.
+//! The projects the composer offers, and the one way the window adds one.
 //!
 //! ```text
-//!  ~/.agents-in-a-box/config/config.toml      workspace_defaults.workspace_scan_paths ─┐
-//!  ~/.agents-in-a-box/config/onboarding.toml  git_directories ─────────────────────────┤
-//!                                                                    registered roots ◀┘
-//!                          repositories found under them, canonical ──▶ Project select
+//!  config.toml      workspace_scan_paths ─┐                 repositories under
+//!  onboarding.toml  git_directories ──────┴─▶ roots ───────▶ them (scanned) ─┐
+//!  projects.toml    projects (Add project) ─▶ exact repository tops ─────────┴─▶ Project select
 //! ```
 //!
-//! The roots are the daemon's own `spawn::registered_roots`, called rather
-//! than copied: the user-level files only, never a project's own
-//! `.ainb/config.toml`, so the list names exactly the repositories a create is
-//! accepted from. The daemon stays the gate; this is only what the window
-//! offers. `tests/create_worktree.rs` creates from a listed project against
-//! the real daemon.
+//! Both sets are the daemon's own readers (`spawn::registered_roots`,
+//! `spawn::registered_projects`), called rather than copied, so the list names
+//! exactly the repositories a create is accepted from. The daemon stays the
+//! gate. `tests/create_worktree.rs` checks both against the real daemon.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ainb_app::config::WorkspaceDefaults;
 use ainb_app::git::WorkspaceScanner;
-use ainb_hangar_daemon::spawn::registered_roots;
+use ainb_hangar_daemon::spawn::{PROJECTS_FILE, registered_projects, registered_roots};
 use serde::Serialize;
 
 /// One repository the composer may create into.
@@ -32,40 +28,46 @@ pub struct RegisteredProject {
     pub path: String,
 }
 
-/// The repositories under `home`'s registered roots, by name, at most
-/// `defaults.max_repositories` of them. Scanned the way the TUI's repository
-/// picker scans (depth and excludes from `defaults`), but never through its
-/// cache, which is keyed on the TUI's own wider set of folders. A repository
-/// whose canonical path leaves every root (a symlink out) is not offered:
-/// the daemon would refuse it.
+impl RegisteredProject {
+    fn at(canonical: &Path) -> Self {
+        Self {
+            name: canonical
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+            path: canonical.display().to_string(),
+        }
+    }
+}
+
+/// The repositories under `home`'s registered roots plus each added project,
+/// by name, at most `defaults.max_repositories` of them. Roots are scanned the
+/// way the TUI's repository picker scans (depth and excludes from
+/// `defaults`), but never through its cache, which is keyed on the TUI's own
+/// wider set of folders. A scanned repository whose canonical path leaves
+/// every root (a symlink out) is not offered: the daemon would refuse it.
 #[must_use]
 pub fn list(home: &Path, defaults: &WorkspaceDefaults) -> Vec<RegisteredProject> {
     let roots = registered_roots(home);
-    if roots.is_empty() {
-        return Vec::new();
-    }
-    let scanned = WorkspaceScanner::new()
-        .with_search_paths(roots.clone())
-        .with_workspace_defaults(defaults)
-        .scan_uncached()
-        .map(|result| result.workspaces)
-        .unwrap_or_default();
+    let scanned: Vec<PathBuf> = if roots.is_empty() {
+        Vec::new()
+    } else {
+        WorkspaceScanner::new()
+            .with_search_paths(roots.clone())
+            .with_workspace_defaults(defaults)
+            .scan_uncached()
+            .map(|result| result.workspaces)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|workspace| std::fs::canonicalize(workspace.path).ok())
+            .filter(|canonical| roots.iter().any(|root| canonical.starts_with(root)))
+            .collect()
+    };
     let mut projects: Vec<RegisteredProject> = Vec::new();
-    for workspace in scanned {
-        let Ok(canonical) = std::fs::canonicalize(&workspace.path) else {
-            continue;
-        };
-        if !roots.iter().any(|root| canonical.starts_with(root)) {
-            continue;
+    for canonical in scanned.into_iter().chain(registered_projects(home)) {
+        let project = RegisteredProject::at(&canonical);
+        if !projects.iter().any(|known| known.path == project.path) {
+            projects.push(project);
         }
-        let path = canonical.display().to_string();
-        if projects.iter().any(|project| project.path == path) {
-            continue;
-        }
-        projects.push(RegisteredProject {
-            name: workspace.name,
-            path,
-        });
     }
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     if projects.len() > defaults.max_repositories {
@@ -79,28 +81,27 @@ pub fn list(home: &Path, defaults: &WorkspaceDefaults) -> Vec<RegisteredProject>
     projects
 }
 
-/// The config key a registered folder is added to.
-const SCAN_PATHS: &str = "workspace_defaults.workspace_scan_paths";
-
 /// Register `folder`, a repository a person picked in the native folder
 /// dialog, so the daemon creates from it: its canonical path is appended to
-/// the user-level `workspace_scan_paths`, comments and every other key left
-/// as they are. Only a repository's own top folder is accepted, never a
-/// folder of many, and never the home folder or one above it: the picker
-/// registers exactly one project, and cannot widen what the daemon trusts to
-/// everything a person owns. A repository already inside a registered folder
-/// is returned as it is, with nothing written.
+/// `projects` in the daemon's [`PROJECTS_FILE`]. The daemon matches that entry
+/// exactly, never as a root, so no repository nested inside it is admitted.
+/// Only a repository's own top folder is accepted, never the home folder or
+/// one above it. A repository the daemon already accepts (inside a registered
+/// root, or added before) is returned as it is, with nothing written.
 ///
 /// # Errors
-/// The sentence the composer shows: not a folder, not a repository's top, the
-/// home folder, or a config file that cannot be read or written.
+/// The sentence the composer shows: no home, not a folder, not a repository's
+/// top, the home folder, or a projects file that cannot be read or written.
 pub fn register(home: &Path, folder: &Path) -> Result<RegisteredProject, String> {
     let shown = folder.display();
+    let home = std::fs::canonicalize(home).map_err(|_| {
+        "The home folder cannot be resolved, so no project can be registered.".to_string()
+    })?;
     let canonical = std::fs::canonicalize(folder)
         .ok()
         .filter(|path| path.is_dir())
         .ok_or_else(|| format!("{shown} is not a folder on this machine."))?;
-    if std::fs::canonicalize(home).is_ok_and(|home| home.starts_with(&canonical)) {
+    if home.starts_with(&canonical) {
         return Err(format!(
             "{shown} holds your home folder: pick one repository's own folder."
         ));
@@ -110,17 +111,13 @@ pub fn register(home: &Path, folder: &Path) -> Result<RegisteredProject, String>
             "{shown} is not the top folder of a git repository: pick the repository's own folder."
         ));
     }
-    let project = RegisteredProject {
-        name: canonical
-            .file_name()
-            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
-        path: canonical.display().to_string(),
-    };
-    if registered_roots(home).iter().any(|root| canonical.starts_with(root)) {
-        return Ok(project);
+    let project = RegisteredProject::at(&canonical);
+    let accepted = registered_roots(&home).iter().any(|root| canonical.starts_with(root))
+        || registered_projects(&home).contains(&canonical);
+    if !accepted {
+        append_project(&home, &project.path)
+            .map_err(|error| format!("Could not register {shown}: {error:#}"))?;
     }
-    append_scan_path(home, &project.path)
-        .map_err(|error| format!("Could not register {shown}: {error:#}"))?;
     Ok(project)
 }
 
@@ -131,6 +128,10 @@ fn repository_top(dir: &Path) -> Option<PathBuf> {
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
+        // An inherited GIT_DIR or GIT_WORK_TREE would answer for that
+        // repository instead of the one at `dir`.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .stdin(std::process::Stdio::null())
         .output()
         .ok()
@@ -138,40 +139,42 @@ fn repository_top(dir: &Path) -> Option<PathBuf> {
         .and_then(|out| std::fs::canonicalize(String::from_utf8_lossy(&out.stdout).trim()).ok())
 }
 
-/// Append `path` to the user-level scan paths under the config file's lock,
-/// read inside the lock so a concurrent settings save is not lost. A file
-/// that exists but does not parse is refused, never replaced.
-fn append_scan_path(home: &Path, path: &str) -> anyhow::Result<()> {
-    use ainb_app::config::{lock, read_existing, write_keys_into_with_lock};
+/// What heads the projects file, so a person who opens it knows what it is.
+const PROJECTS_HEADER: &str = "# Repositories added with Add project in the ainb desktop.\n\
+# The daemon creates worktrees from exactly these folders (never from a\n\
+# repository nested inside one). Remove a line to unregister it.\n";
 
-    let config = home.join(".agents-in-a-box").join("config").join("config.toml");
-    if let Some(parent) = config.parent() {
+/// Append `path` to the projects file under a lock, read inside the lock so
+/// two adds cannot lose one. A file that exists but does not parse is
+/// refused, never replaced.
+fn append_project(home: &Path, path: &str) -> anyhow::Result<()> {
+    use ainb_app::config::{lock, read_existing, write_atomic};
+
+    let file = home.join(".agents-in-a-box").join("config").join(PROJECTS_FILE);
+    if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let lock = lock::lock_for(&config)?;
-    let existing = read_existing(&config)?;
-    let table = if existing.trim().is_empty() {
+    let _lock = lock::lock_for(&file)?;
+    let existing = read_existing(&file)?;
+    let mut table = if existing.trim().is_empty() {
         toml::Table::new()
     } else {
-        existing.parse::<toml::Table>().map_err(|_| {
-            anyhow::anyhow!(
-                "{} does not parse; fix it with `ainb config edit`",
-                config.display()
-            )
-        })?
+        existing
+            .parse::<toml::Table>()
+            .map_err(|_| anyhow::anyhow!("{} does not parse; fix or remove it", file.display()))?
     };
-    let mut paths = table
-        .get("workspace_defaults")
-        .and_then(|defaults| defaults.get("workspace_scan_paths"))
+    let mut projects = table
+        .get("projects")
         .and_then(toml::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    paths.push(toml::Value::String(path.to_string()));
-    write_keys_into_with_lock(
-        &config,
-        &[(SCAN_PATHS.to_string(), toml::Value::Array(paths))],
-        &lock,
-    )
+    projects.push(toml::Value::String(path.to_string()));
+    table.insert("projects".into(), toml::Value::Array(projects));
+    write_atomic(
+        &file,
+        &format!("{PROJECTS_HEADER}{}", toml::to_string(&table)?),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -283,58 +286,57 @@ mod tests {
         assert!(list(home.path(), &WorkspaceDefaults::default()).is_empty());
     }
 
-    #[test]
-    fn a_picked_repository_is_registered_and_then_listed() {
-        let home = tempfile::tempdir().unwrap();
-        write_config(
-            home.path(),
-            "config.toml",
-            "# my notes\n[workspace_defaults]\n# keep me\nworkspace_scan_paths = [\"~/code\"]\nbranch_prefix = \"me/\"\n",
-        );
-        let repo = home.path().join("elsewhere/app");
-        git_repo(&repo);
-
-        let project = register(home.path(), &repo).expect("registered");
-        let canonical = std::fs::canonicalize(&repo).unwrap().display().to_string();
-        assert_eq!(
-            project,
-            RegisteredProject {
-                name: "app".into(),
-                path: canonical.clone()
-            }
-        );
-        assert_eq!(list(home.path(), &WorkspaceDefaults::default()), [project]);
-
-        let text = std::fs::read_to_string(home.path().join(".agents-in-a-box/config/config.toml"))
-            .unwrap();
-        assert!(
-            text.contains("# my notes") && text.contains("# keep me"),
-            "{text}"
-        );
-        assert!(text.contains("branch_prefix = \"me/\""), "{text}");
-        assert!(
-            text.contains(&format!("[\"~/code\", \"{canonical}\"]")),
-            "{text}"
-        );
-
-        // Again: already registered, nothing appended.
-        register(home.path(), &repo).expect("still registered");
-        let again =
-            std::fs::read_to_string(home.path().join(".agents-in-a-box/config/config.toml"))
-                .unwrap();
-        assert_eq!(again, text);
+    fn projects_file(home: &Path) -> PathBuf {
+        home.join(".agents-in-a-box/config").join(PROJECTS_FILE)
     }
 
     #[test]
-    fn registering_with_no_config_file_creates_it() {
+    fn a_picked_repository_is_registered_exactly_and_then_listed() {
         let home = tempfile::tempdir().unwrap();
-        let repo = home.path().join("app");
+        let config = "# my notes\n[workspace_defaults]\nworkspace_scan_paths = [\"~/code\"]\n";
+        write_config(home.path(), "config.toml", config);
+        let repo = home.path().join("elsewhere/app");
         git_repo(&repo);
-        register(home.path(), &repo).expect("registered");
+        git_repo(&repo.join("vendor/lib"));
+
+        let project = register(home.path(), &repo).expect("registered");
+        let canonical = std::fs::canonicalize(&repo).unwrap();
+        assert_eq!(project, RegisteredProject::at(&canonical));
         assert_eq!(
-            registered_roots(home.path()),
-            [std::fs::canonicalize(&repo).unwrap()]
+            list(home.path(), &WorkspaceDefaults::default()),
+            [project],
+            "the project itself, not the repository nested in it"
         );
+        assert_eq!(registered_projects(home.path()), [canonical]);
+        let config_after =
+            std::fs::read_to_string(home.path().join(".agents-in-a-box/config/config.toml"))
+                .unwrap();
+        assert_eq!(config_after, config, "config.toml is not touched");
+
+        // Again: already registered, nothing appended.
+        let text = std::fs::read_to_string(projects_file(home.path())).unwrap();
+        register(home.path(), &repo).expect("still registered");
+        assert_eq!(
+            std::fs::read_to_string(projects_file(home.path())).unwrap(),
+            text
+        );
+    }
+
+    #[test]
+    fn a_repository_inside_a_registered_root_writes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("code/app");
+        git_repo(&repo);
+        write_config(
+            home.path(),
+            "onboarding.toml",
+            &format!(
+                "git_directories = [\"{}\"]\n",
+                home.path().join("code").display()
+            ),
+        );
+        register(home.path(), &repo).expect("accepted as it is");
+        assert!(!projects_file(home.path()).exists());
     }
 
     #[test]
@@ -362,23 +364,27 @@ mod tests {
             let err = register(home.path(), &folder).expect_err("refused");
             assert!(err.contains(why), "{}: {err}", folder.display());
         }
+        let missing_home = home.path().join("no-such-home");
+        let err = register(&missing_home, &repo).expect_err("no home");
+        assert!(err.contains("home folder cannot be resolved"), "{err}");
         assert!(
-            !home.path().join(".agents-in-a-box/config/config.toml").exists(),
+            !projects_file(home.path()).exists(),
             "a refusal writes nothing"
         );
     }
 
     #[test]
-    fn a_config_that_does_not_parse_is_refused_not_replaced() {
+    fn a_projects_file_that_does_not_parse_is_refused_not_replaced() {
         let home = tempfile::tempdir().unwrap();
-        write_config(home.path(), "config.toml", "[workspace_defaults\nbroken");
+        write_config(home.path(), PROJECTS_FILE, "projects = [\"/a\"");
         let repo = home.path().join("app");
         git_repo(&repo);
         let err = register(home.path(), &repo).expect_err("refused");
         assert!(err.contains("does not parse"), "{err}");
-        let text = std::fs::read_to_string(home.path().join(".agents-in-a-box/config/config.toml"))
-            .unwrap();
-        assert_eq!(text, "[workspace_defaults\nbroken");
+        assert_eq!(
+            std::fs::read_to_string(projects_file(home.path())).unwrap(),
+            "projects = [\"/a\""
+        );
     }
 
     #[test]
