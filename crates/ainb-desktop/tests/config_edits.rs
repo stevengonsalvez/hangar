@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use ainb_app::config::AppConfig;
 use ainb_app::config::registry::{self, registry_key};
-use ainb_app::config::renderer_edit::{DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON};
+use ainb_app::config::renderer_edit::{
+    DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON,
+};
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Chord, CommandId, Intent, Keymap, SectionId};
 use ainb_desktop::host::DesktopHost;
@@ -74,13 +76,20 @@ fn a_spawn_row_is_refused_by_name_and_by_key_sequence() {
         if registry::row(pattern).is_some_and(|row| matches!(row.kind, registry::RowKind::Secret)) {
             continue;
         }
+        // Refused like every denied row; the TUI's own theme says where the
+        // desktop's lives instead (`renderer_edit::TUI_THEME_REASON`).
+        let reason = if *pattern == "ui_preferences.theme" {
+            TUI_THEME_REASON
+        } else {
+            DENIED_REASON
+        };
         // By name, whether or not the default config has such a row: the
         // key is judged, not the row.
         let named = pattern.replace('*', "sample");
         let refusal = host
             .refused_from_renderer(&set_row(&named))
             .unwrap_or_else(|| panic!("{named} by name"));
-        assert_eq!(refusal.reason, DENIED_REASON, "{named}");
+        assert_eq!(refusal.reason, reason, "{named}");
         assert_eq!(refusal.command.as_str(), "config.set_row");
 
         // By key sequence, on the real row when the default config has one.
@@ -90,7 +99,7 @@ fn a_spawn_row_is_refused_by_name_and_by_key_sequence() {
         let refusal = host
             .refused_from_renderer(&Intent::Key(Chord::parse("enter").expect("chord")))
             .unwrap_or_else(|| panic!("{key} by Enter"));
-        assert_eq!(refusal.reason, DENIED_REASON, "{key}");
+        assert_eq!(refusal.reason, reason, "{key}");
         assert!(
             refusal.command.as_str().starts_with("config."),
             "{key}: {refusal:?}"
