@@ -350,13 +350,17 @@ test("a created row that lands after the deadline does not take the selection", 
 // A board card and a palette row both select through `session_list.select_row`
 // (`showIntents`, `palette.ts`), so either reaches the flow only as the list's
 // selection moving. Each must beat a created row that lands later.
-for (const source of ["board card", "palette row"]) {
-  test(`a ${source} picked before the created row lands keeps the selection`, async () => {
+test("a selection that moves before the created row lands keeps it, from the board or the palette", async () => {
+  for (const source of ["board card", "palette row"]) {
+    effects.selected = [];
+    cleanup?.();
+    document.body.innerHTML = "";
+    setListed(frame());
     await create();
     setListed(beforeCreated("s-3"));
     await settle();
     setListed(withCreated("s-3"));
     await settle();
-    assert.deepEqual(effects.selected, []);
-  });
-}
+    assert.deepEqual(effects.selected, [], `a ${source} pick wins`);
+  }
+});
