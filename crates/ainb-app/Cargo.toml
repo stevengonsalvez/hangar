@@ -142,6 +142,9 @@ bytes = "1.6"
 ainb-skill-core = { path = "../ainb-skill-core", version = "0.1.0", features = ["test-fixtures"] }
 ainb-hangar-daemon = { path = "../ainb-hangar-daemon", features = ["test-support"] }
 tempfile = "3"
+# A paused clock for the attention poller's cadence tests: they assert "within
+# the floor" and "before the interval", which real sleeps can only approximate.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "config_screen_keys"

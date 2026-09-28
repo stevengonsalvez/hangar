@@ -358,6 +358,7 @@ impl<S: FrameSink> DesktopHost<S> {
                 &self.state.fleet.fleet_snapshot,
                 &self.state.host.attention_poll_running,
                 &self.state.host.daemon_attention_generation,
+                &self.state.host.attention_poll_nudge,
             );
         }
         // The merged attention each session row carries on its frame. The
