@@ -1702,8 +1702,10 @@ fn parse_attention(value: &str) -> ainb_hangar_proto::fleet::AttentionState {
 ///
 /// The reconciler runs both on every 3s tick (see [`reconcile_tick`]), so a
 /// closed session is noticed within one tick. `Panes` alone correlates the
-/// discovered panes without judging any row missing, for callers that only
-/// want a sample folded in.
+/// discovered panes without judging any row missing. Production no longer
+/// runs it; it stays because the test-support entry `reconcile_discovered_panes`
+/// takes a pass, and the daemon's and `ainb`'s integration tests use it to seed
+/// rows from a sample without sweeping the rest.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ReconcilePass {
     /// Correlate the discovered panes only.
@@ -1765,9 +1767,11 @@ pub struct SweepGuard {
 }
 
 impl Default for SweepGuard {
-    /// A fresh guard assumes the last sample saw panes, so an empty roster at
-    /// daemon start (tmux not up yet, tmux-resurrect still restoring) gets the
-    /// same tolerance as one mid-run rather than retiring the whole board.
+    /// A fresh guard assumes the last sample saw panes, so an empty roster from
+    /// a running server at daemon start (tmux-resurrect still restoring) gets
+    /// the same tolerance as one mid-run rather than retiring the whole board.
+    /// No server at all is believed at once, as mid-run, but retires no managed
+    /// row: none has been seen live yet.
     fn default() -> Self {
         Self {
             saw_panes: true,
