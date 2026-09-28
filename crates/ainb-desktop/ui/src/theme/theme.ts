@@ -3,11 +3,16 @@
 // The choice is a per-viewer convenience kept in localStorage. Every read and
 // write is wrapped: storage can be missing or throw (private window, blocked
 // site data), and the window must still paint, in the system's theme.
+//
+// localStorage is the one source of the pick. The host keeps a copy, told on
+// every change and once at start, only so the next launch's native window
+// opens in the right theme before this page has painted (`theme.rs`).
 
 import { createSignal, type Accessor } from "solid-js";
+import type { ThemePreference } from "../../../bindings/Desktop.ts";
 
-/** What a person can pick. */
-export type ThemePreference = "system" | "dark" | "light";
+/** What a person can pick: the host's own type, so the two cannot drift. */
+export type { ThemePreference };
 
 /** What is actually painted. */
 export type Theme = "dark" | "light";
@@ -76,11 +81,16 @@ export interface ThemeControl {
  * Returns the control a settings page reads and sets; transitions are held
  * off for two frames around each switch so colours do not cross-fade at
  * different speeds.
+ *
+ * `tellHost` hears the stored preference once, now, and every pick after, so
+ * the host's copy converges on this page's even when it was never told (a
+ * pick made before the host kept one).
  */
-export function startTheme(): ThemeControl {
+export function startTheme(tellHost: (preference: ThemePreference) => void = () => {}): ThemeControl {
   const root = document.documentElement;
   const query = window.matchMedia?.("(prefers-color-scheme: dark)");
   const [preference, setPreference] = createSignal(readPreference(safeStorage()));
+  tellHost(preference());
   const [painted, setPainted] = createSignal<Theme>(resolveTheme(preference(), query?.matches ?? true));
   const paint = () => {
     root.classList.add("theme-switching");
@@ -99,6 +109,7 @@ export function startTheme(): ThemeControl {
     set(next) {
       setPreference(next);
       writePreference(safeStorage(), next);
+      tellHost(next);
       paint();
     },
   };
