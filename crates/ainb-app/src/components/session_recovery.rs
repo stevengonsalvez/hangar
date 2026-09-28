@@ -1400,19 +1400,30 @@ impl SessionRecoveryState {
     }
 
     /// Refuse to clean up `worktree` while a session other than the one it
-    /// is an orphan of still has it as its worktree. A second agent joins a
-    /// tree without a `by-session` link, so the tree reads as orphaned here
-    /// once the session that made it is gone, while the agent is still in it.
-    /// A store that cannot be read refuses too: it cannot say who is in there.
+    /// is an orphan of still uses it (a row or a link, see
+    /// [`crate::interactive::session_manager::tree_in_use_by_another`]). A
+    /// second agent joins a tree without a `by-session` link, so the tree
+    /// reads as orphaned here once the session that made it is gone, while
+    /// the agent is still in it. Both paths cleanup removes are checked: the
+    /// orphan's own and its `by-name` entry. A store that cannot be read
+    /// refuses too: it cannot say who is in there.
     fn refuse_if_shared(worktree: &OrphanedWorktree) -> Result<(), String> {
-        let store = crate::cli::util::load_session_store()
-            .map_err(|e| format!("Cannot check whether another session uses the worktree: {e}"))?;
+        let unknown =
+            |e: String| format!("Cannot check whether another session uses the worktree: {e}");
+        let store = crate::cli::util::load_session_store().map_err(|e| unknown(e.to_string()))?;
+        let manager =
+            crate::git::WorktreeManager::for_reading().map_err(|e| unknown(e.to_string()))?;
         let own = worktree.id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
-        if store.tree_used_by_another(&worktree.path, own) {
-            return Err(format!(
-                "{} is still used by another session: delete that session first",
-                worktree.name
-            ));
+        let by_name = manager.base_dir().join("by-name").join(&worktree.name);
+        for path in [&worktree.path, &by_name] {
+            if crate::interactive::session_manager::tree_in_use_by_another(
+                &manager, &store, path, own,
+            ) {
+                return Err(format!(
+                    "{} is still used by another session: delete that session first",
+                    worktree.name
+                ));
+            }
         }
         Ok(())
     }
