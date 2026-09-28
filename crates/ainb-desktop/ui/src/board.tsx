@@ -83,7 +83,8 @@ export function Board(props: Props) {
    * Done card acks on the same click that opens it (spec: "click to open"):
    * there is no separate dismiss, opening it IS reading it. */
   const choose = (card: BoardCard) => {
-    if (card.status.kind === "done") props.onAck(card.key, card.evidenceObservedAt);
+    // Done, or an exited agent kept in Done: opening it is reading it.
+    if (card.column === "done") props.onAck(card.key, card.evidenceObservedAt);
     if (card.sessionId === null && card.acp) props.onOpenTranscript(card.key);
     else show(card.sessionId, card.hasOpenRequest);
   };
@@ -152,6 +153,9 @@ export function Board(props: Props) {
                             <Show when={card()?.status.kind === "unverifiable"}>
                               <span class="badge-unverifiable">Unverifiable</span>
                             </Show>
+                            <Show when={card()?.status.kind === "exited"}>
+                              <span class="badge-exited">Exited</span>
+                            </Show>
                             <Show when={(card()?.attention.length ?? 0) > 0}>
                               <span class="card-chips">
                                 <For each={card()?.attention}>
@@ -173,29 +177,14 @@ export function Board(props: Props) {
             );
             return (
               <div class="board-column" data-state={column()?.state}>
-                <Show
-                  when={column()?.state === "idle"}
-                  fallback={
-                    <>
-                      <h2>
-                        {COLUMN_TITLES[column()?.state ?? "needs"]}
-                        <span class="board-count">{cardKeys().length}</span>
-                      </h2>
-                      {list()}
-                    </>
-                  }
-                >
-                  {/* Idle is hidden by default (spec): a native disclosure,
-                      closed until a person asks for it, rather than a JS flag
-                      this component would have to remember on its own. */}
-                  <details class="board-idle-toggle">
-                    <summary>
-                      {COLUMN_TITLES.idle}
-                      <span class="board-count">{cardKeys().length}</span>
-                    </summary>
-                    {list()}
-                  </details>
-                </Show>
+                {/* The count is the length of the very list drawn below it,
+                    in every column: Idle was a closed disclosure whose count
+                    showed and whose cards did not. */}
+                <h2>
+                  {COLUMN_TITLES[column()?.state ?? "needs"]}
+                  <span class="board-count">{cardKeys().length}</span>
+                </h2>
+                {list()}
               </div>
             );
           }}
@@ -258,7 +247,7 @@ function needOf(card: BoardCard | undefined): string | null {
  * other column. */
 function cardLine(card: BoardCard | undefined): string {
   if (card === undefined) return "";
-  if (card.status.kind === "done") return "click to open";
+  if (card.column === "done") return "click to open";
   // The model is free text off the frame, drawn through the same rule as a
   // session name, so a bidi override or an escape cannot restyle the card.
   const parts = [
