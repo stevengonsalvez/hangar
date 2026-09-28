@@ -78,14 +78,22 @@ impl TmuxPaneRow {
     /// writes too (`ainb` `cli/fleet/atc.rs`). The daemon keys a pane on
     /// `pane` plus `server` (`pane_identity` in `ainb-hangar-daemon`).
     fn process_start_fingerprint(&self) -> String {
-        let mut fingerprint = format!(
-            "pane={};pid={};session_started={}",
-            self.pane_id, self.pane_pid, self.session_created
-        );
+        let mut fingerprint = self.key_fingerprint();
         if let Some(server) = self.server_pid {
             fingerprint.push_str(&format!(";server={server}"));
         }
         fingerprint
+    }
+
+    /// The fingerprint without `server=`, which is what the legacy session key
+    /// is minted from. A scanner row's key predates the server field, so
+    /// keeping it out keeps every unmanaged row on the same key through the
+    /// upgrade instead of retiring it and minting a new one.
+    fn key_fingerprint(&self) -> String {
+        format!(
+            "pane={};pid={};session_started={}",
+            self.pane_id, self.pane_pid, self.session_created
+        )
     }
 
     /// Derive lifecycle from what tmux already knows about the pane.
@@ -119,7 +127,7 @@ impl TmuxPaneRow {
         let fingerprint = self.process_start_fingerprint();
         let lifecycle = self.lifecycle(now_secs);
         FleetSession {
-            session_key: SessionKey::legacy(provider, &exact_tmux_target, &fingerprint),
+            session_key: SessionKey::legacy(provider, &exact_tmux_target, &self.key_fingerprint()),
             provider,
             provider_session_id: None,
             cwd: self.cwd,
@@ -409,6 +417,30 @@ mod tests {
         assert_eq!(
             fingerprint("").as_deref(),
             Some("pane=%95;pid=101;session_started=1700000000")
+        );
+    }
+
+    #[test]
+    fn a_scanner_rows_key_does_not_change_when_the_fingerprint_names_its_server() {
+        let session =
+            parse_row("s\t0\t0\t%95\t101\t/repo\tzsh\tclaude\t1700000000\t0\t1700000499\t4100")
+                .expect("parse row")
+                .into_session(&processes(), NOW);
+
+        assert_eq!(
+            session.session_key,
+            SessionKey::legacy(
+                session.provider,
+                "s:0.0",
+                "pane=%95;pid=101;session_started=1700000000"
+            ),
+            "the key an unmanaged row had before the upgrade"
+        );
+        assert!(
+            session
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.ends_with(";server=4100"))
         );
     }
 
