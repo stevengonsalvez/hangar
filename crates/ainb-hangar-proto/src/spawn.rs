@@ -2,15 +2,19 @@
 //! sessions in them, so every surface (desktop, TUI, a paired device later)
 //! creates work through one owner.
 //!
-//! `worktree/create` is dark until its flip PR: the daemon answers
-//! `METHOD_NOT_FOUND` unless `AINB_HANGAR_SPAWN` is set at boot, so a daemon
-//! built from main behaves exactly as v1.29.0 does. The method is not in the
-//! mutation registry while dark; its params already carry the D18 envelope so
-//! the flip only registers it.
+//! `worktree/create`, `worktree/agent_add` and `shell/create` are dark until
+//! their flip PR: the daemon answers `METHOD_NOT_FOUND` unless
+//! `AINB_HANGAR_SPAWN` is set at boot, so a daemon built from main behaves
+//! exactly as v1.29.0 does. None is in the mutation registry while dark; their
+//! params already carry the D18 envelope so the flip only registers them.
 //!
 //! ```text
 //!  desktop ──worktree/create──▶ daemon ──`ainb --format json run --worktree`──▶ git + tmux + agent
 //!          ◀── WorktreeCreateResult ──┘
+//!  desktop ──worktree/agent_add──▶ daemon ──`ainb --format json run --existing-worktree`──▶ tmux + agent
+//!          ◀── WorktreeCreateResult ──┘
+//!  desktop ──shell/create──▶ daemon ──`tmux new-session -d`──▶ a plain shell
+//!          ◀── ShellCreateResult ──┘
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -83,11 +87,64 @@ pub struct WorktreeCreateParams {
     pub mutation: crate::mutation::MutationEnvelope,
 }
 
-/// Why a `worktree/create` request was refused before anything was created.
+/// Parameters for `worktree/agent_add`: one more agent session in a worktree
+/// that already exists, on the branch it already has.
+///
+/// A verb of its own, not a field on [`WorktreeCreateParams`]: that struct
+/// flattens the mutation envelope, so it cannot deny unknown fields, and an
+/// older spawn-enabled daemon would drop an `existing_worktree` field and
+/// create a new worktree instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeAgentAddParams {
+    /// Absolute path of the worktree checkout on the daemon's host: the
+    /// `worktree_path` a create returned.
+    pub worktree_path: String,
+    /// Agent CLI to launch in the worktree.
+    pub agent: SpawnAgent,
+    /// Provider model id, passed through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// First prompt, submitted once the agent's input box is ready.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Start the agent with its permission prompts skipped.
+    #[serde(default)]
+    pub skip_permissions: bool,
+    /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
+    /// Unused while the method is dark.
+    #[serde(flatten)]
+    pub mutation: crate::mutation::MutationEnvelope,
+}
+
+/// Parameters for `shell/create`: a plain shell tmux session, no agent, in a
+/// repository or a worktree the daemon may create work in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCreateParams {
+    /// Absolute path of the directory the shell starts in: a registered
+    /// repository's top, or a worktree ainb created.
+    pub worktree_path: String,
+    /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
+    /// Unused while the method is dark.
+    #[serde(flatten)]
+    pub mutation: crate::mutation::MutationEnvelope,
+}
+
+/// Result for `shell/create`: the shell session the daemon made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellCreateResult {
+    /// The tmux session running the shell; attach with `=<name>`.
+    pub tmux_session_name: String,
+    /// The directory the shell started in, canonical.
+    pub worktree_path: String,
+}
+
+/// Why a spawn request was refused before anything was created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnParamsError {
     /// `repo_path` is not an absolute path.
     RepoPathNotAbsolute,
+    /// `worktree_path` is not an absolute path.
+    WorktreePathNotAbsolute,
     /// A text field is empty, too long, or holds a control character.
     BadField(&'static str),
     /// A ref-like field (`branch`, `base`) would be read as a flag or is not a
@@ -99,6 +156,7 @@ impl std::fmt::Display for SpawnParamsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RepoPathNotAbsolute => f.write_str("repo_path must be an absolute path"),
+            Self::WorktreePathNotAbsolute => f.write_str("worktree_path must be an absolute path"),
             Self::BadField(field) => {
                 write!(f, "{field} is empty, too long, or has control characters")
             }
@@ -121,22 +179,61 @@ impl WorktreeCreateParams {
             return Err(SpawnParamsError::RepoPathNotAbsolute);
         }
         text_ok("repo_path", &self.repo_path, 4096)?;
-        if let Some(model) = &self.model {
-            text_ok("model", model, SPAWN_FIELD_MAX)?;
-        }
         if let Some(branch) = &self.branch {
             ref_ok("branch", branch)?;
         }
         if let Some(base) = &self.base {
             ref_ok("base", base)?;
         }
-        if let Some(prompt) = &self.prompt {
-            if prompt.len() > SPAWN_PROMPT_MAX || prompt.contains('\0') {
-                return Err(SpawnParamsError::BadField("prompt"));
-            }
-        }
-        Ok(())
+        agent_fields_ok(self.model.as_deref(), self.prompt.as_deref())
     }
+}
+
+impl WorktreeAgentAddParams {
+    /// Shape checks that need no filesystem: an absolute worktree path, and
+    /// the same `model` and `prompt` rules as [`WorktreeCreateParams::validate`].
+    /// Whether the path really is a worktree the daemon may use is the
+    /// daemon's own check, against the disk.
+    ///
+    /// # Errors
+    /// The first field that fails, as a [`SpawnParamsError`].
+    pub fn validate(&self) -> Result<(), SpawnParamsError> {
+        if !self.worktree_path.starts_with('/') {
+            return Err(SpawnParamsError::WorktreePathNotAbsolute);
+        }
+        text_ok("worktree_path", &self.worktree_path, 4096)?;
+        agent_fields_ok(self.model.as_deref(), self.prompt.as_deref())
+    }
+}
+
+impl ShellCreateParams {
+    /// Shape checks that need no filesystem: an absolute, bounded path
+    /// without control characters. Whether the daemon may open a shell there
+    /// is its own check, against the disk.
+    ///
+    /// # Errors
+    /// [`SpawnParamsError::WorktreePathNotAbsolute`], or a bad field.
+    pub fn validate(&self) -> Result<(), SpawnParamsError> {
+        if !self.worktree_path.starts_with('/') {
+            return Err(SpawnParamsError::WorktreePathNotAbsolute);
+        }
+        text_ok("worktree_path", &self.worktree_path, 4096)
+    }
+}
+
+/// The `model` and `prompt` rules every spawn verb shares. A prompt may be
+/// long and multi-line, so it is held only to a size bound and no NUL (argv
+/// cannot carry one).
+fn agent_fields_ok(model: Option<&str>, prompt: Option<&str>) -> Result<(), SpawnParamsError> {
+    if let Some(model) = model {
+        text_ok("model", model, SPAWN_FIELD_MAX)?;
+    }
+    if let Some(prompt) = prompt {
+        if prompt.len() > SPAWN_PROMPT_MAX || prompt.contains('\0') {
+            return Err(SpawnParamsError::BadField("prompt"));
+        }
+    }
+    Ok(())
 }
 
 fn text_ok(field: &'static str, value: &str, max: usize) -> Result<(), SpawnParamsError> {
@@ -281,6 +378,81 @@ mod tests {
         )
         .expect("decode with op id");
         assert!(with_op.mutation.op_id.is_some());
+    }
+
+    fn agent_add() -> WorktreeAgentAddParams {
+        WorktreeAgentAddParams {
+            worktree_path: "/home/u/.agents-in-a-box/worktrees/by-name/app--feat--1a2b3c4d".into(),
+            agent: SpawnAgent::Codex,
+            model: None,
+            prompt: Some("-y review it".into()),
+            skip_permissions: false,
+            mutation: crate::mutation::MutationEnvelope::default(),
+        }
+    }
+
+    #[test]
+    fn an_agent_add_needs_an_absolute_worktree_path_and_sane_fields() {
+        assert_eq!(agent_add().validate(), Ok(()));
+        let relative = WorktreeAgentAddParams {
+            worktree_path: "by-name/app".into(),
+            ..agent_add()
+        };
+        assert_eq!(
+            relative.validate(),
+            Err(SpawnParamsError::WorktreePathNotAbsolute)
+        );
+        let control = WorktreeAgentAddParams {
+            worktree_path: "/w/app\n".into(),
+            ..agent_add()
+        };
+        assert_eq!(
+            control.validate(),
+            Err(SpawnParamsError::BadField("worktree_path"))
+        );
+        let nul = WorktreeAgentAddParams {
+            prompt: Some("a\0b".into()),
+            ..agent_add()
+        };
+        assert_eq!(nul.validate(), Err(SpawnParamsError::BadField("prompt")));
+    }
+
+    /// Same sparse, flat wire shape as `worktree/create`.
+    #[test]
+    fn the_agent_add_wire_shape_is_flat_and_sparse() {
+        let minimal =
+            serde_json::json!({"worktree_path": "/w", "agent": "claude", "op_id": "op-1"});
+        let p: WorktreeAgentAddParams = serde_json::from_value(minimal).expect("decode minimal");
+        assert!(p.mutation.op_id.is_some());
+        assert_eq!(
+            serde_json::to_value(WorktreeAgentAddParams {
+                mutation: crate::mutation::MutationEnvelope::default(),
+                ..p
+            })
+            .expect("encode"),
+            serde_json::json!({"worktree_path": "/w", "agent": "claude", "skip_permissions": false})
+        );
+    }
+
+    #[test]
+    fn a_shell_needs_an_absolute_path_without_control_characters() {
+        let shell = |path: &str| ShellCreateParams {
+            worktree_path: path.into(),
+            mutation: crate::mutation::MutationEnvelope::default(),
+        };
+        assert_eq!(shell("/w/app").validate(), Ok(()));
+        assert_eq!(
+            shell("w/app").validate(),
+            Err(SpawnParamsError::WorktreePathNotAbsolute)
+        );
+        assert_eq!(
+            shell("/w/app\u{7}").validate(),
+            Err(SpawnParamsError::BadField("worktree_path"))
+        );
+        let decoded: ShellCreateParams =
+            serde_json::from_value(serde_json::json!({"worktree_path": "/w", "op_id": "op-1"}))
+                .expect("decode");
+        assert!(decoded.mutation.op_id.is_some());
     }
 
     #[test]

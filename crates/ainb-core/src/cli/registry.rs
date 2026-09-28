@@ -3467,6 +3467,31 @@ mod tests {
         assert_eq!(args.repo.as_deref(), Some(std::path::Path::new(".")));
     }
 
+    /// `--existing-worktree` joins a tree some other run made, so every flag
+    /// that picks or makes a tree, and `--name` (starting a tmux session kills
+    /// one already using the name), is refused beside it by clap itself.
+    #[test]
+    fn existing_worktree_conflicts_with_every_tree_flag_and_name() {
+        for (flag, value) in [
+            ("--repo", Some(".")),
+            ("--remote-repo", Some("owner/repo")),
+            ("--worktree", None),
+            ("--create-branch", Some("feat/x")),
+            ("--base", Some("main")),
+            ("--name", Some("first")),
+        ] {
+            let app = CommandRegistry::built_ins().build_clap(root());
+            let mut argv = vec!["ainb", "run", "--existing-worktree", "/w/app", flag];
+            argv.extend(value);
+            let err = app.try_get_matches_from(&argv).expect_err(&format!("{flag} must conflict"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flag}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn label_command_parses_set_and_clear() {
         let app = CommandRegistry::built_ins().build_clap(root());

@@ -840,6 +840,33 @@ impl DaemonClient {
             .await
     }
 
+    /// Add one agent session to an existing worktree (`worktree/agent_add`).
+    ///
+    /// The same CLI run as [`Self::worktree_create`] without the git work,
+    /// bounded the same way, so it waits as long. A daemon without the spawn
+    /// switch answers `METHOD_NOT_FOUND`.
+    pub async fn worktree_agent_add(
+        &self,
+        params: &ainb_hangar_proto::spawn::WorktreeAgentAddParams,
+    ) -> Result<ainb_hangar_proto::spawn::WorktreeCreateResult, DaemonError> {
+        self.call_typed_within(
+            methods::WORKTREE_AGENT_ADD,
+            params,
+            Duration::from_secs(150),
+        )
+        .await
+    }
+
+    /// Open a plain shell tmux session in a repository or an ainb worktree
+    /// (`shell/create`). A daemon without the spawn switch answers
+    /// `METHOD_NOT_FOUND`.
+    pub async fn shell_create(
+        &self,
+        params: &ainb_hangar_proto::spawn::ShellCreateParams,
+    ) -> Result<ainb_hangar_proto::spawn::ShellCreateResult, DaemonError> {
+        self.call_typed(methods::SHELL_CREATE, params).await
+    }
+
     /// Upsert one workspace session into the daemon store.
     pub async fn workspace_session_upsert(
         &self,

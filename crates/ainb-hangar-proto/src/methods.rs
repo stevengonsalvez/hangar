@@ -1828,6 +1828,28 @@ pub const TERMINAL_NOTIFICATION_METHODS: &[&str] = &[TERMINAL_FRAME];
 /// Result: [`crate::spawn::WorktreeCreateResult`].
 pub const WORKTREE_CREATE: &str = "worktree/create";
 
+/// `worktree/agent_add`: one more agent session in a worktree that already
+/// exists, on its current branch.
+///
+/// Dark, like [`WORKTREE_CREATE`]: `METHOD_NOT_FOUND` unless
+/// `AINB_HANGAR_SPAWN` is set at boot, and not in the mutation registry
+/// until its flip PR.
+///
+/// Params: [`crate::spawn::WorktreeAgentAddParams`].
+/// Result: [`crate::spawn::WorktreeCreateResult`].
+pub const WORKTREE_AGENT_ADD: &str = "worktree/agent_add";
+
+/// `shell/create`: a plain shell tmux session, no agent, in a registered
+/// repository or a worktree ainb created.
+///
+/// Dark, like [`WORKTREE_CREATE`]: `METHOD_NOT_FOUND` unless
+/// `AINB_HANGAR_SPAWN` is set at boot, and not in the mutation registry
+/// until its flip PR.
+///
+/// Params: [`crate::spawn::ShellCreateParams`].
+/// Result: [`crate::spawn::ShellCreateResult`].
+pub const SHELL_CREATE: &str = "shell/create";
+
 /// Every daemon method name, in declaration order.
 ///
 /// Single source of truth for the registry tests in this module. The
@@ -2065,6 +2087,8 @@ pub const ALL_METHODS: &[&str] = &[
     HANGAR_ISSUE_CREATE,
     HANGAR_ISSUE_RUN,
     WORKTREE_CREATE,
+    WORKTREE_AGENT_ADD,
+    SHELL_CREATE,
 ];
 
 #[cfg(test)]
@@ -2408,6 +2432,8 @@ mod tests {
             HANGAR_ISSUE_CREATE,
             HANGAR_ISSUE_RUN,
             WORKTREE_CREATE,
+            WORKTREE_AGENT_ADD,
+            SHELL_CREATE,
         ];
         for m in declared {
             assert!(
