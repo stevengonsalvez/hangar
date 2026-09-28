@@ -47,6 +47,15 @@ export function openRowIntent(row: RowId): RendererIntent {
   return { Command: ["session_list.select_row", { target: row, open: true }] };
 }
 
+/**
+ * The intent that selects `row` without attaching it: for a row whose tab is
+ * already open, so the sidebar and the answer banner follow the terminal
+ * that is shown.
+ */
+export function selectRowIntent(row: RowId): RendererIntent {
+  return { Command: ["session_list.select_row", { target: row, open: false }] };
+}
+
 /** Automatic re-attaches before a tab offers "reattach": `REDIAL_DELAYS`. */
 export const REDIALS = 3;
 
