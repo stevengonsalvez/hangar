@@ -589,6 +589,10 @@ pub static SCOPE_TABLE: &[ScopeRow] = &[
     row(m::WORKTREE_AGENT_ADD, A, A, A, D, D),
     // Starts a shell process on the host: the same grant as the spawn verbs.
     row(m::SHELL_CREATE, A, A, A, D, D),
+    // Lists and ends the shells the daemon opened: whoever may open one may
+    // see and close it; phones do neither.
+    row(m::SHELL_LIST, A, A, A, D, D),
+    row(m::SHELL_CLOSE, A, A, A, D, D),
 ];
 
 /// The row for `method`, when it is classified.
