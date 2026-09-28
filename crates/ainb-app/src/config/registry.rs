@@ -1676,6 +1676,9 @@ pub fn validate(key: &str, raw: &str) -> Result<toml::Value> {
             }
         }
         RowKind::List(element) => {
+            if raw.trim_start().starts_with('[') {
+                return list_from_json(key, raw, element);
+            }
             let mut items = Vec::new();
             for item in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 items.push(match element {
@@ -1692,6 +1695,31 @@ pub fn validate(key: &str, raw: &str) -> Result<toml::Value> {
             "'{key}' holds a structured value that cannot be set from the command line; use `ainb config edit`"
         ),
     }
+}
+
+/// A list spelled as a JSON array (`["/a", "/b"]`): the form `ainb config get
+/// --format json` prints, so a value read back can be set again as it is. It
+/// also carries an element with a comma in it, which the comma-separated form
+/// cannot. Anything that opens with `[` is held to this form rather than split
+/// on commas, which stored the JSON text itself as the element.
+fn list_from_json(key: &str, raw: &str, element: ListElement) -> Result<toml::Value> {
+    let items: Vec<serde_json::Value> = serde_json::from_str(raw.trim()).map_err(|e| {
+        anyhow!("'{key}' starts with '[' but is not a JSON array ({e}); pass a JSON array or a comma-separated list")
+    })?;
+    items
+        .into_iter()
+        .map(|item| match (element, item) {
+            (ListElement::Text, serde_json::Value::String(s)) => Ok(toml::Value::String(s)),
+            (ListElement::Text, other) => {
+                bail!("'{key}' takes a JSON array of strings, got {other}")
+            }
+            (ListElement::Integer, other) => match other.as_i64() {
+                Some(n) => Ok(toml::Value::Integer(n)),
+                None => bail!("'{key}' takes whole numbers, got {other}"),
+            },
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(toml::Value::Array)
 }
 
 /// Validate `raw` against the registry, then write it into `root` at `key`.
@@ -2627,6 +2655,47 @@ mod tests {
             value,
             toml::Value::Array(vec![toml::Value::Integer(3000), toml::Value::Integer(5173)])
         );
+    }
+
+    /// `ainb config set workspace_defaults.workspace_scan_paths '["/a"]'` used
+    /// to split on commas and store the JSON text itself as one path.
+    #[test]
+    fn validate_reads_a_json_array_as_the_list_it_spells() {
+        assert_eq!(
+            validate(
+                "workspace_defaults.workspace_scan_paths",
+                r#"["/work/a", "/work/b, c"]"#
+            )
+            .unwrap(),
+            toml::Value::Array(vec![
+                toml::Value::String("/work/a".to_string()),
+                toml::Value::String("/work/b, c".to_string()),
+            ])
+        );
+        assert_eq!(
+            validate("workspace_defaults.workspace_scan_paths", " [] ").unwrap(),
+            toml::Value::Array(Vec::new())
+        );
+        assert_eq!(
+            validate("container_templates.node.config.ports", "[3000, 5173]").unwrap(),
+            toml::Value::Array(vec![toml::Value::Integer(3000), toml::Value::Integer(5173)])
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_json_array_of_the_wrong_shape() {
+        let err = validate("workspace_defaults.workspace_scan_paths", r#"["/a", 1]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("strings"), "{err}");
+        let err = validate("container_templates.node.config.ports", r#"["3000"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whole numbers"), "{err}");
+        let err = validate("workspace_defaults.workspace_scan_paths", r#"["/a""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("JSON array"), "{err}");
     }
 
     #[test]
