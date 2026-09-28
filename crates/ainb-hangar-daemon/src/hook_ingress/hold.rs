@@ -267,6 +267,11 @@ struct Slot {
     /// Bumped per registration, so a waiter left over from an earlier hold
     /// under the same key can never remove a newer one.
     generation: u64,
+    /// Live [`Waiter`]s on this hold. Counted here, under the registry lock,
+    /// rather than read from the channel's receiver count: the last waiter
+    /// out frees the slot, and that must not depend on who else holds a
+    /// receiver.
+    waiters: usize,
     request: HeldRequest,
     tx: watch::Sender<Option<HoldDecision>>,
 }
@@ -302,6 +307,9 @@ pub struct Waiter {
     registry: &'static HoldRegistry,
     key: HoldKey,
     generation: u64,
+    /// Whether this waiter is still counted in its slot's `waiters`. A
+    /// timeout uncounts it at once; `Drop` uncounts it only if nothing did.
+    counted: bool,
     rx: watch::Receiver<Option<HoldDecision>>,
     request: HeldRequest,
 }
@@ -333,14 +341,16 @@ impl HoldRegistry {
         request: HeldRequest,
     ) -> Option<Waiter> {
         let mut inner = self.lock();
-        if let Some(slot) = inner.slots.get(key) {
+        if let Some(slot) = inner.slots.get_mut(key) {
             if slot.attention_id != attention_id {
                 return None;
             }
+            slot.waiters += 1;
             return Some(Waiter {
                 registry: self,
                 key: key.clone(),
                 generation: slot.generation,
+                counted: true,
                 rx: slot.tx.subscribe(),
                 request: slot.request.clone(),
             });
@@ -357,6 +367,7 @@ impl HoldRegistry {
                 attention_id: attention_id.to_string(),
                 fingerprint: fingerprint.map(str::to_string),
                 generation,
+                waiters: 1,
                 request: request.clone(),
                 tx,
             },
@@ -366,6 +377,7 @@ impl HoldRegistry {
             registry: self,
             key: key.clone(),
             generation,
+            counted: true,
             rx,
             request,
         })
@@ -450,14 +462,11 @@ impl Drop for Waiter {
     /// cancelled) frees the slot once it was the last one on that hold, and
     /// only if the slot is still the one it waited on.
     fn drop(&mut self) {
-        let mut inner = self.registry.lock();
-        if inner
-            .slots
-            .get(&self.key)
-            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
-        {
-            inner.remove(&self.key);
+        if !self.counted {
+            return;
         }
+        let mut inner = self.registry.lock();
+        self.uncount(&mut inner);
     }
 }
 
@@ -511,7 +520,7 @@ impl Waiter {
         .await
     }
 
-    fn settle(self, got: Waited) -> HoldEnd {
+    fn settle(mut self, got: Waited) -> HoldEnd {
         match got {
             Ok(Some(d)) => HoldEnd::Decided(self.request.clone(), d),
             Ok(None) => HoldEnd::Released,
@@ -524,19 +533,35 @@ impl Waiter {
     /// after the timer fired is honoured, since `resolve` has already
     /// reported it delivered. Otherwise the slot goes now, so no later
     /// `resolve` can report a delivery this hook never prints.
-    fn time_out(&self) -> HoldEnd {
+    fn time_out(&mut self) -> HoldEnd {
         let mut inner = self.registry.lock();
         if let Some(d) = self.rx.borrow().clone() {
             return HoldEnd::Decided(self.request.clone(), d);
         }
-        if inner
-            .slots
-            .get(&self.key)
-            .is_some_and(|slot| slot.generation == self.generation && slot.tx.receiver_count() <= 1)
-        {
+        // Uncounted now, not when this waiter is dropped: two joined hooks
+        // that both time out before either drops must still free the slot.
+        self.uncount(&mut inner);
+        HoldEnd::TimedOut
+    }
+
+    /// Take this waiter out of its slot's count, once, under the registry
+    /// lock; the last one out frees the slot. A slot of a newer generation
+    /// under the same key is not this waiter's and is left alone.
+    fn uncount(&mut self, inner: &mut Inner) {
+        if !std::mem::replace(&mut self.counted, false) {
+            return;
+        }
+        let Some(slot) = inner.slots.get_mut(&self.key) else {
+            return;
+        };
+        if slot.generation != self.generation {
+            return;
+        }
+        debug_assert!(slot.waiters > 0, "a counted waiter is in the count");
+        slot.waiters -= 1;
+        if slot.waiters == 0 {
             inner.remove(&self.key);
         }
-        HoldEnd::TimedOut
     }
 }
 
@@ -694,6 +719,72 @@ mod tests {
             !reg.resolve("att-1", HoldDecision::Allow { message: None }),
             "one decision only"
         );
+    }
+
+    /// A duplicate hook that times out leaves the hold to the one still
+    /// waiting on it: the slot stays, the answer reaches the other hook, and
+    /// the last waiter out frees it.
+    #[tokio::test]
+    async fn a_timed_out_waiter_leaves_the_hold_to_the_one_still_waiting() {
+        let reg = leaked();
+        let key = HoldKey::new("s", "w1");
+        let mut first = reg.register(&key, "att-w1", None, HeldRequest::Permission).unwrap();
+        let second = reg.register(&key, "att-w1", None, HeldRequest::Permission).unwrap();
+        let got = first.next_decision(Duration::from_millis(1)).await;
+        assert_eq!(first.settle(got), HoldEnd::TimedOut);
+        assert_eq!(reg.len(), 1, "the other hook still waits");
+        assert!(reg.resolve("att-w1", HoldDecision::Allow { message: None }));
+        assert_eq!(
+            second.wait(Duration::from_secs(1)).await,
+            HoldEnd::Decided(
+                HeldRequest::Permission,
+                HoldDecision::Allow { message: None }
+            )
+        );
+        assert!(reg.is_empty());
+    }
+
+    /// Review of #210: two joined hooks that both time out before either is
+    /// dropped. Each is taken out of the count as it times out, so the second
+    /// frees the slot and a late answer delivers nothing.
+    #[tokio::test]
+    async fn two_joined_waiters_that_both_time_out_free_the_hold() {
+        let reg = leaked();
+        let key = HoldKey::new("s", "w2");
+        let mut a = reg.register(&key, "att-w2", None, HeldRequest::Permission).unwrap();
+        let mut b = reg.register(&key, "att-w2", None, HeldRequest::Permission).unwrap();
+        assert!(a.next_decision(Duration::from_millis(1)).await.is_err());
+        assert!(b.next_decision(Duration::from_millis(1)).await.is_err());
+        assert_eq!(a.time_out(), HoldEnd::TimedOut);
+        assert_eq!(b.time_out(), HoldEnd::TimedOut);
+        assert!(
+            !reg.resolve("att-w2", HoldDecision::Allow { message: None }),
+            "neither hook will print it"
+        );
+        assert!(reg.is_empty());
+        drop((a, b));
+        assert!(reg.is_empty());
+    }
+
+    /// Review of #210: a waiter that timed out but is not yet dropped no
+    /// longer counts. With one of three timed out and another dropped, the
+    /// third is the last: its timeout frees the slot.
+    #[tokio::test]
+    async fn a_timed_out_waiter_not_yet_dropped_no_longer_counts() {
+        let reg = leaked();
+        let key = HoldKey::new("s", "w3");
+        let mut a = reg.register(&key, "att-w3", None, HeldRequest::Permission).unwrap();
+        let b = reg.register(&key, "att-w3", None, HeldRequest::Permission).unwrap();
+        let mut c = reg.register(&key, "att-w3", None, HeldRequest::Permission).unwrap();
+        assert!(a.next_decision(Duration::from_millis(1)).await.is_err());
+        assert_eq!(a.time_out(), HoldEnd::TimedOut);
+        drop(b);
+        assert_eq!(reg.len(), 1, "c still waits");
+        assert!(c.next_decision(Duration::from_millis(1)).await.is_err());
+        assert_eq!(c.time_out(), HoldEnd::TimedOut);
+        assert!(!reg.resolve("att-w3", HoldDecision::Allow { message: None }));
+        assert!(reg.is_empty());
+        drop((a, c));
     }
 
     #[tokio::test]
