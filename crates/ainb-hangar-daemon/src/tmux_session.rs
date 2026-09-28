@@ -54,18 +54,21 @@ pub fn strip_daemon_secrets(cmd: &mut Command) -> &mut Command {
 /// holds only those variables for every later pane on it). `start_dir` is
 /// escaped once here ([`tmux_literal_dir`]).
 ///
+/// Either way the session then marks the secrets removed from its own
+/// environment, so a window opened in it later starts without them too. tmux
+/// runs the whole command line before it reaps a pane, so a command that
+/// exits at once does not fail that step.
+///
 /// With `argv`, the pane runs `env -u <secret>… argv`, executed directly (no
 /// shell; tmux 3.0 or later), so a server that already holds a secret does
-/// not pass it on. A window opened later in that session is not covered:
-/// marking the session would be one more command after the create, and a
-/// run that exits at once would make it fail.
+/// not pass it on to the first pane.
 ///
-/// Without `argv`, the pane is the server's default shell: the session then
-/// drops the secrets from its environment and the pane is respawned once, so
-/// the shell (and every later pane in the session) starts without them. The
-/// first shell may have read its rc files before it is replaced. If that
-/// tail fails, tmux exits non-zero with the session already made, so the
-/// caller must remove it.
+/// Without `argv`, the pane is the server's default shell, respawned once
+/// the session has dropped the secrets, so the shell starts without them.
+/// The first shell may have read its rc files before it is replaced.
+///
+/// If a step after the create fails, tmux exits non-zero with the session
+/// already made, so the caller must remove it.
 #[must_use]
 pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsString]) -> Command {
     let mut tmux = Command::new("tmux");
@@ -78,18 +81,19 @@ pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsS
     strip_daemon_secrets(&mut tmux);
     let start_dir = tmux_literal_dir(start_dir);
     tmux.args(["new-session", "-d", "-s", name, "-c", &start_dir]).args(extra);
-    if argv.is_empty() {
-        let session = format!("={name}");
-        for secret in DAEMON_SECRETS {
-            tmux.args([";", "set-environment", "-t", &session, "-r", secret]);
-        }
-        tmux.args([";", "respawn-pane", "-k", "-t", &format!("{session}:")]);
-    } else {
+    if !argv.is_empty() {
         tmux.args(["--", "env"]);
         for secret in DAEMON_SECRETS {
             tmux.args(["-u", secret]);
         }
         tmux.args(argv);
+    }
+    let session = format!("={name}");
+    for secret in DAEMON_SECRETS {
+        tmux.args([";", "set-environment", "-t", &session, "-r", secret]);
+    }
+    if argv.is_empty() {
+        tmux.args([";", "respawn-pane", "-k", "-t", &format!("{session}:")]);
     }
     tmux
 }
@@ -117,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_runs_under_env_without_the_secrets() {
+    fn a_command_runs_under_env_and_its_session_drops_the_secrets() {
         let cmd = tmux_new_session(
             "tmux_hangar-1",
             "/w/a#b",
@@ -143,6 +147,18 @@ mod tests {
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "/logs/wrapper",
                 "arg",
+                ";",
+                "set-environment",
+                "-t",
+                "=tmux_hangar-1",
+                "-r",
+                "HANGAR_CLAUDE_OAUTH_TOKEN",
+                ";",
+                "set-environment",
+                "-t",
+                "=tmux_hangar-1",
+                "-r",
+                "CLAUDE_CODE_OAUTH_TOKEN",
             ]
         );
     }
