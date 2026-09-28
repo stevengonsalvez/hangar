@@ -16,7 +16,9 @@ use uuid::Uuid;
 use super::OutputFormat;
 use crate::cli::util::{find_session, load_session_store};
 use crate::git::{WorktreeInfo, WorktreeManager};
-use crate::interactive::session_manager::SessionStore;
+use crate::interactive::session_manager::{
+    SessionStore, SessionTreeRemoval, remove_session_worktree,
+};
 
 /// Manage git worktrees + inspect session changes. Description set in `cli/registry.rs`.
 #[derive(Subcommand)]
@@ -228,10 +230,19 @@ fn cmd_cleanup(force: bool, dry_run: bool, format: OutputFormat) -> Result<()> {
     let mut removed = 0u32;
     let mut errors = 0u32;
     for (id, info) in &orphans {
-        match manager.remove_worktree(*id) {
-            Ok(()) => {
+        // An orphaned link can still point at a tree a live session joined
+        // with `--existing-worktree`: that tree stays, only the link goes.
+        match remove_session_worktree(&manager, &store, *id) {
+            Ok(SessionTreeRemoval::Removed(_)) => {
                 removed += 1;
                 println!("  Removed: {}", info.path.display());
+            }
+            Ok(SessionTreeRemoval::KeptShared(_)) => {
+                removed += 1;
+                println!(
+                    "  Unlinked: {} (another session still uses it)",
+                    info.path.display()
+                );
             }
             Err(e) => {
                 errors += 1;
@@ -776,5 +787,73 @@ mod tests {
         // Not a git repository
         let result = build_status_report("session-id", "ws", tmp.path());
         assert!(result.is_err());
+    }
+
+    /// A link whose session is gone reads as an orphan, but a session that
+    /// joined the tree with `--existing-worktree` is still in it: cleanup
+    /// takes the link and leaves the tree.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_keeps_an_orphan_link_target_another_session_uses() {
+        let _env = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("AINB_HOME", v),
+                    None => std::env::remove_var("AINB_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("AINB_HOME"));
+        std::env::set_var("AINB_HOME", home.path());
+
+        let git = |cwd: &Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t.invalid"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "init.defaultBranch=main",
+                ])
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(ok, "git {args:?}");
+        };
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init"]);
+        git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let base = home.path().join(".agents-in-a-box").join("worktrees");
+        std::fs::create_dir_all(base.join("by-name")).unwrap();
+        std::fs::create_dir_all(base.join("by-session")).unwrap();
+        let tree = base.join("by-name").join("repo--feat--1a2b3c4d");
+        git(
+            &repo,
+            &["worktree", "add", "-b", "feat", tree.to_str().unwrap()],
+        );
+        let (gone, joined) = (Uuid::new_v4(), Uuid::new_v4());
+        std::os::unix::fs::symlink(&tree, base.join("by-session").join(gone.to_string())).unwrap();
+
+        let mut store = SessionStore::default();
+        let mut row = make_metadata(joined, "ainb-joined", "repo");
+        row.worktree_path = tree.clone();
+        store.upsert(row);
+        store.save().unwrap();
+
+        cmd_cleanup(true, false, OutputFormat::Text).unwrap();
+        assert!(
+            tree.join(".git").is_file(),
+            "cleanup removed a tree a session is in"
+        );
+        assert!(std::fs::symlink_metadata(base.join("by-session").join(gone.to_string())).is_err());
     }
 }
