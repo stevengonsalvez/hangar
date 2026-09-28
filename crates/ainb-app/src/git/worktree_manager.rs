@@ -221,18 +221,7 @@ impl WorktreeManager {
             WorktreeError::NotFound(format!("Session {session_id} worktree not found"))
         })?;
 
-        // Get the original repository path to remove worktree properly
-        if let Ok(repo) = Repository::open(&worktree_path) {
-            if repo.workdir().is_some() {
-                let main_repo_path = self.find_main_repository(&repo)?;
-
-                // Use git command to remove worktree
-                self.remove_worktree_command(&main_repo_path, &worktree_path)?;
-            }
-        } else {
-            // If we can't open as repo, just remove the directory
-            std::fs::remove_dir_all(&worktree_path)?;
-        }
+        self.remove_tree(&worktree_path)?;
 
         // Remove the session symlink if it exists
         if session_path.is_symlink() || session_path.exists() {
@@ -240,6 +229,46 @@ impl WorktreeManager {
         }
 
         info!("Successfully removed worktree: {}", worktree_path.display());
+        Ok(())
+    }
+
+    /// `path`, resolved, when it is a tree this manager made: a folder directly
+    /// in `by-name`. `None` for anything else, including a path that no longer
+    /// exists.
+    pub fn managed_tree(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = std::fs::canonicalize(path).ok()?;
+        let by_name = self.base_worktree_dir.join("by-name");
+        ainb_hangar_daemon::spawn::is_managed_tree(&canonical, &by_name).then_some(canonical)
+    }
+
+    /// Remove a tree this manager made that no `by-session` link names: the
+    /// tree a session joined with `ainb run --existing-worktree` is left
+    /// holding once the session that made it is gone.
+    ///
+    /// Refused as `NotFound` unless `path` is a [`Self::managed_tree`], so a
+    /// session row that points at the user's own checkout can never reach
+    /// the delete.
+    pub fn remove_managed_tree(&self, path: &Path) -> Result<(), WorktreeError> {
+        let tree = self.managed_tree(path).ok_or_else(|| {
+            WorktreeError::NotFound(format!("not a worktree ainb created: {}", path.display()))
+        })?;
+        self.remove_tree(&tree)?;
+        info!("Removed worktree: {}", tree.display());
+        Ok(())
+    }
+
+    /// Remove the checkout at `worktree_path`: through `git worktree remove`
+    /// when git can open it, so its repository forgets it too, else the
+    /// directory itself.
+    fn remove_tree(&self, worktree_path: &Path) -> Result<(), WorktreeError> {
+        if let Ok(repo) = Repository::open(worktree_path) {
+            if repo.workdir().is_some() {
+                let main_repo_path = self.find_main_repository(&repo)?;
+                self.remove_worktree_command(&main_repo_path, worktree_path)?;
+            }
+        } else {
+            std::fs::remove_dir_all(worktree_path)?;
+        }
         Ok(())
     }
 
