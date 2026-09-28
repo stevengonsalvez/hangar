@@ -151,8 +151,19 @@ impl TmuxSession {
         // initial command: it is respawned below, once the option is in place.
         // Passing it here would race the option against a CLI that exits in
         // under a second, which is the whole case this exists for.
+        // The program runs without the daemon's OAuth token, and the session
+        // marks it removed, so a server that already holds it (started by a
+        // process that had it) passes it to neither this pane nor a window
+        // opened here later. One list: `ainb_hangar_daemon::tmux_session`.
+        let program = ainb_hangar_daemon::tmux_session::without_daemon_secrets(&self.program);
         if !self.remain_on_exit {
-            args.push(self.program.clone());
+            args.push(program.clone());
+        }
+        let exact = format!("={}", self.sanitized_name);
+        for secret in ainb_hangar_daemon::tmux_session::DAEMON_SECRETS {
+            args.extend(
+                [";", "set-environment", "-t", exact.as_str(), "-r", secret].map(String::from),
+            );
         }
         // Every tmux call while starting has its stdout dropped (errors still
         // reach stderr): none prints anything a person needs, and `ainb
@@ -165,6 +176,9 @@ impl TmuxSession {
             .context("Failed to start tmux session")?;
 
         if !status.success() {
+            // The create may have landed before the scrub after it failed;
+            // leave no session behind under a name the caller now owns.
+            let _ = self.cleanup().await;
             anyhow::bail!("Failed to create tmux session '{}'", self.sanitized_name);
         }
 
@@ -193,7 +207,7 @@ impl TmuxSession {
             // `-k` kills the holder shell. The pane keeps the cwd it was created
             // with, so `-c` is not needed here.
             let status = Command::new("tmux")
-                .args(["respawn-pane", "-k", "-t", &target, &self.program])
+                .args(["respawn-pane", "-k", "-t", &target, &program])
                 .stdout(std::process::Stdio::null())
                 .status()
                 .await
@@ -392,5 +406,117 @@ mod tests {
         let session = TmuxSession::new("test".to_string(), "bash".to_string());
         assert_eq!(session.name(), "tmux_test");
         assert!(matches!(session.attach_state, AttachState::Detached));
+    }
+
+    /// An agent pane started on a tmux server that already holds the
+    /// daemon's OAuth token (a server some process with the token started)
+    /// has neither token in its environment, and the session marks both
+    /// removed for any window opened in it later. On a private server.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_agent_pane_on_a_server_holding_the_token_gets_neither() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const SECRETS: [(&str, &str); 2] = [
+            ("HANGAR_CLAUDE_OAUTH_TOKEN", "sk-ant-oat-session-override"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-session-child"),
+        ];
+        let tmux_here = std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !tmux_here {
+            assert!(std::env::var_os("CI").is_none(), "tmux is missing under CI");
+            return;
+        }
+        let mut home = crate::test_home::ScopedHome::new();
+        // Under /tmp: macOS caps unix socket paths at 104 bytes.
+        let tmux_tmp = tempfile::Builder::new().prefix("ainb-tss-").tempdir_in("/tmp").unwrap();
+        let uid = std::fs::metadata(tmux_tmp.path()).unwrap().uid();
+        let socket_dir = tmux_tmp.path().join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = socket_dir.join("default");
+        home.set("TMUX_TMPDIR", tmux_tmp.path());
+        home.unset("TMUX");
+        home.set("SHELL", "/bin/sh");
+        home.set("XDG_CONFIG_HOME", home.path().join("config"));
+
+        let pid = std::process::id();
+        let base = format!("tss-base-{pid}");
+        let agent = format!("tss-agent-{pid}");
+        let agent_session = TmuxSession::sanitize_name(&agent);
+        struct KillExact(std::path::PathBuf, Vec<String>);
+        impl Drop for KillExact {
+            fn drop(&mut self) {
+                for name in &self.1 {
+                    eprintln!("killing {name} on {}", self.0.display());
+                    let _ = std::process::Command::new("tmux")
+                        .env_remove("TMUX")
+                        .arg("-S")
+                        .arg(&self.0)
+                        .args(["kill-session", "-t", &format!("={name}")])
+                        .output();
+                }
+            }
+        }
+        let _cleanup = KillExact(socket.clone(), vec![base.clone(), agent_session.clone()]);
+        let tmux = |args: &[&str]| {
+            std::process::Command::new("tmux")
+                .env_remove("TMUX")
+                .arg("-S")
+                .arg(&socket)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let started = std::process::Command::new("tmux")
+            .env_remove("TMUX")
+            .envs(SECRETS)
+            .arg("-S")
+            .arg(&socket)
+            .args(["new-session", "-d", "-s", &base])
+            .output()
+            .unwrap();
+        assert!(started.status.success(), "{started:?}");
+        let global =
+            String::from_utf8_lossy(&tmux(&["show-environment", "-g"]).stdout).into_owned();
+        assert!(
+            global.contains(SECRETS[0].1),
+            "the server holds the token: {global}"
+        );
+
+        let dump = home.path().join("agent.env");
+        let program = format!("export AINB_TSS=1 && env > '{}'; sleep 30", dump.display());
+        let mut session = TmuxSession::new(agent.clone(), program);
+        session.start(home.path()).await.expect("the agent session starts");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let env = loop {
+            let env = std::fs::read_to_string(&dump).unwrap_or_default();
+            if env.contains("PATH=") {
+                break env;
+            }
+            assert!(std::time::Instant::now() < deadline, "the pane never ran");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            env.contains("AINB_TSS=1"),
+            "the program line ran whole: {env}"
+        );
+        for (name, value) in SECRETS {
+            assert!(
+                !env.contains(name) && !env.contains(value),
+                "{name} reached the agent pane"
+            );
+        }
+        let marked = tmux(&["show-environment", "-t", &format!("={agent_session}")]);
+        let marked = String::from_utf8_lossy(&marked.stdout);
+        for (name, _) in SECRETS {
+            assert!(
+                marked.contains(&format!("-{name}")),
+                "the session keeps {name}: {marked}"
+            );
+        }
     }
 }
