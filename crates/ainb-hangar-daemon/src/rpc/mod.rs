@@ -5935,6 +5935,18 @@ mod fleet_launch_tests {
                 "unix:///tmp/codex.sock",
                 "resume",
                 "thread-1",
+                ";",
+                "set-environment",
+                "-t",
+                "=fleet-codex-thread-1",
+                "-r",
+                "HANGAR_CLAUDE_OAUTH_TOKEN",
+                ";",
+                "set-environment",
+                "-t",
+                "=fleet-codex-thread-1",
+                "-r",
+                "CLAUDE_CODE_OAUTH_TOKEN",
             ]
             .into_iter()
             .map(OsString::from)
