@@ -228,6 +228,7 @@ fn cmd_cleanup(force: bool, dry_run: bool, format: OutputFormat) -> Result<()> {
     }
 
     let mut removed = 0u32;
+    let mut unlinked = 0u32;
     let mut errors = 0u32;
     for (id, info) in &orphans {
         // An orphaned link can still point at a tree a live session joined
@@ -238,7 +239,7 @@ fn cmd_cleanup(force: bool, dry_run: bool, format: OutputFormat) -> Result<()> {
                 println!("  Removed: {}", info.path.display());
             }
             Ok(SessionTreeRemoval::KeptShared(_)) => {
-                removed += 1;
+                unlinked += 1;
                 println!(
                     "  Unlinked: {} (another session still uses it)",
                     info.path.display()
@@ -252,7 +253,9 @@ fn cmd_cleanup(force: bool, dry_run: bool, format: OutputFormat) -> Result<()> {
     }
 
     println!();
-    println!("Cleanup complete: {removed} removed, {errors} error(s).");
+    println!(
+        "Cleanup complete: {removed} removed, {unlinked} unlinked (tree still in use), {errors} error(s)."
+    );
     Ok(())
 }
 
