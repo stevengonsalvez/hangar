@@ -29,3 +29,14 @@ test("every tab activation, a person's or the host's, selects that tab's row", (
   assert.match(activate, /const select = selectIntentFor\(tabs\(\), key\);/);
   assert.match(activate, /if \(select !== null\) dispatch\(select\);/);
 });
+
+test("the create flow reads the window's session list and selects through the reducer", () => {
+  assert.ok(MAIN.includes("sessions: () => sessions(),"), "the flow must see the frames the window draws");
+  assert.match(MAIN, /select: \(sessionId\) => dispatch\(selectRowIntent\(\{ session: sessionId \}\)\)/);
+});
+
+test("the answer banner is remounted when the shown terminal changes", () => {
+  // Keyed by the shown session, so a latched banner does not hold the last
+  // session's question over the next pane for its grace.
+  assert.match(MAIN, /<For each=\{\[shownSession\(\)\]\}>\s*\{\(\) => <AnswerSlot /);
+});
