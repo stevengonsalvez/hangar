@@ -50,7 +50,9 @@ import type { SetupView, SetupWrite } from "../../bindings/Desktop.ts";
 import {
   openRowIntent,
   rowOf,
+  selectIntentFor,
   selectRowIntent,
+  shownSessionOf,
   stepTab,
   modalBlocks,
   shellKeydown,
@@ -230,6 +232,10 @@ function Shell() {
   const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
+      // The session list follows the shown terminal, whoever showed it, so
+      // the sidebar row and the answer banner are that session's.
+      const select = selectIntentFor(tabs(), key);
+      if (select !== null) dispatch(select);
       setPane("terminal");
       closeTranscript();
       closeSettings();
@@ -354,10 +360,7 @@ function Shell() {
     else sidebar?.focus();
   };
   const choose = (tab: Tab) => {
-    composer.release();
-    // The session list follows the terminal a person shows, so the sidebar
-    // row and the answer banner are that session's, not the last row clicked.
-    dispatch(tab.state === "detached" ? openRowIntent(rowOf(tab.target)) : selectRowIntent(rowOf(tab.target)));
+    if (tab.state === "detached") openRow(rowOf(tab.target));
     activate(tab.key, false);
   };
   /** Open the palette, or close it the way Esc does: the titlebar's search
@@ -436,10 +439,7 @@ function Shell() {
   window.addEventListener("keydown", onKey);
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
-  const openSession = (id: string) => {
-    composer.release();
-    openRow({ session: id });
-  };
+  const openSession = (id: string) => openRow({ session: id });
 
   onMount(async () => {
     setSidecar(await invoke<SidecarState>("sidecar_state"));
@@ -515,11 +515,7 @@ function Shell() {
   const question = createMemo(() => questionFor(sessions()));
   /** The session whose terminal the work area shows: `undefined` when no
    * terminal is shown, `null` for a tab of no session (`questionOver`). */
-  const shownSession = createMemo(() => {
-    if (!showing("terminal")) return undefined;
-    const target = tabs().find((tab) => tab.key === active())?.target;
-    return target?.kind === "session" ? target.id : null;
-  });
+  const shownSession = createMemo(() => shownSessionOf(showing("terminal"), tabs(), active()));
 
   // The reducer speaks through its notices: a refused send says why in the
   // reducer's own words (a daemon that is gone, a native picker, nothing typed),
