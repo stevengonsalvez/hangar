@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::OutputFormat;
 use super::util::{load_session_store, mutate_session_store};
-use crate::interactive::session_manager::{SessionMetadata, SessionStore};
+use crate::interactive::session_manager::{SessionMetadata, SessionStore, remove_session_worktree};
 use crate::models::session::SessionAgentType;
 
 /// Recover orphaned or crashed sessions. Description set in `cli/registry.rs`.
@@ -496,11 +496,14 @@ fn cleanup_single_orphan(orphan: &OrphanedSession) -> Result<()> {
         }
     }
 
-    // 2. Remove worktree via WorktreeManager if session ID is a valid UUID
+    // 2. Remove the worktree if the session ID is a valid UUID, unless another
+    // session still works in it. The store is read here, per orphan, so a
+    // session this pass already cleaned no longer counts as a user.
     if let Ok(uuid) = Uuid::parse_str(&orphan.id) {
         if let Ok(wm) = crate::git::WorktreeManager::new() {
-            // Ignore errors — worktree may already be gone
-            let _ = wm.remove_worktree(uuid);
+            let store = load_session_store().context("Failed to load session store")?;
+            // Ignore other errors: the worktree may already be gone.
+            let _ = remove_session_worktree(&wm, &store, uuid);
         }
     }
 
@@ -882,5 +885,69 @@ mod tests {
         assert_eq!(cloned.id, "clone-test-id");
         assert!(!cloned.is_tmux_alive);
         assert_eq!(cloned.worktree_path, Some("/tmp/clone-test".to_string()));
+    }
+
+    /// Two stale sessions in one tree: the maker, with its `by-session`
+    /// link, and one that joined with `--existing-worktree`, without. The
+    /// first cleaned must leave the tree for the other, the last takes it.
+    #[cfg(unix)]
+    #[test]
+    fn cleaning_up_a_shared_tree_keeps_it_until_the_last_session() {
+        let _env = crate::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("AINB_HOME", v),
+                    None => std::env::remove_var("AINB_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("AINB_HOME"));
+        std::env::set_var("AINB_HOME", home.path());
+
+        let base = home.path().join(".agents-in-a-box").join("worktrees");
+        let tree = base.join("by-name").join("repo--feat--1a2b3c4d");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("work.txt"), "in progress").unwrap();
+        let (maker, joined) = (Uuid::new_v4(), Uuid::new_v4());
+        std::fs::create_dir_all(base.join("by-session")).unwrap();
+        std::os::unix::fs::symlink(&tree, base.join("by-session").join(maker.to_string())).unwrap();
+
+        let mut store = SessionStore::default();
+        for (id, tmux) in [(maker, "ainb-maker"), (joined, "ainb-joined")] {
+            let mut row = create_test_session(tmux, "repo");
+            row.session_id = id;
+            row.worktree_path = tree.clone();
+            store.upsert(row);
+        }
+        store.save().unwrap();
+        let stale = |id: Uuid, tmux: &str| OrphanedSession {
+            id: id.to_string(),
+            source: OrphanSource::StaleMetadata,
+            tmux_session_name: Some(tmux.to_string()),
+            is_tmux_alive: false,
+            worktree_path: Some(tree.display().to_string()),
+            workspace_name: Some("repo".to_string()),
+            created_at: None,
+            file_path: Some(SessionStore::storage_path().display().to_string()),
+        };
+
+        cleanup_single_orphan(&stale(maker, "ainb-maker")).unwrap();
+        assert!(
+            tree.join("work.txt").is_file(),
+            "cleaning the maker removed a tree in use"
+        );
+        assert!(SessionStore::load().find_by_tmux_name("ainb-joined").is_some());
+
+        cleanup_single_orphan(&stale(joined, "ainb-joined")).unwrap();
+        assert!(
+            !tree.exists(),
+            "the last session's cleanup left the tree behind"
+        );
+        assert!(SessionStore::load().sessions().is_empty());
     }
 }
