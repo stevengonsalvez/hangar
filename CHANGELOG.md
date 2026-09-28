@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - the session list (TUI and desktop) is now ordered newest first: projects and worktrees by their newest session, a worktree's sessions kept together, instead of tmux's alphabetical order; next/previous session walk the same order
 
+### Fixed
+- `ainb config set`: list values starting with `[` now parse as JSON, so `ainb config set workspace_defaults.workspace_scan_paths '["~/code"]'` stores the path instead of the literal text, and `ainb --format json config get` output can be set back unchanged
+
 ## [1.28.5] - 2026-09-13
 ### Fixed
 - expire stale sidebar run state
