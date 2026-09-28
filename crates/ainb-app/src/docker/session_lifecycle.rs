@@ -361,10 +361,14 @@ impl SessionLifecycleManager {
             info!("Removed container for session {}", session_id);
         }
 
-        // Remove worktree
+        // Remove worktree, unless another session still works in it.
         if session_state.worktree_info.is_some() {
-            self.worktree_manager.remove_worktree(session_id)?;
-            info!("Removed worktree for session {}", session_id);
+            let removal = crate::interactive::session_manager::remove_session_worktree_now(
+                &self.worktree_manager,
+                session_id,
+            )
+            .await?;
+            info!("Worktree for session {}: {:?}", session_id, removal);
         }
 
         info!("Successfully removed session {}", session_id);
