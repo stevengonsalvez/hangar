@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import {
+  addProject,
   branchPreview,
   initialFields,
   loadRegisteredProjects,
@@ -70,13 +71,36 @@ export function Composer(props: Props) {
   // Read per open (this is mounted only while open), so a folder registered
   // since the last open is offered. It lands after the first paint: a blank
   // project is filled then, a picked one is left alone.
-  const [registered] = createResource(loadRegisteredProjects, { initialValue: [] });
+  const [registered, { mutate: setRegistered }] = createResource(loadRegisteredProjects, { initialValue: [] });
   const projects = createMemo(() => projectChoices(props.sessions, registered()));
   createEffect(() => {
     const first = projects()[0]?.path;
     if (first !== undefined && untrack(fields).projectPath === "") set("projectPath", first);
   });
   const preview = createMemo(() => branchPreview(fields().name));
+
+  // Add project: the host opens the OS folder picker and registers the pick,
+  // so a create from it is accepted. The new project is listed and chosen;
+  // a cancelled picker changes nothing; a refusal says why under the field.
+  const [adding, setAdding] = createSignal(false);
+  const [addError, setAddError] = createSignal<string | null>(null);
+  const onAddProject = () => {
+    if (adding()) return;
+    setAdding(true);
+    setAddError(null);
+    addProject().then(
+      (project) => {
+        setAdding(false);
+        if (project === null) return;
+        setRegistered((current) => [...(current ?? []).filter((known) => known.path !== project.path), project]);
+        set("projectPath", project.path);
+      },
+      (error: unknown) => {
+        setAdding(false);
+        setAddError(String(error));
+      },
+    );
+  };
 
   const submit = (event: Event) => {
     event.preventDefault();
@@ -163,6 +187,7 @@ export function Composer(props: Props) {
             <For each={projects()}>{(project) => <option value={project.path}>{project.name}</option>}</For>
           </select>
           <Show when={errorFor("projectPath")}>{(message) => <p class="composer-error">{message()}</p>}</Show>
+          <Show when={addError()}>{(message) => <p class="composer-error composer-add-error">{message()}</p>}</Show>
           {/* Nothing to pick, once the host has answered: say how to register
               a folder rather than leaving only "Choose a project." */}
           <Show when={projects().length === 0 && !registered.loading}>
@@ -173,6 +198,14 @@ export function Composer(props: Props) {
             </p>
           </Show>
         </label>
+        <button
+          type="button"
+          class="composer-add-project"
+          disabled={creating() || adding()}
+          onClick={onAddProject}
+        >
+          Add project…
+        </button>
 
         <label class="composer-field">
           <span class="composer-label">Name</span>
