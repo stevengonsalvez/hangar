@@ -228,6 +228,14 @@ async fn a_command_on_a_server_holding_the_secrets_gets_neither() {
         .await;
 
     assert_no_secret(&read_env(&dump), "the command's pane");
+    let later = world.tmux(&["show-environment", "-t", &format!("={name}")]);
+    let later = String::from_utf8_lossy(&later.stdout);
+    for (secret, _) in SECRETS {
+        assert!(
+            later.contains(&format!("-{secret}")),
+            "a later window in the session would get {secret}: {later}"
+        );
+    }
 }
 
 /// The helper starting the server from a daemon that holds the secrets:
