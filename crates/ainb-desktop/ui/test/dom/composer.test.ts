@@ -95,10 +95,10 @@ afterEach(() => {
   clock.now = 1_000;
 });
 
-async function open() {
+async function open(sessions: SessionsView_Serialize = frame()) {
   const container = document.createElement("div");
   document.body.appendChild(container);
-  cleanup = render(() => createComponent(Harness, { sessions: frame() }), container);
+  cleanup = render(() => createComponent(Harness, { sessions }), container);
   await settle();
   container.querySelector<HTMLButtonElement>(".open-composer")!.click();
   await settle();
@@ -116,6 +116,41 @@ const submitButton = (container: HTMLElement) => container.querySelector<HTMLBut
 test("opening via the button mounts the composer over the default project", async () => {
   const container = await open();
   assert.ok(container.querySelector(".composer"), "the composer is mounted");
+  assert.equal(container.querySelector<HTMLSelectElement>(".composer-project")?.value, "/repo");
+});
+
+test("with no session anywhere, the registered projects fill the Project select and create uses one", async () => {
+  hostReplies.set("projects_list", [
+    { name: "api", path: "/code/api" },
+    { name: "web", path: "/code/web" },
+  ]);
+  hostReplies.set("worktree_create", {
+    session_id: "u-1",
+    tmux_session_name: "api-abcd1234",
+    worktree_path: "/code/api/.worktrees/abcd1234",
+    branch: "ainb/first",
+  });
+  const container = await open({ workspaces: [], selected_session_id: null } as unknown as SessionsView_Serialize);
+  const select = container.querySelector<HTMLSelectElement>(".composer-project")!;
+  assert.deepEqual(
+    [...select.options].map((option) => [option.textContent, option.value]),
+    [
+      ["api", "/code/api"],
+      ["web", "/code/web"],
+    ],
+  );
+  assert.equal(select.value, "/code/api", "the first registered project is picked");
+  assert.equal(container.querySelector(".composer-error"), null, "no 'Choose a project' with one to choose");
+
+  fill(container, ".composer-name", "first");
+  submitButton(container).click();
+  await settle();
+  assert.equal((hostCalls.get("worktree_create") as { args: { repo_path: string } }).args.repo_path, "/code/api");
+});
+
+test("a host without the projects command still offers the frame's projects", async () => {
+  hostReplies.set("projects_list", new Error("command projects_list not found"));
+  const container = await open();
   assert.equal(container.querySelector<HTMLSelectElement>(".composer-project")?.value, "/repo");
 });
 
