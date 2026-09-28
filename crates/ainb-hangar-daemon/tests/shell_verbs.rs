@@ -1,5 +1,5 @@
-//! `shell/create` with the switch on, end to end through dispatch, against
-//! real git and a real tmux server.
+//! `shell/create`, `shell/list` and `shell/close` with the switch on, end to
+//! end through dispatch, against real git and a real tmux server.
 //!
 //! The server is PRIVATE: `TMUX_TMPDIR` points at a per-test directory and
 //! `TMUX` is removed, so the daemon's own `tmux new-session` lands on a server
@@ -46,13 +46,17 @@ fn tmux_available() -> bool {
 }
 
 async fn call(params: serde_json::Value) -> serde_json::Value {
+    call_method(m::SHELL_CREATE, params).await
+}
+
+async fn call_method(method: &str, params: serde_json::Value) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
     let request = RpcRequest {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
         id: RpcId::Number(7),
-        method: m::SHELL_CREATE.to_string(),
+        method: method.to_string(),
         params,
     };
     let response = rpc::dispatch_as(
@@ -145,6 +149,11 @@ impl World {
         // A plain shell with no startup files: a developer's rc could `cd`
         // somewhere else and move the pane off the directory under test.
         std::env::set_var("SHELL", "/bin/sh");
+        // No UTF-8 locale, as a daemon launchd started has none: tmux then
+        // mangles tabs and non-ASCII in its formats unless it is told `-u`.
+        for locale in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            std::env::remove_var(locale);
+        }
         std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "1");
         Self {
             home,
@@ -165,6 +174,8 @@ impl World {
         Command::new("tmux")
             .env("TMUX_TMPDIR", &self.tmux_dir)
             .env_remove("TMUX")
+            // The locale is gone (see `new`): read names and paths as UTF-8.
+            .arg("-u")
             .args(args)
             .output()
             .expect("run tmux")
@@ -178,6 +189,24 @@ impl World {
             self.made.push(name.to_string());
         }
         response
+    }
+
+    /// Create a shell with `op_id`, remembering its session for cleanup.
+    async fn shell_with_op(&mut self, path: &str, op_id: &str) -> serde_json::Value {
+        let response = call(serde_json::json!({ "worktree_path": path, "op_id": op_id })).await;
+        if let Some(name) = response["result"]["tmux_session_name"].as_str() {
+            self.made.push(name.to_string());
+        }
+        response
+    }
+
+    /// A session made directly on the private server, remembered for
+    /// cleanup: one the daemon did not open.
+    fn foreign(&mut self, name: &str) {
+        let dir = self.home.path().display().to_string();
+        let out = self.tmux(&["new-session", "-d", "-s", name, "-c", &dir]);
+        assert!(out.status.success(), "{out:?}");
+        self.made.push(name.to_string());
     }
 
     fn alive(&self, name: &str) -> bool {
@@ -231,8 +260,11 @@ async fn a_shell_opens_in_the_requested_worktree() {
         .as_str()
         .unwrap_or_else(|| panic!("a shell was made: {response}"))
         .to_string();
-    assert!(name.starts_with("ainb-sh-"), "{name}");
-    assert_eq!(name.len(), "ainb-sh-".len() + 8, "{name}");
+    assert!(
+        ainb_hangar_proto::spawn::is_daemon_shell_name(&name),
+        "a daemon shell has the daemon's own prefix, not the TUI's: {name}"
+    );
+    assert!(name.starts_with("ainb-dsh-"), "{name}");
     assert_eq!(response["result"]["worktree_path"], tree.as_str());
     assert!(world.alive(&name));
     assert_eq!(world.pane_path(&name), tree, "the shell starts in the tree");
@@ -460,4 +492,254 @@ async fn a_shell_on_a_server_already_holding_the_token_gets_neither() {
             "the session keeps {secret}: {marked}"
         );
     }
+}
+fn shell_name(response: &serde_json::Value) -> String {
+    response["result"]["tmux_session_name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a shell was made: {response}"))
+        .to_string()
+}
+
+/// `shell/list` shows the daemon's shells with their folders, and never the
+/// TUI's shells or a session the user made.
+#[tokio::test]
+async fn the_list_shows_the_daemon_shells_and_nothing_else() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let (tree, repo) = (world.worktree(), world.repo());
+    let in_tree = shell_name(&world.shell(&tree).await);
+    let in_repo = shell_name(&world.shell(&repo).await);
+    world.foreign("ainb-sh-0a1b2c3d");
+    world.foreign("work");
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+
+    let mut expected = vec![
+        serde_json::json!({ "tmux_session_name": in_tree, "worktree_path": tree }),
+        serde_json::json!({ "tmux_session_name": in_repo, "worktree_path": repo }),
+    ];
+    expected.sort_by_key(|shell| shell["tmux_session_name"].as_str().unwrap().to_string());
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::Value::Array(expected),
+        "{listed}"
+    );
+}
+
+/// No tmux server at all is no shells, not an error.
+#[tokio::test]
+async fn the_list_is_empty_without_a_tmux_server() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let world = World::new();
+    assert!(world.sessions().is_empty());
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::json!([]),
+        "{listed}"
+    );
+}
+
+/// `shell/close` ends exactly the named shell. A second close of it answers
+/// `closed: false`, so a retry reads the same as the first.
+#[tokio::test]
+async fn a_close_ends_exactly_the_named_shell() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let tree = world.worktree();
+    let first = shell_name(&world.shell(&tree).await);
+    let second = shell_name(&world.shell(&tree).await);
+
+    let closed = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": first }),
+    )
+    .await;
+    assert_eq!(
+        closed["result"],
+        serde_json::json!({ "closed": true }),
+        "{closed}"
+    );
+    assert!(!world.alive(&first));
+    assert!(world.alive(&second), "closing one shell ended another");
+
+    let again = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": first }),
+    )
+    .await;
+    assert_eq!(
+        again["result"],
+        serde_json::json!({ "closed": false }),
+        "{again}"
+    );
+}
+
+/// A close reaches only a daemon shell, by its exact name: the TUI's shell
+/// is refused before tmux runs, and a longer name sharing the prefix is not
+/// matched the way a bare `-t` would match it.
+#[tokio::test]
+async fn a_close_never_reaches_a_session_the_daemon_did_not_open() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    world.foreign("ainb-sh-0a1b2c3d");
+    world.foreign("ainb-dsh-0a1b2c3d-work");
+    world.foreign("main");
+
+    for name in ["ainb-sh-0a1b2c3d", "main", "ainb-dsh-0a1b2c3d-work"] {
+        let refused = call_method(
+            m::SHELL_CLOSE,
+            serde_json::json!({ "tmux_session_name": name }),
+        )
+        .await;
+        assert_eq!(
+            refused["error"]["code"].as_i64(),
+            Some(-32602),
+            "{name}: {refused}"
+        );
+    }
+    let prefix = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": "ainb-dsh-0a1b2c3d" }),
+    )
+    .await;
+    assert_eq!(
+        prefix["result"],
+        serde_json::json!({ "closed": false }),
+        "{prefix}"
+    );
+    for name in ["ainb-sh-0a1b2c3d", "ainb-dsh-0a1b2c3d-work", "main"] {
+        assert!(world.alive(name), "{name} was closed");
+    }
+}
+
+/// A create retried with the same op id (a lost reply) returns the shell the
+/// first attempt made and opens no second one. The same op id for another
+/// folder is refused; a new op id is a new shell.
+#[tokio::test]
+async fn a_retried_create_with_the_same_op_id_returns_the_same_shell() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let (tree, repo) = (world.worktree(), world.repo());
+
+    let first = world.shell_with_op(&tree, "0123456789abcdef0123456789abcdef").await;
+    let retry = world.shell_with_op(&tree, "0123456789abcdef0123456789abcdef").await;
+
+    assert_eq!(first["result"], retry["result"], "{first} / {retry}");
+    assert_eq!(
+        world.sessions(),
+        vec![shell_name(&first)],
+        "one shell, not two"
+    );
+
+    let elsewhere = world.shell_with_op(&repo, "0123456789abcdef0123456789abcdef").await;
+    assert_eq!(
+        elsewhere["error"]["code"].as_i64(),
+        Some(-32602),
+        "{elsewhere}"
+    );
+
+    let other = world.shell_with_op(&tree, "fedcba9876543210fedcba9876543210").await;
+    assert_ne!(shell_name(&other), shell_name(&first));
+    assert_eq!(world.sessions().len(), 2);
+}
+
+/// A name already taken is never attached to or replaced: the create moves
+/// on to a fresh one, and gives up after its tries with the taken session
+/// untouched.
+#[tokio::test]
+async fn a_taken_shell_name_is_retried_with_a_fresh_one() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    world.foreign("ainb-dsh-aaaaaaaa");
+    let params = ainb_hangar_proto::spawn::ShellCreateParams {
+        worktree_path: world.worktree(),
+        mutation: ainb_hangar_proto::mutation::MutationEnvelope::default(),
+    };
+
+    let mut ids = ["aaaaaaaa", "bbbbbbbb"].into_iter().map(str::to_string);
+    let made = ainb_hangar_daemon::spawn::shell_create_named(&params, || ids.next().unwrap())
+        .await
+        .expect("a fresh name after the taken one");
+    world.made.push(made.tmux_session_name.clone());
+    assert_eq!(made.tmux_session_name, "ainb-dsh-bbbbbbbb");
+
+    let refused =
+        ainb_hangar_daemon::spawn::shell_create_named(&params, || "aaaaaaaa".into()).await;
+    assert!(
+        matches!(&refused, Err(ainb_hangar_daemon::spawn::SpawnError::Failed(why)) if why.contains("duplicates")),
+        "{refused:?}"
+    );
+    assert!(world.alive("ainb-dsh-aaaaaaaa"));
+    assert_eq!(
+        world.pane_path("ainb-dsh-aaaaaaaa"),
+        canonical(world.home.path())
+    );
+}
+
+/// A folder whose name is not ASCII and ends in `;`: tmux would read the
+/// `;` as the end of the command and, without a UTF-8 locale, hand the name
+/// back mangled. The shell opens there, lists there, and a retried create
+/// with its op id finds it there.
+#[tokio::test]
+async fn an_odd_folder_name_opens_lists_and_replays_as_itself() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let sibling = world.home.path().join("code/caf\u{e9}");
+    std::fs::create_dir_all(&sibling).unwrap();
+    git(&sibling, &["init", "-q", "-b", "main"]);
+    let odd = world.home.path().join("code/caf\u{e9};");
+    std::fs::create_dir_all(&odd).unwrap();
+    git(&odd, &["init", "-q", "-b", "main"]);
+    let odd = canonical(&odd);
+
+    let first = world.shell_with_op(&odd, "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a").await;
+    let name = shell_name(&first);
+    assert_eq!(first["result"]["worktree_path"], odd.as_str());
+    assert_eq!(
+        world.pane_path(&name),
+        odd,
+        "not the sibling without the `;`"
+    );
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::json!([{ "tmux_session_name": name, "worktree_path": odd }]),
+        "{listed}"
+    );
+
+    let retry = world.shell_with_op(&odd, "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a").await;
+    assert_eq!(retry["result"], first["result"], "{retry}");
+    assert_eq!(world.sessions(), vec![name]);
 }
