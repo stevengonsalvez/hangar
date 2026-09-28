@@ -883,6 +883,7 @@ body {
 .composer select:focus-visible,
 .composer textarea:focus-visible,
 .composer-agent:focus-visible,
+.composer-add-project:focus-visible,
 .composer-cancel:focus-visible,
 .composer-create:focus-visible,
 .composer-advanced summary:focus-visible {
@@ -893,7 +894,8 @@ body {
 .composer input:disabled,
 .composer select:disabled,
 .composer textarea:disabled,
-.composer-agent:disabled {
+.composer-agent:disabled,
+.composer-add-project:disabled {
   opacity: 0.6;
 }
 
@@ -936,6 +938,17 @@ body {
   border-color: var(--primary);
   background: var(--highlight);
   color: var(--primary);
+}
+
+.composer-add-project {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font-size: var(--text-sub);
+  cursor: pointer;
 }
 
 .composer-advanced {
