@@ -8,10 +8,10 @@ import { hostCalls, hostReplies, settle } from "./window.ts";
 
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { createComponent, Show } from "solid-js";
+import { createComponent, createSignal, Show } from "solid-js";
 import { render } from "solid-js/web";
 import type { Session_Serialize, SessionsView_Serialize, Workspace_Serialize } from "../../../../ainb-app/bindings/AppState";
-import { createComposerFlow } from "../../src/composer.ts";
+import { createComposerFlow, initialFields } from "../../src/composer.ts";
 import { Composer } from "../../src/composer.tsx";
 
 function session(id: string, workspacePath: string): Session_Serialize {
@@ -29,8 +29,12 @@ function frame(): SessionsView_Serialize {
   } as unknown as SessionsView_Serialize;
 }
 
-/** What the flow did outside the view: toasts raised, focus restores. */
-const effects = { toasts: [] as string[], restored: 0 };
+/** What the flow did outside the view: toasts raised, focus restores, rows
+ * selected. */
+const effects = { toasts: [] as string[], restored: 0, selected: [] as string[] };
+
+/** The session list the window draws; a test pushes the next frame. */
+const [listed, setListed] = createSignal<SessionsView_Serialize>(frame());
 
 /**
  * The window's own flow (`createComposerFlow`, the code `main.tsx` runs),
@@ -43,6 +47,8 @@ function Harness(props: { sessions: SessionsView_Serialize }) {
     restoreFocus: () => {
       effects.restored += 1;
     },
+    sessions: listed,
+    select: (sessionId) => effects.selected.push(sessionId),
   });
   const button = document.createElement("button");
   button.type = "button";
@@ -80,6 +86,8 @@ afterEach(() => {
   hostCalls.clear();
   effects.toasts = [];
   effects.restored = 0;
+  effects.selected = [];
+  setListed(frame());
 });
 
 async function open() {
@@ -278,4 +286,59 @@ test("an invalid base ref marks the field invalid and disables Create", async ()
   await settle();
   assert.equal(base?.getAttribute("aria-invalid"), null);
   assert.equal(submitButton(container).disabled, false);
+});
+
+/** The frame after the daemon listed the created session `u-2`. */
+function withCreated(): SessionsView_Serialize {
+  return {
+    workspaces: [workspace("repo", "/repo", [session("s-1", "/repo"), session("u-2", "/repo")])],
+    selected_session_id: "s-1",
+  } as unknown as SessionsView_Serialize;
+}
+
+const createdReply = {
+  session_id: "u-2",
+  tmux_session_name: "repo-u2",
+  worktree_path: "/repo/.worktrees/u2",
+  branch: "ainb/fix-login",
+};
+
+test("a created session is selected once the session list carries it, and only once", async () => {
+  hostReplies.set("worktree_create", createdReply);
+  const container = await open();
+  fill(container, ".composer-name", "Fix login");
+  submitButton(container).click();
+  await settle();
+  assert.deepEqual(effects.selected, [], "not listed yet: nothing to select, and the old row is not reselected");
+
+  setListed(withCreated());
+  await settle();
+  assert.deepEqual(effects.selected, ["u-2"], "the new session takes the selection");
+
+  setListed({ ...withCreated() });
+  await settle();
+  assert.deepEqual(effects.selected, ["u-2"], "a later frame does not select it again over a person's pick");
+});
+
+test("a pick a person makes before the created row lands keeps the selection", async () => {
+  let release = () => {};
+  hostReplies.set("worktree_create", createdReply);
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  cleanup = render(() => {
+    const flow = createComposerFlow({
+      toast: () => {},
+      restoreFocus: () => {},
+      sessions: listed,
+      select: (sessionId) => effects.selected.push(sessionId),
+    });
+    release = flow.release;
+    flow.submit({ ...initialFields(undefined), projectPath: "/repo", name: "Fix login" });
+    return [];
+  }, container);
+  await settle();
+  release();
+  setListed(withCreated());
+  await settle();
+  assert.deepEqual(effects.selected, []);
 });
