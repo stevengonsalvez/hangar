@@ -10669,12 +10669,17 @@ impl AppState {
                 warn!("Session not found in lifecycle manager: {}", e);
                 info!("Attempting to remove orphaned worktree directly");
 
-                // Remove the worktree directly
+                // Remove the worktree directly, unless another session still
+                // works in it.
                 let worktree_manager = WorktreeManager::new()?;
-                if let Err(worktree_err) = worktree_manager.remove_worktree(session_id) {
-                    warn!("Failed to remove worktree: {}", worktree_err);
-                } else {
-                    info!("Successfully removed orphaned worktree");
+                match crate::interactive::session_manager::remove_session_worktree_now(
+                    &worktree_manager,
+                    session_id,
+                )
+                .await
+                {
+                    Ok(removal) => info!("Orphaned worktree: {removal:?}"),
+                    Err(worktree_err) => warn!("Failed to remove worktree: {}", worktree_err),
                 }
             }
         }
