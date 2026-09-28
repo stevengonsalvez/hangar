@@ -25,6 +25,7 @@ use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
+use ainb_desktop::theme::{self, Theme, ThemePreference};
 use ainb_desktop::updater::{self, Check, Install, Phase, Settings as UpdateSettings, Updater};
 use ainb_hangar_proto::agent_status::AgentState;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -73,6 +74,8 @@ struct Window {
     /// The updater and the last check it made, which "install" acts on.
     updater: Arc<Mutex<Updater>>,
     last_check: Arc<Mutex<Option<Check>>>,
+    /// The host's copy of the theme a person picked (`theme_set`).
+    theme_file: PathBuf,
 }
 
 /// Drain the host's queued session-store writes before this process ends
@@ -616,6 +619,73 @@ fn update_settings(window: tauri::State<'_, Window>) -> Result<UpdateSettings, S
         .clone())
 }
 
+/// The page's theme pick, told on every change and once at start: kept for
+/// the next launch's window, and painted on this one's native chrome.
+#[tauri::command]
+fn theme_set(
+    window: tauri::State<'_, Window>,
+    webview: tauri::WebviewWindow,
+    preference: ThemePreference,
+) {
+    if let Err(error) = theme::store(&window.theme_file, preference) {
+        tracing::warn!(%error, "theme pick not kept for the next launch");
+    }
+    paint_window_theme(&webview, preference);
+}
+
+/// Create the main window already in `preference`'s theme: its appearance
+/// forced before the webview exists, and its background the page's, set
+/// before it is first shown. `tauri.conf.json` declares the window with
+/// `create: false` so it is created here rather than before `setup`.
+fn open_main_window(
+    app: &tauri::AppHandle,
+    preference: ThemePreference,
+) -> tauri::Result<tauri::WebviewWindow> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == "main")
+        .cloned()
+        .ok_or(tauri::Error::WindowNotFound)?;
+    let webview = tauri::WebviewWindowBuilder::from_config(app, &config)?
+        .theme(preference.forced().map(tauri_theme))
+        .visible(false)
+        .build()?;
+    paint_window_theme(&webview, preference);
+    if config.visible {
+        webview.show()?;
+    }
+    Ok(webview)
+}
+
+/// Hold the window's appearance to `preference` (or release it to the OS for
+/// System) and set its background to the page's for the theme that resolves
+/// to. A failure costs a frame of the wrong colour, never the window.
+fn paint_window_theme(webview: &tauri::WebviewWindow, preference: ThemePreference) {
+    if let Err(error) = webview.set_theme(preference.forced().map(tauri_theme)) {
+        tracing::warn!(%error, "window appearance not set");
+    }
+    // What the OS paints now; dark, the page's own default, when unknown.
+    let system = match webview.theme() {
+        Ok(tauri::Theme::Light) => Theme::Light,
+        _ => Theme::Dark,
+    };
+    let [red, green, blue] = preference.resolve(system).background();
+    let color = tauri::window::Color(red, green, blue, 255);
+    if let Err(error) = webview.set_background_color(Some(color)) {
+        tracing::warn!(%error, "window background not set");
+    }
+}
+
+fn tauri_theme(theme: Theme) -> tauri::Theme {
+    match theme {
+        Theme::Light => tauri::Theme::Light,
+        Theme::Dark => tauri::Theme::Dark,
+    }
+}
+
 #[tauri::command]
 fn sidecar_state(window: tauri::State<'_, Window>) -> SidecarView {
     window.sidecar.state().borrow().view()
@@ -727,6 +797,10 @@ fn main() {
             let hangar_home = ainb_hangar_core::hangar_home()
                 .ok_or("the hangar home cannot be resolved: set AINB_HANGAR_HOME")?;
             init_logging(&hangar_home);
+            // First, so the window is on screen as early as before, and in
+            // the right theme from its first frame.
+            let theme_file = hangar_home.join(theme::THEME_FILE);
+            open_main_window(app.handle(), theme::load(&theme_file))?;
             // The desktop loads the user config itself and hands it to the
             // host, which reads nothing from disk for it.
             let config = AppConfig::load().unwrap_or_else(|error| {
@@ -801,6 +875,7 @@ fn main() {
                 sidecar_config,
                 updater,
                 last_check: Arc::new(Mutex::new(None)),
+                theme_file,
             });
 
             menu::install(app.handle());
@@ -917,7 +992,8 @@ fn main() {
             worktree_create,
             update_check,
             update_apply,
-            update_settings
+            update_settings,
+            theme_set
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
