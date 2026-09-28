@@ -122,7 +122,6 @@ pub fn install_claude_hooks_for(
     let bytes = serde_json::to_vec_pretty(&merged).context("serializing settings.json")?;
     write_settings(&path, &bytes)?;
     Ok(InstalledSettings {
-        path,
         before: before_bytes,
         written: bytes,
     })
@@ -131,8 +130,6 @@ pub fn install_claude_hooks_for(
 /// What [`install_claude_hooks_for`] changed in `settings.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledSettings {
-    /// The settings file written.
-    pub path: PathBuf,
     /// Its exact bytes before the write; `None` when there was no file.
     pub before: Option<Vec<u8>>,
     /// The exact bytes written.
