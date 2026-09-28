@@ -56,6 +56,31 @@ export function selectRowIntent(row: RowId): RendererIntent {
   return { Command: ["session_list.select_row", { target: row, open: false }] };
 }
 
+/**
+ * The select-only intent for tab `key`'s row, or `null` when no listed tab
+ * has that key. Sent on every activation, a person's or the host's, so the
+ * session list's selection is always the shown terminal's.
+ */
+export function selectIntentFor(tabs: readonly Tab[], key: string): RendererIntent | null {
+  const tab = tabs.find((candidate) => candidate.key === key);
+  return tab === undefined ? null : selectRowIntent(rowOf(tab.target));
+}
+
+/**
+ * The session whose terminal the work area shows, the answer banner's scope
+ * (`questionOver`): `undefined` when no terminal is shown, `null` for a tab
+ * of no session (a bare tmux tab, or no active tab at all).
+ */
+export function shownSessionOf(
+  showingTerminal: boolean,
+  tabs: readonly Tab[],
+  active: string | null,
+): string | null | undefined {
+  if (!showingTerminal) return undefined;
+  const target = tabs.find((tab) => tab.key === active)?.target;
+  return target?.kind === "session" ? target.id : null;
+}
+
 /** Automatic re-attaches before a tab offers "reattach": `REDIAL_DELAYS`. */
 export const REDIALS = 3;
 
