@@ -58,7 +58,10 @@ test("a relaunch restores the stored panes, following the tabs the host has live
   assert.deepEqual(panes(), ["g1:a*a", "g2:b,c,d*b!"], "the gone tab dropped out; new ones joined the focused pane");
   const width = parseFloat(group("g2").style.width);
   assert.ok(Math.abs(width - 15) < 1e-9, `a stored sliver loads at the minimum share, not ${width}%`);
-  assert.equal(stored().root.children[1].tabs.length, 3, "and the followed layout is stored again");
+  // tmux_gone may yet reopen: until it does, a person reshapes the panes, or
+  // the restore times out, the stored layout is kept as it was. The menu
+  // split in a later test ends it, and stores the split.
+  assert.deepEqual(stored().root.children[0].tabs, ["tmux_a", "tmux_gone"], "the stored layout waits for the tab still missing");
 });
 
 test("the panes show one terminal each, side by side", async () => {
