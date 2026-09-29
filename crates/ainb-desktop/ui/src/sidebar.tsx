@@ -1,9 +1,11 @@
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, Show } from "solid-js";
 import type { AgentCardFrame, FleetView_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
 import { isSelected, label } from "./sessions.ts";
+import { SidebarFilter } from "./sidebar_filter.tsx";
+import { filterProjectGroups, hidesProject, hidesSession } from "./sidebar_filter.ts";
 import {
   agentLabel,
   formatGitChanges,
@@ -75,7 +77,39 @@ export function Sidebar(props: Props) {
   // objects would remount every row whenever any one changed, and a focused
   // row would drop the keyboard to <body>. Keys are equal frame to frame, so
   // the lists patch, and each row reads its current data through its key.
-  const groups = createMemo(() => keyedList(projectGroups(props.sessions), (group) => group.path));
+  const allGroups = createMemo(() => projectGroups(props.sessions));
+  // The filter's text: a signal, never storage, so a relaunch opens the whole
+  // list, as Orca's own search drops its query when its surface closes. It
+  // only hides rows: the selection is the host's and stays where it was.
+  const [query, setQuery] = createSignal("");
+  const kept = createMemo(() => filterProjectGroups(allGroups(), query()));
+  const groups = createMemo(() => keyedList(kept(), (group) => group.path));
+  const cardCount = (from: readonly ProjectGroup[]) => from.reduce((sum, group) => sum + group.cards.length, 0);
+  const matched = () => (kept() === allGroups() ? null : cardCount(kept()));
+
+  // Orca lifts the sidebar filters hiding a workspace it activates
+  // (`worktree-activation.ts`), since a target that is not drawn cannot be
+  // revealed. The same here, on a CHANGE only: the host moving the selection
+  // to a row the query hides, or a create landing in a project it hides.
+  // Typing a query that hides the current selection is the person's own
+  // choice and stays. The memos pass on a value only when it changes, so a
+  // frame repeating the same selection does not count as a move.
+  const selectedId = createMemo(() => props.sessions?.selected_session_id ?? null);
+  createEffect(
+    on(
+      selectedId,
+      (id) => {
+        if (id !== null && hidesSession(allGroups(), query(), id)) setQuery("");
+      },
+      { defer: true },
+    ),
+  );
+  const pendingPath = createMemo(() => props.pending?.projectPath ?? null);
+  createEffect(
+    on(pendingPath, (path) => {
+      if (path !== null && hidesProject(allGroups(), query(), path)) setQuery("");
+    }),
+  );
   const groupKeys = createMemo(() => groups().keys, [], { equals: sameKeys });
   const [collapsed, setCollapsed] = createSignal(readCollapsed(safeStorage()));
   /** `<details>` already flipped its own `open` before `onToggle` fires:
@@ -93,6 +127,13 @@ export function Sidebar(props: Props) {
   const pendingIn = (group: ProjectGroup): PendingWorktree | null =>
     props.pending && props.pending.projectPath === group.path ? props.pending : null;
 
+  /** Why the list is empty: the host has not answered yet, it has nothing, or
+   * it has rows and the filter hides every one of them. */
+  const emptyText = () => {
+    if (allGroups().length > 0) return "No worktrees match";
+    return props.loading || !props.sessions ? "Loading sessions" : "No sessions";
+  };
+
   return (
     <aside class="sidebar" aria-label="Sessions" tabIndex={-1} ref={props.ref}>
       <div class="sidebar-head">
@@ -104,10 +145,8 @@ export function Sidebar(props: Props) {
           <span class="stale">stale</span>
         </Show>
       </div>
-      <Show
-        when={groupKeys().length > 0}
-        fallback={<p class="empty">{props.loading || !props.sessions ? "Loading sessions" : "No sessions"}</p>}
-      >
+      <SidebarFilter query={query()} onQuery={setQuery} matched={matched()} total={cardCount(allGroups())} />
+      <Show when={groupKeys().length > 0} fallback={<p class="empty">{emptyText()}</p>}>
         <For each={groupKeys()}>
           {(groupKey) => {
             const group = (): ProjectGroup | undefined => groups().byKey.get(groupKey);
