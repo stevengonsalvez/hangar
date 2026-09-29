@@ -120,10 +120,7 @@ fn the_mutating_spawn_verbs_are_in_the_mutation_registry() {
         m::SHELL_CREATE,
         m::SHELL_CLOSE,
     ] {
-        assert!(
-            ainb_hangar_proto::mutation::is_mutating(method),
-            "{method}"
-        );
+        assert!(ainb_hangar_proto::mutation::is_mutating(method), "{method}");
     }
     assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_LIST));
 }
