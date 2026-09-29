@@ -143,8 +143,10 @@ function Shell() {
   // (`layout.ts`), kept in this window's storage across reloads.
   const [tabs, setTabs] = createSignal<Tab[]>([]);
   const [layout, setLayout] = createSignal<Layout>(initialLayout([]));
-  // Whether the stored layout has been read: on the host's first tab strip,
-  // whose keys it needs.
+  // Whether the stored layout has been read: on the host's first strip that
+  // lists a tab. A relaunched host lists none until a tab opens (it restores
+  // no tabs), and reading then would follow the stored layout to nothing and
+  // store that over it.
   let restored = false;
   /** The shown tab of the focused group: the terminal with the keyboard,
    * the one the sidebar and the answer banner follow. */
@@ -159,11 +161,12 @@ function Shell() {
     const byKey = new Map(tabs().map((tab) => [tab.key, tab]));
     return groups(layout()).flatMap((group) => group.tabs.flatMap((key) => byKey.get(key) ?? []));
   };
-  /** Take `next` as the layout, and store it; the same layout is a no-op. */
+  /** Take `next` as the layout, and store it once the stored one has been
+   * read; the same layout is a no-op. */
   const commitLayout = (next: Layout) => {
     if (next === layout()) return;
     setLayout(next);
-    writeLayout(safeStorage(), next);
+    if (restored) writeLayout(safeStorage(), next);
   };
   // Tab keys in the order they were shown, most recent last: which tab a
   // group shows when its shown one closes. Read only then, so not a signal.
@@ -314,11 +317,15 @@ function Shell() {
     for (const key of focusers.keys()) {
       if (!keys.includes(key)) focusers.delete(key);
     }
-    // The first strip restores the stored layout, following it; every later
-    // one is followed (`followHost`), which returns the layout itself when
-    // nothing changed, so a strip that only restates the tabs costs nothing.
-    commitLayout(restored ? followHost(layout(), keys, recent) : readLayout(safeStorage(), keys));
-    restored = true;
+    // The first strip with a tab restores the stored layout, following it;
+    // every later one is followed (`followHost`), which returns the layout
+    // itself when nothing changed, so a strip that only restates the tabs
+    // costs nothing.
+    if (restored) commitLayout(followHost(layout(), keys, recent));
+    else if (keys.length > 0) {
+      restored = true;
+      commitLayout(readLayout(safeStorage(), keys));
+    }
     if (view.focus !== null) activate(view.focus, true);
     else if (active() !== shownBefore) {
       // The shown tab closed or ended (its tmux session died, say), and its
@@ -459,8 +466,8 @@ function Shell() {
   };
   /** "Close split pane": every tab of the group closes, as Orca's does
    * (`orca:src/renderer/src/components/tab-group/useTabGroupCloseScopeCommands.ts:24-34`).
-   * The layout's own `closeGroup` only merges a group away; the terminals
-   * are the host's to end, and its next strip collapses the group. */
+   * The terminals are the host's to end; its next strip, without them,
+   * collapses the group. */
   const closePaneGroup = (id: GroupId) => {
     const group = groups(layout()).find((candidate) => candidate.id === id);
     for (const key of group?.tabs ?? []) {
