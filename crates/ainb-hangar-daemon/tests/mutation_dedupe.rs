@@ -23,32 +23,12 @@ use ainb_hangar_proto::mutation::{ACK_KEY, MUTATING_METHODS};
 use ainb_hangar_proto::{RpcId, RpcRequest};
 use ainb_hangar_store::Store;
 
+mod common;
+use common::private_host;
+
 /// No handler in the registry should take anywhere near this. A method that
 /// does is a method that would wedge a real client, and the test says so.
 const PER_CALL: Duration = Duration::from_secs(30);
-
-/// A host this process keeps to itself, set before any test dispatches: an
-/// empty `HOME` (no registered folder, so the spawn verbs' samples are
-/// refused before they run anything), a private tmux server directory with
-/// no server in it, and the spawn switch unset, as a default daemon has it.
-/// Every test calls this first; the values outlive the tests on purpose.
-fn private_host() {
-    static SET: std::sync::Once = std::sync::Once::new();
-    SET.call_once(|| {
-        let home = tempfile::tempdir().unwrap().keep();
-        // Under /tmp: macOS caps unix socket paths at 104 bytes.
-        let tmux_dir =
-            std::path::PathBuf::from("/tmp").join(format!("ainb-dedupe-{}", std::process::id()));
-        std::fs::create_dir_all(&tmux_dir).unwrap();
-        // Edition 2021: set_var is safe, and the Once runs it before any
-        // test goes on.
-        std::env::set_var("HOME", home);
-        std::env::remove_var("AINB_HOME");
-        std::env::set_var("TMUX_TMPDIR", tmux_dir);
-        std::env::remove_var("TMUX");
-        std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
-    });
-}
 
 fn health() -> DaemonHealth {
     DaemonHealth {
