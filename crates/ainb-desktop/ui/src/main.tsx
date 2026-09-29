@@ -42,6 +42,7 @@ import { cardForSession, statusForTarget } from "./status.ts";
 import { TerminalTab } from "./terminal_tab.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
+import { runRowPick } from "./row_menu.ts";
 import { Titlebar } from "./titlebar.tsx";
 import { Statusbar } from "./statusbar.tsx";
 import { SettingsPage } from "./settings.tsx";
@@ -678,6 +679,13 @@ function Shell() {
             acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
+            onRowPick={(pick) =>
+              runRowPick(pick, {
+                open: openSession,
+                run: (intents) => void run(intents),
+                copy: (text) => void invoke("clipboard_write", { text }),
+              })
+            }
             ref={(element) => (sidebar = element)}
           />
           <section class="workarea">
