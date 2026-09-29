@@ -204,23 +204,23 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
         .await
         .expect_err("a repository nested in an added project is refused");
 
-    // A repository under an onboarding folder is already accepted: adding it
-    // writes nothing, and the daemon creates from it.
-    let onboarded = user_home.path().join("onboarded");
-    git_init(&onboarded.join("tool"));
-    std::fs::write(
-        user_home.path().join(".agents-in-a-box/config/onboarding.toml"),
-        format!("git_directories = [\"{}\"]\n", onboarded.display()),
-    )
-    .unwrap();
-    let projects_file = user_home.path().join(".agents-in-a-box/config/projects.toml");
-    let before = std::fs::read_to_string(&projects_file).unwrap();
-    ainb_desktop::projects::register(user_home.path(), &onboarded.join("tool"))
-        .expect("already accepted");
-    assert_eq!(std::fs::read_to_string(&projects_file).unwrap(), before);
-    request(&client, plain(&onboarded.join("tool")))
+    // A repository deep inside a registered folder, past the scan's depth:
+    // adding it records it, so the list offers it and the daemon creates
+    // from it.
+    let deep = user_home.path().join("code/a/b/c/d/deep");
+    git_init(&deep);
+    let added = ainb_desktop::projects::register(user_home.path(), &deep).expect("registered");
+    assert!(
+        ainb_desktop::projects::list(
+            user_home.path(),
+            &ainb_app::config::WorkspaceDefaults::default()
+        )
+        .contains(&added),
+        "the deep repository is listed once added"
+    );
+    request(&client, plain(&deep))
         .await
-        .expect("a repository under an onboarding folder is created from");
+        .expect("a deep repository inside a registered folder is created from");
 
     let created = request(
         &client,
