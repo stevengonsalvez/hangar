@@ -66,6 +66,27 @@ test("a relaunch restores the stored panes, following the tabs the host has live
   assert.deepEqual(stored().root.children[0].tabs, ["tmux_a", "tmux_gone"], "the stored layout waits for the tab still missing");
 });
 
+test("each pane's + opens its menu on that pane's shown tab, and the top strip has none", async () => {
+  assert.equal(document.querySelector('nav.tabs:not(.pane-strip) .tab-new'), null, "no + beside Board and Review");
+  const groups = [...document.querySelectorAll<HTMLElement>(".pane-group")];
+  assert.ok(groups.length > 1, `several panes to tell apart: ${panes()}`);
+  for (const pane of groups) {
+    assert.equal(pane.querySelectorAll(".pane-strip .tab-new").length, 1, `one + in ${pane.dataset.group}'s strip`);
+    const shown = pane.querySelector<HTMLElement>(".tab.active[data-key]")!.dataset.key!.slice(5);
+    pane.querySelector<HTMLButtonElement>(".pane-strip .tab-new")!.click();
+    await until(() => document.querySelector(".tab-create-menu") !== null, "the + menu");
+    document.querySelector<HTMLButtonElement>('.tab-create-menu [data-item="terminal"]')!.click();
+    await until(() => host.calls.at(-1)?.command === "shell_open", "a shell asked for");
+    assert.deepEqual(host.calls.at(-1)!.args, { target: { kind: "session", id: `u-${shown}` } }, `${pane.dataset.group}'s + opens in ${shown}`);
+    pane.querySelector<HTMLButtonElement>(".pane-strip .tab-new")!.click();
+    await until(() => document.querySelector(".tab-create-menu") !== null, "the + menu again");
+    document.querySelector<HTMLButtonElement>('.tab-create-menu [data-agent="codex"]')!.click();
+    await until(() => host.calls.at(-1)?.command === "worktree_agent_add", "an agent asked for");
+    assert.deepEqual(host.calls.at(-1)!.args, { args: { target: { kind: "session", id: `u-${shown}` }, agent: "codex" } });
+    await tick();
+  }
+});
+
 test("the panes show one terminal each, side by side", async () => {
   document.querySelector<HTMLElement>(".terminals-tab .tab-title")!.click();
   await until(() => visible().length === 2, "both panes' terminals");
