@@ -423,3 +423,77 @@ test("a Done card says click to open, and clicking it acks the turn and moves it
   assert.equal(afterAck.dataset.status, "idle", "acked: no longer Done");
   assert.ok(board.column("idle")!.contains(afterAck), "and it moved into the Idle column");
 });
+
+/** Several agents all named "claude", as the Mac's Done column showed them:
+ * two on their own branches, one on an SSH row with no branch, and one the
+ * sidebar has no row for. */
+function sameNameWorld() {
+  const row = (id: string, branch: string) => ({ ...session(id, "claude"), branch_name: branch });
+  const sessions = {
+    workspaces: [
+      {
+        name: "repo",
+        sessions: [row("login", "agents/fix-login"), row("search", "agents/add-search"), row("ssh", "")],
+      },
+    ],
+    selected_session_id: null,
+  } as unknown as SessionsView_Serialize;
+  const fleet = {
+    fleet_metadata: {
+      login: { provider_session_id: "p-login" },
+      search: { provider_session_id: "p-search" },
+      ssh: { provider_session_id: "p-ssh" },
+    },
+    fleet_snapshot: [],
+    daemon_attention: { by_session_id: {} },
+    daemon_reachable: true,
+  } as unknown as FleetView_Serialize;
+  const finished = (key: string) => ({
+    session_key: key,
+    state: "idle",
+    provider: "claude",
+    lifecycle: "running",
+    transport_health: "ok",
+    wait_kind: null,
+    has_open_request: false,
+    turn_complete: true,
+    tier: "hook",
+    evidence_observed_at: 5,
+  });
+  const agentStatus = {
+    absent: null,
+    view: {
+      health: { kind: "fresh" },
+      cards: ["claude:p-login", "claude:p-search", "claude:p-ssh", "claude:p-stray"].map(finished),
+    },
+  } as unknown as AgentStatusView;
+  return { sessions, fleet, agentStatus };
+}
+
+test("two Done cards with the same name show their own branches", async () => {
+  const board = await open(sameNameWorld());
+  const login = board.card("claude:p-login")!;
+  const search = board.card("claude:p-search")!;
+  assert.ok(board.column("done")!.contains(login) && board.column("done")!.contains(search));
+  assert.equal(login.querySelector(".card-title")?.textContent, "claude");
+  assert.equal(search.querySelector(".card-title")?.textContent, "claude");
+  assert.equal(login.querySelector(".card-branch")?.textContent, "agents/fix-login");
+  assert.equal(search.querySelector(".card-branch")?.textContent, "agents/add-search");
+  assert.equal(
+    login.querySelector(".card-branch")?.getAttribute("title"),
+    "agents/fix-login",
+    "the full branch on hover when the card cuts it short",
+  );
+});
+
+test("a card with no branch draws no branch line and no stray separator", async () => {
+  const board = await open(sameNameWorld());
+  for (const key of ["claude:p-ssh", "claude:p-stray"]) {
+    const node = board.card(key)!;
+    assert.ok(node, `${key} still draws`);
+    assert.equal(node.querySelector(".card-branch"), null, `${key} has no empty branch line`);
+    const text = node.textContent ?? "";
+    assert.ok(!/·\s*·|^\s*·|·\s*$/.test(text), `${key} reads "${text}"`);
+    assert.ok(!(node.querySelector(".card-title")?.textContent ?? "").includes("·"), `${key} title carries no separator`);
+  }
+});

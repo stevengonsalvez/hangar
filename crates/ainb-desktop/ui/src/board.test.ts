@@ -10,7 +10,17 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
 import { cardForSession, statusForSession } from "./status.ts";
-import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, countIn, elsewhereCount, showIntents } from "./board.ts";
+import {
+  agentStateCounts,
+  attentionRows,
+  boardColumns,
+  boardHealth,
+  cardBranch,
+  COLUMNS,
+  countIn,
+  elsewhereCount,
+  showIntents,
+} from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -197,6 +207,33 @@ test("a card takes its row's name and the fleet's model, and one with no row sti
   assert.ok(stray, "an agent the sidebar has not listed is still on the board");
   assert.equal(stray.sessionId, null);
   assert.equal(stray.title, "claude p-9", "named by provider and id, not the raw key");
+});
+
+test("a card's branch is its row's branch, drawn through the label rule", () => {
+  assert.equal(cardBranch("agents/fix-login", "claude"), "agents/fix-login");
+  assert.equal(cardBranch("  feature/x  ", "claude"), "feature/x", "trimmed");
+  assert.equal(cardBranch("feat\u202Eure", "claude"), "feature", "a bidi override cannot restyle the card");
+});
+
+test("a card has no branch when its row has none, or when the branch only repeats the title", () => {
+  assert.equal(cardBranch(undefined, "claude"), null, "no row");
+  assert.equal(cardBranch("", "claude"), null, "an SSH row carries an empty branch");
+  assert.equal(cardBranch("   ", "claude"), null);
+  // Orca drops the second line rather than say one name twice.
+  assert.equal(cardBranch("fix-login", "fix-login"), null);
+});
+
+test("two cards with the same name are told apart by their rows' branches", () => {
+  const { sessions, fleet } = world(["u-1", "claude", "p-1"], ["u-2", "claude", "p-2"]);
+  const rows = sessions.workspaces[0].sessions as unknown as { branch_name: string }[];
+  rows[0].branch_name = "agents/fix-login";
+  rows[1].branch_name = "agents/add-search";
+  const cards = boardColumns(status(card("claude:p-1"), card("claude:p-2"), card("claude:p-9")), fleet, sessions, NO_ACKS)
+    .flatMap((column) => column.cards);
+  const branchOf = (key: string) => cards.find((c) => c.key === key)?.branch;
+  assert.equal(branchOf("claude:p-1"), "agents/fix-login");
+  assert.equal(branchOf("claude:p-2"), "agents/add-search");
+  assert.equal(branchOf("claude:p-9"), null, "a card with no row has no branch");
 });
 
 test("an agent with something open floats to the top of its column", () => {
