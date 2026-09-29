@@ -68,7 +68,14 @@ pub fn list(home: &Path, defaults: &WorkspaceDefaults) -> Vec<RegisteredProject>
         });
     }
     projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    projects.truncate(defaults.max_repositories);
+    if projects.len() > defaults.max_repositories {
+        tracing::info!(
+            found = projects.len(),
+            shown = defaults.max_repositories,
+            "project list cut at workspace_defaults.max_repositories"
+        );
+        projects.truncate(defaults.max_repositories);
+    }
     projects
 }
 
