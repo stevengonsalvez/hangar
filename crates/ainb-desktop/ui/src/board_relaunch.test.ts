@@ -45,7 +45,18 @@ function status(...cards: AgentCardFrame[]): AgentStatusView {
 function relaunched(...rows: [string, string, string][]) {
   const sessions = {
     workspaces: [
-      { name: "repo", sessions: rows.map(([id, name]) => ({ id, name, status: "Stopped", attention: [] })) },
+      {
+        name: "repo",
+        sessions: rows.map(([id, name]) => ({
+          id,
+          name,
+          // The host reads the branch back off the worktree's checkout when it
+          // rebuilds a stopped row (`stopped_session_from_metadata`).
+          branch_name: `agents/${name}`,
+          status: "Stopped",
+          attention: [],
+        })),
+      },
     ],
   } as unknown as SessionsView_Serialize;
   const fleet = {
@@ -71,6 +82,12 @@ test("after a relaunch an exited card keeps its row's name, never the key fallba
   assert.equal(cards.length, 1);
   assert.equal(cards[0].title, "fix-login");
   assert.equal(cards[0].sessionId, "u-1", "the card opens its row");
+});
+
+test("after a relaunch an exited card keeps its row's branch", () => {
+  const { sessions, fleet } = relaunched(["u-1", "claude", ACKED]);
+  const cards = boardColumns(status(exited(`claude:${ACKED}`, 5)), fleet, sessions, NO_ACKS).flatMap((c) => c.cards);
+  assert.equal(cards[0].branch, "agents/claude");
 });
 
 test("a relaunch is not an ack: a stored ack keeps its exit in Idle, an unseen exit stays Done", () => {
