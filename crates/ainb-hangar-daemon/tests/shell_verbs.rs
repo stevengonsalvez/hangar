@@ -717,6 +717,47 @@ async fn a_same_prefix_session_without_the_owner_is_neither_listed_nor_closed() 
     assert!(!world.alive(&ours));
 }
 
+/// The owner is read from the session itself. A `set -g @ainb_owner daemon`
+/// (a tmux.conf line, or any other tool on the server) is a global option,
+/// which a `#{@ainb_owner}` format falls back to: read that way it would
+/// mark every `ainb-dsh-` session on the server as the daemon's.
+#[tokio::test]
+async fn a_global_owner_option_does_not_make_a_foreign_shell_ours() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let tree = world.worktree();
+    let ours = shell_name(&world.shell(&tree).await);
+    world.foreign("ainb-dsh-0a1b2c3d");
+    let global = world.tmux(&["set-option", "-g", "@ainb_owner", "daemon"]);
+    assert!(global.status.success(), "{global:?}");
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::json!([{ "tmux_session_name": ours, "worktree_path": tree }]),
+        "{listed}"
+    );
+
+    let refused = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": "ainb-dsh-0a1b2c3d" }),
+    )
+    .await;
+    assert_eq!(
+        refused["result"],
+        serde_json::json!({ "closed": false }),
+        "{refused}"
+    );
+    assert!(
+        world.alive("ainb-dsh-0a1b2c3d"),
+        "a session marked only by the global option was closed"
+    );
+}
+
 /// A create retried with the same op id (a lost reply) replays the shell the
 /// first attempt made, through the D18 ledger, and opens no second one. The
 /// same op id for another folder is rejected; a new op id is a new shell.
