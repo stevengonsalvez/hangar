@@ -120,6 +120,19 @@ export function TerminalView(props: Props) {
           if (text) term.paste(text);
         });
     };
+    // Orca's `terminal.clear` clears xterm and the host's buffer (orca
+    // `terminal-scrollback-clear.ts:8-16`). The host's buffer here is tmux's
+    // history, which the host clears, then it redraws this client. A tmux
+    // client draws on the alternate screen, where `clear()` would blank the
+    // agent's screen while tmux paints only what changes: xterm clears its
+    // own buffer only on the normal screen.
+    const clear = () => {
+      if (term.buffer.active.type === "normal") {
+        term.clear();
+        term.scrollToBottom();
+      }
+      void invoke("terminal_clear", { key: props.tab.key });
+    };
     // Orca's rows in Orca's order, the ones this window can do today. Find
     // is ours: Orca's menu has none, the pane's find bar is one chord away.
     setMenuEntries([
@@ -160,10 +173,11 @@ export function TerminalView(props: Props) {
       if (shell) {
         // Marked handled, so the window's own listener does not act twice.
         event.preventDefault();
-        // Copy and paste act on this pane, so they are answered here; the rest
-        // is the shell's.
+        // Copy, paste and clear act on this pane, so they are answered here;
+        // the rest is the shell's.
         if (shell.kind === "copy") copy();
         else if (shell.kind === "paste") paste();
+        else if (shell.kind === "clear") clear();
         else props.onAccelerator(shell);
         return false;
       }

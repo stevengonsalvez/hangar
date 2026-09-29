@@ -98,6 +98,12 @@ export type Accelerator =
   | { kind: "split"; direction: "right" | "down" }
   | { kind: "attention" }
   | { kind: "hosts" }
+  /** Clear the focused terminal's scrollback. */
+  | { kind: "clear" }
+  /** Show or hide the sidebar. */
+  | { kind: "sidebar" }
+  /** Show the next (`1`) or previous (`-1`) worktree in the sidebar. */
+  | { kind: "worktree"; step: 1 | -1 }
   | { kind: "copy" }
   | { kind: "paste" };
 
@@ -127,7 +133,7 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
   if (!mod || event.altKey) return null;
   if (event.code === "KeyH" && (!mac || event.shiftKey)) return { kind: "hosts" };
   if (mac && event.shiftKey && event.code === "KeyD") return { kind: "split", direction: "down" };
-  if (mac && event.shiftKey) return null;
+  if (mac && event.shiftKey) return worktreeChord(event.code);
   // Copy and paste: macOS has them on the Edit menu, natively. Elsewhere the
   // pane owns ctrl+c and ctrl+v, so the shell's ctrl+shift pair does it.
   if (!mac && (event.code === "KeyC" || event.code === "KeyV")) {
@@ -142,8 +148,18 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
       return { kind: "next" };
     case "KeyW":
       return { kind: "close" };
+    // Orca's `terminal.clear` is Cmd+K (orca `definitions-core-3.ts:244-251`),
+    // so the palette is on Orca's worktree switcher, `worktree.palette`: Cmd+J,
+    // Ctrl+Shift+J off macOS (`definitions-core-1.ts:34-45`). Orca's Cmd+P is
+    // Go to File, which this window has none of.
     case "KeyK":
+      return { kind: "clear" };
+    case "KeyJ":
       return { kind: "palette" };
+    // `sidebar.left.toggle` (orca `definitions-core-1.ts:181-188`). Orca's Ctrl+B
+    // off macOS is tmux's prefix; here it is Ctrl+Shift+B, which sends no byte.
+    case "KeyB":
+      return { kind: "sidebar" };
     // The new-worktree composer: Cmd+N on macOS, Ctrl+Shift+N elsewhere, like
     // every chord here. Plain Ctrl+N belongs to the pane (next-history in a
     // shell, completion in vim), so off macOS it needs the Shift.
@@ -158,6 +174,18 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
     default:
       return null;
   }
+}
+
+/**
+ * `worktree.navigateUp` / `worktree.navigateDown` (orca
+ * `definitions-core-1.ts:46-61`): Cmd+Shift+Up and Cmd+Shift+Down, macOS only.
+ * Off macOS their Ctrl+Shift form is a key the pane gets: xterm sends
+ * Ctrl+Shift+Up and Ctrl+Shift+Down as ESC [1;6A and ESC [1;6B.
+ */
+function worktreeChord(code: string): Accelerator | null {
+  if (code === "ArrowUp") return { kind: "worktree", step: -1 };
+  if (code === "ArrowDown") return { kind: "worktree", step: 1 };
+  return null;
 }
 
 /**
@@ -191,9 +219,21 @@ export function shellKeydown(deps: {
     if (event.defaultPrevented) return;
     const shell = accelerator(event, deps.mac);
     if (shell === null || modalBlocks(shell, deps.modalOpen())) return;
+    if (leftToFocus(shell, event.target instanceof Element ? event.target : null)) return;
     event.preventDefault();
     deps.run(shell);
   };
+}
+
+/**
+ * Whether the window leaves `shell` to the element with the keyboard, neither
+ * taking nor running it. Clear is a terminal's own, answered by the focused
+ * pane before the window sees it: anywhere else there is nothing to clear. A
+ * worktree step in a text field is that field's Cmd+Shift+Up and Down, which
+ * select to its start and end.
+ */
+export function leftToFocus(shell: Accelerator, target: FocusedLike | null): boolean {
+  return shell.kind === "clear" || (shell.kind === "worktree" && keyboardTaken(target));
 }
 
 /** The shape of a focused element this needs: `document.activeElement` fits. */

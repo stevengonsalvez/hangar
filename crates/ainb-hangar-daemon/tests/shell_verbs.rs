@@ -852,6 +852,81 @@ async fn a_retried_create_with_the_same_op_id_returns_the_same_shell() {
     assert_eq!(world.sessions().len(), 2);
 }
 
+/// A create whose `tmux new-session` outlives the bound may still make the
+/// shell (the server can finish after its client is gone), so the op id is
+/// answered, not freed: the retry under it hears the same answer and runs no
+/// second `new-session`. A stand-in `tmux` ahead of the real one on `PATH`
+/// logs every call and holds a `new-session` past the bound.
+#[tokio::test]
+async fn a_timed_out_shell_create_keeps_its_op_id_and_runs_tmux_once() {
+    /// Puts `PATH` and the real tmux bound back, even if an assert panics.
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ainb_hangar_daemon::spawn::set_shell_tmux_timeout_for_test(None);
+            match self.0.take() {
+                Some(path) => std::env::set_var("PATH", path),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut world = World::new();
+    let tree = world.worktree();
+    let bin = world.home.path().join("slow-tmux");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = world.home.path().join("tmux-calls.txt");
+    let tmux = bin.join("tmux");
+    std::fs::write(
+        &tmux,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{calls}'\ncase \"$*\" in *new-session*) sleep 3 ;; esac\nexit 0\n",
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let old_path = std::env::var_os("PATH");
+    let _restore = Restore(old_path.clone());
+    let mut path = std::ffi::OsString::from(&bin);
+    if let Some(old) = &old_path {
+        path.push(":");
+        path.push(old);
+    }
+    std::env::set_var("PATH", path);
+    ainb_hangar_daemon::spawn::set_shell_tmux_timeout_for_test(Some(
+        std::time::Duration::from_millis(300),
+    ));
+
+    let first = world.shell_with_op(&tree, "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4").await;
+    let retry = world.shell_with_op(&tree, "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4").await;
+
+    let new_sessions = std::fs::read_to_string(&calls)
+        .unwrap_or_default()
+        .lines()
+        .filter(|call| call.contains("new-session"))
+        .count();
+    assert_eq!(new_sessions, 1, "one op id, one `tmux new-session`");
+    for (what, response) in [("first", &first), ("retry", &retry)] {
+        assert_eq!(
+            response["error"]["code"].as_i64(),
+            Some(i64::from(ainb_hangar_proto::spawn::SPAWN_STARTED)),
+            "{what}: {response}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("may still appear")),
+            "{what}: {response}"
+        );
+    }
+    assert_eq!(
+        retry["error"]["data"]["mutation"]["outcome"], "replayed",
+        "{retry}"
+    );
+}
+
 /// A name already taken is never attached to or replaced: the create moves
 /// on to a fresh one, and gives up after its tries with the taken session
 /// untouched.

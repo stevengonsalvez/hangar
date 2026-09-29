@@ -283,6 +283,20 @@ fn terminal_visible(window: tauri::State<'_, Window>, keys: Vec<String>) -> bool
     window.terminals.as_ref().is_some_and(|terminals| terminals.set_visible(keys))
 }
 
+/// Cmd+K: clear the tab's scrollback in tmux and redraw its client. Off the
+/// main thread: it forks tmux twice, and a wedged tmux must not stall the
+/// window. A failure is the toast `Terminals::clear` shows.
+#[tauri::command]
+async fn terminal_clear(window: tauri::State<'_, Window>, key: String) -> Result<(), String> {
+    let Some(terminals) = window.terminals.clone() else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || terminals.clear(&key))
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 fn terminal_close(window: tauri::State<'_, Window>, key: String) {
     if let Some(terminals) = &window.terminals {
@@ -1139,6 +1153,7 @@ fn main() {
             terminal_input,
             terminal_resize,
             terminal_visible,
+            terminal_clear,
             terminal_close,
             worktree_create,
             projects_list,
