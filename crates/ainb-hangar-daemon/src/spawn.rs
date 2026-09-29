@@ -159,10 +159,7 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
     let mut push_all = |value: Option<&toml::Value>| {
         for entry in value.and_then(toml::Value::as_array).into_iter().flatten() {
             if let Some(path) = entry.as_str() {
-                let expanded = path
-                    .strip_prefix("~/")
-                    .map_or_else(|| PathBuf::from(path), |rest| home.join(rest));
-                if let Ok(canonical) = std::fs::canonicalize(expanded) {
+                if let Ok(canonical) = std::fs::canonicalize(expand_home(home, path)) {
                     roots.push(canonical);
                 }
             }
@@ -179,6 +176,21 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
         push_all(table.get("git_directories"));
     }
     roots
+}
+
+/// The refusal for a repository in no registered folder and not an added
+/// project. `worktree/create` answers it with
+/// [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] rather than
+/// `INVALID_PARAMS`, so a client can offer the fix by code, not by sentence.
+pub const UNREGISTERED: &str = "repo_path is not under a registered workspace folder: add its \
+                                folder to workspace_defaults.workspace_scan_paths";
+
+/// `path` with a leading `~/` meaning `home`, as the registered folder
+/// files are read.
+#[must_use]
+pub fn expand_home(home: &Path, path: &str) -> PathBuf {
+    path.strip_prefix("~/")
+        .map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
 }
 
 /// The file [`registered_projects`] reads, under `~/.agents-in-a-box/config`.
@@ -205,7 +217,7 @@ pub fn registered_projects(home: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .filter_map(toml::Value::as_str)
-        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter_map(|path| std::fs::canonicalize(expand_home(home, path)).ok())
         .collect()
 }
 
@@ -228,11 +240,7 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
     if !roots.iter().any(|root| canonical.starts_with(root))
         && !registered_projects(home).contains(&canonical)
     {
-        return Err(SpawnError::Invalid(
-            "repo_path is not under a registered workspace folder: add its folder to \
-             workspace_defaults.workspace_scan_paths"
-                .into(),
-        ));
+        return Err(SpawnError::Invalid(UNREGISTERED.into()));
     }
     let top = std::process::Command::new("git")
         .arg("-C")
