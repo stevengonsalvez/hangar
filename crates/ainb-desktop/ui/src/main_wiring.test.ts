@@ -70,7 +70,7 @@ test("a sidebar row's menu runs through the window's own open, ordered dispatch 
   // right pick; this is the one place those deps become real host calls.
   assert.match(
     MAIN,
-    /onRowPick=\{\(pick\) =>\s*runRowPick\(pick, \{\s*open: openSession,\s*run: \(intents\) => void run\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*reselect: shownRowIntents,\s*\}\)\s*\}/,
+    /onRowPick=\{\(pick\) =>(?:\s*\/\/[^\n]*)*\s*runRowPick\(pick, \{\s*open: \(id\) => void answer\(\[openRowIntent\(\{ session: id \}\)\]\),\s*run: \(intents\) => void answer\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*reselect: shownRowIntents,\s*\}\)\s*\}/,
   );
   // The row that goes back is the shown terminal's, and only while one is shown.
   const shown = body("shownRowIntents", "onMount(");
