@@ -14,6 +14,7 @@
 //! stalled tab holds at most `WINDOW_BYTES + READ_QUEUE * CHUNK_BYTES`, about
 //! 8 MiB, so 64 MiB with [`MAX_ATTACHED_TABS`] attached.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
@@ -28,7 +29,16 @@ use uuid::Uuid;
 /// The most tabs one host keeps attached. Opening one more detaches the tab
 /// idle longest; it stays listed and re-attaches on click. Each attached tab
 /// is a tmux client and four threads, so the cap bounds both.
+///
+/// A tab in view is never detached, so while more than this many are on
+/// screen the cap gives way; the next open after they leave the screen
+/// brings the attached tabs back down to it.
 pub const MAX_ATTACHED_TABS: usize = 8;
+
+/// The most tabs the webview may name in view at once. The cap spares every
+/// one of them, so this also bounds the attached tabs: at most one more than
+/// this, the tab being opened beside a screen full of panes.
+pub const MAX_VISIBLE_TABS: usize = 16;
 
 /// Waits before each automatic re-attach of a tab whose client dropped while
 /// its tmux session lives. After the last, the tab is detached and offers
@@ -432,9 +442,20 @@ struct Inner {
     tabs: Mutex<Vec<Tab>>,
     events: Box<dyn TabEvents>,
     reports: Mutex<mpsc::Sender<Intent>>,
-    /// The tab the webview last showed, which the cap never evicts. Locked
-    /// only while the tabs lock is held, or on its own.
-    in_view: Mutex<Option<String>>,
+    /// The tabs the webview has on screen, which the cap never evicts.
+    /// Locked only while the tabs lock is held, or on its own.
+    in_view: Mutex<InView>,
+}
+
+/// The tabs on screen. Until the webview names them ([`Terminals::set_visible`])
+/// the tab it sized last is the one on screen, as a window of one pane has it.
+#[derive(Default)]
+struct InView {
+    keys: HashSet<String>,
+    /// The webview has named its tabs on screen, so sizing one no longer
+    /// marks it: split panes each size themselves, and the last to do so is
+    /// not the only one showing.
+    named: bool,
 }
 
 /// Every terminal tab of one host. Cheap to clone: clones share the tabs.
@@ -457,7 +478,7 @@ impl Terminals {
                 tabs: Mutex::new(Vec::new()),
                 events: Box::new(events),
                 reports: Mutex::new(reports),
-                in_view: Mutex::new(None),
+                in_view: Mutex::new(InView::default()),
             }),
         }
     }
@@ -609,27 +630,53 @@ impl Terminals {
         ));
     }
 
-    /// Whether `key` names the tab the window is showing.
-    ///
-    /// The webview sizes a tab when it shows it, which is what marks it, so
-    /// this is the window's own answer to "is this pane in front of the
-    /// operator" without the renderer asserting it.
+    /// Whether `key` names a listed tab the window has on screen: one the
+    /// webview named in view, or, before it names any, the one it sized last.
     #[must_use]
     pub fn showing(&self, key: &str) -> bool {
-        lock(&self.inner.in_view).as_deref() == Some(key)
+        let tabs = lock(&self.inner.tabs);
+        position(&tabs, key).is_some() && lock(&self.inner.in_view).keys.contains(key)
+    }
+
+    /// The tabs on screen are now exactly `keys`, one per pane the layout
+    /// shows; the webview sends them on every layout change. `false`, with
+    /// the set left as it was, for more than [`MAX_VISIBLE_TABS`] distinct
+    /// keys.
+    ///
+    /// Duplicates count once. A key no tab has yet is kept: a pane can be
+    /// laid out before its tab is listed, since an open goes through the
+    /// reducer, and until a tab has the key it spares nothing and
+    /// [`Self::showing`] is `false` for it.
+    ///
+    /// From the first call on, sizing a tab no longer marks it in view.
+    pub fn set_visible(&self, keys: Vec<String>) -> bool {
+        let keys: HashSet<String> = keys.into_iter().collect();
+        if keys.len() > MAX_VISIBLE_TABS {
+            tracing::warn!(
+                keys = keys.len(),
+                "more than {MAX_VISIBLE_TABS} terminals named in view; refused"
+            );
+            return false;
+        }
+        *lock(&self.inner.in_view) = InView { keys, named: true };
+        true
     }
 
     /// Size the tab's client to the webview's grid.
     ///
-    /// The webview sizes a tab whenever it shows it, so this also marks the
-    /// tab in view, which the cap skips: a quiet tab on screen is not evicted
-    /// while others stream.
+    /// Until the webview names its tabs in view, sizing one also makes it the
+    /// only tab in view: a window of one pane sizes a tab whenever it shows
+    /// it, so a quiet tab on screen is not evicted while others stream.
     pub fn resize(&self, key: &str, cols: u16, rows: u16) {
         let mut tabs = lock(&self.inner.tabs);
         let Some(index) = position(&tabs, key) else {
             return;
         };
-        *lock(&self.inner.in_view) = Some(key.to_string());
+        let mut in_view = lock(&self.inner.in_view);
+        if !in_view.named {
+            in_view.keys = HashSet::from([key.to_string()]);
+        }
+        drop(in_view);
         let tab = &mut tabs[index];
         tab.flow.touch();
         // The size reaches the shared tmux window of every client on the
@@ -687,20 +734,29 @@ impl Terminals {
         )
     }
 
-    /// Detach the tab idle longest when the cap is reached.
+    /// Detach the tabs idle longest until one more fits under the cap.
+    ///
+    /// A tab in view is never detached: with every attached tab on screen
+    /// nothing goes, and the one being attached takes the tabs past the cap.
     fn make_room(&self, tabs: &mut [Tab]) {
-        let attached = tabs.iter().filter(|tab| tab.client.is_some()).count();
-        if attached < MAX_ATTACHED_TABS {
-            return;
+        let mut attached = tabs.iter().filter(|tab| tab.client.is_some()).count();
+        while attached >= MAX_ATTACHED_TABS {
+            let idlest = {
+                let in_view = lock(&self.inner.in_view);
+                tabs.iter_mut()
+                    .filter(|tab| tab.client.is_some() && !in_view.keys.contains(tab.target.tmux()))
+                    .min_by_key(|tab| tab.flow.last_active())
+            };
+            let Some(tab) = idlest else {
+                tracing::debug!(attached, "every attached terminal is in view; over the cap");
+                return;
+            };
+            self.detach_for_cap(tab);
+            attached -= 1;
         }
-        let in_view = lock(&self.inner.in_view).clone();
-        let Some(tab) = tabs
-            .iter_mut()
-            .filter(|tab| tab.client.is_some() && Some(tab.target.tmux()) != in_view.as_deref())
-            .min_by_key(|tab| tab.flow.last_active())
-        else {
-            return;
-        };
+    }
+
+    fn detach_for_cap(&self, tab: &mut Tab) {
         tab.client = None;
         tab.generation += 1;
         tab.flow.retarget(tab.generation);
