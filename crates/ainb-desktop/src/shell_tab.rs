@@ -83,6 +83,10 @@ pub enum Verb {
     Close,
 }
 
+/// What an open that may have made its shell says: the shell is not known to
+/// be gone, so another press could make a second one.
+pub const MAY_STILL_OPEN: &str = "The terminal may still open; check before opening another.";
+
 /// A daemon error as the sentence the window shows. Chosen by the error's
 /// code, never by its words; the daemon's own detail is shown where it has
 /// one to give.
@@ -104,12 +108,14 @@ pub fn refusal_text(verb: Verb, error: &DaemonError) -> String {
         DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
             format!("{doing} failed: the daemon refused it: {message}")
         }
-        // tmux ran and did not settle: the shell may exist. The op id is
-        // spent, so a new press is a new shell, and a shell that did appear
-        // comes back as a tab on the next launch (`shell/list`).
-        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => format!(
-            "{doing} did not finish: {message}. If it appears, it opens as a tab on the next launch."
-        ),
+        // tmux ran and did not settle, or the daemon went quiet: the shell
+        // may exist. The op id is spent, so another press is another shell.
+        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED && verb == Verb::Open => {
+            format!("{MAY_STILL_OPEN} ({message})")
+        }
+        DaemonError::Timeout(_) if verb == Verb::Open => {
+            format!("{MAY_STILL_OPEN} (the daemon did not answer in time)")
+        }
         DaemonError::Rpc { message, .. } => format!("{doing} failed: {message}"),
         DaemonError::Timeout(_) => format!("{doing} failed: the daemon did not answer in time."),
         other => format!("{doing} failed: the daemon is not reachable: {other}"),
@@ -286,12 +292,16 @@ mod tests {
         };
         let text = refusal_text(Verb::Open, &started);
         assert!(!text.contains("failed"), "{text}");
+        assert!(text.starts_with(MAY_STILL_OPEN), "{text}");
         assert!(
             text.contains("may still appear as ainb-dsh-0123abcd"),
             "{text}"
         );
-        assert!(text.contains("next launch"), "{text}");
         let slow = DaemonError::Timeout(std::time::Duration::from_secs(30));
-        assert!(refusal_text(Verb::Open, &slow).contains("did not answer in time"));
+        let text = refusal_text(Verb::Open, &slow);
+        assert!(text.starts_with(MAY_STILL_OPEN), "{text}");
+        // A close that timed out opened nothing.
+        let text = refusal_text(Verb::Close, &slow);
+        assert!(text.starts_with("Closing the terminal failed"), "{text}");
     }
 }
