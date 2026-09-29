@@ -1,10 +1,12 @@
-//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs ship dark: with
-//! `AINB_HANGAR_SPAWN` unset at boot the daemon answers `METHOD_NOT_FOUND`,
-//! exactly as a v1.29.0 daemon does. The worktree verbs are not in the
-//! mutation registry yet; `shell/create` and `shell/close` are.
+//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are served
+//! by default, and `AINB_HANGAR_SPAWN=0` at boot keeps them off: the daemon
+//! then answers `METHOD_NOT_FOUND`, exactly as a daemon from before the
+//! verbs does. Every mutating one of them is in the mutation registry,
+//! whatever the switch says.
 //!
-//! Its own test binary: the switch is read once per process, so the enabled
-//! path lives in `spawn_verbs.rs`, a separate process that sets it.
+//! Its own test binary: the switch is read once per process, so the default
+//! path lives in `spawn_verbs.rs` and `shell_verbs.rs`, separate processes
+//! that leave it unset.
 
 use std::time::Instant;
 
@@ -24,8 +26,16 @@ fn health() -> DaemonHealth {
     }
 }
 
+/// Set the opt-out before any dispatch in this process reads the switch.
+/// Every dispatching test calls this first.
+fn opted_out() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    // Edition 2021: set_var is safe.
+    SET.call_once(|| std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "0"));
+}
+
 #[tokio::test]
-async fn worktree_create_is_method_not_found_by_default() {
+async fn worktree_create_is_method_not_found_with_the_opt_out() {
     assert_method_not_found(
         m::WORKTREE_CREATE,
         serde_json::json!({"repo_path": "/tmp", "agent": "claude"}),
@@ -34,7 +44,7 @@ async fn worktree_create_is_method_not_found_by_default() {
 }
 
 #[tokio::test]
-async fn worktree_agent_add_is_method_not_found_by_default() {
+async fn worktree_agent_add_is_method_not_found_with_the_opt_out() {
     assert_method_not_found(
         m::WORKTREE_AGENT_ADD,
         serde_json::json!({"worktree_path": "/tmp", "agent": "claude"}),
@@ -43,7 +53,7 @@ async fn worktree_agent_add_is_method_not_found_by_default() {
 }
 
 #[tokio::test]
-async fn shell_create_is_method_not_found_by_default() {
+async fn shell_create_is_method_not_found_with_the_opt_out() {
     assert_method_not_found(
         m::SHELL_CREATE,
         serde_json::json!({"worktree_path": "/tmp"}),
@@ -52,12 +62,12 @@ async fn shell_create_is_method_not_found_by_default() {
 }
 
 #[tokio::test]
-async fn shell_list_is_method_not_found_by_default() {
+async fn shell_list_is_method_not_found_with_the_opt_out() {
     assert_method_not_found(m::SHELL_LIST, serde_json::json!({})).await;
 }
 
 #[tokio::test]
-async fn shell_close_is_method_not_found_by_default() {
+async fn shell_close_is_method_not_found_with_the_opt_out() {
     assert_method_not_found(
         m::SHELL_CLOSE,
         serde_json::json!({"tmux_session_name": "ainb-dsh-0a1b2c3d"}),
@@ -67,9 +77,10 @@ async fn shell_close_is_method_not_found_by_default() {
 
 /// A well-formed request for `method` gets `METHOD_NOT_FOUND` and no result.
 async fn assert_method_not_found(method: &str, params: serde_json::Value) {
+    opted_out();
     assert!(
-        std::env::var_os(ainb_hangar_daemon::spawn::SPAWN_ENV).is_none(),
-        "run with {} unset: that is the default being proven",
+        !ainb_hangar_daemon::spawn::enabled(),
+        "{}=0 must keep the spawn verbs off",
         ainb_hangar_daemon::spawn::SPAWN_ENV
     );
     let dir = tempfile::tempdir().unwrap();
@@ -98,26 +109,22 @@ async fn assert_method_not_found(method: &str, params: serde_json::Value) {
     assert!(response.get("result").is_none(), "{response}");
 }
 
+/// Every spawn verb that changes the host is in the ledger: a retried op id
+/// replays the first answer (the same worktree, agent or shell) rather than
+/// running again. Listing is a read.
 #[test]
-fn worktree_create_is_not_in_the_mutation_registry_while_dark() {
-    assert!(!ainb_hangar_proto::mutation::is_mutating(
-        m::WORKTREE_CREATE
-    ));
-}
-
-#[test]
-fn worktree_agent_add_is_not_in_the_mutation_registry_while_dark() {
-    assert!(!ainb_hangar_proto::mutation::is_mutating(
-        m::WORKTREE_AGENT_ADD
-    ));
-}
-
-/// The shell verbs are in the ledger while dark: a retried op id replays
-/// the first create rather than opening a second shell. Listing is a read.
-#[test]
-fn shell_create_and_close_are_in_the_mutation_registry_while_dark() {
-    assert!(ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
-    assert!(ainb_hangar_proto::mutation::is_mutating(m::SHELL_CLOSE));
+fn the_mutating_spawn_verbs_are_in_the_mutation_registry() {
+    for method in [
+        m::WORKTREE_CREATE,
+        m::WORKTREE_AGENT_ADD,
+        m::SHELL_CREATE,
+        m::SHELL_CLOSE,
+    ] {
+        assert!(
+            ainb_hangar_proto::mutation::is_mutating(method),
+            "{method}"
+        );
+    }
     assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_LIST));
 }
 
