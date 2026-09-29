@@ -10,7 +10,18 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
 import { cardForSession, statusForSession } from "./status.ts";
-import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, countIn, elsewhereCount, showIntents } from "./board.ts";
+import {
+  agentStateCounts,
+  attentionRows,
+  boardColumns,
+  boardHealth,
+  cardBranch,
+  COLUMNS,
+  countIn,
+  elsewhereCount,
+  nextNeedsYou,
+  showIntents,
+} from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -199,6 +210,33 @@ test("a card takes its row's name and the fleet's model, and one with no row sti
   assert.equal(stray.title, "claude p-9", "named by provider and id, not the raw key");
 });
 
+test("a card's branch is its row's branch, drawn through the label rule", () => {
+  assert.equal(cardBranch("agents/fix-login", "claude"), "agents/fix-login");
+  assert.equal(cardBranch("  feature/x  ", "claude"), "feature/x", "trimmed");
+  assert.equal(cardBranch("feat\u202Eure", "claude"), "feature", "a bidi override cannot restyle the card");
+});
+
+test("a card has no branch when its row has none, or when the branch only repeats the title", () => {
+  assert.equal(cardBranch(undefined, "claude"), null, "no row");
+  assert.equal(cardBranch("", "claude"), null, "an SSH row carries an empty branch");
+  assert.equal(cardBranch("   ", "claude"), null);
+  // Orca drops the second line rather than say one name twice.
+  assert.equal(cardBranch("fix-login", "fix-login"), null);
+});
+
+test("two cards with the same name are told apart by their rows' branches", () => {
+  const { sessions, fleet } = world(["u-1", "claude", "p-1"], ["u-2", "claude", "p-2"]);
+  const rows = sessions.workspaces[0].sessions as unknown as { branch_name: string }[];
+  rows[0].branch_name = "agents/fix-login";
+  rows[1].branch_name = "agents/add-search";
+  const cards = boardColumns(status(card("claude:p-1"), card("claude:p-2"), card("claude:p-9")), fleet, sessions, NO_ACKS)
+    .flatMap((column) => column.cards);
+  const branchOf = (key: string) => cards.find((c) => c.key === key)?.branch;
+  assert.equal(branchOf("claude:p-1"), "agents/fix-login");
+  assert.equal(branchOf("claude:p-2"), "agents/add-search");
+  assert.equal(branchOf("claude:p-9"), null, "a card with no row has no branch");
+});
+
 test("an agent with something open floats to the top of its column", () => {
   const { sessions, fleet } = world();
   const [needs] = boardColumns(
@@ -374,4 +412,39 @@ test("an idle agent whose row already rings Ask is counted once, in one of need-
   (sessions.workspaces[0].sessions[0] as { attention: unknown[] }).attention = [{ kind: "Ask", options: [], route: "Daemon" }];
   const columns = boardColumns(status(card("claude:p-1", { state: "idle" })), fleet, sessions, NO_ACKS);
   assert.equal(countIn(columns, "needs") + countIn(columns, "idle"), 1);
+});
+
+test("the attention jump walks the Needs you column top to bottom, then wraps", () => {
+  // The column's own order, the one the board draws: an open request first,
+  // then by title. The jump reads that list and never counts one of its own.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"], ["u-2", "web", "p-2"], ["u-3", "cli", "p-3"]);
+  const columns = boardColumns(
+    status(
+      card("claude:p-2", { state: "waiting" }),
+      card("claude:p-1", { state: "waiting" }),
+      card("claude:p-3", { state: "working" }),
+    ),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  assert.equal(nextNeedsYou(columns, null)?.key, "claude:p-1", "nothing jumped to yet: the top card");
+  assert.equal(nextNeedsYou(columns, "claude:p-1")?.key, "claude:p-2");
+  assert.equal(nextNeedsYou(columns, "claude:p-2")?.key, "claude:p-1", "past the last card, back to the top");
+  assert.equal(nextNeedsYou(columns, "claude:p-3")?.key, "claude:p-1", "a card that left Needs starts it over");
+});
+
+test("the attention jump skips a card no click can open, and finds nothing when nothing needs you", () => {
+  // `codex:gone` has no session row and no transcript: the board draws it
+  // disabled, so the jump has nowhere to take the person.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const waiting = boardColumns(
+    status(card("claude:p-1", { state: "waiting" }), card("codex:gone", { state: "waiting" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  assert.equal(nextNeedsYou(waiting, "claude:p-1")?.key, "claude:p-1");
+  const quiet = boardColumns(status(card("claude:p-1", { state: "working" })), fleet, sessions, NO_ACKS);
+  assert.equal(nextNeedsYou(quiet, null), null);
 });

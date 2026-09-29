@@ -3,8 +3,8 @@
 //! `updater_gate.rs` checks the updater's): the colour comes from
 //! `theme::window_paint` and reaches `set_background_color`, the appearance is
 //! set before the theme it leaves is read, and an OS theme change repaints
-//! the background. The decision itself is `theme::window_paint`'s own unit
-//! test; this holds the two call sites to it.
+//! the background from the pick held in memory. The decision itself is
+//! `theme::window_paint`'s own unit test; this holds the two call sites to it.
 
 use std::path::Path;
 
@@ -87,9 +87,20 @@ fn an_os_theme_change_repaints_the_background() {
         "WindowEvent::ThemeChanged(",
         "the OS switching theme is heard",
     );
+    let repaint = &window[event..];
     at(
-        &window[event..],
+        repaint,
         "paint_window_background(",
         "the OS switching theme repaints the background",
+    );
+    at(
+        repaint,
+        "theme.current()",
+        "the repaint takes the pick held in memory (`ThemePick`)",
+    );
+    assert!(
+        !repaint.contains("theme::load("),
+        "the repaint must not re-read the file: a failed write or an edit \
+         behind the app's back would move the paint:\n{repaint}"
     );
 }

@@ -516,9 +516,13 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 ///
 /// # Errors
 /// [`SpawnError::Unregistered`] for a repository no registered folder or
-/// project admits and [`SpawnError::Invalid`] for any other request refused,
-/// both before anything ran; [`SpawnError::Failed`] when `ainb run` failed
-/// or outlived the bound.
+/// project admits. [`SpawnError::Invalid`] for any other request refused:
+/// params that fail `validate`, a `repo_path` with `.` or `..` components,
+/// that is not a directory or not the top of a git repository, or a `branch`
+/// that already exists. Both are answered before `ainb run` ran.
+/// [`SpawnError::Failed`] when the daemon has no home directory, or
+/// `ainb run` could not be started, failed, outlived the bound, or printed
+/// no result it could read.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -543,7 +547,15 @@ pub async fn worktree_create(
 /// session row: `ainb run` never deletes a tree or a branch it did not make.
 ///
 /// # Errors
-/// As [`worktree_create`].
+/// [`SpawnError::Unregistered`] for a worktree whose source repository no
+/// registered folder or project admits. [`SpawnError::Invalid`] for any other
+/// request refused: params that fail `validate`, or a `worktree_path` with
+/// `.` or `..` components, that is not a directory, not a folder directly in
+/// [`managed_worktrees`], not the top of a linked worktree, or whose source
+/// repository is otherwise refused. Both are answered before `ainb run` ran.
+/// [`SpawnError::Failed`] when the daemon has no home directory, the
+/// worktree check could not finish, or `ainb run` failed as for
+/// [`worktree_create`].
 pub async fn worktree_agent_add(
     params: &WorktreeAgentAddParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {

@@ -125,6 +125,13 @@ export function Board(props: Props) {
                             }}
                           >
                             <span class="card-title">{card()?.title}</span>
+                            <Show when={card()?.branch}>
+                              {(branch) => (
+                                <span class="card-branch" title={branch()}>
+                                  {branch()}
+                                </span>
+                              )}
+                            </Show>
                             <Show when={needOf(card())}>
                               {(need) => (
                                 <span class="card-need chip" data-kind={need()}>

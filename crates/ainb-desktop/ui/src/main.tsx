@@ -27,7 +27,7 @@ import { phaseOf, questionFor, questionOver, type Refusal, sendInOrder } from ".
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
-import { agentStateCounts, boardColumns, countIn, sameColumns } from "./board.ts";
+import { agentStateCounts, boardColumns, countIn, nextNeedsYou, sameColumns, showIntents } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -406,6 +406,38 @@ function Shell() {
     select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
   });
 
+  /** The Needs you card the last Cmd+U revealed, so the next press moves on. */
+  let jumped: string | null = null;
+  /**
+   * Cmd+U: reveal the next agent in the board's Needs you column. On the board
+   * its card takes focus and its row is selected, as a click on it does;
+   * anywhere else its tab is shown, or opened when it has none. Every send
+   * goes after `answer_home`, so from Settings or the Inbox nothing is
+   * refused. With nothing waiting it says so: Orca has no such chord, so
+   * there is no silence to match, and a chord that does nothing reads as dead.
+   */
+  const jumpToAttention = () => {
+    const card = nextNeedsYou(columns(), jumped);
+    if (card === null) {
+      toast("Nobody needs you");
+      return;
+    }
+    jumped = card.key;
+    // No row: an ACP agent (`nextNeedsYou` skips any other), shown by its transcript.
+    if (card.sessionId === null) {
+      void invoke("answer_home").then(() => openTranscript(card.key));
+      return;
+    }
+    if (showing("board")) {
+      void answer(showIntents(card.sessionId, card.hasOpenRequest));
+      [...document.querySelectorAll<HTMLElement>(".board-card")].find((node) => node.dataset.card === card.key)?.focus();
+      return;
+    }
+    const tab = tabs().find((one) => one.target.kind === "session" && one.target.id === card.sessionId);
+    if (tab !== undefined) choose(tab);
+    else void answer([openRowIntent({ session: card.sessionId })]);
+  };
+
   const onAccelerator = (shell: Accelerator) => {
     // A modal owns the keyboard: no chord may switch or close a tab, or focus
     // a terminal, behind the open composer.
@@ -428,8 +460,10 @@ function Shell() {
         if (key !== null) void invoke("terminal_close", { key });
         return;
       }
-      // ponytail: the attention jump is D2, the host switcher R1.
       case "attention":
+        jumpToAttention();
+        return;
+      // ponytail: the host switcher is R1.
       case "hosts":
         return;
       // Answered by the terminal that has focus; outside one there is no

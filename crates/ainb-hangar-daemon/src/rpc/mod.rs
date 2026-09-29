@@ -1931,8 +1931,9 @@ async fn handle(
         methods::WORKSPACE_SESSION_UPSERT => handle_session_upsert(pool, req).await,
         methods::WORKSPACE_SESSION_DELETE => handle_session_delete(pool, req).await,
         methods::WORKSPACE_SESSION_RECONCILE => handle_session_reconcile(pool).await,
-        // Dark: with the boot switch off this arm does not match and the
-        // request falls through to METHOD_NOT_FOUND below.
+        // Served by default. `AINB_HANGAR_SPAWN=0` at boot opts out: these
+        // arms then do not match and the request falls through to
+        // METHOD_NOT_FOUND below, as on a daemon from before the verbs.
         methods::WORKTREE_CREATE if crate::spawn::enabled() => handle_worktree_create(req).await,
         methods::WORKTREE_AGENT_ADD if crate::spawn::enabled() => {
             handle_worktree_agent_add(req).await

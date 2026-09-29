@@ -37,7 +37,7 @@ fn health() -> DaemonHealth {
 }
 
 /// A fake `ainb`: writes its environment to `env.txt` and its argv (one per
-/// line) to `argv.txt`, then either
+/// line) to `argv.txt`, appends one line per run to `runs.txt`, then either
 /// prints one JSON line and exits 0, or prints to stderr and exits 3.
 fn fake_ainb(dir: &Path, succeed: bool) -> std::path::PathBuf {
     let bin = dir.join("ainb");
@@ -53,9 +53,10 @@ exit 3"#
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nenv > '{env}'\n: > '{argv}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n{body}\n",
+            "#!/bin/sh\necho run >> '{runs}'\nenv > '{env}'\n: > '{argv}'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{argv}'; done\n{body}\n",
             argv = argv_file.display(),
-            env = dir.join("env.txt").display()
+            env = dir.join("env.txt").display(),
+            runs = dir.join("runs.txt").display()
         ),
     )
     .unwrap();
@@ -69,7 +70,13 @@ async fn call(params: serde_json::Value) -> serde_json::Value {
 
 async fn call_method(method: &str, params: serde_json::Value) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open_in(dir.path()).await.unwrap();
+    call_in(dir.path(), method, params).await
+}
+
+/// Dispatch against the daemon store in `dir`, so calls that share a `dir`
+/// share the D18 ledger, as a real daemon's do.
+async fn call_in(dir: &Path, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let store = Store::open_in(dir).await.unwrap();
     let broker = EventBroker::new();
     let request = RpcRequest {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
@@ -214,6 +221,100 @@ async fn a_create_runs_ainb_run_with_the_request_and_returns_its_session() {
     }
     assert!(argv.contains(&"--model=opus"), "{argv:?}");
     assert_eq!(argv.last(), Some(&"--prompt=-y fix it"));
+}
+
+/// Send `params` twice to one daemon store under `home`, as a client retrying
+/// with the same op id does, and return both responses.
+async fn sent_twice(
+    home: &Path,
+    method: &str,
+    params: serde_json::Value,
+) -> (serde_json::Value, serde_json::Value) {
+    let ledger = home.join("daemon-store");
+    std::fs::create_dir_all(&ledger).unwrap();
+    let first = call_in(&ledger, method, params.clone()).await;
+    let retry = call_in(&ledger, method, params).await;
+    (first, retry)
+}
+
+/// `ainb run` ran once across a call and its retry: the first was `created`,
+/// the retry `replayed`, with the first result.
+fn assert_ran_once_and_replayed(
+    tools: &Path,
+    first: &serde_json::Value,
+    retry: &serde_json::Value,
+) {
+    let runs = std::fs::read_to_string(tools.join("runs.txt")).unwrap_or_default();
+    assert_eq!(
+        runs.lines().count(),
+        1,
+        "`ainb run` ran {} times for one op id: {retry}",
+        runs.lines().count()
+    );
+    let ack = ainb_hangar_proto::mutation::ACK_KEY;
+    assert_eq!(first["result"][ack]["outcome"], "created", "{first}");
+    assert_eq!(retry["result"][ack]["outcome"], "replayed", "{retry}");
+    let answer = |response: &serde_json::Value| {
+        let mut result = response["result"].clone();
+        result.as_object_mut().expect("a result").remove(ack);
+        result
+    };
+    assert_eq!(
+        answer(first)["tmux_session_name"],
+        "app-11111111",
+        "{first}"
+    );
+    assert_eq!(answer(retry), answer(first), "the first answer, replayed");
+}
+
+/// A create retried with its op id is answered from the D18 ledger: one
+/// `ainb run`, so one worktree and branch, and the retry gets the session
+/// the first call made.
+#[tokio::test]
+async fn a_create_retried_with_its_op_id_runs_ainb_once_and_replays_the_answer() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let (first, retry) = sent_twice(
+        repo.home.path(),
+        m::WORKTREE_CREATE,
+        serde_json::json!({
+            "repo_path": repo.repo(),
+            "agent": "claude",
+            "branch": "feat/x",
+            "op_id": "op-create-once",
+        }),
+    )
+    .await;
+
+    assert_ran_once_and_replayed(tools.path(), &first, &retry);
+}
+
+/// An agent_add retried with its op id is answered from the D18 ledger: one
+/// `ainb run`, so one agent in the tree, not two.
+#[tokio::test]
+async fn an_agent_add_retried_with_its_op_id_runs_ainb_once_and_replays_the_answer() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let registered = Registered::new();
+    let tree =
+        registered.managed_worktree(Path::new(&registered.repo()), "app--feat--1a2b3c4d", "feat");
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let (first, retry) = sent_twice(
+        registered.home.path(),
+        m::WORKTREE_AGENT_ADD,
+        serde_json::json!({
+            "worktree_path": tree,
+            "agent": "codex",
+            "op_id": "op-agent-add-once",
+        }),
+    )
+    .await;
+
+    assert_ran_once_and_replayed(tools.path(), &first, &retry);
 }
 
 /// `ainb run` starts tmux itself, and a tmux server keeps the environment it
