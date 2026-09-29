@@ -346,7 +346,8 @@ pub mod single_instance;
 pub mod skills_sync;
 /// `worktree/create`, `worktree/agent_add` and the `shell/*` verbs: the
 /// daemon as the one owner of new work, served by default and kept off by
-/// `AINB_HANGAR_SPAWN=0` (desktop redesign P3a, W1).
+/// `AINB_HANGAR_SPAWN=0` or `[hangar] spawn = false` in the hangar home's
+/// `config/config.toml` (desktop redesign P3a, W1).
 pub mod spawn;
 /// Claim-time squad-leader briefing builder (multica `squad_briefing.go` parity,
 /// gap #7).
@@ -907,12 +908,14 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
     crate::hook_ingress::remove_stale(&dir);
     // The same for `ainb run` output: a daemon killed mid-create left it.
     crate::spawn::remove_stale_run_logs();
-    // Read the spawn switch now, once, so the log says what this daemon
+    // Read the spawn switches now, once, so the log says what this daemon
     // serves before any request arrives.
     tracing::info!(
         served = crate::spawn::enabled(),
-        "spawn verbs (worktree/create, worktree/agent_add, shell/*); {}=0 keeps them off",
-        crate::spawn::SPAWN_ENV
+        "spawn verbs (worktree/create, worktree/agent_add, shell/*); {}=0, or `{}` = false in {}, keeps them off",
+        crate::spawn::SPAWN_ENV,
+        crate::spawn::SPAWN_CONFIG_KEY,
+        crate::spawn::config_path_in(&dir).display()
     );
 
     // Crash breadcrumbs start HERE, once this process owns the home — never

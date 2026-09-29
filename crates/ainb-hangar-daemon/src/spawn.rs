@@ -23,11 +23,13 @@
 //! prefix, [`DAEMON_SHELL_PREFIX`], and the owner option every one of them
 //! carries, [`SHELL_OWNER_OPTION`].
 //!
-//! Served by default. [`SPAWN_ENV`] set at boot to anything but `1`
-//! (`AINB_HANGAR_SPAWN=0`) turns them off, and they answer
-//! `METHOD_NOT_FOUND`, which a client cannot tell from an older daemon. An
-//! environment variable, never a `daemon_config` key, so no connected
-//! surface can switch it either way.
+//! Served by default. Two boot-time switches turn them off, and they then
+//! answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
+//! daemon: [`SPAWN_ENV`] set to anything but `1` (`AINB_HANGAR_SPAWN=0`), or
+//! [`SPAWN_CONFIG_KEY`] (`[hangar] spawn = false`) in the hangar home's
+//! `config/config.toml`. Either one saying off wins. An environment variable
+//! and a file the daemon only reads, never a `daemon_config` key, so no
+//! connected surface can switch them either way.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -43,17 +45,41 @@ use ainb_hangar_proto::spawn::{
 /// `0` (or any other value) keeps them off. See [`served_by`].
 pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 
+/// The same switch as a file key: `spawn` under `[hangar]` in
+/// [`config_path_in`]. Absent or `true` serves them, `false` keeps them off.
+/// See [`served_by_config`].
+pub const SPAWN_CONFIG_KEY: &str = "hangar.spawn";
+
 /// Upper bound on one `ainb run`. It waits up to 30s for the agent's input
 /// box before sending the prompt, and a first-run Codex thread claim can add
 /// more; past this the create is reported failed rather than hanging a caller.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Whether the spawn verbs are served, read once so a later `set_var` cannot
-/// flip a running daemon.
+/// Whether the spawn verbs are served, read once so a later `set_var` or
+/// config edit cannot flip a running daemon.
+///
+/// Served only when both switches serve them: an opt-out in either one wins,
+/// so `AINB_HANGAR_SPAWN=1` does not undo `[hangar] spawn = false`, and an
+/// app launched without the variable still honours the file.
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| served_by(std::env::var_os(SPAWN_ENV).as_deref()))
+    *ON.get_or_init(|| {
+        let env = served_by(std::env::var_os(SPAWN_ENV).as_deref());
+        // No home, no file to read: the variable alone decides.
+        let file =
+            crate::hangar_dir().map_or(true, |home| served_by_config(&config_path_in(&home)));
+        env && file
+    })
+}
+
+/// The file [`SPAWN_CONFIG_KEY`] is read from: `<hangar home>/config/config.toml`.
+///
+/// The user config, which the daemon also reads `[codex] app_server` from. A
+/// project's `.ainb/config.toml` never reaches the daemon.
+#[must_use]
+pub fn config_path_in(hangar_home: &Path) -> PathBuf {
+    hangar_home.join("config").join("config.toml")
 }
 
 /// Whether a daemon whose [`SPAWN_ENV`] is `value` serves the spawn verbs.
@@ -66,6 +92,60 @@ pub fn enabled() -> bool {
 #[must_use]
 pub fn served_by(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_none_or(|value| value == "1")
+}
+
+/// Whether the config file at `path` lets the spawn verbs be served.
+///
+/// The file twin of [`served_by`]: only a missing file, no `[hangar]`
+/// section, an empty one, or `spawn = true` serves them. Everything else
+/// keeps them off, with a warning, so a mistyped opt-out fails closed:
+/// `false` or any other value (`"0"`, `0`, `"off"`), any other key under
+/// `[hangar]` (it holds this one key, so another is a typo of it), a
+/// `hangar` that is not a table, `spawn` under `[hangar_daemon]` (a section
+/// this file does not feed), a link to nowhere, and a file that cannot be
+/// read or is not valid TOML.
+#[must_use]
+pub fn served_by_config(path: &Path) -> bool {
+    let off = |why: &str| {
+        tracing::warn!(path = %path.display(), "{why}; spawn verbs kept off");
+        false
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // A dangling link (a dotfiles checkout that is not there) is not
+        // "no file": the opt-out may be behind it.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            return true;
+        }
+        Err(error) => return off(&format!("cannot read hangar config: {error}")),
+    };
+    let table: toml::Table = match text.parse() {
+        Ok(table) => table,
+        Err(error) => return off(&format!("hangar config is not valid TOML: {error}")),
+    };
+    if table.get("hangar_daemon").and_then(|section| section.get("spawn")).is_some() {
+        return off(&format!(
+            "`hangar_daemon.spawn` is not read from this file; the key is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    let Some(section) = table.get("hangar") else {
+        return true;
+    };
+    let Some(section) = section.as_table() else {
+        return off("`hangar` must be a table");
+    };
+    if let Some(other) = section.keys().find(|key| *key != "spawn") {
+        return off(&format!(
+            "`hangar.{other}` is not a key; the spawn opt-out is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    match section.get("spawn") {
+        None => true,
+        Some(toml::Value::Boolean(on)) => *on,
+        Some(_) => off(&format!("`{SPAWN_CONFIG_KEY}` must be true or false")),
+    }
 }
 
 /// Why a create failed, split so the RPC layer can tell a bad request from a
@@ -1541,6 +1621,57 @@ mod tests {
         for off in ["0", "", "false", "off", "no", "true", " 1"] {
             assert!(!served_by(Some(OsStr::new(off))), "{off:?} keeps them off");
         }
+    }
+
+    /// On unless the file opts out; anything it cannot read as `true` is off.
+    #[test]
+    fn the_config_file_serves_the_spawn_verbs_unless_opted_out() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_path_in(home.path());
+        assert!(served_by_config(&path), "no file serves them: the default");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for on in [
+            "",
+            "[other]\nkey = 1\n",
+            "[hangar_daemon]\nautostandup = 1\n",
+            "[hangar]\n",
+            "[hangar]\nspawn = true\n",
+        ] {
+            std::fs::write(&path, on).unwrap();
+            assert!(served_by_config(&path), "{on:?} serves them");
+        }
+        for off in [
+            "[hangar]\nspawn = false\n",
+            "hangar.spawn = false\n",
+            "[hangar]\nspawn = \"0\"\n",
+            "[hangar]\nspawn = \"true\"\n",
+            "[hangar]\nspawn = 1\n",
+            "hangar = \"off\"\n",
+            "[hangar\nspawn = true\n",
+            "[hangar]\nspawn_verbs = false\n",
+            "[hangar]\nspawn = true\nspwan = false\n",
+            "[hangar_daemon]\nspawn = false\n",
+        ] {
+            std::fs::write(&path, off).unwrap();
+            assert!(!served_by_config(&path), "{off:?} keeps them off");
+        }
+    }
+
+    /// A config file the daemon cannot read is not taken as "no opt-out".
+    #[test]
+    fn an_unreadable_config_file_keeps_the_spawn_verbs_off() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_path_in(home.path());
+        // A directory where the file should be: present, but never readable.
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(!served_by_config(&path));
+
+        let linked = home.path().join("linked.toml");
+        std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
+        assert!(
+            !served_by_config(&linked),
+            "a link to nowhere is not a missing file"
+        );
     }
 
     #[test]
