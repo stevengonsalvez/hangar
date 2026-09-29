@@ -140,7 +140,7 @@ export function TerminalSearch(props: Props) {
     else if (event.key === "Enter") findNext();
     else return;
     // Only the keys the bar answers are kept from the window; its chords
-    // (Cmd+K, Cmd+W) still work from the query field.
+    // (Cmd+J, Cmd+W) still work from the query field.
     event.preventDefault();
     event.stopPropagation();
   };
