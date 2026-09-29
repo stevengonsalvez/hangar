@@ -354,24 +354,46 @@ async fn a_bad_request_is_invalid_params_and_spawns_nothing() {
     );
 }
 
-/// A create that times out keeps draining `ainb run`'s output. A run still
+/// The run's output files under `home`: `(name, mode)` for each.
+fn run_output(home: &Path) -> Vec<(String, u32)> {
+    let dir = home.join(".agents-in-a-box/hangar/logs/spawn");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let mode = entry.metadata().map_or(0, |m| m.permissions().mode() & 0o777);
+            (entry.file_name().to_string_lossy().into_owned(), mode)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// A create that times out leaves `ainb run` writing to its files. A run still
 /// working past the timeout (the prompt wait, a slow first thread) writes
-/// later; if its pipes had been closed, that write would kill it on EPIPE
-/// before its own rollback, leaving the tmux session, worktree and branch
-/// behind. The stand-in writes to both streams after the timeout and only
-/// then leaves its marker, so the marker says it lived through the writes.
+/// later; if its output had gone to pipes the daemon stopped reading, that
+/// write would kill it on EPIPE before its own rollback, leaving the tmux
+/// session, worktree and branch behind. The stand-in writes to both streams
+/// after the timeout, leaves its marker, and holds until released, so the
+/// files are read while the run is live: private to the daemon's user, with
+/// the late lines in them. Once it exits, nothing is left behind.
 #[tokio::test]
-async fn a_timed_out_create_keeps_draining_so_a_late_write_does_not_kill_the_run() {
+async fn a_late_write_after_timeout_lands_in_the_file() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tools = tempfile::tempdir().unwrap();
     let repo = Registered::new();
     let marker = tools.path().join("lived.txt");
+    let release = tools.path().join("release.txt");
     let bin = tools.path().join("ainb");
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nsleep 1\necho 'late progress' >&2\necho 'late line'\necho 'more progress' >&2\n: > '{}'\n",
-            marker.display()
+            "#!/bin/sh\nsleep 1\necho 'late progress' >&2\necho 'late line'\necho 'more progress' >&2\n: > '{marker}'\n\
+             n=0; while [ ! -e '{release}' ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n",
+            marker = marker.display(),
+            release = release.display()
         ),
     )
     .unwrap();
@@ -397,6 +419,34 @@ async fn a_timed_out_create_keeps_draining_so_a_late_write_does_not_kill_the_run
     assert!(
         marker.exists(),
         "the run died on a write after the timeout: its output was no longer drained"
+    );
+
+    // Live: the late lines are in the files, and only the daemon's user can
+    // read them or list the directory they sit in.
+    let spawn_logs = repo.home.path().join(".agents-in-a-box/hangar/logs/spawn");
+    let dir_mode = std::fs::metadata(&spawn_logs).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "{} is {dir_mode:o}", spawn_logs.display());
+    let live = run_output(repo.home.path());
+    assert_eq!(live.len(), 2, "one stdout and one stderr file: {live:?}");
+    for (name, mode) in &live {
+        assert_eq!(*mode, 0o600, "{name} is {mode:o} while the run is live");
+        let text = std::fs::read_to_string(spawn_logs.join(name)).unwrap();
+        let late = if name.ends_with(".stdout") {
+            "late line"
+        } else {
+            "more progress"
+        };
+        assert!(text.contains(late), "{name} lost the late write: {text:?}");
+    }
+
+    std::fs::write(&release, "").unwrap();
+    while !run_output(repo.home.path()).is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        run_output(repo.home.path()),
+        Vec::<(String, u32)>::new(),
+        "the run's output outlived the run"
     );
 }
 
