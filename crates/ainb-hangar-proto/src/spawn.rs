@@ -156,8 +156,12 @@ pub struct ShellCreateResult {
 ///
 /// Its own prefix, not the TUI's `ainb-sh-`: the TUI filters its own shells
 /// out of its tmux list by that one, so a daemon shell under it could not be
-/// told from the TUI's and was neither listed nor closed by anything. `shell/list` and `shell/close` act on this prefix
-/// alone.
+/// told from the TUI's and was neither listed nor closed by anything.
+///
+/// The prefix alone does not make a session the daemon's: `shell/list` and
+/// `shell/close` also require the `@ainb_owner` user option the daemon sets
+/// on every shell it opens, so a user's session that happens to use this
+/// prefix is never listed or closed.
 pub const DAEMON_SHELL_PREFIX: &str = "ainb-dsh-";
 
 /// Whether `name` is a shell the daemon opened: [`DAEMON_SHELL_PREFIX`]
