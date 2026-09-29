@@ -16,6 +16,8 @@
 //!   page draws it.
 //! - [`shell::Shell`] locks the host and the executor together for the
 //!   window's commands and tick.
+//! - [`shell_tab`] opens a plain shell tab in a worktree through the daemon,
+//!   and ends it with the tab.
 //! - [`sidecar`] finds or starts the bundled hangar daemon and holds this
 //!   surface's presence against it.
 //! - [`theme`] keeps the host's copy of the theme a person picked, so the
@@ -36,6 +38,7 @@ pub mod intent;
 pub mod projects;
 pub mod setup;
 pub mod shell;
+pub mod shell_tab;
 pub mod sidecar;
 pub mod terminal;
 pub mod theme;
