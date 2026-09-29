@@ -51,7 +51,13 @@ async fn call(params: serde_json::Value) -> serde_json::Value {
 
 async fn call_method(method: &str, params: serde_json::Value) -> serde_json::Value {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open_in(dir.path()).await.unwrap();
+    call_in(dir.path(), method, params).await
+}
+
+/// Dispatch against the daemon store in `dir`, so calls that share a `dir`
+/// share the D18 ledger, as a real daemon's do.
+async fn call_in(dir: &Path, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let store = Store::open_in(dir).await.unwrap();
     let broker = EventBroker::new();
     let request = RpcRequest {
         jsonrpc: ainb_hangar_proto::jsonrpc_version(),
@@ -191,9 +197,18 @@ impl World {
         response
     }
 
-    /// Create a shell with `op_id`, remembering its session for cleanup.
+    /// Create a shell with `op_id` against this world's one daemon store (so
+    /// a retry meets the ledger the first call wrote), remembering its
+    /// session for cleanup.
     async fn shell_with_op(&mut self, path: &str, op_id: &str) -> serde_json::Value {
-        let response = call(serde_json::json!({ "worktree_path": path, "op_id": op_id })).await;
+        let ledger = self.home.path().join("daemon-store");
+        std::fs::create_dir_all(&ledger).unwrap();
+        let response = call_in(
+            &ledger,
+            m::SHELL_CREATE,
+            serde_json::json!({ "worktree_path": path, "op_id": op_id }),
+        )
+        .await;
         if let Some(name) = response["result"]["tmux_session_name"].as_str() {
             self.made.push(name.to_string());
         }
@@ -493,6 +508,14 @@ async fn a_shell_on_a_server_already_holding_the_token_gets_neither() {
         );
     }
 }
+/// The shell a create answered with, without the ledger's ack.
+fn shell_of(response: &serde_json::Value) -> (serde_json::Value, serde_json::Value) {
+    (
+        response["result"]["tmux_session_name"].clone(),
+        response["result"]["worktree_path"].clone(),
+    )
+}
+
 fn shell_name(response: &serde_json::Value) -> String {
     response["result"]["tmux_session_name"]
         .as_str()
@@ -631,9 +654,9 @@ async fn a_close_never_reaches_a_session_the_daemon_did_not_open() {
     }
 }
 
-/// A create retried with the same op id (a lost reply) returns the shell the
-/// first attempt made and opens no second one. The same op id for another
-/// folder is refused; a new op id is a new shell.
+/// A create retried with the same op id (a lost reply) replays the shell the
+/// first attempt made, through the D18 ledger, and opens no second one. The
+/// same op id for another folder is rejected; a new op id is a new shell.
 #[tokio::test]
 async fn a_retried_create_with_the_same_op_id_returns_the_same_shell() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -647,7 +670,11 @@ async fn a_retried_create_with_the_same_op_id_returns_the_same_shell() {
     let first = world.shell_with_op(&tree, "0123456789abcdef0123456789abcdef").await;
     let retry = world.shell_with_op(&tree, "0123456789abcdef0123456789abcdef").await;
 
-    assert_eq!(first["result"], retry["result"], "{first} / {retry}");
+    assert_eq!(shell_of(&first), shell_of(&retry), "{first} / {retry}");
+    assert_eq!(
+        retry["result"]["mutation"]["outcome"], "replayed",
+        "{retry}"
+    );
     assert_eq!(
         world.sessions(),
         vec![shell_name(&first)],
@@ -657,7 +684,7 @@ async fn a_retried_create_with_the_same_op_id_returns_the_same_shell() {
     let elsewhere = world.shell_with_op(&repo, "0123456789abcdef0123456789abcdef").await;
     assert_eq!(
         elsewhere["error"]["code"].as_i64(),
-        Some(-32602),
+        Some(i64::from(ainb_hangar_proto::mutation::MUTATION_REJECTED)),
         "{elsewhere}"
     );
 
@@ -740,6 +767,6 @@ async fn an_odd_folder_name_opens_lists_and_replays_as_itself() {
     );
 
     let retry = world.shell_with_op(&odd, "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a").await;
-    assert_eq!(retry["result"], first["result"], "{retry}");
+    assert_eq!(shell_of(&retry), shell_of(&first), "{retry}");
     assert_eq!(world.sessions(), vec![name]);
 }
