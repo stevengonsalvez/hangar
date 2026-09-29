@@ -186,6 +186,38 @@ async fn a_shell_tab_opens_reattaches_and_ends_through_the_daemon() {
     );
     assert!(shell_tab::is_shell_tab(&terminals, &key));
 
+    // A shell whose tab cannot attach is closed again: the window shows no
+    // tab for it, so nothing else would end it. This window's tmux cannot
+    // run, so every attach fails.
+    let broken = Terminals::new(
+        Tmux::new(PathBuf::from("/nonexistent/tmux")),
+        Quiet,
+        reports.clone(),
+    );
+    let failed = shell_tab::open_tab(&client, &broken, &repo.display().to_string())
+        .await
+        .expect_err("the tab cannot attach");
+    assert!(
+        failed.report.is_some(),
+        "the reducer hears the failed attach"
+    );
+    assert!(
+        failed.message.contains("closed again"),
+        "{}",
+        failed.message
+    );
+    let running = client.shell_list().await.expect("listed");
+    // Whatever runs is ended by name when the test ends, a leak included.
+    cleanup
+        .sessions
+        .extend(running.shells.iter().map(|s| s.tmux_session_name.clone()));
+    assert_eq!(
+        running.shells.iter().map(|s| s.tmux_session_name.as_str()).collect::<Vec<_>>(),
+        [key.as_str()],
+        "shell/close ended the unattached shell; only the first one runs"
+    );
+    drop(broken);
+
     // Relaunch: a window with no tabs lists the daemon's shells and
     // reattaches them, unfocused.
     let relaunched = Terminals::new(Tmux::new(program), Quiet, reports);
