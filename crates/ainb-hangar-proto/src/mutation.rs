@@ -1232,11 +1232,11 @@ pub static MUTATING_METHODS: &[MutatingMethod] = &[
         r#"{"slug":"harness","tier":"standard"}"#
     ),
     // ── daemon shells ────────────────────────────────────────────────────
-    // Registered while still dark (METHOD_NOT_FOUND without the spawn
-    // switch): the ledger is what makes a retried create return the shell
-    // the first attempt made instead of opening a second one. A dark daemon
-    // does not record its METHOD_NOT_FOUND, so the same op id runs once the
-    // switch is on.
+    // The ledger is what makes a retried create return the shell the first
+    // attempt made instead of opening a second one. A daemon started with
+    // the spawn opt-out does not record its METHOD_NOT_FOUND, nor any spawn
+    // verb its REPO_NOT_REGISTERED, so the same op id runs once the verb is
+    // served or the project is added.
     mutating_method!(
         m::SHELL_CREATE,
         crate::spawn::ShellCreateParams,
@@ -1250,6 +1250,25 @@ pub static MUTATING_METHODS: &[MutatingMethod] = &[
         Dedupe,
         Fk::None,
         r#"{"tmux_session_name":"ainb-dsh-0a1b2c3d"}"#
+    ),
+    // ── worktree spawn ───────────────────────────────────────────────────
+    // Registered by the change that serves them by default: a retried create
+    // replays the worktree and agent the first attempt made instead of
+    // cutting a second branch, and a retried agent_add replays the agent it
+    // started instead of starting another in the same tree.
+    mutating_method!(
+        m::WORKTREE_CREATE,
+        crate::spawn::WorktreeCreateParams,
+        Dedupe,
+        Fk::None,
+        r#"{"repo_path":"/tmp","agent":"claude"}"#
+    ),
+    mutating_method!(
+        m::WORKTREE_AGENT_ADD,
+        crate::spawn::WorktreeAgentAddParams,
+        Dedupe,
+        Fk::None,
+        r#"{"worktree_path":"/tmp","agent":"claude"}"#
     ),
 ];
 
