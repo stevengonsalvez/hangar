@@ -6,8 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- **daemon**: the spawn verbs (`worktree/create`, `worktree/agent_add`, `shell/create`, `shell/list`, `shell/close`) are served by default, so the desktop can create worktrees, add agents to them and open shells with no setup. Start the daemon with `AINB_HANGAR_SPAWN=0` to keep them off: they then answer `METHOD_NOT_FOUND`, as an older daemon does. Any value other than `1` keeps them off; only an unset variable means on
+- **cli**: `ainb run --existing-worktree <PATH>` is listed in `ainb run --help`: start one more agent in a worktree ainb created, on the branch it already has
+
 ### Changed
 - the session list (TUI and desktop) is now ordered newest first: projects and worktrees by their newest session, a worktree's sessions kept together, instead of tmux's alphabetical order; next/previous session walk the same order
+- **daemon**: `worktree/agent_add` and `shell/create` answer `REPO_NOT_REGISTERED` (-32010) for a repository outside every registered folder, as `worktree/create` does, instead of `INVALID_PARAMS`. That refusal leaves the request's op id free, so the same request retried after adding the project runs
+- **auth**: a claude login that exists only as `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell no longer reaches agents the daemon starts, or agents started through ainb's tmux sessions (TUI and `ainb run`). A keychain or `~/.claude` login is unaffected (#216)
+- **tmux**: agent command lines run under `/bin/sh -c` instead of tmux's default shell; ainb builds them in POSIX syntax (#216)
+- **daemon**: shells the daemon opened before owner marking (#238) carry no `@ainb_owner` option, so `shell/list` does not list them and `shell/close` does not close them; end them with `tmux kill-session -t =<name>`
+
+### Security
+- **cli**: `ainb run --existing-worktree` no longer auto-imports MCP servers from the worktree's `.mcp.json` into the shared pool; it pools only servers already in ainb's config. The first agent in a tree may have written that file, possibly with its permission prompts skipped
+- **daemon**: `shell/list` and `shell/close` read a shell's `@ainb_owner` option from the session only, so a global `set -g @ainb_owner daemon` no longer marks every `ainb-dsh-` session as the daemon's
 
 ## [1.28.5] - 2026-09-13
 ### Fixed
