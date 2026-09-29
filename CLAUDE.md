@@ -283,6 +283,23 @@ points `~/.codex/config.toml` / `~/.copilot/mcp-config.json` at the pool
 shim (with `.bak` backups) so Codex and Copilot sessions share the same
 backend processes as Claude.
 
+The one exception is `ainb run --existing-worktree` (the daemon's
+`worktree/agent_add`): it pools only servers already in `[mcp_servers.*]`
+and never auto-imports the tree's `.mcp.json`. The tree's first agent, maybe
+running with `--dangerously-skip-permissions`, could have written that file,
+and the added launch would otherwise spawn whatever it declares on the host.
+
+### Daemon spawn verbs
+
+The Hangar daemon serves `worktree/create`, `worktree/agent_add`,
+`shell/create`, `shell/list` and `shell/close` by default (the desktop's
+create, add-agent and shell paths). Start the daemon with
+`AINB_HANGAR_SPAWN=0` to keep them off: they then answer `METHOD_NOT_FOUND`,
+exactly as a daemon from before them does. Only an unset variable means on;
+`1` is also on and any other value is off, so a mistyped opt-out fails
+closed. It is read once at boot (the daemon logs `served=`) and is never a
+`daemon_config` key, so no connected surface can change it.
+
 ## Conventions (paths & plugins)
 
 - **All ainb state lives under `~/.agents-in-a-box/`** — config, plus the Hangar
