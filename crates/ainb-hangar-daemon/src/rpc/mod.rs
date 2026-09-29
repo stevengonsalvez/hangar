@@ -6410,9 +6410,29 @@ async fn exact_live_tmux_session_name(
     let discovered = ainb_fleet_core::discover::discover_all_tmux_panes()
         .await
         .map_err(|error| crate::fleet_provider::ProviderError::Transport(error.to_string()))?;
+    live_tmux_session_name(target, fingerprint, &discovered)
+}
+
+/// The tmux session a managed Codex row's destructive action may kill.
+///
+/// Every caller runs `kill-session` on the result, so this is session-scoped
+/// and strict: the pane must be live at the target, running the recorded
+/// process, AND still in the session it was recorded in
+/// ([`crate::fleet::same_pane_in_session`]). The sweep retargets a MANAGED row
+/// to wherever its pane went, so a Codex pane moved into someone's `work`
+/// session sits at `work:0.1`; a pane-only check would pass there and the
+/// action would kill every other pane in `work`.
+fn live_tmux_session_name(
+    target: &str,
+    fingerprint: &str,
+    discovered: &[ainb_fleet_core::types::FleetSession],
+) -> Result<String, crate::fleet_provider::ProviderError> {
     if !discovered.iter().any(|candidate| {
         candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
+            && candidate
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|observed| crate::fleet::same_pane_in_session(fingerprint, observed))
     }) {
         return Err(crate::fleet_provider::ProviderError::Stale(
             DETAIL_TMUX_IDENTITY_CHANGED.to_string(),
@@ -6428,6 +6448,227 @@ async fn exact_live_tmux_session_name(
                 "exact tmux target has no session name".to_string(),
             )
         })
+}
+
+#[cfg(test)]
+mod codex_session_gate_tests {
+    use super::{live_tmux_pane, live_tmux_session_name};
+    use ainb_fleet_core::types::{
+        AttentionState, Capabilities, Confidence, FleetSession, LifecycleState, ManagementState,
+        Provenance, Provider, SessionKey, TransportHealth,
+    };
+
+    fn pane(target: &str, fingerprint: &str) -> FleetSession {
+        FleetSession {
+            session_key: SessionKey::legacy(Provider::Codex, target, fingerprint),
+            provider: Provider::Codex,
+            provider_session_id: None,
+            cwd: "/work".to_string(),
+            exact_tmux_target: Some(target.to_string()),
+            pane_pid: Some(935),
+            process_start_fingerprint: Some(fingerprint.to_string()),
+            lifecycle: LifecycleState::Running,
+            attention: AttentionState::None,
+            management: ManagementState::Degraded,
+            capabilities: Capabilities::degraded_tmux(),
+            provenance: std::collections::BTreeSet::from([Provenance::Tmux]),
+            confidence: Confidence::Inferred,
+            transport_health: TransportHealth::Healthy,
+            first_seen_ms: Some(0),
+            last_seen_ms: None,
+            version: 0,
+        }
+    }
+
+    /// Stop, Kill, Restart and Archive all `kill-session` the name this
+    /// returns. A managed Codex pane `join-pane`d into the user's `work`
+    /// session is retargeted there by the sweep, and must be refused rather
+    /// than hand `work` to `kill-session`.
+    #[test]
+    fn a_codex_pane_moved_into_another_session_is_not_killed_with_it() {
+        let recorded = "pane=%95;pid=935;session_started=1785400000;server=4100";
+        let moved = pane(
+            "work:0.1",
+            "pane=%95;pid=935;session_started=1785300000;server=4100",
+        );
+        let refused = live_tmux_session_name("work:0.1", recorded, &[moved]);
+        assert!(
+            matches!(refused, Err(crate::fleet_provider::ProviderError::Stale(_))),
+            "a moved pane must not name its new session for kill-session: {refused:?}"
+        );
+
+        let other_server = pane(
+            "fleet-codex-t-1:0.0",
+            "pane=%95;pid=935;session_started=1785400000;server=4200",
+        );
+        assert!(
+            live_tmux_session_name("fleet-codex-t-1:0.0", recorded, &[other_server]).is_err(),
+            "another server's %95 in a same-named session is not this pane"
+        );
+        let before_upgrade = "pane=%95;pid=935;session_started=1785400000";
+        let moved_since = pane(
+            "work:0.1",
+            "pane=%95;pid=935;session_started=1785300000;server=4100",
+        );
+        assert!(
+            live_tmux_session_name("work:0.1", before_upgrade, &[moved_since]).is_err(),
+            "nor may a row recorded before `server=` kill a session its pane moved into"
+        );
+
+        let home = pane("fleet-codex-t-1:0.0", recorded);
+        assert_eq!(
+            live_tmux_session_name("fleet-codex-t-1:0.0", recorded, &[home]).ok(),
+            Some("fleet-codex-t-1".to_string()),
+            "the pane still in its own session is the one to stop"
+        );
+
+        let upgraded = pane("fleet-codex-t-1:0.0", recorded);
+        assert_eq!(
+            live_tmux_session_name("fleet-codex-t-1:0.0", before_upgrade, &[upgraded]).ok(),
+            Some("fleet-codex-t-1".to_string()),
+            "a row recorded before `server=` still reaches its own session"
+        );
+    }
+
+    /// A Claude hook from `claude-a:1.1` at `observed_at`, from process `pid`.
+    async fn hook_from(pool: &sqlx::SqlitePool, pid: u32, observed_at: i64) {
+        hook_at(pool, "claude-a:1.1", 1_785_400_000, pid, observed_at).await;
+    }
+
+    /// A Claude hook from pane `%95` on server 4100, sitting at `target` in a
+    /// session created at `session_started`, from process `pid`.
+    async fn hook_at(
+        pool: &sqlx::SqlitePool,
+        target: &str,
+        session_started: i64,
+        pid: u32,
+        observed_at: i64,
+    ) {
+        let sink = crate::events::EventBroker::new().sink();
+        crate::fleet::apply_hook(
+            pool,
+            &sink,
+            crate::fleet::HookObservation {
+                event_id: format!("respawn:{pid}:{observed_at}"),
+                provider: "claude",
+                provider_session_id: "sess-respawn",
+                event_type: "UserPromptSubmit",
+                cwd: "/work/repo",
+                payload: &serde_json::json!({
+                    "tmux_target": target,
+                    "process_start_fingerprint": format!(
+                        "pane=%95;pid={pid};session_started={session_started};server=4100"
+                    ),
+                }),
+                observed_at,
+                transcript_model: None,
+            },
+        )
+        .await
+        .expect("hook applies");
+    }
+
+    /// The Headroom downgrade path: `respawn-pane -k`, then `claude --resume`
+    /// under the same session id. Same pane, same session, new pid. The row
+    /// must follow the new process, or every send to it fails as a changed
+    /// identity with nothing to rebind it.
+    #[tokio::test]
+    async fn a_pane_respawned_in_place_still_takes_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ainb_hangar_store::Store::open_in(dir.path()).await.unwrap();
+        let pool = store.pool();
+        let key = "claude:sess-respawn";
+        let respawned = pane(
+            "claude-a:1.1",
+            "pane=%95;pid=999;session_started=1785400000;server=4100",
+        );
+
+        hook_from(pool, 935, 1_000).await;
+        hook_from(pool, 999, 2_000).await;
+
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.lifecycle_state, "RUNNING", "the new run's hook applied");
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT applied FROM fleet_event WHERE event_id = 'respawn:999:2000'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 1, "the fence applies the respawned run's hook");
+        let fingerprint = row.process_start_fingerprint.as_deref().expect("route");
+        assert_eq!(
+            fingerprint,
+            "pane=%95;pid=999;session_started=1785400000;server=4100"
+        );
+        assert_eq!(row.bound_fingerprint.as_deref(), Some(fingerprint));
+        assert!(
+            live_tmux_pane(
+                "claude-a:1.1",
+                fingerprint,
+                std::slice::from_ref(&respawned)
+            )
+            .is_some(),
+            "the send gate finds the respawned pane live, not a changed identity"
+        );
+        assert!(
+            live_tmux_pane(
+                "claude-a:1.1",
+                "pane=%95;pid=935;session_started=1785400000;server=4100",
+                std::slice::from_ref(&respawned)
+            )
+            .is_none(),
+            "and the old process's fingerprint is refused there"
+        );
+    }
+
+    /// Probe P1: the pane is moved into an OLDER session (`join-pane` into
+    /// `old`), then respawned there. Its `session_started` now reads earlier
+    /// than the run the row holds, which is the session's age, not the run's,
+    /// so the respawned run must still apply and take sends.
+    #[tokio::test]
+    async fn a_pane_moved_to_an_older_session_and_respawned_still_takes_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ainb_hangar_store::Store::open_in(dir.path()).await.unwrap();
+        let pool = store.pool();
+        let key = "claude:sess-respawn";
+        let respawned = "pane=%95;pid=999;session_started=1785300000;server=4100";
+
+        hook_at(pool, "claude-a:1.1", 1_785_400_000, 935, 1_000).await;
+        hook_at(pool, "old:0.3", 1_785_300_000, 935, 2_000).await;
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.tmux_target.as_deref(),
+            Some("old:0.3"),
+            "the move applied"
+        );
+
+        hook_at(pool, "old:0.3", 1_785_300_000, 999, 3_000).await;
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT applied FROM fleet_event WHERE event_id = 'respawn:999:3000'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 1, "the respawned run is not refused as older");
+        let row = ainb_hangar_store::repo::fleet::FleetRepo::get_session(pool, key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.process_start_fingerprint.as_deref(), Some(respawned));
+        assert_eq!(row.bound_fingerprint.as_deref(), Some(respawned));
+        assert_eq!(row.tmux_target.as_deref(), Some("old:0.3"));
+        let live = pane("old:0.3", respawned);
+        assert!(
+            live_tmux_pane("old:0.3", respawned, std::slice::from_ref(&live)).is_some(),
+            "the send gate finds the respawned pane live"
+        );
+    }
 }
 
 async fn persist_codex_exit(
@@ -7121,6 +7362,24 @@ fn approve_socket_path() -> std::io::Result<PathBuf> {
         .map_err(|error| std::io::Error::other(format!("cannot resolve approve socket: {error}")))
 }
 
+/// The discovered pane a pane-scoped action (send-keys, a picker key) may
+/// type into: live at `target` and running the recorded process
+/// ([`crate::fleet::same_pane_process`]). Session-scoped actions use
+/// [`live_tmux_session_name`] instead.
+fn live_tmux_pane<'a>(
+    target: &str,
+    fingerprint: &str,
+    discovered: &'a [ainb_fleet_core::types::FleetSession],
+) -> Option<&'a ainb_fleet_core::types::FleetSession> {
+    discovered.iter().find(|candidate| {
+        candidate.exact_tmux_target.as_deref() == Some(target)
+            && candidate
+                .process_start_fingerprint
+                .as_deref()
+                .is_some_and(|observed| crate::fleet::same_pane_process(fingerprint, observed))
+    })
+}
+
 async fn verified_tmux_send(
     session: &ainb_hangar_store::repo::fleet::FleetSessionRow,
     text: &str,
@@ -7142,11 +7401,7 @@ async fn verified_tmux_send(
         Ok(discovered) => discovered,
         Err(error) => return (ActionReceiptStatus::Failed, Some(error.to_string())),
     };
-    let live = discovered.iter().any(|candidate| {
-        candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
-    });
-    if !live {
+    if live_tmux_pane(target, fingerprint, &discovered).is_none() {
         return (
             ActionReceiptStatus::Failed,
             Some(DETAIL_TMUX_IDENTITY_CHANGED.to_string()),
@@ -7185,11 +7440,8 @@ async fn verified_tmux_picker(
         Ok(discovered) => discovered,
         Err(error) => return (ActionReceiptStatus::Failed, Some(error.to_string())),
     };
-    let live = discovered.iter().any(|candidate| {
-        candidate.exact_tmux_target.as_deref() == Some(target)
-            && candidate.process_start_fingerprint.as_deref() == Some(fingerprint)
-            && candidate.provider.as_str() == session.provider
-    });
+    let live = live_tmux_pane(target, fingerprint, &discovered)
+        .is_some_and(|candidate| candidate.provider.as_str() == session.provider);
     if !live {
         return (
             ActionReceiptStatus::Failed,

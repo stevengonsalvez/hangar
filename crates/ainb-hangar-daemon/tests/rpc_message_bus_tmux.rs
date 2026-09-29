@@ -24,6 +24,10 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 /// The pane the fake tmux reports, and the identity the seeded session claims.
+///
+/// The seeded fingerprint predates `server=`, while the fake reports the pane
+/// on server 7, as every scan does now: a row written before an upgrade must
+/// still be the live pane it names, or every send to it fails.
 const PANE_TARGET: &str = "msgbus:0.0";
 const PANE_FINGERPRINT: &str = "pane=%9;pid=1;session_started=100";
 
@@ -35,7 +39,7 @@ fn install_fake_tmux(dir: &Path, log: &Path) {
     let script = format!(
         "#!/bin/sh\n\
          if [ \"$1\" = \"list-panes\" ]; then\n\
-         \tprintf 'msgbus\\t0\\t0\\t%%9\\t1\\t/work\\tzsh\\t\\t100\\t0\\t%s\\n' \"$(date +%%s)\"\n\
+         \tprintf 'msgbus\\t0\\t0\\t%%9\\t1\\t/work\\tzsh\\t\\t100\\t0\\t%s\\t7\\n' \"$(date +%%s)\"\n\
          \texit 0\n\
          fi\n\
          printf '%s\\n' \"$*\" >> {log}\n\

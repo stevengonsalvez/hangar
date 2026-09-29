@@ -89,7 +89,7 @@ pub enum PaneBinding {
     FromHook {
         /// `session:window.pane`.
         target: String,
-        /// `pane=…;pid=…;session_started=…`, when the hook carried one.
+        /// `pane=…;pid=…;session_started=…;server=…`, when the hook carried one.
         fingerprint: Option<String>,
     },
     /// Exactly one discovered pane matched `(provider, cwd)`.
@@ -186,14 +186,15 @@ pub async fn resolve(
                 let same_pane = hook_fingerprint
                     .as_deref()
                     .and_then(crate::fleet::pane_identity)
-                    .is_some_and(|observed| {
-                        decision.fingerprint.as_deref().and_then(crate::fleet::pane_identity)
-                            == Some(observed)
-                    });
+                    .zip(decision.fingerprint.as_deref().and_then(crate::fleet::pane_identity))
+                    .is_some_and(|(observed, bound)| observed.same_pane(&bound));
                 let target = hook_target.filter(|_| same_pane).unwrap_or(decision.target);
+                let fingerprint =
+                    adopted_fingerprint(decision.fingerprint.as_deref(), hook_fingerprint)
+                        .or(decision.fingerprint);
                 return Ok(PaneBinding::Correlated {
                     target,
-                    fingerprint: decision.fingerprint,
+                    fingerprint,
                     // Nothing to retire: the legacy row was retired when this
                     // binding was first made.
                     legacy_key: None,
@@ -272,12 +273,53 @@ async fn bound_decision(
     }))
 }
 
+/// The hook's fingerprint, when the binding should take it on.
+///
+/// Only called once the hook has confirmed the binding, so the hook names the
+/// bound pane. The decision is otherwise written once, and two cases would
+/// wedge on the recorded fingerprint:
+///
+/// - The pane was respawned in place (`respawn-pane -k`, then `claude --resume`
+///   under the same session id): same pane, new `pid`. Kept, the route would
+///   name a process that is gone, and every send would refuse it as a changed
+///   identity with nothing to rebind it.
+/// - The binding was written before fingerprints named the tmux server: it
+///   would key its pane on `session_started` for its whole life, and a later
+///   move would still retire it.
+///
+/// A binding that already names its server and the same `pid` keeps its
+/// fingerprint even when the hook's `session_started` differs (a move): the
+/// store's fence orders runs by `session_started`, and a moved pane is not a
+/// new run.
+fn adopted_fingerprint(bound: Option<&str>, hook: Option<String>) -> Option<String> {
+    let bound = bound?;
+    let hook = hook?;
+    let bound_identity = crate::fleet::pane_identity(bound)?;
+    let hook_identity = crate::fleet::pane_identity(&hook)?;
+    let respawned = !crate::fleet::same_pane_process(bound, &hook);
+    let gains_server = !bound_identity.names_server() && hook_identity.names_server();
+    (respawned || gains_server).then_some(hook)
+}
+
 /// Compare the bound pane against what is in it now.
+///
+/// By pane identity ([`crate::fleet::PaneIdentity::same_pane`]), the key the
+/// sweep uses, not by the raw fingerprint: the raw string also changes when the
+/// pane moves to another session (`session_started`) and when a row written
+/// before fingerprints named the tmux server meets one that does, and neither
+/// is a different pane. Only a fingerprint with no identity in it is compared
+/// whole.
 ///
 /// The hook's own fingerprint is preferred when the hook named the same pane:
 /// it is this agent reporting its own process, which is better evidence than a
-/// scan. Otherwise the tier-5 scan for `(provider, cwd)` is consulted, and a
-/// pane absent from it is `Unobserved` rather than broken.
+/// scan, so its `pid` is not compared (see `pane_owner` in `fleet.rs` for the
+/// drift that allows). Otherwise the tier-5 scan row at the bound target is
+/// consulted, and there the `pid` IS compared
+/// ([`crate::fleet::same_pane_process`]): a scan cannot tell this agent from a
+/// new one in a respawned pane, which is the reuse #961 must catch, and a
+/// binding that held there would leave every send failing on the pid check
+/// with nothing to rebind it. A pane absent from the scan is `Unobserved`
+/// rather than broken.
 async fn confirm(
     pool: &SqlitePool,
     managed_key: &str,
@@ -290,7 +332,7 @@ async fn confirm(
         return Ok(Confirmation::Unobserved);
     };
     if let Some(observed) = hook_fingerprint {
-        return Ok(if observed == bound {
+        return Ok(if same_pane(bound, observed) {
             Confirmation::Holds
         } else {
             Confirmation::Broken(
@@ -315,7 +357,7 @@ async fn confirm(
     let Some((_, Some(observed))) = live else {
         return Ok(Confirmation::Unobserved);
     };
-    if observed == bound {
+    if crate::fleet::same_pane_process(bound, &observed) {
         return Ok(Confirmation::Holds);
     }
     Ok(Confirmation::Broken(
@@ -325,6 +367,18 @@ async fn confirm(
             .map(|candidate| candidate.tmux_target)
             .collect(),
     ))
+}
+
+/// Whether the `observed` fingerprint is still the `bound` pane, whatever runs
+/// in it.
+fn same_pane(bound: &str, observed: &str) -> bool {
+    match (
+        crate::fleet::pane_identity(bound),
+        crate::fleet::pane_identity(observed),
+    ) {
+        (Some(bound), Some(observed)) => bound.same_pane(&observed),
+        _ => bound == observed,
+    }
 }
 
 /// Choose a binding from the candidate set. Split from the query so the
@@ -675,6 +729,51 @@ mod tests {
             reason.describe("claude", "/w/app").contains("dev:1.0"),
             "the operator is told which pane was lost: {}",
             reason.describe("claude", "/w/app")
+        );
+    }
+
+    /// #961 in real fingerprints: `respawn-pane` keeps the pane id, server and
+    /// session and replaces the process. With no hook to vouch for this agent,
+    /// the scan's new `pid` must break the binding. Keeping it would leave the
+    /// route pointing at a pane every send refuses, with nothing to rebind it.
+    #[tokio::test]
+    async fn a_respawned_pane_seen_only_by_the_scan_breaks_the_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ainb_hangar_store::Store::open_in(dir.path()).await.expect("open store");
+        apply(
+            &store,
+            "hook:bind",
+            "claude:sid-9",
+            1,
+            bound_patch("sid-9", "pane=%1;pid=100;session_started=5;server=7"),
+        )
+        .await;
+        apply(
+            &store,
+            "scan:respawned",
+            "tmux:dev:1.0",
+            2,
+            ainb_hangar_store::repo::fleet::FleetSessionPatch {
+                provider: Some("claude".to_string()),
+                cwd: Some("/w/app".to_string()),
+                tmux_target: Some("dev:1.0".to_string()),
+                process_start_fingerprint: Some(
+                    "pane=%1;pid=999;session_started=5;server=7".to_string(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let binding = resolve(store.pool(), "claude:sid-9", "claude", "/w/app", None, None)
+            .await
+            .expect("resolve");
+        assert!(
+            matches!(
+                binding,
+                PaneBinding::Unbound(UnboundReason::Invalidated { .. })
+            ),
+            "a new process in the bound pane is a reused pane: {binding:?}"
         );
     }
 

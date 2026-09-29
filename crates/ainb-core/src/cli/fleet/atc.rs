@@ -2576,7 +2576,7 @@ fn current_tmux_identity() -> Option<(String, String)> {
             pane.as_os_str(),
             std::ffi::OsStr::new("-F"),
             std::ffi::OsStr::new(
-                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{session_created}",
+                "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{session_created}\t#{pid}",
             ),
         ])
         .output()
@@ -2585,16 +2585,35 @@ fn current_tmux_identity() -> Option<(String, String)> {
     parse_hook_tmux_identity(std::str::from_utf8(&output.stdout).ok()?)
 }
 
+/// The hook's own pane as `(target, fingerprint)`, in the shape the tmux scan
+/// mints (`ainb-fleet-core` `discover/tmux.rs`): the trailing `server=` is the
+/// tmux server pid, which keeps a pane's identity across a move to another
+/// session, where `session_started` changes. A tmux that reports no server
+/// pid keeps the older shape, as the scan does, rather than losing the pane.
 fn parse_hook_tmux_identity(row: &str) -> Option<(String, String)> {
-    let fields = row.trim().split('\t').collect::<Vec<_>>();
-    if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+    let fields = row.trim_end_matches(['\r', '\n']).split('\t').collect::<Vec<_>>();
+    let [
+        session,
+        window,
+        pane_index,
+        pane,
+        pid,
+        session_started,
+        server,
+    ] = fields[..]
+    else {
+        return None;
+    };
+    let identity = [session, window, pane_index, pane, pid, session_started];
+    if identity.iter().any(|field| field.trim().is_empty()) {
         return None;
     }
-    let target = format!("{}:{}.{}", fields[0], fields[1], fields[2]);
-    let fingerprint = format!(
-        "pane={};pid={};session_started={}",
-        fields[3], fields[4], fields[5]
-    );
+    let target = format!("{session}:{window}.{pane_index}");
+    let mut fingerprint = format!("pane={pane};pid={pid};session_started={session_started}");
+    let server = server.trim();
+    if !server.is_empty() {
+        fingerprint.push_str(&format!(";server={server}"));
+    }
     Some((target, fingerprint))
 }
 
@@ -3481,11 +3500,21 @@ mod tests {
 
     #[test]
     fn hook_tmux_identity_matches_discovery_fingerprint_shape() {
-        let identity = parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\n")
+        let identity = parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t4100\n")
             .expect("exact tmux identity");
         assert_eq!(identity.0, "claude-a:2.1");
-        assert_eq!(identity.1, "pane=%9;pid=4242;session_started=1700000000");
+        assert_eq!(
+            identity.1,
+            "pane=%9;pid=4242;session_started=1700000000;server=4100"
+        );
         assert!(parse_hook_tmux_identity("claude-a\t2\t1").is_none());
+        assert_eq!(
+            parse_hook_tmux_identity("claude-a\t2\t1\t%9\t4242\t1700000000\t\n")
+                .map(|identity| identity.1)
+                .as_deref(),
+            Some("pane=%9;pid=4242;session_started=1700000000"),
+            "a tmux with no server pid keeps the older shape, as the scan does"
+        );
     }
 
     // --- H-A1: the hook NEVER returns Err (always exit 0) --------------------
