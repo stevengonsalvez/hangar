@@ -107,6 +107,11 @@ describe("the window at its default size", () => {
       await click(".tab[data-state] .tab-close");
       await browser.waitUntil(async () => (await $$(".tab[data-state]")).length < count, { timeout: 15_000 });
     }
+    // Rows redraw as frames land: read the selected one's id once it is drawn.
+    await $(".session-row.selected").waitForExist({
+      timeout: 15_000,
+      timeoutMsg: "no sidebar row is selected after the tabs closed",
+    });
     const selectedId = await $(".session-row.selected").getAttribute("data-session");
     await $(`.empty-selected[data-session="${selectedId}"]`).waitForExist({
       timeout: 15_000,
