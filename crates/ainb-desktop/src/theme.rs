@@ -16,6 +16,7 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 
@@ -124,18 +125,32 @@ pub fn load(path: &Path) -> ThemePreference {
 }
 
 /// Store `preference` at `path`, whole or not at all: written beside it and
-/// renamed over it, so a crash mid-write leaves the previous pick.
+/// renamed over it, so a crash mid-write leaves the previous pick. Each write
+/// stages under its own name, so two picks stored at once never rename a
+/// file the other is still writing or has already moved.
 ///
 /// # Errors
 ///
 /// When the directory cannot be created or the file cannot be written.
 pub fn store(path: &Path, preference: ThemePreference) -> io::Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let staged = path.with_extension("tmp");
-    std::fs::write(&staged, preference.as_str())?;
-    std::fs::rename(&staged, path)
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let staged = path.with_file_name(name);
+    let written =
+        std::fs::write(&staged, preference.as_str()).and_then(|()| std::fs::rename(&staged, path));
+    if written.is_err() {
+        // Best effort: the error being returned is the one that matters.
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -217,6 +232,38 @@ mod tests {
         assert_eq!(load(&path), ThemePreference::System, "an unknown word");
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
         assert_eq!(load(&path), ThemePreference::System, "not UTF-8");
+    }
+
+    /// Picks written at once (the page tells every change, and the start)
+    /// each land whole: no write renames a staged file another is still
+    /// writing or has already moved, and none is left behind.
+    #[test]
+    fn picks_stored_at_once_each_land_whole_and_leave_no_staged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(THEME_FILE);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    for round in 0..50 {
+                        let preference = ALL[(writer + round) % ALL.len()];
+                        store(path, preference).unwrap_or_else(|error| {
+                            panic!("writer {writer} round {round}: {error}")
+                        });
+                    }
+                });
+            }
+        });
+        let word = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            ThemePreference::parse(&word).is_some(),
+            "the file holds one whole pick, not {word:?}"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [THEME_FILE], "no staged file is left behind");
     }
 
     #[test]
