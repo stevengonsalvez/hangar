@@ -9,6 +9,7 @@ import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, t
 import { tauriTransport } from "./transport.ts";
 import { terminalAppearance, type Theme } from "./theme/theme.ts";
 import { findChord, TerminalSearch } from "./terminal_search.tsx";
+import { nextFontSize, TERMINAL_FONT_SIZE, zoomChord } from "./terminal_zoom.ts";
 
 interface Props {
   tab: Tab;
@@ -45,7 +46,7 @@ export function TerminalView(props: Props) {
     const term = new Terminal({
       cursorBlink: true,
       fontFamily: '"SF Mono", Menlo, "JetBrains Mono", ui-monospace, monospace',
-      fontSize: 13,
+      fontSize: TERMINAL_FONT_SIZE,
       scrollback: 5000,
       // The find bar's match highlights are xterm decorations, still a
       // proposed API; Orca's panes turn it on for the same reason.
@@ -117,6 +118,15 @@ export function TerminalView(props: Props) {
         setFinding(true);
         findInput?.focus();
         findInput?.select();
+        return false;
+      }
+      const zoom = zoomChord(event, props.mac);
+      if (zoom) {
+        event.preventDefault();
+        // This pane only, as Orca's zoom is: a new cell size is a new grid,
+        // so it refits and the shell hears the new size.
+        term.options.fontSize = nextFontSize(term.options.fontSize ?? TERMINAL_FONT_SIZE, zoom);
+        resize();
         return false;
       }
       if (event.key === "Escape" && leave(event.timeStamp)) {
