@@ -18,7 +18,8 @@ use std::time::Duration;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
-use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
+use ainb_desktop::agent_add::AddAgentArgs;
+use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree, SpawnVerb, spawn_refusal_text};
 use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
@@ -422,11 +423,41 @@ async fn worktree_create(
     let client = ainb_app::fleet::bridge::daemon::surface_client(
         ainb_hangar_proto::connections::SurfaceKind::Desktop,
     )
-    .map_err(|error| ainb_desktop::create::refusal_text(&error))?;
+    .map_err(|error| spawn_refusal_text(&error, SpawnVerb::CreateWorktree))?;
     let created = ainb_desktop::create::request(&client, args).await?;
     tracing::info!(session = %created.session_id, "window created a worktree session");
-    // The session exists either way; a tab that cannot open is said out loud
-    // rather than leaving the person with a closed composer and nothing new.
+    open_created_tab(&app, &window, &created);
+    Ok(created)
+}
+
+/// Add one more agent to the worktree `args.target` names, then open its tab.
+///
+/// The page sends ids and an agent, never a path: the worktree is read from
+/// the host's own session list or shell tab ([`resolve_worktree`]), and the
+/// daemon does the work (`worktree/agent_add`). A refusal comes back as the
+/// sentence the window shows.
+#[tauri::command]
+async fn worktree_agent_add(
+    app: tauri::AppHandle,
+    window: tauri::State<'_, Window>,
+    args: AddAgentArgs,
+) -> Result<CreatedWorktree, String> {
+    let worktree = resolve_worktree(&window, &args.target)?;
+    let client = ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| spawn_refusal_text(&error, SpawnVerb::AddAgent))?;
+    let created = ainb_desktop::agent_add::request(&client, worktree, args.agent).await?;
+    tracing::info!(session = %created.session_id, "window added an agent to a worktree");
+    open_created_tab(&app, &window, &created);
+    Ok(created)
+}
+
+/// Open the tab of a session the daemon just made, which the host focuses.
+///
+/// The session exists either way; a tab that cannot open is said out loud
+/// rather than leaving the person with nothing new on screen.
+fn open_created_tab(app: &tauri::AppHandle, window: &Window, created: &CreatedWorktree) {
     let attach_problem = match (
         &window.terminals,
         uuid::Uuid::parse_str(&created.session_id),
@@ -454,12 +485,11 @@ async fn worktree_create(
             "Created {} but could not open its tab: {problem}",
             created.branch
         ));
-        tracing::warn!(%message, "worktree created without a tab");
+        tracing::warn!(%message, "session created without a tab");
         if let Err(error) = app.emit("toast", &message) {
             tracing::warn!(%error, "toast not delivered to the webview");
         }
     }
-    Ok(created)
 }
 
 /// What deleting a session would remove, for the delete dialog to say before
@@ -1317,6 +1347,7 @@ fn main() {
             shell_close,
             shell_reattach,
             worktree_create,
+            worktree_agent_add,
             session_delete_preview,
             session_delete,
             session_rename,
