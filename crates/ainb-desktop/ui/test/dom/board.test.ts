@@ -322,6 +322,20 @@ function idleWorld() {
           evidence_observed_at: 3,
         },
         {
+          // A finished turn with no session row and no transcript: nothing
+          // opens it, so nothing can ack it out of Done.
+          session_key: "claude:p-lost",
+          state: "idle",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: true,
+          tier: "hook",
+          evidence_observed_at: 9,
+        },
+        {
           session_key: "claude:p-orphan",
           state: "exited",
           provider: "claude",
@@ -352,7 +366,11 @@ test("every column draws exactly the cards its count says, Idle and exited agent
   assert.deepEqual(drawn.needs, ["claude:p-wait"]);
   assert.deepEqual(drawn.working, ["claude:p-work"]);
   assert.deepEqual(drawn.done, ["claude:p-done", "claude:p-gone"], "an exited agent is kept, in Done");
-  assert.deepEqual(drawn.idle, ["claude:p-orphan", "claude:p-idle", "claude:p-unv"], "the row-less exited agent too");
+  assert.deepEqual(
+    drawn.idle,
+    ["claude:p-lost", "claude:p-orphan", "claude:p-idle", "claude:p-unv"],
+    "the row-less finished turn and exited agent too",
+  );
   const unverifiable = board.card("claude:p-unv")!;
   assert.equal(unverifiable.dataset.status, "unverifiable");
   assert.ok(unverifiable.querySelector(".badge-unverifiable"), "the card carries the unverifiable badge");
@@ -380,6 +398,14 @@ test("an exited agent with no row waits in Idle, disabled, and never says click 
   assert.equal(orphan.disabled, true);
   assert.notEqual(orphan.querySelector(".card-line")?.textContent, "click to open");
   assert.ok(orphan.querySelector(".badge-exited"));
+});
+
+test("a finished turn with no row waits in Idle, disabled, and never says click to open", async () => {
+  const board = await open(idleWorld());
+  const lost = board.card("claude:p-lost")! as HTMLButtonElement;
+  assert.ok(board.column("idle")!.contains(lost), "nothing can open it, so nothing could ack it out of Done");
+  assert.equal(lost.disabled, true);
+  assert.notEqual(lost.querySelector(".card-line")?.textContent, "click to open");
 });
 
 test("a Done card says click to open, and clicking it acks the turn and moves it to Idle", async () => {
