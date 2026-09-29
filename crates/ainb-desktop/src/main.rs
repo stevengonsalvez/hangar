@@ -297,6 +297,87 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
     }
 }
 
+/// The daemon client this window asks, or the sentence saying why not.
+fn daemon_client(
+    verb: ainb_desktop::shell_tab::Verb,
+) -> Result<ainb_hangar_client::DaemonClient, String> {
+    ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| ainb_desktop::shell_tab::refusal_text(verb, &error))
+}
+
+/// Open a plain shell in the worktree of the listed session `session`,
+/// as a tab, and answer the tab's key. The folder is the host's, from its
+/// own session list, never the page's; the daemon opens the shell.
+#[tauri::command]
+async fn shell_open(window: tauri::State<'_, Window>, session: String) -> Result<String, String> {
+    use ainb_desktop::shell_tab::{self, Verb};
+    let terminals =
+        window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
+    let dir = uuid::Uuid::parse_str(&session)
+        .ok()
+        .and_then(|id| window.shell.session_worktree(id))
+        .ok_or("That session is not listed any more; pick one in the sidebar.")?;
+    let shell = shell_tab::open(&daemon_client(Verb::Open)?, &dir).await?;
+    tracing::info!(tmux = %shell.tmux_session_name, "window opened a shell");
+    // A report back is the tab failing to attach; the reducer shows it.
+    if let Some(report) = terminals.open(shell_tab::target(&shell)) {
+        window.shell.dispatch(report);
+    }
+    Ok(shell.tmux_session_name)
+}
+
+/// Close the shell tab `key` and end its shell (`shell/close`). Any other
+/// tab is refused: this ends only shells the daemon opened.
+#[tauri::command]
+async fn shell_close(window: tauri::State<'_, Window>, key: String) -> Result<(), String> {
+    use ainb_desktop::shell_tab::{self, Verb};
+    let terminals = window.terminals.as_ref().ok_or("No terminal tabs are open.")?;
+    shell_tab::close_tab(terminals, &daemon_client(Verb::Close)?, &key)
+        .await
+        .map(|_| ())
+}
+
+/// Re-attach the detached shell tab `key`: it has no session-list row to go
+/// through.
+#[tauri::command]
+fn shell_reattach(window: tauri::State<'_, Window>, key: String) {
+    if let Some(report) = window
+        .terminals
+        .as_ref()
+        .and_then(|terminals| ainb_desktop::shell_tab::reattach(terminals, &key))
+    {
+        window.shell.dispatch(report);
+    }
+}
+
+/// Reattach, as tabs, the shells the daemon still runs from an earlier
+/// launch. Once per launch; a daemon without the verb, or none reachable,
+/// leaves the strip as it is.
+async fn restore_shells(handle: tauri::AppHandle) {
+    let window = handle.state::<Window>();
+    let Some(terminals) = window.terminals.as_ref() else {
+        return;
+    };
+    let client = match daemon_client(ainb_desktop::shell_tab::Verb::Open) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "shells not restored");
+            return;
+        }
+    };
+    match ainb_desktop::shell_tab::restore(&client, terminals).await {
+        Ok((listed, reports)) => {
+            tracing::info!(listed, failed = reports.len(), "restored shell tabs");
+            for report in reports {
+                window.shell.dispatch(report);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "shells not restored"),
+    }
+}
+
 /// Create a worktree with an agent in it, then open its tab.
 ///
 /// The daemon does the work (`worktree/create`); this command only asks and
@@ -1082,6 +1163,7 @@ fn main() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut shells_restored = false;
                 loop {
                     let (view, connected) = {
                         let state = states.borrow_and_update();
@@ -1106,6 +1188,10 @@ fn main() {
                                 tracing::warn!(%error, "host id not delivered to the webview");
                             }
                             window.shell.set_host(host_id);
+                        }
+                        if !shells_restored {
+                            shells_restored = true;
+                            tauri::async_runtime::spawn(restore_shells(handle.clone()));
                         }
                     }
                     if let Err(error) = handle.emit("sidecar", view) {
@@ -1147,6 +1233,9 @@ fn main() {
             terminal_resize,
             terminal_clear,
             terminal_close,
+            shell_open,
+            shell_close,
+            shell_reattach,
             worktree_create,
             projects_list,
             project_add,
