@@ -1094,21 +1094,6 @@ body {
   border-color: var(--gold);
 }
 
-/* Idle is hidden behind a native disclosure, closed by default (spec): the
-   summary reads exactly like every other column's own heading. */
-.board-idle-toggle summary {
-  display: flex;
-  justify-content: space-between;
-  padding: 8px 10px;
-  font-size: 13px;
-  color: var(--gold);
-  cursor: pointer;
-}
-
-.board-idle-toggle[open] summary {
-  border-bottom: 1px solid var(--border);
-}
-
 .board-column ul,
 .attention-list ul {
   list-style: none;
@@ -1224,7 +1209,8 @@ body {
 /* Unverifiable falls in with Idle (there is no fifth column for it), so its
    own dashed badge is what tells the two apart on the card (spec: "a muted
    dashed badge"). */
-.badge-unverifiable {
+.badge-unverifiable,
+.badge-exited {
   align-self: flex-start;
   padding: 0 5px;
   border: 1px dashed var(--idle);
@@ -2190,7 +2176,3 @@ body {
   display: contents;
 }
 
-.board-idle-toggle summary:focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
-}

@@ -130,15 +130,22 @@ test("a later turn's Done shows again after an earlier turn was acked", () => {
   assert.deepEqual(by.done, ["a:1"], "turn 8 was never acked, only turn 7 was");
 });
 
-test("an exited agent's card is hidden, not a fifth column", () => {
-  const { sessions, fleet } = world();
-  const columns = boardColumns(status(card("a:1", { state: "exited" })), fleet, sessions, NO_ACKS);
-  assert.deepEqual(
-    columns.flatMap((column) => column.cards.map((c) => c.key)),
-    [],
-  );
+test("an exited agent is kept in Done until opened, then Idle, never a fifth column", () => {
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const gone = card("claude:p-1", { state: "exited", evidence_observed_at: 5 });
+  const byColumn = (acks: AckMap) =>
+    Object.fromEntries(boardColumns(status(gone), fleet, sessions, acks).map((column) => [column.state, column.cards.map((c) => c.key)]));
+  assert.deepEqual(byColumn(NO_ACKS), { needs: [], working: [], done: ["claude:p-1"], idle: [] });
+  assert.deepEqual(byColumn(ackTurn(NO_ACKS, "claude:p-1", 5)), { needs: [], working: [], done: [], idle: ["claude:p-1"] });
 });
 
+test("an exited agent nobody can open goes straight to Idle, never stuck in Done", () => {
+  const { sessions, fleet } = world(); // no row for this card
+  const columns = boardColumns(status(card("claude:p-orphan", { state: "exited" })), fleet, sessions, NO_ACKS);
+  const [idle] = columns.filter((column) => column.state === "idle");
+  assert.deepEqual(idle.cards.map((c) => c.key), ["claude:p-orphan"]);
+  assert.equal(idle.cards[0].sessionId, null);
+});
 test("an unverifiable card falls in with idle, marked unverifiable rather than drawn as plainly idle", () => {
   const { sessions, fleet } = world();
   const columns = boardColumns(status(card("a:1", { state: "unverifiable" })), fleet, sessions, NO_ACKS);
