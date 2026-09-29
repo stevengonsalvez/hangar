@@ -291,6 +291,21 @@ body {
   color: var(--muted-foreground);
 }
 
+/* While filtering, the `n / m` count sits left of the clear button, so the
+   field keeps room for both. */
+.sidebar-filter.filtering .sidebar-filter-input {
+  padding-inline-end: 72px;
+}
+
+.sidebar-filter-count {
+  position: absolute;
+  inset-inline-end: 26px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
 .sidebar-filter-clear {
   position: absolute;
   inset-inline-end: 2px;
