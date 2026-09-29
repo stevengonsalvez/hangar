@@ -102,6 +102,7 @@ async function mount(sessions = SESSIONS) {
             open: (id) => calls.push(["open", id]),
             run: (intents) => calls.push(["run", intents]),
             copy: (text) => calls.push(["copy", text]),
+            reselect: () => [],
           }),
       }),
     container,
@@ -123,7 +124,9 @@ function focusIs(expected: Element | undefined, message = "focus") {
   assert.ok(active === expected, `${message}: focus is on ${active?.outerHTML.slice(0, 80) ?? "nothing"}`);
 }
 
+/** A right-click as a browser sends it: the press, then the menu event. */
 async function rightClick(target: Element, x = 40, y = 60) {
+  target.dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true, button: 2 }) as unknown as Event);
   const event = new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: x, clientY: y });
   target.dispatchEvent(event as unknown as Event);
   await settle();
@@ -230,7 +233,7 @@ test("a row that cannot take an action draws it disabled, skips it, and never ru
   const calls = await mount();
   await rightClick(row("remote-1"));
   const editor = item("Open in Editor");
-  assert.equal(editor.disabled, true);
+  assert.equal(editor.getAttribute("aria-disabled"), "true");
   assert.match(editor.title, /local/i, "the tooltip says why");
   editor.click();
   await settle();
@@ -244,9 +247,9 @@ test("a row that cannot take an action draws it disabled, skips it, and never ru
 test("a row with no worktree path cannot copy or open a path", async () => {
   await mount([session("bare-1", "")]);
   await rightClick(row("bare-1"));
-  assert.equal(item("Copy Path").disabled, true);
-  assert.equal(item("Open in Editor").disabled, true);
-  assert.equal(item("Copy Worktree Name").disabled, false);
+  assert.equal(item("Copy Path").getAttribute("aria-disabled"), "true");
+  assert.equal(item("Open in Editor").getAttribute("aria-disabled"), "true");
+  assert.equal(item("Copy Worktree Name").getAttribute("aria-disabled"), null);
 });
 
 test("a press outside the menu, or Tab, closes it", async () => {
@@ -287,4 +290,63 @@ test("the menu closes when its session leaves the list, so no item acts on a row
   setFrame([...SESSIONS]);
   await settle();
   assert.ok(menu(), "a frame that still carries the row leaves the menu open");
+});
+
+test("a row says it has a menu", async () => {
+  await mount();
+  assert.equal(row("claude-1").getAttribute("aria-haspopup"), "menu");
+});
+
+test("the keyboard leaving the menu for another control closes it and leaves the keyboard there", async () => {
+  await mount();
+  const field = document.createElement("input");
+  document.body.appendChild(field);
+  await rightClick(row("claude-1"));
+  assert.ok(menu(), "open");
+  field.focus();
+  await settle();
+  assert.ok(menu() === null, "the palette or composer taking the keyboard closes the menu");
+  focusIs(field, "the keyboard stays where it went");
+});
+
+test("a press outside closes the menu without pulling the keyboard back to the row", async () => {
+  await mount();
+  const field = document.createElement("input");
+  document.body.appendChild(field);
+  await rightClick(row("claude-1"));
+  field.dispatchEvent(new window.MouseEvent("pointerdown", { bubbles: true }) as unknown as Event);
+  await settle();
+  assert.ok(menu() === null);
+  // The press's own default action moves the keyboard to what was pressed;
+  // the menu must not have pulled it to the row first.
+  assert.ok(document.activeElement !== row("claude-1"), "the row did not take the keyboard");
+});
+
+test("the window losing focus or resizing closes the menu", async () => {
+  await mount();
+  for (const type of ["blur", "resize"]) {
+    await rightClick(row("claude-1"));
+    assert.ok(menu(), `open before ${type}`);
+    window.dispatchEvent(new window.Event(type) as unknown as Event);
+    await settle();
+    assert.ok(menu() === null, `${type} closes it`);
+  }
+});
+
+test("a right-click near the window's corner keeps the whole menu on screen", async () => {
+  const proto = window.HTMLElement.prototype as unknown as { getBoundingClientRect(): unknown };
+  const real = proto.getBoundingClientRect;
+  proto.getBoundingClientRect = function (this: Element) {
+    return this.getAttribute("role") === "menu"
+      ? { left: 0, top: 0, right: 200, bottom: 120, width: 200, height: 120, x: 0, y: 0 }
+      : real.call(this);
+  };
+  try {
+    await mount();
+    await rightClick(row("claude-1"), window.innerWidth - 10, window.innerHeight - 10);
+    assert.equal(menu()!.style.left, `${window.innerWidth - 200}px`);
+    assert.equal(menu()!.style.top, `${window.innerHeight - 120}px`);
+  } finally {
+    proto.getBoundingClientRect = real;
+  }
 });
