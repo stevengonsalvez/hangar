@@ -595,7 +595,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
                         tracing::warn!(%error, "the wait on a timed-out `ainb run` ended");
                     }
                 }
-                logs.remove();
+                drop(logs);
             });
             return Err(SpawnError::Failed(format!(
                 "`ainb run` is still running after {}s: {pending}; check the sidebar",
@@ -605,7 +605,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     };
     let stdout = logs.read_stdout();
     let stderr = logs.read_stderr();
-    logs.remove();
+    drop(logs);
     if !status.success() {
         return Err(SpawnError::Failed(format!(
             "`ainb run` failed: {}",
@@ -617,7 +617,9 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
 
 /// Where one `ainb run` writes its stdout and stderr: two files under the
 /// daemon's log dir (`<hangar>/hangar/logs/spawn/`), readable by the daemon's
-/// user only, removed once the run's outcome is read.
+/// user only. Dropping it removes them, so every arm of a run clears its
+/// output: the outcome read, an open or a spawn that failed, a wait that
+/// errored, and a timed-out run once it ends.
 struct RunLogs {
     stdout: std::path::PathBuf,
     stderr: std::path::PathBuf,
@@ -625,10 +627,13 @@ struct RunLogs {
 
 impl RunLogs {
     fn create() -> Result<Self, SpawnError> {
-        let dir = crate::log_dir()
-            .map_err(|e| SpawnError::Failed(format!("no log directory for `ainb run`: {e}")))?
-            .join("spawn");
-        std::fs::create_dir_all(&dir)
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = run_logs_dir()
+            .map_err(|e| SpawnError::Failed(format!("no log directory for `ainb run`: {e}")))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
             .map_err(|e| SpawnError::Failed(format!("creating {}: {e}", dir.display())))?;
         let name = uuid::Uuid::new_v4().simple().to_string();
         Ok(Self {
@@ -663,10 +668,55 @@ impl RunLogs {
     fn read_stderr(&self) -> Vec<u8> {
         std::fs::read(&self.stderr).unwrap_or_default()
     }
+}
 
-    fn remove(&self) {
+impl Drop for RunLogs {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.stdout);
         let _ = std::fs::remove_file(&self.stderr);
+    }
+}
+
+/// `<hangar>/hangar/logs/spawn/`, where every `ainb run` writes its output.
+fn run_logs_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(crate::log_dir()?.join("spawn"))
+}
+
+/// Remove the `ainb run` output a previous daemon left behind. A run's files
+/// go when its outcome is read, but a daemon killed mid-run never reads it.
+///
+/// Called at boot once this process owns the home, so no run of this
+/// daemon's is writing yet. A run a dead daemon started may still be; its
+/// writes go on landing in the unlinked file, so removing it never fails the
+/// run.
+pub fn remove_stale_run_logs() {
+    let Ok(dir) = run_logs_dir() else {
+        return;
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "could not list stale `ainb run` output");
+            return;
+        }
+    };
+    let mut removed = 0_usize;
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::warn!(
+                file = %entry.path().display(),
+                %error,
+                "could not remove stale `ainb run` output"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "removed stale `ainb run` output");
     }
 }
 
