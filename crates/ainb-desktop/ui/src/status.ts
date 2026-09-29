@@ -30,9 +30,10 @@ export type Need = "ask" | "approve" | "wait" | "elicitation" | "error";
 /**
  * The vocabulary itself: the spec table's five words, plus `exited` for a
  * session whose process is gone. The board keeps an exited agent in Done
- * until it is opened, then in Idle (`board.ts columnOf`), marked Exited; a
- * sidebar row or a tab for one must not look idle either: idle is a live
- * agent at rest, exited is nothing running.
+ * until it is opened; once acked it counts as idle, as Orca settles an
+ * acknowledged finished agent into gray idle, and sits in Idle marked Exited
+ * (`board.ts columnOf`). A sidebar row or a tab for one still reads
+ * `exited`, never plain idle: nothing is running there.
  */
 export type UiStatus =
   | { kind: "needs"; need: Need }
