@@ -73,16 +73,19 @@ pub const SPAWN_PROMPT_MAX: usize = 64 * 1024;
 /// project is added runs.
 pub const REPO_NOT_REGISTERED: i32 = -32010;
 
-/// JSON-RPC error code for `worktree/create` or `worktree/agent_add` when
-/// `ainb run` was started and did not hand back a session: it is still
-/// running past the daemon's bound, the daemon lost its wait on it, it
-/// failed, or its output was not a session.
+/// JSON-RPC error code for a spawn verb that started its work and got no
+/// session back: `worktree/create` or `worktree/agent_add` when `ainb run`
+/// is still running past the daemon's bound, the daemon lost its wait on
+/// it, it failed, or its output was not a session; `shell/create` when
+/// `tmux new-session` did not answer in time, or failed after running, and
+/// the shell may still exist.
 ///
-/// The run settles its own effects (a slow one keeps going and may still
-/// make the session, a failed one ran its own rollback), so this IS the op
-/// id's answer: the ledger records it, and a retry with the same op id
-/// replays it rather than starting a second `ainb run`. A new attempt is a
-/// new op id. Distinct from the spec's `-32603`, which frees the op id.
+/// What was started settles its own effects (a slow run keeps going and may
+/// still make the session, a failed one ran its own rollback, a shell may
+/// still appear), so this IS the op id's answer: the ledger records it, and
+/// a retry with the same op id replays it rather than starting a second run
+/// or shell. A new attempt is a new op id. Distinct from the spec's
+/// `-32603`, which frees the op id.
 pub const SPAWN_STARTED: i32 = -32011;
 
 /// Parameters for `worktree/create`: a new git worktree on a new branch, with
