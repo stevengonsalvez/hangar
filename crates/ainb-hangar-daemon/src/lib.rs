@@ -603,19 +603,18 @@ fn codex_app_server_from_config() -> ConfigSetting {
 /// [`codex_app_server_from_config`] for the config file at `path`, so each
 /// file state is testable without touching `$AINB_HANGAR_HOME`.
 fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let parsed = match hangar_config(path) {
+        Ok(Some(parsed)) => parsed,
+        // Any read that finds nothing, a link to nowhere too, is "not set".
+        Ok(None) => return ConfigSetting::Absent,
+        Err(HangarConfigError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return ConfigSetting::Absent;
         }
-        Err(error) => {
+        Err(HangarConfigError::Read(error)) => {
             tracing::warn!(path = %path.display(), %error, "cannot read hangar config");
             return ConfigSetting::Unreadable;
         }
-    };
-    let parsed: toml::Value = match text.parse() {
-        Ok(parsed) => parsed,
-        Err(error) => {
+        Err(HangarConfigError::Parse(error)) => {
             tracing::warn!(path = %path.display(), %error, "hangar config is not valid TOML");
             return ConfigSetting::Unreadable;
         }
@@ -636,6 +635,42 @@ fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
             }
         },
     }
+}
+
+/// Read and parse the hangar home's config file at `path` (see
+/// [`spawn::config_path_in`]): the one reader behind every key the daemon
+/// takes from it, `[hangar] spawn` and `[codex] app_server`. One read per
+/// call; each caller keeps its own answer for each outcome.
+///
+/// `Ok(None)` is nothing at `path` at all. A link to nowhere is not that: it
+/// is a [`HangarConfigError::Read`] of kind `NotFound`, so a caller for which
+/// the file may hold an opt-out can refuse to read it as "missing".
+///
+/// # Errors
+///
+/// [`HangarConfigError`] when the file cannot be read or is not valid TOML.
+pub fn hangar_config(path: &std::path::Path) -> Result<Option<toml::Table>, HangarConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(HangarConfigError::Read(error)),
+    };
+    text.parse()
+        .map(Some)
+        .map_err(|error: toml::de::Error| HangarConfigError::Parse(format!("{error}")))
+}
+
+/// Why [`hangar_config`] has no table to give.
+#[derive(Debug)]
+pub enum HangarConfigError {
+    /// The file is there (or a link to it is) but could not be read.
+    Read(std::io::Error),
+    /// The file is not valid TOML: a description of where and why.
+    Parse(String),
 }
 
 /// What the hangar config had to say about `[codex] app_server`.

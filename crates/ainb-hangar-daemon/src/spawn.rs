@@ -110,20 +110,17 @@ pub fn served_by_config(path: &Path) -> bool {
         tracing::warn!(path = %path.display(), "{why}; spawn verbs kept off");
         false
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
+    let table = match crate::hangar_config(path) {
+        Ok(Some(table)) => table,
+        Ok(None) => return true,
         // A dangling link (a dotfiles checkout that is not there) is not
         // "no file": the opt-out may be behind it.
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
-        {
-            return true;
+        Err(crate::HangarConfigError::Read(error)) => {
+            return off(&format!("cannot read hangar config: {error}"));
         }
-        Err(error) => return off(&format!("cannot read hangar config: {error}")),
-    };
-    let table: toml::Table = match text.parse() {
-        Ok(table) => table,
-        Err(error) => return off(&format!("hangar config is not valid TOML: {error}")),
+        Err(crate::HangarConfigError::Parse(error)) => {
+            return off(&format!("hangar config is not valid TOML: {error}"));
+        }
     };
     if table.get("hangar_daemon").and_then(|section| section.get("spawn")).is_some() {
         return off(&format!(
