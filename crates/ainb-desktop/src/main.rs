@@ -307,13 +307,11 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
 }
 
 /// The daemon client this window asks, or the sentence saying why not.
-fn daemon_client(
-    verb: ainb_desktop::shell_tab::Verb,
-) -> Result<ainb_hangar_client::DaemonClient, String> {
+fn daemon_client(verb: SpawnVerb) -> Result<ainb_hangar_client::DaemonClient, String> {
     ainb_app::fleet::bridge::daemon::surface_client(
         ainb_hangar_proto::connections::SurfaceKind::Desktop,
     )
-    .map_err(|error| ainb_desktop::shell_tab::refusal_text(verb, &error))
+    .map_err(|error| spawn_refusal_text(&error, verb))
 }
 
 /// The folder `target` names, resolved from the host's own session list or
@@ -340,11 +338,11 @@ async fn shell_open(
     window: tauri::State<'_, Window>,
     target: ainb_desktop::worktree_target::WorktreeTarget,
 ) -> Result<String, String> {
-    use ainb_desktop::shell_tab::{self, Verb};
+    use ainb_desktop::shell_tab;
     let terminals =
         window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
     let dir = resolve_worktree(&window, &target)?;
-    match shell_tab::open_tab(&daemon_client(Verb::Open)?, terminals, &dir).await {
+    match shell_tab::open_tab(&daemon_client(SpawnVerb::OpenTerminal)?, terminals, &dir).await {
         Ok(key) => {
             tracing::info!(tmux = %key, "window opened a shell");
             Ok(key)
@@ -363,9 +361,9 @@ async fn shell_open(
 /// tab is refused: this ends only shells the daemon opened.
 #[tauri::command]
 async fn shell_close(window: tauri::State<'_, Window>, key: String) -> Result<(), String> {
-    use ainb_desktop::shell_tab::{self, Verb};
+    use ainb_desktop::shell_tab;
     let terminals = window.terminals.as_ref().ok_or("No terminal tabs are open.")?;
-    shell_tab::close_tab(terminals, &daemon_client(Verb::Close)?, &key)
+    shell_tab::close_tab(terminals, &daemon_client(SpawnVerb::CloseTerminal)?, &key)
         .await
         .map(|_| ())
 }
@@ -391,7 +389,7 @@ async fn restore_shells(handle: tauri::AppHandle) {
     let Some(terminals) = window.terminals.as_ref() else {
         return;
     };
-    let client = match daemon_client(ainb_desktop::shell_tab::Verb::Open) {
+    let client = match daemon_client(SpawnVerb::OpenTerminal) {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(%error, "shells not restored");
