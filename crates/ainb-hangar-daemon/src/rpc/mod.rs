@@ -1953,19 +1953,21 @@ async fn handle(
 async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::spawn::WorktreeCreateParams =
         parse_params(req, "WorktreeCreateParams")?;
-    match crate::spawn::worktree_create(&params).await {
-        Ok(created) => to_value(&created),
-        Err(crate::spawn::SpawnError::Invalid(message))
-            if message == crate::spawn::UNREGISTERED =>
-        {
-            Err(RpcError {
-                code: ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
-                message,
-                data: None,
-            })
-        }
-        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
-        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
+    let created = crate::spawn::worktree_create(&params).await.map_err(spawn_error)?;
+    to_value(&created)
+}
+
+/// The JSON-RPC error for a spawn verb's refusal, chosen by the error's
+/// variant, never by its message.
+fn spawn_error(error: crate::spawn::SpawnError) -> RpcError {
+    match error {
+        crate::spawn::SpawnError::Unregistered(message) => RpcError {
+            code: ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+            message,
+            data: None,
+        },
+        crate::spawn::SpawnError::Invalid(message) => invalid_params(&message),
+        crate::spawn::SpawnError::Failed(message) => internal(&message),
     }
 }
 
@@ -1974,11 +1976,8 @@ async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, R
 async fn handle_worktree_agent_add(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::spawn::WorktreeAgentAddParams =
         parse_params(req, "WorktreeAgentAddParams")?;
-    match crate::spawn::worktree_agent_add(&params).await {
-        Ok(created) => to_value(&created),
-        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
-        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
-    }
+    let created = crate::spawn::worktree_agent_add(&params).await.map_err(spawn_error)?;
+    to_value(&created)
 }
 
 /// `shell/create`: a plain shell tmux session in a repository or worktree
@@ -1986,33 +1985,24 @@ async fn handle_worktree_agent_add(req: &RpcRequest) -> Result<serde_json::Value
 async fn handle_shell_create(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::spawn::ShellCreateParams =
         parse_params(req, "ShellCreateParams")?;
-    match crate::spawn::shell_create(&params).await {
-        Ok(created) => to_value(&created),
-        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
-        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
-    }
+    let created = crate::spawn::shell_create(&params).await.map_err(spawn_error)?;
+    to_value(&created)
 }
 
 /// `shell/list`: the shells the daemon opened that are still running (see
 /// [`crate::spawn::shell_list`]).
 async fn handle_shell_list(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
     let _: ainb_hangar_proto::spawn::ShellListParams = parse_params(req, "ShellListParams")?;
-    match crate::spawn::shell_list().await {
-        Ok(listed) => to_value(&listed),
-        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
-        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
-    }
+    let listed = crate::spawn::shell_list().await.map_err(spawn_error)?;
+    to_value(&listed)
 }
 
 /// `shell/close`: end one daemon shell by its exact name (see
 /// [`crate::spawn::shell_close`]).
 async fn handle_shell_close(req: &RpcRequest) -> Result<serde_json::Value, RpcError> {
     let params: ainb_hangar_proto::spawn::ShellCloseParams = parse_params(req, "ShellCloseParams")?;
-    match crate::spawn::shell_close(&params).await {
-        Ok(closed) => to_value(&closed),
-        Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
-        Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
-    }
+    let closed = crate::spawn::shell_close(&params).await.map_err(spawn_error)?;
+    to_value(&closed)
 }
 
 /// Return the authoritative host Fleet snapshot.
@@ -15247,6 +15237,28 @@ mod tests {
             failure.code, STORE_UNAVAILABLE,
             "the fresh-launch branch must degrade, not hard-fail and delete a worktree: \
              {failure:?}"
+        );
+    }
+
+    /// The unregistered code follows the variant, not the sentence: any
+    /// wording of an `Unregistered` refusal answers `REPO_NOT_REGISTERED`, and
+    /// an `Invalid` carrying the very same text stays `INVALID_PARAMS`.
+    #[test]
+    fn an_unregistered_refusal_is_coded_by_its_variant_not_its_message() {
+        use crate::spawn::{SpawnError, UNREGISTERED};
+
+        for message in [UNREGISTERED, "reworded: add this folder first", ""] {
+            let error = spawn_error(SpawnError::Unregistered(message.into()));
+            assert_eq!(
+                error.code,
+                ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+                "{message:?}"
+            );
+            assert_eq!(error.message, message, "the message is carried as it is");
+        }
+        assert_eq!(
+            spawn_error(SpawnError::Invalid(UNREGISTERED.into())).code,
+            INVALID_PARAMS
         );
     }
 
