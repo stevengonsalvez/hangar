@@ -177,7 +177,10 @@ body {
   color: var(--gold);
 }
 
-.banner button {
+/* The empty pane's Open terminal shares the look, or it is WebKit's default
+   macOS button. */
+.banner button,
+.empty-selected .empty-open {
   background: transparent;
   border: 1px solid var(--gold);
   border-radius: 6px;
