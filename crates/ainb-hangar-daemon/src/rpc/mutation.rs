@@ -344,7 +344,9 @@ fn store_error(error: &sqlx::Error) -> RpcError {
 /// wait was lost, it failed, its output was not a session) is
 /// [`SPAWN_STARTED`](ainb_hangar_proto::spawn::SPAWN_STARTED), which is
 /// recorded, so a retry replays the answer instead of running `ainb run` a
-/// second time. `INTERNAL_ERROR` there means nothing was started: no home
+/// second time. `shell/create` answers the same once `tmux new-session` ran
+/// without making the shell for certain (no answer in time, or a failure
+/// the best-effort take-back may not have undone). `INTERNAL_ERROR` there means nothing was started: no home
 /// directory, a worktree check that could not finish, no place for the run's
 /// output, or an `ainb` that could not be spawned. (Serializing the session a
 /// run returned is the one step after an effect that answers through
