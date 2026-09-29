@@ -110,6 +110,18 @@ export function SettingsPage(props: Props) {
           Back to board
         </button>
       </header>
+      {/* Above the rows: the TUI theme row's refusal sends the person here. */}
+      <Show when={props.onTheme}>
+        {(onTheme) => (
+          <section class="appearance-panel" aria-label="Appearance">
+            <h3>Appearance</h3>
+            <div class="appearance-row">
+              <span class="appearance-label">Theme</span>
+              <ThemeSwitch value={props.theme ?? "system"} onChange={(next) => onTheme()(next)} />
+            </div>
+          </section>
+        )}
+      </Show>
       <div class="settings-body">
         <nav class="settings-tree" aria-label="Categories">
           <For each={treeKeys()}>
@@ -189,17 +201,6 @@ export function SettingsPage(props: Props) {
           </For>
         </div>
       </div>
-      <Show when={props.onTheme}>
-        {(onTheme) => (
-          <section class="appearance-panel" aria-label="Appearance">
-            <h3>Appearance</h3>
-            <div class="appearance-row">
-              <span class="appearance-label">Theme</span>
-              <ThemeSwitch value={props.theme ?? "system"} onChange={(next) => onTheme()(next)} />
-            </div>
-          </section>
-        )}
-      </Show>
       <section class="daemons-panel" aria-label="Daemons">
         <h3>Daemons: runtime health</h3>
         <table>
