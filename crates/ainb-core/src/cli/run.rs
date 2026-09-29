@@ -650,13 +650,23 @@ fn setup_mcp_pool(args: &RunArgs, work_dir: &std::path::Path, session_name: &str
 }
 
 /// The servers a launch pools: every `configured` one, then the stdio
-/// servers the worktree's own `.mcp.json` declares.
+/// servers the worktree's own `.mcp.json` declares, unless the launch joins
+/// an existing worktree.
+///
+/// `--existing-worktree` (the daemon's `worktree/agent_add`) runs in a tree
+/// another agent has been working in, maybe with its permission prompts
+/// skipped, so that agent could have written the `.mcp.json`. Pooling a
+/// server spawns it on the host, and that is not the file's call: such a
+/// launch pools only what is already in ainb's config.
 fn pool_candidates(
-    _args: &RunArgs,
+    args: &RunArgs,
     configured: Vec<crate::mcp_pool::PooledServer>,
     work_dir: &std::path::Path,
 ) -> Vec<crate::mcp_pool::PooledServer> {
     let mut pooled = configured;
+    if args.existing_worktree.is_some() {
+        return pooled;
+    }
     // Auto-import: stdio servers already declared in the worktree's
     // .mcp.json join the pool too (config entries win on name conflict).
     // Users who never touched ainb config still get pooling for free.
