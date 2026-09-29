@@ -8,7 +8,7 @@ use std::rc::Rc;
 use ainb_app::config::AppConfig;
 use ainb_app::config::registry::{self, registry_key};
 use ainb_app::config::renderer_edit::{
-    DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON,
+    DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_KEY, TUI_THEME_REASON,
 };
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Chord, CommandId, Intent, Keymap, SectionId};
@@ -70,19 +70,18 @@ fn a_spawn_row_is_refused_by_name_and_by_key_sequence() {
     let log = Log::default();
     let mut host = host(&log);
     let mut by_key = 0;
-    for (pattern, _) in DENIED {
+    // The TUI's own theme is refused the same two ways, saying where the
+    // desktop's lives instead (`renderer_edit::TUI_THEME_REASON`).
+    let refused = DENIED
+        .iter()
+        .map(|(pattern, _)| (*pattern, DENIED_REASON))
+        .chain([(TUI_THEME_KEY, TUI_THEME_REASON)]);
+    for (pattern, reason) in refused {
         // A secret row on the deny list is refused as a secret first; the
         // secret test below covers it.
         if registry::row(pattern).is_some_and(|row| matches!(row.kind, registry::RowKind::Secret)) {
             continue;
         }
-        // Refused like every denied row; the TUI's own theme says where the
-        // desktop's lives instead (`renderer_edit::TUI_THEME_REASON`).
-        let reason = if *pattern == "ui_preferences.theme" {
-            TUI_THEME_REASON
-        } else {
-            DENIED_REASON
-        };
         // By name, whether or not the default config has such a row: the
         // key is judged, not the row.
         let named = pattern.replace('*', "sample");
