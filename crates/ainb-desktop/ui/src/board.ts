@@ -254,6 +254,22 @@ export function countIn(columns: readonly BoardColumn[], state: BoardColumnKind)
 }
 
 /**
+ * The Needs you card the attention jump (Cmd+U) reveals after `after`: the
+ * next one down the column as the board draws it, wrapping to the top, or the
+ * top card when `after` is no longer in the column. Read off the board's own
+ * columns, like the footer's count, so the jump and the board agree on who
+ * needs you. A card no click can open (no session row, no transcript) is
+ * drawn disabled and skipped here too. `null` when nothing needs you.
+ */
+export function nextNeedsYou(columns: readonly BoardColumn[], after: string | null): BoardCard | null {
+  const needs = columns.find((column) => column.state === "needs")?.cards ?? [];
+  const openable = needs.filter((card) => card.sessionId !== null || card.acp);
+  if (openable.length === 0) return null;
+  const at = openable.findIndex((card) => card.key === after);
+  return openable[(at + 1) % openable.length];
+}
+
+/**
  * Whether two projections draw the same board. A drain that touches Sessions,
  * Fleet or agent_status recomputes the columns; without this every card button
  * would be rebuilt, and a keyboard user's focus dropped, on every one.
