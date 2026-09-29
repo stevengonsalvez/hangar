@@ -10,6 +10,7 @@ import type {
   SessionsView_Serialize,
   Workspace_Serialize,
 } from "../../../ainb-app/bindings/AppState";
+import { unhandled } from "./status.ts";
 
 /** Precedence, tightest first, as `AttentionKind`'s `Ord` in Rust. */
 export const ATTENTION_ORDER: readonly AttentionKind[] = ["Ask", "Wait", "Approve", "Err", "Done"];
@@ -37,9 +38,9 @@ export function rowStatus(status: SessionStatus): RowStatus {
     case "Stopped":
       return "stopped";
     // A host at another version may send a status this build does not know:
-    // said as unknown, not guessed.
+    // said as unknown, not guessed, and warned about once.
     default:
-      return "unknown";
+      return unhandled(status as never, "unknown");
   }
 }
 
