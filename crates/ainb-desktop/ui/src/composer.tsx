@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import {
+  addProject,
   branchPreview,
   initialFields,
   loadRegisteredProjects,
@@ -70,13 +71,43 @@ export function Composer(props: Props) {
   // Read per open (this is mounted only while open), so a folder registered
   // since the last open is offered. It lands after the first paint: a blank
   // project is filled then, a picked one is left alone.
-  const [registered] = createResource(loadRegisteredProjects, { initialValue: [] });
+  const [registered, { mutate: setRegistered, refetch: refetchRegistered }] = createResource(loadRegisteredProjects, {
+    initialValue: [],
+  });
   const projects = createMemo(() => projectChoices(props.sessions, registered()));
+  // Nothing to pick, once the host has answered.
+  const empty = () => projects().length === 0 && !registered.loading;
   createEffect(() => {
     const first = projects()[0]?.path;
     if (first !== undefined && untrack(fields).projectPath === "") set("projectPath", first);
   });
   const preview = createMemo(() => branchPreview(fields().name));
+
+  // Add project: the host opens the OS folder picker and registers the pick,
+  // so a create from it is accepted. The new project is listed and chosen;
+  // a cancelled picker changes nothing; a refusal says why under the field.
+  const [adding, setAdding] = createSignal(false);
+  const [addError, setAddError] = createSignal<string | null>(null);
+  const onAddProject = () => {
+    if (adding()) return;
+    setAdding(true);
+    setAddError(null);
+    addProject().then(
+      (project) => {
+        setAdding(false);
+        if (project === null) return;
+        // Listed and chosen at once, then the host's own list, which is the
+        // truth about what the daemon now accepts.
+        setRegistered((current) => [...(current ?? []).filter((known) => known.path !== project.path), project]);
+        set("projectPath", project.path);
+        void refetchRegistered();
+      },
+      (error: unknown) => {
+        setAdding(false);
+        setAddError(String(error));
+      },
+    );
+  };
 
   const submit = (event: Event) => {
     event.preventDefault();
@@ -158,21 +189,56 @@ export function Composer(props: Props) {
             aria-invalid={invalid("projectPath") ? "true" : undefined}
             disabled={creating()}
             value={fields().projectPath}
-            onChange={(event) => set("projectPath", event.currentTarget.value)}
+            onChange={(event) => {
+              setAddError(null);
+              set("projectPath", event.currentTarget.value);
+            }}
           >
-            <For each={projects()}>{(project) => <option value={project.path}>{project.name}</option>}</For>
+            {/* `selected` per option, not only the select's value: a refetched
+                list replaces the options, and a replaced option would
+                otherwise drop the choice back to the first row. */}
+            <For each={projects()}>
+              {(project) => (
+                <option value={project.path} selected={project.path === fields().projectPath}>
+                  {project.name}
+                </option>
+              )}
+            </For>
           </select>
           <Show when={errorFor("projectPath")}>{(message) => <p class="composer-error">{message()}</p>}</Show>
+          <Show when={addError()}>{(message) => <p class="composer-error composer-add-error">{message()}</p>}</Show>
           {/* Nothing to pick, once the host has answered: say how to register
               a folder rather than leaving only "Choose a project." */}
-          <Show when={projects().length === 0 && !registered.loading}>
-            <p class="composer-hint composer-empty-projects">
-              No projects yet. Add your repositories' folder to workspace_defaults.workspace_scan_paths, then reopen.
-              For example (this replaces the whole list, so include any folder already in it):{" "}
-              <code>{REGISTER_FOLDER_COMMAND}</code>
-            </p>
+          <Show when={empty()}>
+            <div class="composer-hint composer-empty-projects">
+              <p>
+                No projects yet. Add one repository with Add folder, or add your repositories' folder to
+                workspace_defaults.workspace_scan_paths and reopen. For example (this replaces the whole list, so
+                include any folder already in it):{" "}
+                <code>{REGISTER_FOLDER_COMMAND}</code>
+              </p>
+              <button
+                type="button"
+                class="composer-add-folder"
+                disabled={creating() || adding()}
+                onClick={onAddProject}
+              >
+                Add folder…
+              </button>
+            </div>
           </Show>
         </label>
+        {/* The empty state carries its own Add folder: one add button at a time. */}
+        <Show when={!empty()}>
+          <button
+            type="button"
+            class="composer-add-project"
+            disabled={creating() || adding()}
+            onClick={onAddProject}
+          >
+            Add project…
+          </button>
+        </Show>
 
         <label class="composer-field">
           <span class="composer-label">Name</span>

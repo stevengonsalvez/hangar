@@ -11,7 +11,9 @@
 
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
-use ainb_hangar_proto::spawn::{SpawnAgent, WorktreeCreateParams, WorktreeCreateResult};
+use ainb_hangar_proto::spawn::{
+    REPO_NOT_REGISTERED, SpawnAgent, WorktreeCreateParams, WorktreeCreateResult,
+};
 use serde::{Deserialize, Serialize};
 
 /// The JSON-RPC code for a method the daemon does not serve.
@@ -105,6 +107,10 @@ pub fn refusal_text(error: &DaemonError) -> String {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
             "This daemon does not create worktrees yet: start it with AINB_HANGAR_SPAWN=1.".into()
         }
+        DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => {
+            "This repository is not in a registered project folder: use Add project to pick its folder, then create again."
+                .into()
+        }
         DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
             format!("The daemon refused the request: {message}")
         }
@@ -194,6 +200,20 @@ mod tests {
             message: "base is not a valid git ref name".into(),
         };
         assert!(refusal_text(&bad).contains("base is not a valid git ref name"));
+        let unregistered = DaemonError::Rpc {
+            code: REPO_NOT_REGISTERED,
+            message: "repo_path is not under a registered workspace folder: add its folder to \
+                      workspace_defaults.workspace_scan_paths"
+                .into(),
+        };
+        assert!(refusal_text(&unregistered).contains("use Add project"));
+        // By code, not by sentence: the same words under INVALID_PARAMS are
+        // just a refusal.
+        let worded = DaemonError::Rpc {
+            code: INVALID_PARAMS,
+            message: "repo_path is not under a registered workspace folder".into(),
+        };
+        assert!(refusal_text(&worded).starts_with("The daemon refused the request"));
         let failed = DaemonError::Rpc {
             code: -32603,
             message: "`ainb run` failed: branch exists".into(),

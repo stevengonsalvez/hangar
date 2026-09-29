@@ -63,6 +63,12 @@ pub const SPAWN_FIELD_MAX: usize = 200;
 /// Longest accepted first prompt, in bytes.
 pub const SPAWN_PROMPT_MAX: usize = 64 * 1024;
 
+/// JSON-RPC error code for a `worktree/create` whose repository is in no
+/// registered workspace folder and is not an added project. Distinct from
+/// `INVALID_PARAMS` so a client can offer the fix (add the project) by code,
+/// never by matching the message.
+pub const REPO_NOT_REGISTERED: i32 = -32010;
+
 /// Parameters for `worktree/create`: a new git worktree on a new branch, with
 /// one agent session running in it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

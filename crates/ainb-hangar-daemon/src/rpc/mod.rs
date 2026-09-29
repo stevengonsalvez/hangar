@@ -1955,6 +1955,15 @@ async fn handle_worktree_create(req: &RpcRequest) -> Result<serde_json::Value, R
         parse_params(req, "WorktreeCreateParams")?;
     match crate::spawn::worktree_create(&params).await {
         Ok(created) => to_value(&created),
+        Err(crate::spawn::SpawnError::Invalid(message))
+            if message == crate::spawn::UNREGISTERED =>
+        {
+            Err(RpcError {
+                code: ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+                message,
+                data: None,
+            })
+        }
         Err(crate::spawn::SpawnError::Invalid(message)) => Err(invalid_params(&message)),
         Err(crate::spawn::SpawnError::Failed(message)) => Err(internal(&message)),
     }

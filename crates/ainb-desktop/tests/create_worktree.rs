@@ -54,6 +54,30 @@ fn fake_ainb(dir: &Path) -> PathBuf {
     bin
 }
 
+/// `git init` a repository at `dir`.
+fn git_init(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let ok = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(ok, "git init {}", dir.display());
+}
+
+/// A create from `repo` with every optional field left out.
+fn plain(repo: &Path) -> CreateWorktreeArgs {
+    CreateWorktreeArgs {
+        repo_path: std::fs::canonicalize(repo).unwrap().display().to_string(),
+        branch: None,
+        base: None,
+        agent: SpawnAgent::Claude,
+        model: None,
+        prompt: None,
+    }
+}
+
 struct Home(tempfile::TempDir);
 
 impl Home {
@@ -156,6 +180,48 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
         ainb_hangar_client::socket_path_in(&home.path()),
         token.trim().to_string(),
     );
+    // A repository outside every registered folder is refused, and the
+    // sentence says how to fix it from the window.
+    let stray = user_home.path().join("stray");
+    git_init(&stray);
+    let refused = request(&client, plain(&stray))
+        .await
+        .expect_err("an unregistered repository is refused");
+    assert!(
+        refused.contains("Add project"),
+        "the refusal names the fix: {refused}"
+    );
+    // The fix it names: Add project registers the repository, and the
+    // daemon, which reads the registered projects per call, creates from it,
+    // and from nothing nested inside it.
+    let nested = stray.join("vendor/lib");
+    git_init(&nested);
+    ainb_desktop::projects::register(user_home.path(), &stray).expect("registered");
+    request(&client, plain(&stray))
+        .await
+        .expect("a registered project is created from");
+    request(&client, plain(&nested))
+        .await
+        .expect_err("a repository nested in an added project is refused");
+
+    // A repository deep inside a registered folder, past the scan's depth:
+    // adding it records it, so the list offers it and the daemon creates
+    // from it.
+    let deep = user_home.path().join("code/a/b/c/d/deep");
+    git_init(&deep);
+    let added = ainb_desktop::projects::register(user_home.path(), &deep).expect("registered");
+    assert!(
+        ainb_desktop::projects::list(
+            user_home.path(),
+            &ainb_app::config::WorkspaceDefaults::default()
+        )
+        .contains(&added),
+        "the deep repository is listed once added"
+    );
+    request(&client, plain(&deep))
+        .await
+        .expect("a deep repository inside a registered folder is created from");
+
     let created = request(
         &client,
         CreateWorktreeArgs {
@@ -188,6 +254,17 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
         "the window never skips permission prompts: {argv:?}"
     );
     assert_eq!(argv.last(), Some(&"--prompt=hello from the window"));
+
+    // Onboarding replaces workspace_scan_paths wholesale; an added project is
+    // not there, so it survives.
+    std::fs::write(
+        user_home.path().join(".agents-in-a-box/config/config.toml"),
+        "[workspace_defaults]\nworkspace_scan_paths = []\n",
+    )
+    .unwrap();
+    request(&client, plain(&stray))
+        .await
+        .expect("an added project outlives a scan-path rewrite");
 
     drop(sidecar);
 }
