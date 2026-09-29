@@ -395,8 +395,10 @@ function Shell() {
    */
   // Stops at the first refusal: a pick whose cursor move was refused must not
   // go on to send Enter on whatever option the reducer is pointing at.
-  const run = async (intents: RendererIntent[]) => {
-    report(await sendInOrder(intents, (intent) => invoke<Refusal | null>("dispatch", { intent })));
+  const run = async (intents: RendererIntent[]): Promise<Refusal | null> => {
+    const refusal = await sendInOrder(intents, (intent) => invoke<Refusal | null>("dispatch", { intent }));
+    report(refusal);
+    return refusal;
   };
   /** Select a session-list row and attach it, so the reducer marks it attached. */
   const openRow = (row: RowId) => dispatch(openRowIntent(row));
@@ -426,10 +428,10 @@ function Shell() {
    * the session list first, by the reducer's own screen (#121), and then the
    * rows go as before.
    */
-  const answer = async (intents: RendererIntent[]) => {
-    if (intents.length === 0) return;
+  const answer = async (intents: RendererIntent[]): Promise<Refusal | null> => {
+    if (intents.length === 0) return null;
     await invoke("answer_home");
-    await run(intents);
+    return run(intents);
   };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
@@ -545,14 +547,16 @@ function Shell() {
       [...document.querySelectorAll<HTMLElement>(".board-card")].find((node) => node.dataset.card === card.key)?.focus();
       return;
     }
-    showSession(card.sessionId);
+    void showSession(card.sessionId);
   };
   /** Show `sessionId`'s tab, or open one when it has none: after
-   * `answer_home`, so from Settings or the Inbox nothing is refused. */
-  const showSession = (sessionId: string) => {
+   * `answer_home`, so from Settings or the Inbox nothing is refused. The
+   * open's refusal, if the host refused it; `null` when a tab was shown. */
+  const showSession = async (sessionId: string): Promise<Refusal | null> => {
     const tab = tabs().find((one) => one.target.kind === "session" && one.target.id === sessionId);
-    if (tab !== undefined) choose(tab);
-    else void answer([openRowIntent({ session: sessionId })]);
+    if (tab === undefined) return answer([openRowIntent({ session: sessionId })]);
+    choose(tab);
+    return null;
   };
   /** Hide the sidebar, or show it again. A hidden sidebar cannot keep the
    * keyboard: it goes to the shown terminal, or nowhere. */
@@ -608,10 +612,12 @@ function Shell() {
         const from = steppedTo ?? shownSession() ?? sessions()?.selected_session_id ?? null;
         const next = stepWorktree(sessions(), from, shell.step, readCollapsed(safeStorage()));
         if (next === null) return;
-        showSession(next);
         // Tabless: its tab opens when the host answers, and `activate` then
-        // forgets this.
+        // forgets this. A refused open opens nothing, so it is forgotten then.
         if (!tabs().some((tab) => tab.target.kind === "session" && tab.target.id === next)) steppedTo = next;
+        void showSession(next).then((refusal) => {
+          if (refusal !== null && steppedTo === next) steppedTo = null;
+        });
         return;
       }
       case "sidebar":
@@ -949,7 +955,7 @@ function Shell() {
                 drops a latched banner at once instead of holding the last
                 session's question over the next one's pane for the grace. */}
             <For each={[shownSession()]}>
-              {() => <AnswerSlot question={questionOver(question(), shownSession())} ask={ask()} run={answer} />}
+              {() => <AnswerSlot question={questionOver(question(), shownSession())} ask={ask()} run={async (intents) => void (await answer(intents))} />}
             </For>
             <Show when={transcriptKey()}>
               {(key) => (
