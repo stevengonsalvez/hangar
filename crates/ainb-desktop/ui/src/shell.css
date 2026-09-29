@@ -265,6 +265,56 @@ body {
   color: var(--muted-foreground);
 }
 
+/* The filter field under the sidebar's head (`sidebar_filter.tsx`): the
+   clear button sits inside the field's right edge, so the field keeps room
+   for it rather than letting typed text run under it. */
+.sidebar-filter {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 4px 12px 6px;
+}
+
+.sidebar-filter-input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 24px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-meta);
+}
+
+.sidebar-filter-input::placeholder {
+  color: var(--muted-foreground);
+}
+
+.sidebar-filter-clear {
+  position: absolute;
+  inset-inline-end: 2px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.sidebar-filter-clear:hover {
+  color: var(--text);
+}
+
+.sidebar-filter-input:focus-visible,
+.sidebar-filter-clear:focus-visible {
+  border-color: var(--ring);
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
 /* A project group: a native disclosure, so collapsing one needs no keyboard
    handling and no click-target math of its own (`sidebar.tsx`). */
 .workspace {
