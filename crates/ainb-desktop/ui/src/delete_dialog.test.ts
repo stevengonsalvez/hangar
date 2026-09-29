@@ -6,6 +6,7 @@ import {
   createDeleteFlow,
   deleteCopy,
   dirtyHint,
+  forcesDelete,
   UNCHECKED_HINT,
   type DeletePreview,
   type PreviewState,
@@ -26,6 +27,32 @@ test("a tree that goes with the session reads as Orca's worktree delete", () => 
   assert.equal(`${copy.before}${copy.target}${copy.after}`, "Remove Fix login from git and delete its workspace folder.");
   assert.equal(copy.confirm, "Delete Workspace");
   assert.equal(copy.ready, true);
+});
+
+test("dirty or uncounted work asks for Force Delete, and says it forces", () => {
+  for (const changes of [3, null]) {
+    const copy = deleteCopy("Fix login", ready({ tree: "removed", changes }));
+    assert.equal(copy.confirm, "Force Delete", `changes ${changes}`);
+    assert.equal(copy.force, true);
+    assert.equal(forcesDelete(ready({ tree: "removed", changes })), true);
+  }
+  assert.equal(deleteCopy("x", ready({ tree: "removed", changes: 0 })).force, false);
+  // Nothing on disk goes with a shared or kept tree: nothing to force.
+  assert.equal(forcesDelete(ready({ tree: "shared", changes: null })), false);
+  assert.equal(forcesDelete(ready({ tree: "kept", changes: null })), false);
+});
+
+test("a forced confirm tells the host what it was shown", async () => {
+  const sent: unknown[] = [];
+  const flow = createDeleteFlow({
+    preview: async () => ({ tree: "removed", changes: 3 }),
+    remove: async (_id, confirmed) => void sent.push(confirmed),
+    toast: () => undefined,
+  });
+  flow.open(pick("a"));
+  await tick();
+  flow.confirm();
+  assert.deepEqual(sent, [{ expected: "removed", expectedChanges: 3, force: true }]);
 });
 
 test("a shared tree is never offered for removal: only the session goes", () => {
@@ -72,7 +99,7 @@ test("confirm deletes once and closes; a second confirm does nothing", async () 
   const removed: string[] = [];
   const flow = createDeleteFlow({
     preview: async () => ({ tree: "removed", changes: 0 }),
-    remove: async (id, expected) => void removed.push(`${id}:${expected}`),
+    remove: async (id, confirmed) => void removed.push(`${id}:${JSON.stringify(confirmed)}`),
     toast: () => undefined,
   });
   flow.open(pick("a"));
@@ -82,7 +109,7 @@ test("confirm deletes once and closes; a second confirm does nothing", async () 
   flow.confirm();
   flow.confirm();
   // With the fate the person was shown, for the host to check again.
-  assert.deepEqual(removed, ["a:removed"]);
+  assert.deepEqual(removed, ['a:{"expected":"removed","expectedChanges":0,"force":false}']);
   assert.equal(flow.target(), null);
 });
 
