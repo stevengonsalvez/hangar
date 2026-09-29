@@ -1,9 +1,10 @@
 //! A spawn opt-out survives the sidecar respawning the daemon: after the
 //! first daemon is killed and the supervisor starts a fresh one, all five
 //! spawn verbs still answer `METHOD_NOT_FOUND`, whether the opt-out is the
-//! file key (`[hangar] spawn = false`) or the app's `AINB_HANGAR_SPAWN=0`.
-//! A daemon with neither serves them after a respawn, which proves the binary
-//! under test has the verbs at all.
+//! file key (`[hangar] spawn = false`, which `AINB_HANGAR_SPAWN=1` does not
+//! undo) or the `AINB_HANGAR_SPAWN=0` the supervisor hands each daemon it
+//! starts. A daemon with neither, beside an unrelated config, serves them
+//! after a respawn, which proves the binary under test has the verbs at all.
 //!
 //! Its own process: `HOME` and `TMUX_TMPDIR` point at private directories
 //! the spawned daemons inherit, so nothing reaches the user's home or tmux,
@@ -214,9 +215,21 @@ async fn the_apps_env_opt_out_survives_a_respawn() {
     drop(sidecar);
 }
 
+/// Off wins: the app's `AINB_HANGAR_SPAWN=1` does not undo the file key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_opt_out_is_not_undone_by_the_env_saying_on() {
+    let world = World::new();
+    world.write_config("[hangar]\nspawn = false\n");
+    let sidecar = world.respawned(world.config(Some("1"))).await;
+    assert_all_dark(&world.client()).await;
+    drop(sidecar);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn with_no_opt_out_a_respawned_daemon_serves_the_verbs() {
     let world = World::new();
+    // The common case: a user config that says nothing about the switch.
+    world.write_config("[ui_preferences]\nshow_git_status = true\n");
     let sidecar = world.respawned(world.config(None)).await;
     let listed = world
         .client()
