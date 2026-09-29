@@ -167,7 +167,9 @@ export function Composer(props: Props) {
               a folder rather than leaving only "Choose a project." */}
           <Show when={projects().length === 0 && !registered.loading}>
             <p class="composer-hint composer-empty-projects">
-              No projects yet. Register a folder of repositories, then reopen: <code>{REGISTER_FOLDER_COMMAND}</code>
+              No projects yet. Add your repositories' folder to workspace_defaults.workspace_scan_paths, then reopen.
+              For example (this replaces the whole list, so include any folder already in it):{" "}
+              <code>{REGISTER_FOLDER_COMMAND}</code>
             </p>
           </Show>
         </label>
