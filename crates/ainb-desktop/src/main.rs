@@ -307,25 +307,47 @@ fn daemon_client(
     .map_err(|error| ainb_desktop::shell_tab::refusal_text(verb, &error))
 }
 
-/// Open a plain shell in the worktree of the listed session `session`,
-/// as a tab, and answer the tab's key. The folder is the host's, from its
-/// own session list, never the page's; the daemon opens the shell.
+/// The folder `target` names, resolved from the host's own session list or
+/// shell tabs, never from the page.
+fn resolve_worktree(
+    window: &Window,
+    target: &ainb_desktop::worktree_target::WorktreeTarget,
+) -> Result<String, String> {
+    target.resolve(
+        |id| window.shell.session_worktree(id),
+        |key| match window.terminals.as_ref()?.target(key)? {
+            TabTarget::Shell { dir, .. } => Some(dir),
+            _ => None,
+        },
+    )
+}
+
+/// Open a plain shell in the worktree `target` names, as a tab, and answer
+/// the tab's key. The folder is the host's, from its own session list or
+/// shell tabs, never the page's; the daemon opens the shell, and closes it
+/// again when its tab cannot attach (`shell_tab::open_tab`).
 #[tauri::command]
-async fn shell_open(window: tauri::State<'_, Window>, session: String) -> Result<String, String> {
+async fn shell_open(
+    window: tauri::State<'_, Window>,
+    target: ainb_desktop::worktree_target::WorktreeTarget,
+) -> Result<String, String> {
     use ainb_desktop::shell_tab::{self, Verb};
     let terminals =
         window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
-    let dir = uuid::Uuid::parse_str(&session)
-        .ok()
-        .and_then(|id| window.shell.session_worktree(id))
-        .ok_or("That session is not listed any more; pick one in the sidebar.")?;
-    let shell = shell_tab::open(&daemon_client(Verb::Open)?, &dir).await?;
-    tracing::info!(tmux = %shell.tmux_session_name, "window opened a shell");
-    // A report back is the tab failing to attach; the reducer shows it.
-    if let Some(report) = terminals.open(shell_tab::target(&shell)) {
-        window.shell.dispatch(report);
+    let dir = resolve_worktree(&window, &target)?;
+    match shell_tab::open_tab(&daemon_client(Verb::Open)?, terminals, &dir).await {
+        Ok(key) => {
+            tracing::info!(tmux = %key, "window opened a shell");
+            Ok(key)
+        }
+        Err(failed) => {
+            // The reducer shows a failed attach in its own words.
+            if let Some(report) = failed.report {
+                window.shell.dispatch(report);
+            }
+            Err(failed.message)
+        }
     }
-    Ok(shell.tmux_session_name)
 }
 
 /// Close the shell tab `key` and end its shell (`shell/close`). Any other
