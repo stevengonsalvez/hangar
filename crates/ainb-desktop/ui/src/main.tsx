@@ -44,13 +44,13 @@ import {
   focusGroup,
   groups,
   initialLayout,
-  readLayout,
+  readStored,
   splitGroup,
   writeLayout,
   type GroupId,
   type Layout,
 } from "./layout.ts";
-import { followHost } from "./panes.ts";
+import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
@@ -143,11 +143,17 @@ function Shell() {
   // (`layout.ts`), kept in this window's storage across reloads.
   const [tabs, setTabs] = createSignal<Tab[]>([]);
   const [layout, setLayout] = createSignal<Layout>(initialLayout([]));
-  // Whether the stored layout has been read: on the host's first strip that
-  // lists a tab. A relaunched host lists none until a tab opens (it restores
-  // no tabs), and reading then would follow the stored layout to nothing and
-  // store that over it.
-  let restored = false;
+  // Where the window is in bringing the stored layout back. The host
+  // restores no tabs: after a relaunch its strip is empty, then gains a tab
+  // at a time as a person opens them. So the stored layout is read on the
+  // first strip with a tab, and rebuilt from on every strip (never written)
+  // until every stored tab is open again, a person reshapes the panes, or
+  // `RESTORE_MS` passes. Only then does the window follow the host and store
+  // what it shows; following earlier would drop each stored tab not open
+  // yet, and store that over the layout being restored.
+  let phase: "waiting" | Restore | "following" = "waiting";
+  // The tab last activated during a restore: kept shown across rebuilds.
+  let restoreShown: string | null = null;
   /** The shown tab of the focused group: the terminal with the keyboard,
    * the one the sidebar and the answer banner follow. */
   const active = () => {
@@ -161,12 +167,12 @@ function Shell() {
     const byKey = new Map(tabs().map((tab) => [tab.key, tab]));
     return groups(layout()).flatMap((group) => group.tabs.flatMap((key) => byKey.get(key) ?? []));
   };
-  /** Take `next` as the layout, and store it once the stored one has been
-   * read; the same layout is a no-op. */
+  /** Take `next` as the layout, and store it once the window follows the
+   * host (`phase`); the same layout is a no-op. */
   const commitLayout = (next: Layout) => {
     if (next === layout()) return;
     setLayout(next);
-    if (restored) writeLayout(safeStorage(), next);
+    if (phase === "following") writeLayout(safeStorage(), next);
   };
   // Tab keys in the order they were shown, most recent last: which tab a
   // group shows when its shown one closes. Read only then, so not a signal.
@@ -268,6 +274,7 @@ function Shell() {
       // Shown in its own group, and that group focused: the host's
       // `TabsView.focus` lands here as a person's click does.
       commitLayout(activateTab(layout(), key));
+      if (typeof phase === "object") restoreShown = key;
       recent = visited(recent, key);
       // The session list follows the shown terminal, whoever showed it, so
       // the sidebar row and the answer banner are that session's.
@@ -317,14 +324,17 @@ function Shell() {
     for (const key of focusers.keys()) {
       if (!keys.includes(key)) focusers.delete(key);
     }
-    // The first strip with a tab restores the stored layout, following it;
-    // every later one is followed (`followHost`), which returns the layout
-    // itself when nothing changed, so a strip that only restates the tabs
-    // costs nothing.
-    if (restored) commitLayout(followHost(layout(), keys, recent));
+    // Followed (`followHost`), which returns the layout itself when nothing
+    // changed, so a strip that only restates the tabs costs nothing; or,
+    // while the stored layout comes back, rebuilt from it (`phase`).
+    if (phase === "following") commitLayout(followHost(layout(), keys, recent));
     else if (keys.length > 0) {
-      restored = true;
-      commitLayout(readLayout(safeStorage(), keys));
+      const restore = phase === "waiting" ? beginRestore(readStored(safeStorage()), Date.now()) : phase;
+      phase = restoreDone(restore, keys, Date.now()) ? "following" : restore;
+      commitLayout(rebuild(restore, keys, restoreShown));
+      // Stored on the strip that ends the restore, even when the rebuild is
+      // the layout already shown and so wrote nothing.
+      if (phase === "following") writeLayout(safeStorage(), layout());
     }
     if (view.focus !== null) activate(view.focus, true);
     else if (active() !== shownBefore) {
@@ -451,6 +461,8 @@ function Shell() {
   const applyLayout = (next: Layout) => {
     const before = layout();
     const shownBefore = active();
+    // A person reshaping the panes ends a restore: what they made is kept.
+    phase = "following";
     commitLayout(next);
     const shown = active();
     if (shown !== null && (next.focused !== before.focused || shown !== shownBefore)) activate(shown, false);
