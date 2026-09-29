@@ -68,16 +68,22 @@ export function usageSegment(usage: UsageView | undefined, stale = false): Usage
     const state = stats.state === "absent" ? "unavailable" : stats.state === "failed" ? "failed" : "loading";
     return { ...none, state };
   }
+  const notCurrent = summary.state !== "ready" || usage?.failure != null || stale;
   const providers = summary.providers.map((entry) => ({ provider: entry.name, figure: chipFigure(entry.bucket) }));
-  if (providers.length === 0) return { ...none, state: summary.state === "unavailable" ? "unavailable" : "empty" };
+  // A frame over its caps can cut every provider: that is "+N", not "none".
+  if (providers.length === 0 && summary.providers_cut === 0) {
+    // The dash already says an unavailable summary is not current.
+    if (summary.state === "unavailable") return { ...none, state: "unavailable" };
+    return { ...none, state: "empty", stale: notCurrent };
+  }
   const folded = providers.slice(MAX_CHIPS).map((chip) => `${chip.provider} ${chip.figure}`);
   if (summary.providers_cut > 0) folded.push(`${summary.providers_cut} not sent`);
   return {
     state: "ready",
     chips: providers.slice(0, MAX_CHIPS),
-    more: providers.length - Math.min(providers.length, MAX_CHIPS) + summary.providers_cut,
+    more: folded.length === 0 ? 0 : providers.slice(MAX_CHIPS).length + summary.providers_cut,
     moreTitle: folded.length === 0 ? "" : `Also: ${folded.join(", ")}`,
-    stale: summary.state !== "ready" || usage?.failure != null || stale,
+    stale: notCurrent,
     title,
   };
 }
