@@ -11,14 +11,17 @@ interface Props {
 
 /**
  * The row menu's Delete confirmation, the way Orca's behaves (a Radix dialog
- * in `DeleteWorktreeDialog.tsx:336-423`): the confirm button takes the
- * keyboard so Delete then Enter confirms (`:340-351`), Tab stays inside, Esc
+ * in `DeleteWorktreeDialog.tsx:336-423`): on a clean tree the confirm button
+ * takes the keyboard so Delete then Enter confirms (`:340-351`); on a dirty
+ * or uncounted one the button reads Force Delete and Cancel takes it instead.
+ * Tab stays inside, Esc
  * or a press on the scrim cancels, and the keyboard goes back to where it was
  * (the row) when it closes.
  */
 export function DeleteDialog(props: Props) {
   let dialog!: HTMLDivElement;
   let confirm!: HTMLButtonElement;
+  let cancel!: HTMLButtonElement;
   const copy = () => deleteCopy(props.target.name, props.state);
   const changes = () => changesLine(props.state);
 
@@ -31,10 +34,12 @@ export function DeleteDialog(props: Props) {
   onCleanup(() => queueMicrotask(() => (opener?.isConnected ? opener : sidebar)?.focus()));
 
   onMount(() => dialog.focus());
-  // The confirm button is disabled while the host checks; it takes the
-  // keyboard once it can be pressed, unless the keyboard already moved on.
+  // The confirm button is disabled while the host checks. Once it can be
+  // pressed, a clean delete puts the keyboard on it, as Orca does; a Force
+  // Delete puts it on Cancel, so Enter never wipes work by reflex. Unless the
+  // keyboard already moved on.
   createEffect(() => {
-    if (copy().ready && document.activeElement === dialog) confirm.focus();
+    if (copy().ready && document.activeElement === dialog) (copy().force ? cancel : confirm).focus();
   });
 
   const onWindowKey = (event: KeyboardEvent) => {
@@ -116,7 +121,7 @@ export function DeleteDialog(props: Props) {
           )}
         </Show>
         <div class="delete-dialog-actions">
-          <button type="button" class="delete-dialog-cancel" onClick={() => props.onClose()}>
+          <button ref={cancel} type="button" class="delete-dialog-cancel" onClick={() => props.onClose()}>
             Cancel
           </button>
           <button
