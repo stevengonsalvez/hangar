@@ -11,6 +11,7 @@ import { terminalAppearance, type Theme } from "./theme/theme.ts";
 import { findChord, TerminalSearch } from "./terminal_search.tsx";
 import { nextFontSize, TERMINAL_FONT_SIZE, zoomChord } from "./terminal_zoom.ts";
 import { menuChord, TerminalMenu, type MenuEntry, type MenuPoint } from "./terminal_menu.tsx";
+import { loadTerminalLinks } from "./terminal_links.ts";
 
 interface Props {
   tab: Tab;
@@ -79,6 +80,9 @@ export function TerminalView(props: Props) {
     const searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
     setSearch(searchAddon);
+    // A link click asks the host, which opens only an http or https URL in
+    // the default browser (`open_url`): the webview opens nothing itself.
+    loadTerminalLinks(term, pane, props.mac, (url) => void invoke("open_url", { url }));
     focusTerminal = () => term.focus();
     try {
       const webgl = new WebglAddon();
