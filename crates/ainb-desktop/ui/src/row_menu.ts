@@ -7,7 +7,8 @@
 // has more items than this. Only the ones this window already has an action
 // for are here: an existing reducer command or host command, nothing new.
 
-import type { Session_Serialize } from "../../../ainb-app/bindings/AppState";
+import type { Session_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
+import { allSessions } from "./sessions.ts";
 import { selectRowIntent, type RendererIntent } from "./tabs.ts";
 
 /** What a menu item does when chosen. */
@@ -84,6 +85,11 @@ export function opensRowMenu(event: KeyLike): boolean {
  */
 export function editorIntents(sessionId: string): RendererIntent[] {
   return [selectRowIntent({ session: sessionId }), { Command: ["session_list.editor", null] }];
+}
+
+/** Session `id` as `view` has it now, or `undefined` once it has left. */
+export function sessionIn(view: SessionsView_Serialize | undefined, id: string): Session_Serialize | undefined {
+  return allSessions(view).find((session) => session.id === id);
 }
 
 /** An item chosen on a row: what to do, to which session, and the worktree's
