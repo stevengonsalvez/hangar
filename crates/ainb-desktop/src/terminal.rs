@@ -12,7 +12,9 @@
 //! [`WINDOW_BYTES`] of what it was sent, so a slow webview stalls the reader
 //! and tmux holds the output, instead of a queue growing without bound. A
 //! stalled tab holds at most `WINDOW_BYTES + READ_QUEUE * CHUNK_BYTES`, about
-//! 8 MiB, so 64 MiB with [`MAX_ATTACHED_TABS`] attached.
+//! 8 MiB, so 64 MiB with [`MAX_ATTACHED_TABS`] attached. Tabs in view are
+//! spared the cap, so the worst case is [`MAX_VISIBLE_TABS`] panes on screen
+//! and one tab opening beside them: 17 attached, about 136 MiB.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
