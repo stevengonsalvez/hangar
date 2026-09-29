@@ -293,12 +293,36 @@ and the added launch would otherwise spawn whatever it declares on the host.
 
 The Hangar daemon serves `worktree/create`, `worktree/agent_add`,
 `shell/create`, `shell/list` and `shell/close` by default (the desktop's
-create, add-agent and shell paths). Start the daemon with
-`AINB_HANGAR_SPAWN=0` to keep them off: they then answer `METHOD_NOT_FOUND`,
-exactly as a daemon from before them does. Only an unset variable means on;
-`1` is also on and any other value is off, so a mistyped opt-out fails
-closed. It is read once at boot (the daemon logs `served=`) and is never a
-`daemon_config` key, so no connected surface can change it.
+create, add-agent and shell paths). Two switches keep them off; they then
+answer `METHOD_NOT_FOUND`, exactly as a daemon from before them does:
+
+| Switch | Off | On |
+|--------|-----|----|
+| env `AINB_HANGAR_SPAWN` | `0`, or any value but `1` | unset or `1` |
+| file key `spawn` under `[hangar]` in `<hangar home>/config/config.toml` | `false`, any other value, a file that cannot be read or does not parse | no file, no key, or `true` |
+
+```toml
+# ~/.agents-in-a-box/config/config.toml ($AINB_HANGAR_HOME/config/config.toml when set)
+[hangar]
+spawn = false
+```
+
+Precedence: off wins. The verbs are served only when both switches say on,
+so `AINB_HANGAR_SPAWN=1` does not undo `spawn = false`; remove the key to
+turn them back on. A mistyped value in either fails closed. Both are read
+once at boot (the daemon logs `served=`), so a change takes a daemon
+restart, and neither is a `daemon_config` key: no connected surface can
+change them, and `ainb config set` refuses `hangar.spawn` as unknown.
+
+The desktop app passes its own `AINB_HANGAR_SPAWN` to every daemon it
+starts, a respawn included. An app launched from Finder or the Dock on
+macOS does not see your shell's environment; give it the variable with
+`launchctl setenv AINB_HANGAR_SPAWN 0`, then quit and relaunch the app. A
+daemon that is already running keeps what it read at its own boot and
+outlives the app, so stop it too (`ainb hangar daemon stop`) and the
+relaunched app starts a fresh one. `launchctl unsetenv AINB_HANGAR_SPAWN`
+undoes it, again after a relaunch. The file key needs no `launchctl`: it
+applies however the app or daemon was launched, at the daemon's next boot.
 
 ## Conventions (paths & plugins)
 

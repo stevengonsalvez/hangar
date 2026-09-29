@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 - **daemon**: the spawn verbs (`worktree/create`, `worktree/agent_add`, `shell/create`, `shell/list`, `shell/close`) are served by default, so the desktop can create worktrees, add agents to them and open shells with no setup. Start the daemon with `AINB_HANGAR_SPAWN=0` to keep them off: they then answer `METHOD_NOT_FOUND`, as an older daemon does. Any value other than `1` keeps them off; only an unset variable means on
+- **daemon**: the spawn verbs can also be kept off with a file key, `[hangar] spawn = false` in `~/.agents-in-a-box/config/config.toml` (`$AINB_HANGAR_HOME/config/config.toml` when set), which works however the daemon or the desktop app was launched. Read once at boot beside `AINB_HANGAR_SPAWN`; either one saying off wins, so `AINB_HANGAR_SPAWN=1` does not undo it. Any value other than `true`, and a config file that cannot be read or parsed, keeps them off
+- **desktop**: the app passes its `AINB_HANGAR_SPAWN` to every daemon it starts, a respawn included, so an opt-out survives the daemon being restarted under it. For an app launched from Finder or the Dock, set it with `launchctl setenv AINB_HANGAR_SPAWN 0`, relaunch the app and stop a daemon already running (`ainb hangar daemon stop`); `launchctl unsetenv AINB_HANGAR_SPAWN` undoes it
 - **cli**: `ainb run --existing-worktree <PATH>` is listed in `ainb run --help`: start one more agent in a worktree ainb created, on the branch it already has
 
 ### Changed
