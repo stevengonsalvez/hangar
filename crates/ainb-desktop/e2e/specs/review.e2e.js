@@ -11,11 +11,11 @@
 // quietly shrank cannot leave the journey passing over nothing.
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appliedBatches, click, intentsSent, selectedNode } from "../support.js";
-import { run, seeded } from "../world.js";
+import { env, run, seeded } from "../world.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -267,6 +267,24 @@ describe("reviewing from the window", () => {
       timeout: 30_000,
       timeoutMsg: `the frame never named ${other} as the selected category`,
     });
+    // Appearance > Light reaches the host: its copy of the pick, which the
+    // next launch creates the window from, reads `light`. Put back to System
+    // after, so the specs that follow run in the theme they always have.
+    const themeFile = join(env().AINB_HANGAR_HOME, "desktop-theme");
+    const storedTheme = () => {
+      try {
+        return readFileSync(themeFile, "utf8");
+      } catch {
+        return null;
+      }
+    };
+    for (const pick of ["light", "system"]) {
+      await click(`.theme-choice[data-theme-choice="${pick}"]`, 30_000);
+      await browser.waitUntil(() => storedTheme() === pick, {
+        timeout: 30_000,
+        timeoutMsg: `Appearance > ${pick} never reached the host's copy: ${themeFile} reads ${JSON.stringify(storedTheme())}`,
+      });
+    }
     await click(".settings-head .close", 30_000);
 
     // #1221's line, asserted rather than only recorded: the window draws the
