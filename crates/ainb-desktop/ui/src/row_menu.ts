@@ -102,6 +102,9 @@ export interface RowPickDeps {
   run(intents: RendererIntent[]): void;
   /** The host's `clipboard_write`. */
   copy(text: string): void;
+  /** The intent that puts the session list's selection back on the row of
+   * the terminal the window shows, or nothing when it shows none. */
+  reselect(): RendererIntent[];
 }
 
 /** Run `pick` through the one existing action that serves it. */
@@ -110,7 +113,9 @@ export function runRowPick(pick: RowPick, deps: RowPickDeps): void {
     case "open":
       return deps.open(pick.session.id);
     case "editor":
-      return deps.run(editorIntents(pick.session.id));
+      // The selection scopes the answer banner (`questionOver`): left on this
+      // row, it would hide the shown terminal's own question.
+      return deps.run([...editorIntents(pick.session.id), ...deps.reselect()]);
     case "copy_path":
       return deps.copy(pick.session.workspace_path);
     case "copy_name":
