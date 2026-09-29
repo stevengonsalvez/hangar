@@ -113,3 +113,15 @@ test("a status this build does not know is unknown, never guessed as stopped", (
   assert.equal(rowStatus("Paused" as unknown as SessionStatus), "unknown");
   assert.equal(rowStatus("Stopped"), "stopped");
 });
+
+test("a lifecycle this build does not know is warned about once, not on every render", () => {
+  const warn = console.warn;
+  const seen: string[] = [];
+  console.warn = (message: string) => seen.push(message);
+  try {
+    for (let i = 0; i < 3; i += 1) rowStatus("Hibernating" as unknown as SessionStatus);
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(seen.filter((message) => message.includes("Hibernating")).length, 1);
+});
