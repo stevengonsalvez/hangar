@@ -2415,3 +2415,49 @@ body {
   display: contents;
 }
 
+
+/* A pane's right-click menu, as Orca's `TerminalContextMenu`: opened at the
+   pointer, on the elevated surface the tokens keep for menus. */
+.terminal-menu {
+  position: fixed;
+  /* Over xterm's layers and the find bar (12). */
+  z-index: 13;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  min-width: 240px;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: 8px;
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  backdrop-filter: blur(20px);
+  color: var(--text);
+}
+
+.terminal-menu button {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--text-row);
+  text-align: left;
+  cursor: pointer;
+}
+
+.terminal-menu button:focus {
+  background: var(--accent);
+  outline: none;
+}
+
+.terminal-menu kbd {
+  margin-left: auto;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
