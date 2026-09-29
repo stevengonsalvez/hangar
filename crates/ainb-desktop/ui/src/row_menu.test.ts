@@ -22,14 +22,30 @@ test("a local row with a worktree path offers every wired item", () => {
   const items = rowMenuItems(session());
   assert.deepEqual(
     items.map((item) => item.action),
-    ["open", "editor", "copy_path", "copy_name"],
+    ["open", "editor", "copy_path", "copy_name", "delete"],
   );
-  assert.deepEqual(enabled(items), ["open", "editor", "copy_path", "copy_name"]);
+  assert.deepEqual(enabled(items), ["open", "editor", "copy_path", "copy_name", "delete"]);
+});
+
+test("Delete comes last and is the one destructive item, as Orca's", () => {
+  const items = rowMenuItems(session());
+  assert.deepEqual(
+    items.filter((item) => item.destructive).map((item) => item.action),
+    ["delete"],
+  );
+  assert.equal(items.at(-1)?.label, "Delete");
+});
+
+test("a Boss row cannot be deleted from the window, and says why", () => {
+  const items = rowMenuItems(session({ mode: "Boss" }));
+  const remove = items.find((item) => item.action === "delete");
+  assert.equal(remove?.disabled, true);
+  assert.match(remove?.reason ?? "", /terminal/);
 });
 
 test("a row with no worktree path cannot open an editor or copy a path, and says why", () => {
   const items = rowMenuItems(session({ workspace_path: "" }));
-  assert.deepEqual(enabled(items), ["open", "copy_name"]);
+  assert.deepEqual(enabled(items), ["open", "copy_name", "delete"]);
   for (const item of items.filter((candidate) => candidate.disabled)) {
     assert.ok(item.reason && item.reason.length > 0, `${item.action} names why it is off`);
   }
@@ -39,16 +55,18 @@ test("a remote row cannot open its path in a local editor, as Orca marks Open in
   const items = rowMenuItems(session({ ssh_target: { host: "box" } as Session_Serialize["ssh_target"] }));
   assert.deepEqual(enabled(items), ["open", "copy_path", "copy_name"]);
   assert.match(items.find((item) => item.action === "editor")?.reason ?? "", /local/i);
+  // The delete runs on this machine: a remote row's session is not here.
+  assert.match(items.find((item) => item.action === "delete")?.reason ?? "", /local/i);
 });
 
 test("the arrow keys walk the enabled items and wrap, skipping disabled ones", () => {
   const items = rowMenuItems(session({ workspace_path: "" }));
-  // open(0) editor(1, off) copy_path(2, off) copy_name(3)
+  // open(0) editor(1, off) copy_path(2, off) copy_name(3) delete(4)
   assert.equal(stepItem(items, 0, 1), 3);
-  assert.equal(stepItem(items, 3, 1), 0);
-  assert.equal(stepItem(items, 0, -1), 3);
+  assert.equal(stepItem(items, 4, 1), 0);
+  assert.equal(stepItem(items, 0, -1), 4);
   assert.equal(stepItem(items, -1, 1), 0, "from nothing, down lands on the first");
-  assert.equal(stepItem(items, -1, -1), 3, "from nothing, up lands on the last");
+  assert.equal(stepItem(items, -1, -1), 4, "from nothing, up lands on the last");
 });
 
 test("a menu with nothing enabled has nowhere to step", () => {
@@ -81,6 +99,7 @@ test("each pick runs the window's existing action for it, and only that one", ()
         run: (intents: RendererIntent[]) => calls.push(["run", intents]),
         copy: (text: string) => calls.push(["copy", text]),
         reselect: () => [],
+        confirmDelete: (pick) => calls.push(["confirmDelete", pick.session.id, pick.name]),
       },
     );
     return calls;
@@ -89,6 +108,8 @@ test("each pick runs the window's existing action for it, and only that one", ()
   assert.deepEqual(ran("editor"), [["run", editorIntents("s-1")]]);
   assert.deepEqual(ran("copy_path"), [["copy", "/repo/wt-a"]]);
   assert.deepEqual(ran("copy_name"), [["copy", "wt-a"]]);
+  // Delete only asks: the confirmation deletes, never the pick.
+  assert.deepEqual(ran("delete"), [["confirmDelete", "s-1", "wt-a"]]);
 });
 
 test("open in editor puts the selection back on the shown terminal's row after it", () => {
@@ -96,7 +117,13 @@ test("open in editor puts the selection back on the shown terminal's row after i
   const sent: RendererIntent[][] = [];
   runRowPick(
     { action: "editor", session: session(), name: "wt-a" },
-    { open: () => undefined, run: (intents) => sent.push(intents), copy: () => undefined, reselect: () => [back] },
+    {
+      open: () => undefined,
+      run: (intents) => sent.push(intents),
+      copy: () => undefined,
+      reselect: () => [back],
+      confirmDelete: () => undefined,
+    },
   );
   // Else the sidebar selection, which scopes the answer banner, stays on the
   // row the editor opened and hides the shown terminal's own question.
