@@ -801,6 +801,99 @@ mod tests {
         assert_ne!(session.branch_name, "ainb/fpl");
     }
 
+    /// Relaunch restore: an agent that exited leaves no tmux session, so the
+    /// load pass rebuilds its row from `sessions.json`. That row must carry the
+    /// id the agent was launched under, as the live row does, or it cannot join
+    /// its exited Fleet row: the window then has no name for the card and
+    /// falls back to `claude <id prefix>`.
+    #[test]
+    fn a_stopped_row_rebuilt_at_relaunch_joins_its_exited_fleet_row() {
+        use crate::interactive::{SessionMetadata, SessionStore};
+        use ainb_hangar_proto::fleet::{
+            AttentionState, FleetCapabilities, FleetConfidence, FleetProvenance, FleetProvider,
+            FleetSession, LifecycleState, ManagementState, PaneBinding, TransportHealth,
+        };
+        use std::collections::HashSet;
+
+        if !crate::test_support::git_available() {
+            eprintln!("SKIP: git unavailable");
+            return;
+        }
+        let fx = crate::test_support::real_git_fixture();
+        let claude_id = "60d6bea2-6f7d-4e0a-9c1b-2f3a4b5c6d7e";
+        let metadata = SessionMetadata {
+            session_id: uuid::Uuid::new_v4(),
+            tmux_session_name: "tmux_feature".to_string(),
+            worktree_path: fx.worktree.clone(),
+            workspace_name: "feature".to_string(),
+            created_at: chrono::Utc::now(),
+            agent_type: SessionAgentType::Claude,
+            headroom_enabled: false,
+            rtk_enabled: false,
+            skip_permissions: Some(true),
+            model: None,
+            model_source: Default::default(),
+            codex_model: None,
+            codex_thread_id: None,
+            claude_session_id: Some(claude_id.to_string()),
+        };
+        let mut store = SessionStore::default();
+        store.sessions.insert(metadata.tmux_session_name.clone(), metadata.clone());
+
+        // No tmux session is live: the agent exited while the window was shut.
+        let mut workspaces = Vec::new();
+        super::super::add_stopped_sessions(
+            &mut workspaces,
+            &HashSet::new(),
+            &crate::config::SessionLabelStore::default(),
+            &store,
+        );
+        let row = workspaces
+            .iter()
+            .flat_map(|workspace| workspace.sessions.iter())
+            .find(|session| session.id == metadata.session_id)
+            .expect("the stopped row is rebuilt from the store");
+        assert_eq!(row.provider_session_id.as_deref(), Some(claude_id));
+
+        let exited = FleetSession {
+            session_key: format!("claude:{claude_id}"),
+            provider: FleetProvider::Claude,
+            provider_session_id: Some(claude_id.to_string()),
+            tmux_target: None,
+            process_start_fingerprint: None,
+            cwd: "/elsewhere".into(),
+            display_name: None,
+            lifecycle: LifecycleState::Exited,
+            active_work_count: 0,
+            attention: AttentionState::None,
+            current_request_fingerprint: None,
+            current_request: None,
+            management: ManagementState::Managed,
+            transport_health: TransportHealth::Healthy,
+            capabilities: FleetCapabilities::default(),
+            provenance: FleetProvenance::Authoritative,
+            pane_binding: PaneBinding::Bound,
+            confidence: FleetConfidence::High,
+            discovered_at: 1_000,
+            last_observed_at: 2_000,
+            lifecycle_updated_at: 2_000,
+            session_incarnation: None,
+            attention_updated_at: 0,
+            model: None,
+            reasoning_effort: None,
+            model_updated_at: 0,
+            version: 1,
+            updated_revision: 1,
+        };
+        let joined = AppState::fleet_metadata_for(row, &[exited])
+            .expect("the exited Fleet row is this row's own");
+        assert_eq!(
+            joined.provider_session_id.as_deref(),
+            Some(claude_id),
+            "the board joins the card to this row, and its name, by this id"
+        );
+    }
+
     #[tokio::test]
     async fn idle_restart_respawns_a_dead_codex_pane_with_exact_remote_thread() {
         use crate::interactive::InteractiveSessionManager;
