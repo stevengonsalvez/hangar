@@ -42,6 +42,7 @@ import { cardForSession, statusForTarget } from "./status.ts";
 import { TerminalTab } from "./terminal_tab.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
+import { runRowPick } from "./row_menu.ts";
 import { Titlebar } from "./titlebar.tsx";
 import { Statusbar } from "./statusbar.tsx";
 import { SettingsPage } from "./settings.tsx";
@@ -496,6 +497,14 @@ function Shell() {
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
   const openSession = (id: string) => openRow({ session: id });
+  /** The select-only intent for the shown terminal's row, or none when no
+   * terminal is shown: what a sidebar row menu sends after it moves the
+   * selection, so the answer banner stays that terminal's. */
+  const shownRowIntents = (): RendererIntent[] => {
+    const key = active();
+    const back = showing("terminal") && key !== null ? selectIntentFor(tabs(), key) : null;
+    return back === null ? [] : [back];
+  };
 
   onMount(async () => {
     setSidecar(await invoke<SidecarState>("sidecar_state"));
@@ -678,6 +687,16 @@ function Shell() {
             acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
+            onRowPick={(pick) =>
+              // Through `answer`, home first: the sidebar is drawn over
+              // Settings and the Inbox, whose screens refuse a row.
+              runRowPick(pick, {
+                open: (id) => void answer([openRowIntent({ session: id })]),
+                run: (intents) => void answer(intents),
+                copy: (text) => void invoke("clipboard_write", { text }),
+                reselect: shownRowIntents,
+              })
+            }
             ref={(element) => (sidebar = element)}
           />
           <section class="workarea">

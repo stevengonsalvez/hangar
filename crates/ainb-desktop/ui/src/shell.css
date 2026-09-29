@@ -997,6 +997,45 @@ body {
   padding: 10px 14px;
 }
 
+/* A sidebar row's context menu (`row_menu.tsx`): Orca's small dropdown at the
+   pointer, on the elevated menu tokens. Fixed, so a scrolled sidebar still
+   puts it where the right-click was. */
+.row-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 13rem;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+}
+
+.row-menu-item {
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+  text-align: left;
+  cursor: pointer;
+}
+
+.row-menu-item:hover:not([aria-disabled="true"]),
+.row-menu-item:focus-visible {
+  background: var(--highlight);
+  outline: none;
+}
+
+.row-menu-item[aria-disabled="true"] {
+  color: var(--muted-foreground);
+  cursor: default;
+}
+
 /* The new-worktree composer (Mod+N): a floating surface like the palette's,
    over `--float-bg`/`--float-border`/`--float-shadow` rather than the flat
    `--panel` the palette reads, since this one is a form, not a scrolling
