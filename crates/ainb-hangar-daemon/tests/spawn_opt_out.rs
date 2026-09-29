@@ -6,7 +6,9 @@
 //!
 //! Its own test binary: the switch is read once per process, so the default
 //! path lives in `spawn_verbs.rs` and `shell_verbs.rs`, separate processes
-//! that leave it unset.
+//! that leave it unset. It runs on a private host (see
+//! [`common::private_host`]), so a verb the switch failed to keep off would
+//! meet an empty home and a private tmux server, never the user's.
 
 use std::time::Instant;
 
@@ -15,6 +17,8 @@ use ainb_hangar_daemon::rpc::{self, DaemonHealth, auth::Caller};
 use ainb_hangar_proto::methods as m;
 use ainb_hangar_proto::{RpcId, RpcRequest};
 use ainb_hangar_store::Store;
+
+mod common;
 
 fn health() -> DaemonHealth {
     DaemonHealth {
@@ -26,10 +30,11 @@ fn health() -> DaemonHealth {
     }
 }
 
-/// Set the opt-out before any dispatch in this process reads the switch.
-/// Every dispatching test calls this first.
+/// Isolate the host, then set the opt-out before any dispatch in this
+/// process reads the switch. Every dispatching test calls this first.
 fn opted_out() {
     static SET: std::sync::Once = std::sync::Once::new();
+    common::private_host();
     // Edition 2021: set_var is safe.
     SET.call_once(|| std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "0"));
 }
