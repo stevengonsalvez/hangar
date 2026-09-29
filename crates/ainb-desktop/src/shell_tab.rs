@@ -146,6 +146,50 @@ pub async fn close(client: &DaemonClient, tmux_session_name: &str) -> Result<boo
         .map_err(|error| refusal_text(Verb::Close, &error))
 }
 
+/// Why a new shell tab did not open.
+#[derive(Debug)]
+pub struct OpenTabError {
+    /// The sentence for the window.
+    pub message: String,
+    /// The reducer's report of a failed attach, for the host to dispatch.
+    pub report: Option<Intent>,
+}
+
+/// Open a shell in `worktree_path` and attach it as a tab; answer the tab's
+/// key.
+///
+/// A shell whose tab cannot attach is closed again before this returns: the
+/// window shows no tab for it, so nothing else would ever end it.
+///
+/// # Errors
+/// The daemon's refusal, or the failed attach with its report.
+pub async fn open_tab(
+    client: &DaemonClient,
+    terminals: &Terminals,
+    worktree_path: &str,
+) -> Result<String, OpenTabError> {
+    let shell = open(client, worktree_path).await.map_err(|message| OpenTabError {
+        message,
+        report: None,
+    })?;
+    let name = shell.tmux_session_name.clone();
+    let Some(report) = terminals.open(target(&shell)) else {
+        return Ok(name);
+    };
+    let message = match close(client, &name).await {
+        Ok(_) => "The terminal opened but its tab could not attach, so it was closed again.".into(),
+        Err(error) => {
+            format!(
+                "The terminal opened but its tab could not attach, and closing it failed: {error}"
+            )
+        }
+    };
+    Err(OpenTabError {
+        message,
+        report: Some(report),
+    })
+}
+
 /// The tab a daemon shell is attached as.
 #[must_use]
 pub fn target(shell: &ShellCreateResult) -> TabTarget {
