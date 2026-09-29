@@ -308,7 +308,7 @@ mod created_at_tests {
     }
 
     #[test]
-    fn a_container_docker_gave_no_time_sorts_last_not_first() {
+    fn a_container_docker_gave_no_time_is_the_epoch() {
         assert_eq!(container_created_at(None), chrono::DateTime::UNIX_EPOCH);
         assert_eq!(
             container_created_at(Some(i64::MAX)),
