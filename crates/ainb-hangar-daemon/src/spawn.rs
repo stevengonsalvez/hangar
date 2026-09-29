@@ -23,10 +23,11 @@
 //! prefix, [`DAEMON_SHELL_PREFIX`], and the owner option every one of them
 //! carries, [`SHELL_OWNER_OPTION`].
 //!
-//! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
-//! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
-//! daemon. An environment variable, never a `daemon_config` key, so no
-//! connected surface can switch it on.
+//! Served by default. [`SPAWN_ENV`] set at boot to anything but `1`
+//! (`AINB_HANGAR_SPAWN=0`) turns them off, and they answer
+//! `METHOD_NOT_FOUND`, which a client cannot tell from an older daemon. An
+//! environment variable, never a `daemon_config` key, so no connected
+//! surface can switch it either way.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,7 +39,8 @@ use ainb_hangar_proto::spawn::{
     is_daemon_shell_name,
 };
 
-/// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves the spawn verbs.
+/// The boot-time switch for the spawn verbs: unset or `1` serves them,
+/// `0` (or any other value) keeps them off. See [`served_by`].
 pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 
 /// Upper bound on one `ainb run`. It waits up to 30s for the agent's input
@@ -51,7 +53,19 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var(SPAWN_ENV).is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| served_by(std::env::var_os(SPAWN_ENV).as_deref()))
+}
+
+/// Whether a daemon whose [`SPAWN_ENV`] is `value` serves the spawn verbs.
+///
+/// Only an unset variable changes meaning with the flip: unset now serves
+/// them, and every value keeps the answer it had while they were opt-in
+/// (`1` on, anything else off). So `AINB_HANGAR_SPAWN=0`, `=false` or `=`
+/// is an opt-out, and a typo in one fails closed rather than silently
+/// turning the verbs on.
+#[must_use]
+pub fn served_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value == "1")
 }
 
 /// Why a create failed, split so the RPC layer can tell a bad request from a
@@ -1507,6 +1521,17 @@ mod tests {
         );
         let (_source, stray) = stray_tree(&managed);
         assert!(unregistered(&stray), "a tree of an unregistered repository");
+    }
+
+    /// On unless the operator set the variable to something other than `1`.
+    #[test]
+    fn the_spawn_verbs_are_served_unless_opted_out() {
+        use std::ffi::OsStr;
+        assert!(served_by(None), "unset serves them: the default");
+        assert!(served_by(Some(OsStr::new("1"))));
+        for off in ["0", "", "false", "off", "no", "true", " 1"] {
+            assert!(!served_by(Some(OsStr::new(off))), "{off:?} keeps them off");
+        }
     }
 
     #[test]
