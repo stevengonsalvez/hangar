@@ -130,13 +130,20 @@ fn changes_at(tree: &Path) -> Option<u32> {
 /// `force` is the person confirming what the dialog showed them: dirty or
 /// uncounted work. It never covers more than that: a file that appeared
 /// after the count (a live agent still writing) refuses the delete, forced
-/// or not, so nothing the person was not shown is wiped.
+/// or not, and so does a recount that fails after the dialog showed a real
+/// count, so nothing the person was not shown is wiped. Dirty work without
+/// `force` is refused here too, whatever the window asked.
 fn changes_refusal(seen: Option<u32>, now: Option<u32>, force: bool) -> Option<&'static str> {
     const GREW: &str = "New uncommitted changes appeared in this worktree since the dialog counted them. Nothing was deleted: open Delete again.";
     const UNKNOWN: &str = "The uncommitted changes in this worktree could not be counted. Nothing was deleted: open Delete again.";
+    const DIRTY: &str = "This worktree has uncommitted changes and the delete was not forced. Nothing was deleted: open Delete again.";
+    // In this order: each arm wins over the ones below it.
     match (seen, now) {
         (Some(seen), Some(now)) if now > seen => Some(GREW),
-        (_, None) | (None, Some(_)) if !force => Some(UNKNOWN),
+        // The person was shown "could not be counted" and chose Force Delete.
+        (None, _) if force => None,
+        (_, None) | (None, _) => Some(UNKNOWN),
+        (Some(_), Some(now)) if now > 0 && !force => Some(DIRTY),
         _ => None,
     }
 }
@@ -248,6 +255,10 @@ mod tests {
     #[test]
     fn shown_dirty_work_goes_only_when_forced() {
         assert_eq!(changes_refusal(Some(2), Some(2), true), None);
+        // The host refuses dirty work without force; it does not rely on
+        // the window to have asked for Force Delete.
+        assert!(changes_refusal(Some(2), Some(2), false).is_some());
+        assert!(changes_refusal(Some(3), Some(1), false).is_some());
         // Fewer is fine: the agent committed, nothing unseen is lost.
         assert_eq!(changes_refusal(Some(2), Some(1), true), None);
     }
@@ -258,6 +269,9 @@ mod tests {
         assert!(changes_refusal(Some(0), None, false).is_some());
         assert!(changes_refusal(None, Some(4), false).is_some());
         assert_eq!(changes_refusal(None, None, true), None);
-        assert_eq!(changes_refusal(Some(1), None, true), None);
+        // The dialog showed a real count; an unknown recount is not what
+        // the person forced.
+        assert!(changes_refusal(Some(1), None, true).is_some());
+        assert_eq!(changes_refusal(None, Some(4), true), None);
     }
 }
