@@ -1,7 +1,10 @@
 // Cmd+K (Ctrl+Shift+K off macOS) in a mounted pane (`TerminalView`, as the
-// window mounts it) clears its scrollback, Orca's `terminal.clear`. The pane
-// answers it itself, as it does copy and paste: the window is not asked, and
-// the shell gets no byte. Plain Ctrl+K stays the shell's kill-line.
+// window mounts it) is Orca's `terminal.clear`. The pane answers it itself, as
+// it does copy and paste: the window is not asked, and the shell gets no byte.
+// The host clears tmux's history (`terminal_clear`). xterm clears its own
+// buffer only on the normal screen: a tmux client is on the alternate screen,
+// where clearing would blank the agent's screen. Plain Ctrl+K stays the
+// shell's kill-line.
 
 import { hostCalls, settle } from "./window.ts";
 
@@ -32,8 +35,10 @@ const paint = () => new Promise((done) => setTimeout(done, 50));
 
 type Chord = { code: string; key: string; keyCode: number; metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean };
 
-/** One attached pane on `mac` or not, with a screenful and more painted. */
-async function mountPane(mac: boolean) {
+const OLD_LINES = Array.from({ length: 40 }, (_, n) => `old line ${n}`).join("\r\n") + "\r\n$ ";
+
+/** One attached pane on `mac` or not, with `text` painted. */
+async function mountPane(mac: boolean, text = OLD_LINES) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const asked: Accelerator[] = [];
@@ -54,8 +59,7 @@ async function mountPane(mac: boolean) {
   await settle();
   const output = (hostCalls.get("terminal_output") as { bytes: ByteChannel } | undefined)?.bytes;
   assert.ok(output, "the pane opened its output channel");
-  const lines = Array.from({ length: 40 }, (_, n) => `old line ${n}`).join("\r\n") + "\r\n$ ";
-  output.onmessage(new TextEncoder().encode(lines).buffer as ArrayBuffer);
+  output.onmessage(new TextEncoder().encode(text).buffer as ArrayBuffer);
   await paint();
   const terminal = container.querySelector(".xterm-helper-textarea") as HTMLTextAreaElement;
   assert.ok(terminal, "xterm mounted its keyboard target");
@@ -114,6 +118,22 @@ for (const mac of [true, false]) {
     assert.equal(await pane.matches("old lin"), "No results", "and none in the scrollback");
     assert.deepEqual(pane.asked, [], "the window was not asked");
     assert.equal(hostCalls.get("terminal_input"), undefined, "and the shell got no byte");
+    assert.deepEqual(hostCalls.get("terminal_clear"), { key: "tmux_app" }, "the host clears tmux's history");
+  });
+
+  test(`${name} on the alternate screen, where a tmux client draws, keeps the agent's screen`, async () => {
+    // What tmux sends a client it attaches: the alternate screen, then the
+    // pane drawn row by row.
+    const rows = Array.from({ length: 20 }, (_, n) => `\x1b[${n + 1};1Hagent row ${n}`).join("");
+    const pane = await mountPane(mac, `\x1b[?1049h\x1b[H\x1b[2J${rows}\x1b[22;1H> prompt`);
+    assert.match(pane.shown(), /agent row 0.*agent row 19.*> prompt/s);
+    const event = await pane.press(chord);
+    assert.equal(event.defaultPrevented, true, "the chord was taken");
+    assert.match(pane.shown(), /agent row 0.*agent row 19.*> prompt/s, "every agent row still on screen");
+    assert.deepEqual(hostCalls.get("terminal_clear"), { key: "tmux_app" }, "tmux clears its history and redraws");
+    // tmux paints only what changed: typing lands on the prompt row, not row 0.
+    await pane.write("x");
+    assert.match(pane.shown(), /agent row 0.*> promptx/s);
   });
 }
 
@@ -122,6 +142,7 @@ test("plain Ctrl+K stays the shell's kill-line on either platform", async () => 
     const pane = await mountPane(mac);
     await pane.press({ code: "KeyK", key: "k", keyCode: 75, ctrlKey: true });
     assert.deepEqual(pane.asked, []);
+    assert.equal(hostCalls.get("terminal_clear"), undefined, "the host is not asked to clear");
     assert.equal((hostCalls.get("terminal_input") as { data: string } | undefined)?.data, "\x0b");
     assert.match(pane.shown(), /old line 39/, "nothing cleared");
     assert.match((await pane.matches("old lin")) ?? "", /\/40$/, "nothing cleared from the scrollback");
