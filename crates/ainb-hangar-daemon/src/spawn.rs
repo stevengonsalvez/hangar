@@ -79,14 +79,15 @@ pub enum SpawnError {
     /// layer answers [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] by
     /// type, whatever the message says.
     Unregistered(String),
-    /// Nothing was started: `ainb run` could not be run at all, or tmux
-    /// could not make a shell.
+    /// Nothing was started: `ainb run` or tmux could not be run at all, or
+    /// every fresh shell name was taken.
     Failed(String),
-    /// `ainb run` was started and did not hand back a session: it outlived
-    /// the bound, its wait was lost, it failed, or its output was not a
-    /// session. The run settles its own effects, so the RPC layer answers
-    /// [`ainb_hangar_proto::spawn::SPAWN_STARTED`], which the ledger records:
-    /// a retry under the same op id must never start a second run.
+    /// `ainb run`, or a shell's `tmux new-session`, was started and did not
+    /// hand back a session: it outlived the bound, its wait was lost, it
+    /// failed, or its output was not a session. What it made is its own
+    /// (a slow run keeps going, a shell may still appear), so the RPC layer
+    /// answers [`ainb_hangar_proto::spawn::SPAWN_STARTED`], which the ledger
+    /// records: a retry under the same op id must never start a second one.
     Started(String),
 }
 
@@ -596,7 +597,9 @@ fn resolve_shell_dir(
 /// [`SpawnError::Unregistered`] for a folder that registering a project
 /// would admit (see `resolve_shell_dir`) and [`SpawnError::Invalid`] for any
 /// other directory or op id refused, both before tmux ran;
-/// [`SpawnError::Failed`] when tmux could not make the session.
+/// [`SpawnError::Failed`] when tmux could not be run or every fresh name was
+/// taken; [`SpawnError::Started`] when `new-session` ran and may have made
+/// the shell (it did not answer in time, or failed after running).
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
     shell_create_named(params, || {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
@@ -667,7 +670,7 @@ pub async fn shell_create_named(
                 // try to take it back. The server may still make it after its
                 // client is gone, so name it too: nothing else would find it.
                 kill_own_shell(&name).await;
-                return Err(SpawnError::Failed(format!(
+                return Err(SpawnError::Started(format!(
                     "tmux did not answer within {}s; the shell may still appear as {name}",
                     shell_tmux_timeout().as_secs()
                 )));
@@ -685,8 +688,9 @@ pub async fn shell_create_named(
             // session under it now is the one this command made before the
             // steps after it (secret scrub, owner and op id labels) failed:
             // take it back.
+            // The take-back is best-effort, so the session may outlive it.
             kill_own_shell(&name).await;
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "tmux could not start the shell {name}: {}",
                 stderr_tail(&out.stderr)
             )));
