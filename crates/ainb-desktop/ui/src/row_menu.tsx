@@ -102,7 +102,7 @@ export function RowMenu(props: Props) {
             ref={(element) => (buttons[index()] = element)}
             type="button"
             role="menuitem"
-            class="row-menu-item"
+            class={item.destructive ? "row-menu-item destructive" : "row-menu-item"}
             tabIndex={-1}
             // Not `disabled`: that would hide the item and its reason from a
             // screen reader. The arrows skip it and a click runs nothing.

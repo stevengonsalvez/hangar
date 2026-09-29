@@ -103,6 +103,7 @@ async function mount(sessions = SESSIONS) {
             run: (intents) => calls.push(["run", intents]),
             copy: (text) => calls.push(["copy", text]),
             reselect: () => [],
+            confirmDelete: () => undefined,
           }),
       }),
     container,
@@ -150,7 +151,7 @@ test("a right-click on a row opens the menu at the pointer, instead of the webvi
   assert.equal(open.style.top, "60px");
   assert.deepEqual(
     [...open.querySelectorAll('[role="menuitem"]')].map((el) => el.textContent),
-    ["Open", "Open in Editor", "Copy Path", "Copy Worktree Name"],
+    ["Open", "Open in Editor", "Copy Path", "Copy Worktree Name", "Delete"],
   );
   focusIs(item("Open"), "the first item takes the keyboard");
 });
@@ -217,9 +218,9 @@ test("the context-menu key and Shift+F10 open the menu from a focused row, and a
   focusIs(item("Open in Editor"));
   await key(document.activeElement!, { key: "ArrowUp" });
   await key(document.activeElement!, { key: "ArrowUp" });
-  focusIs(item("Copy Worktree Name"), "up from the first wraps to the last");
+  focusIs(item("Delete"), "up from the first wraps to the last");
   await key(document.activeElement!, { key: "End" });
-  focusIs(item("Copy Worktree Name"));
+  focusIs(item("Delete"));
   await key(document.activeElement!, { key: "Home" });
   focusIs(item("Open"));
   await key(document.activeElement!, { key: "Escape" });
