@@ -49,8 +49,10 @@ pub struct SidecarConfig {
     /// the last step leaves the app degraded.
     pub reconnect_backoff: Vec<Duration>,
     /// The app's `AINB_HANGAR_SPAWN` as it launched, set on every daemon this
-    /// supervisor starts (a respawn too), or removed when the app had none,
-    /// so an opt-out never depends on what the child happens to inherit.
+    /// supervisor starts (a respawn too), or removed when the app had none.
+    /// The child used to inherit it; passing it explicitly keeps the opt-out
+    /// through any later scrub of the child's environment, and lets a test
+    /// set it without touching this process's.
     pub spawn_switch: Option<std::ffi::OsString>,
 }
 
