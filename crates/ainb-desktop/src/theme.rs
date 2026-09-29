@@ -133,6 +133,17 @@ pub fn load(path: &Path) -> ThemePreference {
 ///
 /// When the directory cannot be created or the file cannot be written.
 pub fn store(path: &Path, preference: ThemePreference) -> io::Result<()> {
+    store_word(path, preference.as_str())
+}
+
+/// Store `word` at `path` the way [`store`] stores a pick: whole or not at
+/// all, each write staged under its own name. The notifications toggle
+/// (`notify::store`) is kept the same way.
+///
+/// # Errors
+///
+/// When the directory cannot be created or the file cannot be written.
+pub(crate) fn store_word(path: &Path, word: &str) -> io::Result<()> {
     static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -144,8 +155,7 @@ pub fn store(path: &Path, preference: ThemePreference) -> io::Result<()> {
         WRITES.fetch_add(1, Ordering::Relaxed)
     ));
     let staged = path.with_file_name(name);
-    let written =
-        std::fs::write(&staged, preference.as_str()).and_then(|()| std::fs::rename(&staged, path));
+    let written = std::fs::write(&staged, word).and_then(|()| std::fs::rename(&staged, path));
     if written.is_err() {
         // Best effort: the error being returned is the one that matters.
         let _ = std::fs::remove_file(&staged);
