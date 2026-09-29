@@ -27,6 +27,29 @@ use ainb_hangar_store::Store;
 /// does is a method that would wedge a real client, and the test says so.
 const PER_CALL: Duration = Duration::from_secs(30);
 
+/// A host this process keeps to itself, set before any test dispatches: an
+/// empty `HOME` (no registered folder, so the spawn verbs' samples are
+/// refused before they run anything), a private tmux server directory with
+/// no server in it, and the spawn switch unset, as a default daemon has it.
+/// Every test calls this first; the values outlive the tests on purpose.
+fn private_host() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    SET.call_once(|| {
+        let home = tempfile::tempdir().unwrap().keep();
+        // Under /tmp: macOS caps unix socket paths at 104 bytes.
+        let tmux_dir =
+            std::path::PathBuf::from("/tmp").join(format!("ainb-dedupe-{}", std::process::id()));
+        std::fs::create_dir_all(&tmux_dir).unwrap();
+        // Edition 2021: set_var is safe, and the Once runs it before any
+        // test goes on.
+        std::env::set_var("HOME", home);
+        std::env::remove_var("AINB_HOME");
+        std::env::set_var("TMUX_TMPDIR", tmux_dir);
+        std::env::remove_var("TMUX");
+        std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
+    });
+}
+
 fn health() -> DaemonHealth {
     DaemonHealth {
         socket_path: "/tmp/mutation-dedupe.sock".to_string(),
@@ -99,6 +122,7 @@ async fn dispatch(
 /// `replayed` each.
 #[tokio::test]
 async fn every_mutating_method_replays_exactly_once() {
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
@@ -106,7 +130,7 @@ async fn every_mutating_method_replays_exactly_once() {
     let mut deduplicated = 0usize;
     let mut transient: Vec<&str> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
-    let mut dark: Vec<&str> = Vec::new();
+    let mut unregistered: Vec<&str> = Vec::new();
 
     for (index, entry) in MUTATING_METHODS.iter().enumerate() {
         let mut params: serde_json::Value = serde_json::from_str(entry.sample_params)
@@ -176,14 +200,15 @@ async fn every_mutating_method_replays_exactly_once() {
             continue;
         }
 
-        if is_dark(&first) {
-            // A verb this daemon does not serve yet: nothing ran, and the op
-            // id stays free so the same retry executes once the switch is on.
+        if is_unregistered(&first) {
+            // A spawn verb refused before it ran anything: its sample path is
+            // in no registered folder of this empty home. The op id stays
+            // free so the same retry executes once the project is added.
             // Like a transient answer, it carries no ack and is not replayed.
             assert_eq!(
                 ack(&first),
                 serde_json::Value::Null,
-                "{} is dark and must not have recorded an ack: {first}",
+                "{} was refused as unregistered and must not have recorded an ack: {first}",
                 entry.method
             );
             assert_eq!(
@@ -192,7 +217,7 @@ async fn every_mutating_method_replays_exactly_once() {
                 "{} did not answer its retry the same way",
                 entry.method
             );
-            dark.push(entry.method);
+            unregistered.push(entry.method);
             continue;
         }
 
@@ -225,7 +250,7 @@ async fn every_mutating_method_replays_exactly_once() {
     // started). A second silent hole fails the gate.
     eprintln!(
         "deduplicated {deduplicated} of {} mutating methods; \
-         transient: {transient:?}; refused: {refused:?}; dark: {dark:?}",
+         transient: {transient:?}; refused: {refused:?}; unregistered: {unregistered:?}",
         MUTATING_METHODS.len()
     );
     // NAMED, not counted. A count leaves room for one hole to close while
@@ -243,15 +268,17 @@ async fn every_mutating_method_replays_exactly_once() {
         "the only method allowed to refuse here is the one with no live session \
          to answer into; a refusal is not recorded, by design"
     );
+    // No method is dark: the spawn verbs are served by default, so a
+    // `METHOD_NOT_FOUND` here fails the `created` assertion above.
     assert_eq!(
-        dark,
-        vec!["shell/create", "shell/close"],
-        "the only methods allowed to be dark are the spawn verbs, whose switch \
-         this fixture leaves off"
+        unregistered,
+        vec!["shell/create", "worktree/create"],
+        "the only methods allowed to refuse as unregistered are the spawn verbs \
+         whose samples name a repository, in a home that registers none"
     );
     assert_eq!(
         deduplicated,
-        MUTATING_METHODS.len() - transient.len() - refused.len() - dark.len(),
+        MUTATING_METHODS.len() - transient.len() - refused.len() - unregistered.len(),
         "every other method must reach the ledger"
     );
 }
@@ -280,16 +307,18 @@ fn is_transient(response: &serde_json::Value) -> bool {
     code == Some(i64::from(ainb_hangar_proto::STORE_UNAVAILABLE)) || code == Some(-32603)
 }
 
-/// `METHOD_NOT_FOUND`: a verb this daemon does not serve, here the spawn
-/// verbs with their boot switch off.
-fn is_dark(response: &serde_json::Value) -> bool {
-    response["error"]["code"].as_i64() == Some(-32601)
+/// `REPO_NOT_REGISTERED`: a spawn verb whose repository no registered folder
+/// or project admits, refused before it ran anything.
+fn is_unregistered(response: &serde_json::Value) -> bool {
+    response["error"]["code"].as_i64()
+        == Some(i64::from(ainb_hangar_proto::spawn::REPO_NOT_REGISTERED))
 }
 
 /// Criterion 1, second half (amendment 15): a second principal replaying the
 /// same op id is refused, and nothing runs.
 #[tokio::test]
 async fn a_second_principal_replaying_an_op_id_is_rejected() {
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
@@ -342,6 +371,7 @@ async fn a_second_principal_replaying_an_op_id_is_rejected() {
 /// the same question differently are not one operation, even under one op id.
 #[tokio::test]
 async fn the_same_op_id_with_a_different_body_is_rejected() {
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
@@ -379,6 +409,7 @@ async fn the_same_op_id_with_a_different_body_is_rejected() {
 /// This is the property that keeps the N-1 leg of the skew matrix green.
 #[tokio::test]
 async fn a_request_without_an_op_id_is_untouched() {
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
@@ -418,6 +449,7 @@ async fn a_request_without_an_op_id_is_untouched() {
 /// is keyed under the minted host.
 #[tokio::test]
 async fn an_op_id_claimed_before_the_mint_replays_after_it() {
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
     let broker = EventBroker::new();
@@ -488,47 +520,27 @@ async fn an_op_id_claimed_before_the_mint_replays_after_it() {
 }
 
 /// A dark verb's refusal frees its op id: `shell/create` with op id X answers
-/// `METHOD_NOT_FOUND` while the spawn switch is off, and the same op id and
+/// `METHOD_NOT_FOUND` from a daemon that does not serve it (started with
+/// `AINB_HANGAR_SPAWN=0`, or from before the verb), and the same op id and
 /// body runs for real once the verb is served. Recorded instead, the retry
 /// after the flip would be replayed the old refusal and never open a shell.
 ///
-/// The switch is read once per process, so "served" is the dispatcher's own
-/// guard with a handler that answers, the same seam `dispatch` drives.
+/// Once it has run, the op id is taken: a second call after the flip is
+/// `replayed` with the first answer and the handler does not run again.
+///
+/// The switch is read once per process and is on here, so both halves go
+/// through the dispatcher's own ledger guard, the seam `dispatch` drives,
+/// with a handler that refuses as a dark daemon does and then one that
+/// answers.
 #[tokio::test]
 async fn a_dark_verb_leaves_its_op_id_free_for_the_flip() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    assert!(
-        std::env::var_os(ainb_hangar_daemon::spawn::SPAWN_ENV).is_none(),
-        "run with {} unset: the dark half is what is being proven",
-        ainb_hangar_daemon::spawn::SPAWN_ENV
-    );
+    private_host();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open_in(dir.path()).await.unwrap();
-    let broker = EventBroker::new();
-    let events = broker.sink();
     let method = ainb_hangar_proto::methods::SHELL_CREATE;
     let body = serde_json::json!({ "worktree_path": "/tmp", "op_id": "op-dark-flip" });
-
-    for attempt in ["first", "retry while dark"] {
-        let refused = dispatch(&store, &events, &Caller::Operator, method, body.clone()).await;
-        assert_eq!(
-            refused["error"]["code"].as_i64(),
-            Some(-32601),
-            "{attempt}: {refused}"
-        );
-        assert_eq!(
-            ack(&refused),
-            serde_json::Value::Null,
-            "{attempt}: {refused}"
-        );
-    }
-
-    let ran = AtomicBool::new(false);
-    let served = serde_json::json!({
-        "tmux_session_name": "ainb-dsh-0a1b2c3d",
-        "worktree_path": "/tmp",
-    });
     let now_ms = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -536,23 +548,75 @@ async fn a_dark_verb_leaves_its_op_id_free_for_the_flip() {
             .as_millis(),
     )
     .unwrap();
+
+    for attempt in ["first", "retry while dark"] {
+        let refused = rpc::mutation::guard(
+            store.pool(),
+            &request(method, body.clone()),
+            &Caller::Operator,
+            now_ms,
+            || async {
+                Err(ainb_hangar_proto::RpcError {
+                    code: -32601,
+                    message: format!("unknown method: {method}"),
+                    data: None,
+                })
+            },
+        )
+        .await
+        .expect_err("a dark verb refuses");
+        assert_eq!(refused.code, -32601, "{attempt}: {refused:?}");
+        assert!(
+            refused.data.as_ref().and_then(|d| d.get(ACK_KEY)).is_none(),
+            "{attempt}: a dark refusal records no ack: {refused:?}"
+        );
+    }
+
+    let runs = AtomicUsize::new(0);
+    let served = serde_json::json!({
+        "tmux_session_name": "ainb-dsh-0a1b2c3d",
+        "worktree_path": "/tmp",
+    });
+    let serve = || async {
+        runs.fetch_add(1, Ordering::SeqCst);
+        Ok(served.clone())
+    };
+
     let after = rpc::mutation::guard(
         store.pool(),
-        &request(method, body),
+        &request(method, body.clone()),
         &Caller::Operator,
         now_ms,
-        || async {
-            ran.store(true, Ordering::SeqCst);
-            Ok(served.clone())
-        },
+        serve,
     )
     .await
     .expect("the served verb answers");
-
-    assert!(
-        ran.load(Ordering::SeqCst),
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
         "the retry after the flip must execute"
     );
     assert_eq!(after[ACK_KEY]["outcome"], "created", "{after}");
     assert_eq!(after["tmux_session_name"], "ainb-dsh-0a1b2c3d", "{after}");
+
+    let again = rpc::mutation::guard(
+        store.pool(),
+        &request(method, body),
+        &Caller::Operator,
+        now_ms,
+        serve,
+    )
+    .await
+    .expect("the replay answers");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "a second call with the same op id must not run the handler again"
+    );
+    assert_eq!(again[ACK_KEY]["outcome"], "replayed", "{again}");
+    let answer = |mut value: serde_json::Value| {
+        value.as_object_mut().expect("an object").remove(ACK_KEY);
+        value
+    };
+    assert_eq!(answer(again), answer(after), "the first answer, replayed");
 }
