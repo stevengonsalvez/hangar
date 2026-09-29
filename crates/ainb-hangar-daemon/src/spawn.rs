@@ -673,27 +673,43 @@ impl Drop for RunLogs {
 
 /// `<hangar>/hangar/logs/spawn/`, where every `ainb run` writes its output:
 /// created `0700` when missing and made `0700` when it is not (`DirBuilder`'s
-/// mode only applies to a directory it creates).
+/// mode only applies to a directory it creates, and an older daemon's
+/// `create_dir_all` left it `0755`, or `0775` under umask 002).
 ///
-/// `Err` unless it is a real directory (not a symlink) this user owns that
-/// nobody else can write, so nothing is ever written into, or removed from,
-/// a directory that is not the daemon's.
+/// `Err` unless it is a real directory (not a symlink) this user owns, so
+/// nothing is ever written into, or removed from, a directory that is not the
+/// daemon's. Ownership is checked BEFORE the mode is tightened, so an open
+/// directory of ours is repaired rather than refused forever; the private
+/// check runs after, as a post-condition.
+///
+/// Accepted: the `logs/` parent is followed if it is a symlink (it is the
+/// daemon's log dir, trusted like the rest of the home), and a process of the
+/// same user could swap `spawn` between the metadata check and
+/// `set_permissions`. Both need this user's own access already.
 fn own_run_logs_dir() -> Result<std::path::PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
     let dir = crate::log_dir().map_err(|e| format!("no log directory: {e}"))?.join("spawn");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&dir)
         .map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    if !crate::hook_ingress::dir_is_ours(&dir) {
+    let meta =
+        std::fs::symlink_metadata(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
         return Err(format!(
-            "{} is not a private directory of this user (a symlink, another user's, or writable by others)",
+            "{} is not a private directory of this user (a symlink, or another user's)",
             dir.display()
         ));
     }
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("making {} private: {e}", dir.display()))?;
+    if !crate::hook_ingress::dir_is_ours(&dir) {
+        return Err(format!(
+            "{} is not a private directory of this user after making it 0700",
+            dir.display()
+        ));
+    }
     Ok(dir)
 }
 
