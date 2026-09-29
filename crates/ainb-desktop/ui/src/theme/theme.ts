@@ -185,7 +185,6 @@ export const TERMINAL_THEMES: Record<Theme, TerminalColors> = {
   },
 };
 
-
 /**
  * The floor xterm holds text to against its cell, per painted theme: Orca's
  * `LIGHT_BG_MIN_CONTRAST` (4.5, WCAG AA) and `DARK_BG_MIN_CONTRAST` (3)
