@@ -11,7 +11,7 @@ import { afterEach, test } from "node:test";
 import { createComponent, Show } from "solid-js";
 import { render } from "solid-js/web";
 import type { Session_Serialize, SessionsView_Serialize } from "../../../../ainb-app/bindings/AppState";
-import { createDeleteFlow, type DeleteFlowDeps, type DeletePreview } from "../../src/delete_dialog.ts";
+import { createDeleteFlow, type Confirmed, type DeleteFlowDeps, type DeletePreview } from "../../src/delete_dialog.ts";
 import { DeleteDialog } from "../../src/delete_dialog.tsx";
 import { runRowPick } from "../../src/row_menu.ts";
 import { Sidebar } from "../../src/sidebar.tsx";
@@ -73,7 +73,7 @@ afterEach(() => {
 });
 
 /** What the host was asked, in order. */
-type Asked = ["preview", string] | ["delete", string, string];
+type Asked = ["preview", string] | ["delete", string, Confirmed];
 
 /** Mount the sidebar and the delete dialog over one flow, as `main.tsx`
  * does. `preview` is the host's answer; the default flow's host commands are
@@ -86,7 +86,7 @@ async function mount(preview: DeletePreview | Error, deps: "fake" | "host" = "fa
       asked.push(["preview", id]);
       return preview instanceof Error ? Promise.reject(preview.message) : Promise.resolve(preview);
     },
-    remove: async (id, expected) => void asked.push(["delete", id, expected]),
+    remove: async (id, confirmed) => void asked.push(["delete", id, confirmed]),
     toast: (text) => toasts.push(text),
   };
   const flow = createDeleteFlow(deps === "fake" ? fake : { toast: fake.toast });
@@ -190,6 +190,30 @@ test("a dirty worktree shows Orca's hint and its tooltip", async () => {
   assert.equal(hint.title, "Deleting this workspace permanently removes these changes from disk.");
 });
 
+test("a dirty worktree asks for Force Delete, with the keyboard on Cancel", async () => {
+  // Orca's `canForceDelete` footer (`DeleteWorktreeDialogFooter.tsx:39-40`):
+  // Enter on the opened dialog must not wipe the work it just listed.
+  await mount({ tree: "removed", changes: 3 });
+  await chooseDelete("claude-1");
+  assert.ok(button("Force Delete"), "the confirm says what it does");
+  focusIs(button("Cancel"), "Cancel has the keyboard");
+});
+
+test("an uncounted worktree asks for Force Delete too", async () => {
+  await mount({ tree: "removed", changes: null });
+  await chooseDelete("claude-1");
+  assert.equal(document.querySelector(".delete-dialog-unchecked")?.textContent, "Could not check this worktree for uncommitted changes.");
+  assert.ok(button("Force Delete"));
+  focusIs(button("Cancel"));
+});
+
+test("a clean worktree keeps Orca's Delete, with the keyboard on it", async () => {
+  await mount({ tree: "removed", changes: 0 });
+  await chooseDelete("claude-1");
+  assert.ok(button("Force Delete") === undefined);
+  focusIs(button("Delete Workspace"));
+});
+
 test("a clean worktree shows no dirty line", async () => {
   await mount({ tree: "removed", changes: 0 });
   await chooseDelete("claude-1");
@@ -199,12 +223,13 @@ test("a clean worktree shows no dirty line", async () => {
 test("confirm calls the host's delete once for the row, and closes", async () => {
   const { asked } = await mount({ tree: "removed", changes: 1 });
   await chooseDelete("shell-1");
-  button("Delete Workspace").click();
+  button("Force Delete").click();
   await settle();
   assert.ok(dialog() === null, "the dialog gets out of the way as the delete starts");
   assert.deepEqual(asked, [
     ["preview", "shell-1"],
-    ["delete", "shell-1", "removed"],
+    // What the person was shown, for the host to count again.
+    ["delete", "shell-1", { expected: "removed", expectedChanges: 1, force: true }],
   ]);
 });
 
@@ -218,7 +243,7 @@ test("pressing the focused confirm twice deletes once", async () => {
   await settle();
   assert.deepEqual(
     asked.filter(([kind]) => kind === "delete"),
-    [["delete", "claude-1", "removed"]],
+    [["delete", "claude-1", { expected: "removed", expectedChanges: 0, force: false }]],
   );
 });
 
@@ -263,7 +288,11 @@ test("a worktree another session shares is not offered for removal", async () =>
   assert.ok(document.querySelector(".delete-dialog-dirty") === null, "no files are at stake");
   button("Delete Session").click();
   await settle();
-  assert.deepEqual(asked.at(-1), ["delete", "claude-1", "shared"], "the session alone goes, and the host is told so");
+  assert.deepEqual(
+    asked.at(-1),
+    ["delete", "claude-1", { expected: "shared", expectedChanges: null, force: false }],
+    "the session alone goes, and the host is told so",
+  );
 });
 
 test("confirm waits for the host's answer, then takes the keyboard", async () => {
@@ -319,7 +348,12 @@ test("the default flow asks the host's own delete commands, by session id", asyn
   assert.deepEqual(hostCalls.get("session_delete_preview"), { sessionId: "claude-1" });
   button("Delete Workspace").click();
   await settle();
-  assert.deepEqual(hostCalls.get("session_delete"), { sessionId: "claude-1", expected: "removed" });
+  assert.deepEqual(hostCalls.get("session_delete"), {
+    sessionId: "claude-1",
+    expected: "removed",
+    expectedChanges: 0,
+    force: false,
+  });
 });
 
 test("a delete the host refuses is said in a toast", async () => {
