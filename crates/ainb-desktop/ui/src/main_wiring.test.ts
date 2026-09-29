@@ -64,3 +64,12 @@ test("closing the shown tab moves the sidebar to the tab shown next", () => {
     /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*if \(!settings\(\) && !inboxOpen\(\)\) \{\s*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) void invoke<Refusal \| null>\("dispatch", \{ intent: select \}\);/,
   );
 });
+
+test("a sidebar row's menu runs through the window's own open, ordered dispatch and clipboard", () => {
+  // `test/dom/sidebar_menu.test.ts` proves the menu hands `runRowPick` the
+  // right pick; this is the one place those deps become real host calls.
+  assert.match(
+    MAIN,
+    /onRowPick=\{\(pick\) =>\s*runRowPick\(pick, \{\s*open: openSession,\s*run: \(intents\) => void run\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*\}\)\s*\}/,
+  );
+});
