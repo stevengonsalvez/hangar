@@ -123,3 +123,23 @@ test("Cmd+Shift+Down from Settings leaves the page first, and nothing is refused
   assert.deepEqual(host.sent[0], { id: "answer_home" });
   assert.deepEqual(refusals(), []);
 });
+
+// Last: it leaves a refusal toast up, which the tests above assert there is none of.
+test("a refused open is forgotten: the next Cmd+Shift+Down tries the same worktree again", async () => {
+  await showTab("u-2");
+  host.refuseOpen.add("u-3");
+  host.sent = [];
+  press(cmdShift("ArrowDown", "ArrowDown"));
+  await until(() => refusals().length > 0, "the refusal toast");
+  await drain();
+  press(cmdShift("ArrowDown", "ArrowDown"));
+  await drain();
+  const opens = host.sent.filter((sent) => sent.id === "session_list.select_row" && sent.open);
+  assert.deepEqual(
+    opens.map((sent) => sent.session),
+    ["u-3", "u-3"],
+    "stepped from u-2 again, not on from the u-3 that never opened",
+  );
+  assert.equal(shownTerminal(), tabOf("u-2").key);
+  host.refuseOpen.clear();
+});
