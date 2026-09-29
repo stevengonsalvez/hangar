@@ -75,6 +75,14 @@ export type PaletteEntry = {
 	active: boolean,
 };
 
+/**  One repository the composer may create into. */
+export type RegisteredProject = {
+	/**  The repository folder's own name. */
+	name: string,
+	/**  Canonical absolute path: the form the daemon compares against. */
+	path: string,
+};
+
 /**
  *  The intents a DOM renderer sends: a key, a named command, pasted text.
  * 

@@ -80,6 +80,29 @@ test("defaultProjectPath falls back to the first project, or empty with none", (
   assert.equal(defaultProjectPath(undefined), "");
 });
 
+test("projectChoices lists registered projects with no session, after the frame's own", () => {
+  const registered = [
+    { name: "api", path: "/repos/api" },
+    { name: "cli", path: "/repos/cli" },
+  ];
+  assert.deepEqual(projectChoices(view([]), registered), registered, "no session yet, still listed");
+  assert.deepEqual(projectChoices(view([workspace("web", "/repos/web", [session("w")]), workspace("api", "/repos/api")]), registered), [
+    { name: "web", path: "/repos/web" },
+    { name: "api", path: "/repos/api" },
+    { name: "cli", path: "/repos/cli" },
+  ], "one row per path, the frame's first");
+  assert.deepEqual(projectChoices(undefined, registered), registered);
+});
+
+test("defaultProjectPath falls back to the first registered project", () => {
+  assert.equal(defaultProjectPath(view([]), [{ name: "cli", path: "/repos/cli" }]), "/repos/cli");
+  assert.equal(
+    defaultProjectPath(view([workspace("api", "/repos/api", [session("a")])], "a"), [{ name: "cli", path: "/repos/cli" }]),
+    "/repos/api",
+    "the selected session's workspace still wins",
+  );
+});
+
 test("initialFields opens on claude and the default project, every other field blank", () => {
   const workspaces = [workspace("api", "/repos/api", [session("a")])];
   const opened = initialFields(view(workspaces, "a"));

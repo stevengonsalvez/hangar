@@ -8,6 +8,8 @@
 //!   failure report.
 //! - [`intent::RendererIntent`] is what the webview may send.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
+//! - [`projects`] lists the repositories the composer may create into,
+//!   sessions or not.
 //! - [`setup`] is the desktop-native path for the onboarding writes the
 //!   webview may not run (#1175), behind a confirmation the shell owns.
 //! - [`daemons_panel`] keeps the daemons collector alive while the settings
@@ -31,6 +33,7 @@ pub mod daemons_panel;
 pub mod executor;
 pub mod host;
 pub mod intent;
+pub mod projects;
 pub mod setup;
 pub mod shell;
 pub mod sidecar;

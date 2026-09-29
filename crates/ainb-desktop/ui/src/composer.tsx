@@ -1,9 +1,11 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, onCleanup, Show, untrack } from "solid-js";
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import {
   branchPreview,
   initialFields,
+  loadRegisteredProjects,
   projectChoices,
+  REGISTER_FOLDER_COMMAND,
   SPAWN_AGENTS,
   validate,
   type ComposerFields,
@@ -65,7 +67,15 @@ export function Composer(props: Props) {
     onCleanup(() => clearTimeout(timer));
   });
 
-  const projects = createMemo(() => projectChoices(props.sessions));
+  // Read per open (this is mounted only while open), so a folder registered
+  // since the last open is offered. It lands after the first paint: a blank
+  // project is filled then, a picked one is left alone.
+  const [registered] = createResource(loadRegisteredProjects, { initialValue: [] });
+  const projects = createMemo(() => projectChoices(props.sessions, registered()));
+  createEffect(() => {
+    const first = projects()[0]?.path;
+    if (first !== undefined && untrack(fields).projectPath === "") set("projectPath", first);
+  });
   const preview = createMemo(() => branchPreview(fields().name));
 
   const submit = (event: Event) => {
@@ -153,6 +163,15 @@ export function Composer(props: Props) {
             <For each={projects()}>{(project) => <option value={project.path}>{project.name}</option>}</For>
           </select>
           <Show when={errorFor("projectPath")}>{(message) => <p class="composer-error">{message()}</p>}</Show>
+          {/* Nothing to pick, once the host has answered: say how to register
+              a folder rather than leaving only "Choose a project." */}
+          <Show when={projects().length === 0 && !registered.loading}>
+            <p class="composer-hint composer-empty-projects">
+              No projects yet. Add your repositories' folder to workspace_defaults.workspace_scan_paths, then reopen.
+              For example (this replaces the whole list, so include any folder already in it):{" "}
+              <code>{REGISTER_FOLDER_COMMAND}</code>
+            </p>
+          </Show>
         </label>
 
         <label class="composer-field">

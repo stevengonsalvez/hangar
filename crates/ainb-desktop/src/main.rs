@@ -336,6 +336,28 @@ async fn worktree_create(
     Ok(created)
 }
 
+/// The composer's Project select: every repository in a folder the daemon
+/// creates from, sessions or not (`ainb_desktop::projects`). Read per open,
+/// off the main thread, because it walks the registered folders; a failure
+/// is an empty list, never an error, since the sessions frame still offers
+/// the projects that have sessions.
+#[tauri::command]
+async fn projects_list() -> Vec<ainb_desktop::projects::RegisteredProject> {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let defaults =
+            AppConfig::load().map(|config| config.workspace_defaults).unwrap_or_default();
+        ainb_desktop::projects::list(&home, &defaults)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "projects list did not run");
+        Vec::new()
+    })
+}
+
 /// The most of the sidecar log "show log" returns.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
@@ -990,6 +1012,7 @@ fn main() {
             terminal_resize,
             terminal_close,
             worktree_create,
+            projects_list,
             update_check,
             update_apply,
             update_settings,
