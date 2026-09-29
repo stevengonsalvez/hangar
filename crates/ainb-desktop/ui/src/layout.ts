@@ -98,7 +98,7 @@ export function initialLayout(keys: readonly string[]): Layout {
 }
 
 /** Every group, in reading order: depth first, so left before right and top
- * before bottom. This is the order `focusNext` walks. */
+ * before bottom. */
 export function groups(layout: Layout): Group[] {
   return leaves(layout.root);
 }
@@ -133,7 +133,7 @@ function withoutTab(group: Group, key: string): Group {
 }
 
 /** The sibling that inherits from the child at `at` when it goes: the one
- * before it, else the one after. The one rule both a closing group's tabs
+ * before it, else the one after. The one rule both a closing group's focus
  * (`recipientOf`) and its space (`withoutGroup`) follow, so the two never
  * go to different siblings. */
 function heirIndex(at: number): number {
@@ -141,7 +141,7 @@ function heirIndex(at: number): number {
 }
 
 /**
- * The group a closing group hands its tabs to: its heir in the parent. When
+ * The group a closing group hands the focus to: its heir in the parent. When
  * that sibling is itself split, the group of it nearest the closing one: its
  * last group when it came before, its first when it came after.
  */
@@ -221,10 +221,18 @@ function floored(ratios: readonly number[]): readonly number[] {
   return ratios.map((ratio) => (ratio <= floor ? floor : floor + (ratio - floor) * scale));
 }
 
-/** `layout` after a tab left `groupId`: the group closes into its sibling
- * when that left it empty, unless it is the last. */
+/**
+ * `layout` after a tab left `groupId`: when that left the group empty, it
+ * closes, unless it is the last. Its sibling before it (after it, for a
+ * first child) takes its space, and the focus when it had it. A group only
+ * ever closes this way: its tabs are the host's, so a pane's tabs are closed
+ * and the pane follows.
+ */
 function closeIfEmpty(layout: Layout, groupId: GroupId): Layout {
-  return findGroup(layout, groupId)?.tabs.length === 0 ? closeGroup(layout, groupId) : layout;
+  const recipient = recipientOf(layout.root, groupId);
+  if (findGroup(layout, groupId)?.tabs.length !== 0 || recipient === null) return layout;
+  const focused = layout.focused === groupId ? recipient : layout.focused;
+  return { ...layout, root: tidy(withoutGroup(layout.root, groupId)!), focused };
 }
 
 /**
@@ -251,25 +259,6 @@ export function splitGroup(layout: Layout, groupId: GroupId, direction: SplitDir
     group.id === groupId ? { kind: "split", axis, children, ratios: [0.5, 0.5] } : group,
   );
   return { root: tidy(root), focused: id, next: layout.next + 1 };
-}
-
-/**
- * Close `groupId`. Its tabs are not closed (the host owns those): they join
- * the end of the sibling group before it (after it, for a first child), which
- * also takes its space, and the focus when the closed group had it. The last
- * group cannot close.
- */
-export function closeGroup(layout: Layout, groupId: GroupId): Layout {
-  const closing = findGroup(layout, groupId);
-  const recipient = recipientOf(layout.root, groupId);
-  if (closing === undefined || recipient === null) return layout;
-  const merged = mapGroups(layout.root, (group) =>
-    group.id === recipient
-      ? { ...group, tabs: [...group.tabs, ...closing.tabs], active: group.active ?? closing.active }
-      : group,
-  );
-  const focused = layout.focused === groupId ? recipient : layout.focused;
-  return { ...layout, root: tidy(withoutGroup(merged, groupId)!), focused };
 }
 
 /** `tabs` with `key` placed at `index`, clamped to the strip; the end when
@@ -351,24 +340,6 @@ export function activateTab(layout: Layout, key: string): Layout {
 export function focusGroup(layout: Layout, groupId: GroupId): Layout {
   if (findGroup(layout, groupId) === undefined || layout.focused === groupId) return layout;
   return { ...layout, focused: groupId };
-}
-
-/** Focus the group `step` places from the focused one in reading order,
- * wrapping, as `stepTab` does for tabs. */
-function focusStep(layout: Layout, step: number): Layout {
-  const all = groups(layout);
-  const at = all.findIndex((group) => group.id === layout.focused);
-  return focusGroup(layout, all[(at + step + all.length) % all.length].id);
-}
-
-/** Focus the next group in reading order, wrapping to the first. */
-export function focusNext(layout: Layout): Layout {
-  return focusStep(layout, 1);
-}
-
-/** Focus the previous group in reading order, wrapping to the last. */
-export function focusPrevious(layout: Layout): Layout {
-  return focusStep(layout, -1);
 }
 
 /**
