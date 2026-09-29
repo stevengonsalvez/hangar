@@ -801,7 +801,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
                         tracing::warn!(%error, "the wait on a timed-out `ainb run` ended");
                     }
                 }
-                logs.remove();
+                drop(logs);
             });
             return Err(SpawnError::Failed(format!(
                 "`ainb run` is still running after {}s: {pending}; check the sidebar",
@@ -811,7 +811,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     };
     let stdout = logs.read_stdout();
     let stderr = logs.read_stderr();
-    logs.remove();
+    drop(logs);
     if !status.success() {
         return Err(SpawnError::Failed(format!(
             "`ainb run` failed: {}",
@@ -823,7 +823,9 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
 
 /// Where one `ainb run` writes its stdout and stderr: two files under the
 /// daemon's log dir (`<hangar>/hangar/logs/spawn/`), readable by the daemon's
-/// user only, removed once the run's outcome is read.
+/// user only. Dropping it removes them, so every arm of a run clears its
+/// output: the outcome read, an open or a spawn that failed, a wait that
+/// errored, and a timed-out run once it ends.
 struct RunLogs {
     stdout: std::path::PathBuf,
     stderr: std::path::PathBuf,
@@ -831,11 +833,8 @@ struct RunLogs {
 
 impl RunLogs {
     fn create() -> Result<Self, SpawnError> {
-        let dir = crate::log_dir()
-            .map_err(|e| SpawnError::Failed(format!("no log directory for `ainb run`: {e}")))?
-            .join("spawn");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| SpawnError::Failed(format!("creating {}: {e}", dir.display())))?;
+        let dir = own_run_logs_dir()
+            .map_err(|e| SpawnError::Failed(format!("no place for `ainb run` output: {e}")))?;
         let name = uuid::Uuid::new_v4().simple().to_string();
         Ok(Self {
             stdout: dir.join(format!("{name}.stdout")),
@@ -869,10 +868,113 @@ impl RunLogs {
     fn read_stderr(&self) -> Vec<u8> {
         std::fs::read(&self.stderr).unwrap_or_default()
     }
+}
 
-    fn remove(&self) {
+impl Drop for RunLogs {
+    fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.stdout);
         let _ = std::fs::remove_file(&self.stderr);
+    }
+}
+
+/// `<hangar>/hangar/logs/spawn/`, where every `ainb run` writes its output:
+/// created `0700` when missing and made `0700` when it is not (`DirBuilder`'s
+/// mode only applies to a directory it creates, and an older daemon's
+/// `create_dir_all` left it `0755`, or `0775` under umask 002).
+///
+/// `Err` unless it is a real directory (not a symlink) this user owns, so
+/// nothing is ever written into, or removed from, a directory that is not the
+/// daemon's. Ownership is checked BEFORE the mode is tightened, so an open
+/// directory of ours is repaired rather than refused forever; the private
+/// check runs after, as a post-condition.
+///
+/// Accepted: the `logs/` parent is followed if it is a symlink (it is the
+/// daemon's log dir, trusted like the rest of the home), and a process of the
+/// same user could swap `spawn` between the metadata check and
+/// `set_permissions`. Both need this user's own access already.
+fn own_run_logs_dir() -> Result<std::path::PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+    let dir = crate::log_dir().map_err(|e| format!("no log directory: {e}"))?.join("spawn");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let meta =
+        std::fs::symlink_metadata(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
+    if !meta.file_type().is_dir() || meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(format!(
+            "{} is not a private directory of this user (a symlink, or another user's)",
+            dir.display()
+        ));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("making {} private: {e}", dir.display()))?;
+    if !crate::hook_ingress::dir_is_ours(&dir) {
+        return Err(format!(
+            "{} is not a private directory of this user after making it 0700",
+            dir.display()
+        ));
+    }
+    Ok(dir)
+}
+
+/// Whether `name` is one of a run's own files: [`RunLogs`] names them by a
+/// simple UUID, 32 lowercase hex digits, then `.stdout` or `.stderr`.
+fn is_run_log_name(name: &str) -> bool {
+    let Some((stem, stream)) = name.split_once('.') else {
+        return false;
+    };
+    stem.len() == 32
+        && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && matches!(stream, "stdout" | "stderr")
+}
+
+/// Remove the `ainb run` output a previous daemon left behind. A run's files
+/// go when its outcome is read, but a daemon killed mid-run never reads it.
+///
+/// Only a run's own files go: regular files named as [`RunLogs`] names them,
+/// directly in [`own_run_logs_dir`]. A symlink is never followed and nothing
+/// is recursed into; a directory that is not the daemon's is not swept.
+///
+/// Called at boot once this process owns the home, so no run of this
+/// daemon's is writing yet. A run a dead daemon started may still be; its
+/// writes go on landing in the unlinked file, so removing it never fails the
+/// run.
+pub fn remove_stale_run_logs() {
+    let dir = match own_run_logs_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(%error, "not sweeping stale `ainb run` output");
+            return;
+        }
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(dir = %dir.display(), %error, "could not list stale `ainb run` output");
+            return;
+        }
+    };
+    let mut removed = 0_usize;
+    for entry in entries.filter_map(Result::ok) {
+        // `DirEntry::file_type` does not follow a symlink.
+        let ours = entry.file_name().to_str().is_some_and(is_run_log_name)
+            && entry.file_type().is_ok_and(|kind| kind.is_file());
+        if !ours {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::warn!(
+                file = %entry.path().display(),
+                %error,
+                "could not remove stale `ainb run` output"
+            ),
+        }
+    }
+    if removed > 0 {
+        tracing::info!(removed, "removed stale `ainb run` output");
     }
 }
 

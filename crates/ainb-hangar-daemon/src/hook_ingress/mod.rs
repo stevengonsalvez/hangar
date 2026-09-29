@@ -24,6 +24,7 @@ mod guard;
 pub mod hold;
 mod ingest;
 mod spool;
+pub(crate) use spool::dir_is_ours;
 
 use std::path::Path;
 use std::sync::Arc;

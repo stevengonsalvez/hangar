@@ -905,6 +905,8 @@ pub async fn boot(once: bool) -> anyhow::Result<()> {
     // says: with the switch off it would otherwise stay forever, with it on it
     // would name a dead pid until the new files replace it.
     crate::hook_ingress::remove_stale(&dir);
+    // The same for `ainb run` output: a daemon killed mid-create left it.
+    crate::spawn::remove_stale_run_logs();
 
     // Crash breadcrumbs start HERE, once this process owns the home — never
     // before. They live in the SHARED home: `start_breadcrumbs` deletes the
