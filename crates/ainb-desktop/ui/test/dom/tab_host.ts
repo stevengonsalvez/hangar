@@ -11,6 +11,13 @@ import "./window.ts";
 import assert from "node:assert/strict";
 
 type Callback = (payload: unknown) => void;
+
+/** `tabs` as the window receives them: fresh objects on every answer, as a
+ * strip crossing the real IPC is. Handing the same objects back each time
+ * would hide a view keyed by tab object, which remounts on every frame. */
+function copy(tabs: readonly TabView[]): TabView[] {
+  return JSON.parse(JSON.stringify(tabs));
+}
 export type TabView = { key: string; target: { kind: "session"; id: string; tmux: string }; state: "attached" };
 
 const HOST = "host-1";
@@ -29,7 +36,7 @@ export const host = {
 /** The host's strip changing on its own schedule, focusing `focus` or not. */
 export function strip(focus: string | null = null): void {
   for (const handler of host.events.get("terminal_tabs") ?? []) {
-    handler({ event: "terminal_tabs", id: 0, payload: { tabs: host.tabs, focus } });
+    handler({ event: "terminal_tabs", id: 0, payload: { tabs: copy(host.tabs), focus } });
   }
 }
 
@@ -53,7 +60,7 @@ let nextCallback = 1;
       case "sidecar_state":
         return { state: "running" };
       case "terminal_tabs":
-        return { tabs: host.tabs, focus: null };
+        return { tabs: copy(host.tabs), focus: null };
       case "terminal_close":
         // The real host drops the tab and answers with the strip, as here.
         host.tabs = host.tabs.filter((one) => one.key !== args.key);
