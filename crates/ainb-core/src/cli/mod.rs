@@ -128,6 +128,7 @@ EXAMPLES:
   ainb run --remote-repo owner/repo --worktree       Clone a GitHub repo first, then isolate
   ainb run --repo . --worktree --tool codex          Use Codex instead of Claude
   ainb run --repo . --worktree --attach              Drop into tmux after creating
+  ainb run --existing-worktree <path>                One more agent in a worktree ainb made
   ainb run --repo .                                  Shared checkout, NO isolation
 
 Without --worktree (or --create-branch) the session runs directly in the
@@ -182,17 +183,16 @@ pub struct RunArgs {
 
     /// Start the session in this existing ainb worktree, on its current branch
     //
-    // For the hangar daemon's dark `worktree/agent_add`: a second agent in a
+    // What the hangar daemon's `worktree/agent_add` runs: a second agent in a
     // tree an earlier `run --worktree` made. Nothing git-side is created, so
     // no failure may delete the tree or its branch (another session may be
-    // working in it). Hidden while the daemon verb is dark, so `run --help`
-    // and the generated CLI reference stay as they are. `--name` is refused
-    // with it: starting a tmux session kills one already using the name, and
-    // that could be the first agent in this tree.
+    // working in it). `--name` is refused with it: starting a tmux session
+    // kills one already using the name, and that could be the first agent in
+    // this tree. The tree's `.mcp.json` is not auto-imported into the MCP pool
+    // (see `run::pool_candidates`).
     #[arg(
         long,
         value_name = "PATH",
-        hide = true,
         conflicts_with_all = ["repo", "remote_repo", "worktree", "create_branch", "base", "name"]
     )]
     pub existing_worktree: Option<PathBuf>,
