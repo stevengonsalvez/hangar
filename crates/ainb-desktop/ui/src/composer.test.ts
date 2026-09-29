@@ -19,6 +19,7 @@ import {
   validate,
   type ComposerFields,
   type CreatedWorktree,
+  type ProjectChoice,
 } from "./composer.ts";
 
 function session(id: string, over: Partial<Session_Serialize> = {}): Session_Serialize {
@@ -45,6 +46,12 @@ function fields(over: Partial<ComposerFields> = {}): ComposerFields {
     ...over,
   };
 }
+
+/** The Project select's rows the fixtures pick from. */
+const LISTED: readonly ProjectChoice[] = [
+  { name: "app", path: "/repos/app" },
+  { name: "repo", path: "/repo" },
+];
 
 test("sanitizeBranchSegment lowercases, folds runs, and trims dashes", () => {
   assert.equal(sanitizeBranchSegment("Fix Login Bug"), "fix-login-bug");
@@ -122,16 +129,21 @@ test("projectChoices lists every workspace, in the frame's own order", () => {
 });
 
 test("a plain request has no errors", () => {
-  assert.deepEqual(validate(fields({ name: "fix login", prompt: "fix it" })), []);
+  assert.deepEqual(validate(fields({ name: "fix login", prompt: "fix it" }), LISTED), []);
 });
 
 test("a blank project is refused before an absolute-path check ever runs", () => {
-  const errors = validate(fields({ projectPath: "" }));
+  const errors = validate(fields({ projectPath: "" }), LISTED);
   assert.deepEqual(errors, [{ field: "projectPath", message: "Choose a project." }]);
 });
 
+test("a project the Project select no longer lists is refused", () => {
+  const errors = validate(fields({ projectPath: "/repos/gone" }), LISTED);
+  assert.deepEqual(errors, [{ field: "projectPath", message: "Choose a listed project." }]);
+});
+
 test("a relative project path is refused", () => {
-  const errors = validate(fields({ projectPath: "repos/app" }));
+  const errors = validate(fields({ projectPath: "repos/app" }), LISTED);
   assert.equal(errors[0]?.field, "projectPath");
 });
 
@@ -141,33 +153,33 @@ const BAD_REFS = ["-rf", "--help", "a..b", "a b", "a~1", "x@{1}", "/a", "a/", "a
 
 test("refs that read as flags or bad refs are refused, on the Advanced branch field", () => {
   for (const bad of BAD_REFS) {
-    const errors = validate(fields({ branch: bad }));
+    const errors = validate(fields({ branch: bad }), LISTED);
     assert.deepEqual(errors, [{ field: "branch", message: "Not a valid git ref." }], bad);
   }
 });
 
 test("refs that read as flags or bad refs are refused, on the base field", () => {
   for (const bad of BAD_REFS) {
-    const errors = validate(fields({ base: bad }));
+    const errors = validate(fields({ base: bad }), LISTED);
     assert.deepEqual(errors, [{ field: "base", message: "Not a valid git ref." }], bad);
   }
 });
 
 test("a name that sanitizes into an invalid branch is refused on the name field", () => {
   // Sanitizing keeps the dot, so this segment ends the ref in `.lock`.
-  const errors = validate(fields({ name: "release.lock" }));
+  const errors = validate(fields({ name: "release.lock" }), LISTED);
   assert.equal(errors[0]?.field, "name");
 });
 
 test("control characters and oversize fields are refused", () => {
-  assert.equal(validate(fields({ model: "a\nb" }))[0]?.field, "model");
-  assert.equal(validate(fields({ model: "m".repeat(SPAWN_FIELD_MAX + 1) }))[0]?.field, "model");
-  assert.equal(validate(fields({ prompt: "x".repeat(SPAWN_PROMPT_MAX + 1) }))[0]?.field, "prompt");
-  assert.equal(validate(fields({ prompt: "a\0b" }))[0]?.field, "prompt");
+  assert.equal(validate(fields({ model: "a\nb" }), LISTED)[0]?.field, "model");
+  assert.equal(validate(fields({ model: "m".repeat(SPAWN_FIELD_MAX + 1) }), LISTED)[0]?.field, "model");
+  assert.equal(validate(fields({ prompt: "x".repeat(SPAWN_PROMPT_MAX + 1) }), LISTED)[0]?.field, "prompt");
+  assert.equal(validate(fields({ prompt: "a\0b" }), LISTED)[0]?.field, "prompt");
 });
 
 test("a blank optional field is never checked: it reaches the daemon as null, not as itself", () => {
-  assert.deepEqual(validate(fields({ model: "", base: "", branch: "", prompt: "" })), []);
+  assert.deepEqual(validate(fields({ model: "", base: "", branch: "", prompt: "" }), LISTED), []);
 });
 
 test("toArgs sends blank fields as null and trims the ones the daemon trims", () => {
@@ -204,7 +216,7 @@ test("toArgs keeps the prompt exactly as typed, only blank becomes null", () => 
 });
 
 test("refs are checked per component, as the daemon does", () => {
-  const withBase = (base: string) => validate({ ...initialFields(undefined), projectPath: "/repo", base });
+  const withBase = (base: string) => validate({ ...initialFields(undefined), projectPath: "/repo", base }, LISTED);
   for (const bad of ["feat/.hidden", "feat/x.lock/y", "@", "a//b", "/a", "a/", ".a", "a.lock"]) {
     assert.equal(withBase(bad).some((error) => error.field === "base"), true, bad);
   }
@@ -237,7 +249,19 @@ test("the flow never sends what the daemon would refuse", () => {
     return Promise.resolve(created);
   });
   flow.openComposer();
-  flow.submit({ ...valid(), base: "-rf" });
+  flow.submit({ ...valid(), base: "-rf" }, LISTED);
+  assert.equal(calls, 0);
+  assert.equal(flow.state().kind, "idle");
+});
+
+test("the flow never sends a project the Project select no longer lists", () => {
+  let calls = 0;
+  const { flow } = flowWith(() => {
+    calls += 1;
+    return Promise.resolve(created);
+  });
+  flow.openComposer();
+  flow.submit({ ...valid(), projectPath: "/repos/gone" }, LISTED);
   assert.equal(calls, 0);
   assert.equal(flow.state().kind, "idle");
 });
@@ -245,7 +269,7 @@ test("the flow never sends what the daemon would refuse", () => {
 test("a success clears the pending card, closes the view and restores focus", async () => {
   const { flow, effects } = flowWith(() => Promise.resolve(created));
   flow.openComposer();
-  flow.submit(valid());
+  flow.submit(valid(), LISTED);
   assert.equal(flow.state().kind, "creating");
   assert.deepEqual(flow.pending(), { projectPath: "/repo", name: "Fix login" });
   await Promise.resolve();
@@ -259,7 +283,7 @@ test("a success clears the pending card, closes the view and restores focus", as
 test("a failure keeps the view open when shown, and toasts when it was closed", async () => {
   const shown = flowWith(() => Promise.reject("branch exists"));
   shown.flow.openComposer();
-  shown.flow.submit(valid());
+  shown.flow.submit(valid(), LISTED);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(shown.flow.state(), { kind: "failed", message: "branch exists" });
   assert.equal(shown.flow.open(), true);
@@ -267,7 +291,7 @@ test("a failure keeps the view open when shown, and toasts when it was closed", 
 
   const closed = flowWith(() => Promise.reject("branch exists"));
   closed.flow.openComposer();
-  closed.flow.submit(valid());
+  closed.flow.submit(valid(), LISTED);
   closed.flow.closeComposer();
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(closed.effects.toasts, ["branch exists"]);
@@ -277,9 +301,9 @@ test("base and model are checked as they are sent: trimmed", () => {
   // `toArgs` trims both, so padding around a value at the limit is not a
   // reason to refuse what the daemon would accept.
   const padded = fields({ model: `  ${"m".repeat(SPAWN_FIELD_MAX)}  `, base: "  main  " });
-  assert.deepEqual(validate(padded), []);
+  assert.deepEqual(validate(padded, LISTED), []);
   assert.equal(toArgs(padded).model, "m".repeat(SPAWN_FIELD_MAX));
   assert.equal(toArgs(padded).base, "main");
   // And past the limit it is still refused, trimmed or not.
-  assert.equal(validate(fields({ model: "m".repeat(SPAWN_FIELD_MAX + 1) }))[0]?.field, "model");
+  assert.equal(validate(fields({ model: "m".repeat(SPAWN_FIELD_MAX + 1) }), LISTED)[0]?.field, "model");
 });
