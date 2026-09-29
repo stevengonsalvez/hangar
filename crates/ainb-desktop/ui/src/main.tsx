@@ -55,6 +55,7 @@ import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./
 import { Panes } from "./panes.tsx";
 import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
 import { NewTerminalButton } from "./shell_tab.tsx";
+import { shownTargetOf, worktreeTarget } from "./worktree_target.ts";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { runRowPick } from "./row_menu.ts";
@@ -660,7 +661,9 @@ function Shell() {
   };
 
   // "New terminal" and every tab close: a shell's tab ends its shell.
-  const shellTabs = createShellTabs({ session: () => sessions()?.selected_session_id ?? null, toast });
+  const plusTarget = () =>
+    worktreeTarget(shownTargetOf(showing("terminal"), tabs(), active()), sessions()?.selected_session_id ?? null);
+  const shellTabs = createShellTabs({ target: plusTarget, toast });
 
   // The accelerators work outside a terminal too; a terminal marks the ones
   // it handled, so they do not run twice.
@@ -963,7 +966,7 @@ function Shell() {
                 )}
               </Show>
               <NewTerminalButton
-                ready={sessions()?.selected_session_id != null}
+                ready={plusTarget() !== null}
                 mac={MAC}
                 onOpen={() => void shellTabs.open()}
               />
