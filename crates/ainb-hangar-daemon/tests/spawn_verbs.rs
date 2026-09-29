@@ -1,4 +1,4 @@
-//! `worktree/create` and `worktree/agent_add` with the switch on, end to end
+//! `worktree/create` and `worktree/agent_add` as a daemon serves them by default, end to end
 //! through dispatch, against a stand-in `ainb` that records its argv and
 //! answers like `ainb --format json run`.
 //!
@@ -9,8 +9,9 @@
 //! CLI's own last words.
 //!
 //! Its own process: `AINB_HANGAR_SPAWN` and `AINB_BIN` are process-global and
-//! the switch is read once, so they are set before the first dispatch and the
-//! tests run serially on one lock.
+//! the switch is read once, so they are settled before the first dispatch and
+//! the tests run serially on one lock. The switch is left UNSET: that the
+//! verbs answer at all is the default being proven.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -167,7 +168,8 @@ impl Registered {
 
 fn switch_on(bin: &Path) {
     // Edition 2021: set_var is safe. Held under SERIAL for the whole test.
-    std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "1");
+    // Unset, not `1`: the verbs are on by default.
+    std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
     std::env::set_var("AINB_BIN", bin);
 }
 
