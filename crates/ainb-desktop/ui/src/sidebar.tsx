@@ -4,6 +4,8 @@ import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
 import { isSelected, label } from "./sessions.ts";
+import { SidebarFilter } from "./sidebar_filter.tsx";
+import { filterProjectGroups } from "./sidebar_filter.ts";
 import {
   agentLabel,
   formatGitChanges,
@@ -75,7 +77,12 @@ export function Sidebar(props: Props) {
   // objects would remount every row whenever any one changed, and a focused
   // row would drop the keyboard to <body>. Keys are equal frame to frame, so
   // the lists patch, and each row reads its current data through its key.
-  const groups = createMemo(() => keyedList(projectGroups(props.sessions), (group) => group.path));
+  const allGroups = createMemo(() => projectGroups(props.sessions));
+  // The filter's text: a signal, never storage, so a relaunch opens the whole
+  // list, as Orca's own search drops its query when its surface closes. It
+  // only hides rows: the selection is the host's and stays where it was.
+  const [query, setQuery] = createSignal("");
+  const groups = createMemo(() => keyedList(filterProjectGroups(allGroups(), query()), (group) => group.path));
   const groupKeys = createMemo(() => groups().keys, [], { equals: sameKeys });
   const [collapsed, setCollapsed] = createSignal(readCollapsed(safeStorage()));
   /** `<details>` already flipped its own `open` before `onToggle` fires:
@@ -93,6 +100,13 @@ export function Sidebar(props: Props) {
   const pendingIn = (group: ProjectGroup): PendingWorktree | null =>
     props.pending && props.pending.projectPath === group.path ? props.pending : null;
 
+  /** Why the list is empty: the host has not answered yet, it has nothing, or
+   * it has rows and the filter hides every one of them. */
+  const emptyText = () => {
+    if (allGroups().length > 0) return "No worktrees match";
+    return props.loading || !props.sessions ? "Loading sessions" : "No sessions";
+  };
+
   return (
     <aside class="sidebar" aria-label="Sessions" tabIndex={-1} ref={props.ref}>
       <div class="sidebar-head">
@@ -104,10 +118,8 @@ export function Sidebar(props: Props) {
           <span class="stale">stale</span>
         </Show>
       </div>
-      <Show
-        when={groupKeys().length > 0}
-        fallback={<p class="empty">{props.loading || !props.sessions ? "Loading sessions" : "No sessions"}</p>}
-      >
+      <SidebarFilter query={query()} onQuery={setQuery} />
+      <Show when={groupKeys().length > 0} fallback={<p class="empty">{emptyText()}</p>}>
         <For each={groupKeys()}>
           {(groupKey) => {
             const group = (): ProjectGroup | undefined => groups().byKey.get(groupKey);
