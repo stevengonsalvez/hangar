@@ -29,6 +29,7 @@ import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
 import { agentStateCounts, boardColumns, countIn, nextNeedsYou, sameColumns, showIntents } from "./board.ts";
+import { readCollapsed, stepWorktree } from "./sidebar_model.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -178,6 +179,9 @@ function Shell() {
   // Tab keys in the order they were shown, most recent last: which tab a
   // group shows when its shown one closes. Read only then, so not a signal.
   let recent: string[] = [];
+  // The session the last worktree step opened, until its tab is shown: the
+  // next step goes on from it, not again from the tab still on screen.
+  let steppedTo: string | null = null;
   // The board is the window's landing surface: what every agent is doing, and
   // what is waiting on a human. A terminal takes the work area while it is
   // chosen, and the board is one click back.
@@ -204,6 +208,9 @@ function Shell() {
   const [setup, setSetup] = createSignal<SetupView | null>(null);
   const focusers = new Map<string, () => void>();
   let sidebar: HTMLElement | undefined;
+  // Whether the sidebar is shown: Cmd+B, Ctrl+Shift+B off macOS. This
+  // window's own, not saved; every launch opens with it shown.
+  const [sidebarShown, setSidebarShown] = createSignal(true);
 
   /**
    * Give the keyboard to `key`'s terminal, on the next frame so a tab that
@@ -271,6 +278,7 @@ function Shell() {
    * take the keyboard from a text field (`terminalMayTakeFocus`).
    */
   const activate = (key: string | null, byHost: boolean, first: RendererIntent[] = []) => {
+    steppedTo = null;
     if (key !== null) {
       // Shown in its own group, and that group focused: the host's
       // `TabsView.focus` lands here as a person's click does.
@@ -489,7 +497,7 @@ function Shell() {
     }
   };
   /** Open the palette, or close it the way Esc does: the titlebar's search
-   * button and the Cmd/Ctrl+Shift+K accelerator both send exactly this, so
+   * button and the Cmd+J (Ctrl+Shift+J) accelerator both send exactly this, so
    * there is one place that decides which way a press or a click goes. */
   const togglePalette = () => {
     if (palette()) closePalette();
@@ -537,9 +545,25 @@ function Shell() {
       [...document.querySelectorAll<HTMLElement>(".board-card")].find((node) => node.dataset.card === card.key)?.focus();
       return;
     }
-    const tab = tabs().find((one) => one.target.kind === "session" && one.target.id === card.sessionId);
+    showSession(card.sessionId);
+  };
+  /** Show `sessionId`'s tab, or open one when it has none: after
+   * `answer_home`, so from Settings or the Inbox nothing is refused. */
+  const showSession = (sessionId: string) => {
+    const tab = tabs().find((one) => one.target.kind === "session" && one.target.id === sessionId);
     if (tab !== undefined) choose(tab);
-    else void answer([openRowIntent({ session: card.sessionId })]);
+    else void answer([openRowIntent({ session: sessionId })]);
+  };
+  /** Hide the sidebar, or show it again. A hidden sidebar cannot keep the
+   * keyboard: it goes to the shown terminal, or nowhere. */
+  const toggleSidebar = () => {
+    const hiding = sidebarShown();
+    if (hiding && sidebar?.contains(document.activeElement)) {
+      const key = active();
+      if (key !== null && showing("terminal")) focusers.get(key)?.();
+      else (document.activeElement as HTMLElement | null)?.blur();
+    }
+    setSidebarShown(!hiding);
   };
 
   const onAccelerator = (shell: Accelerator) => {
@@ -578,13 +602,29 @@ function Shell() {
       case "attention":
         jumpToAttention();
         return;
+      // From the worktree on screen, as Orca steps from the active one; the
+      // host's selection follows a shown terminal a frame later.
+      case "worktree": {
+        const from = steppedTo ?? shownSession() ?? sessions()?.selected_session_id ?? null;
+        const next = stepWorktree(sessions(), from, shell.step, readCollapsed(safeStorage()));
+        if (next === null) return;
+        showSession(next);
+        // Tabless: its tab opens when the host answers, and `activate` then
+        // forgets this.
+        if (!tabs().some((tab) => tab.target.kind === "session" && tab.target.id === next)) steppedTo = next;
+        return;
+      }
+      case "sidebar":
+        toggleSidebar();
+        return;
       // ponytail: the host switcher is R1.
       case "hosts":
         return;
       // Answered by the terminal that has focus; outside one there is no
-      // selection to copy and nowhere to paste.
+      // selection to copy, nowhere to paste, and no pane to clear.
       case "copy":
       case "paste":
+      case "clear":
         return;
       case "palette":
         togglePalette();
@@ -810,7 +850,10 @@ function Shell() {
                 reselect: shownRowIntents,
               })
             }
-            ref={(element) => (sidebar = element)}
+            ref={(element) => {
+              sidebar = element;
+              createEffect(() => element.toggleAttribute("hidden", !sidebarShown()));
+            }}
           />
           <section class="workarea">
             <nav class="tabs" aria-label="Board and terminals" data-host-answers={hostAnswers()} data-host-focus={hostFocus()}>
@@ -996,7 +1039,11 @@ function Shell() {
                         active={visible()}
                         mac={MAC}
                         onAccelerator={onAccelerator}
-                        onLeave={() => sidebar?.focus()}
+                        onLeave={() => {
+                          // Esc Esc asks for the sidebar: a hidden one shows.
+                          setSidebarShown(true);
+                          sidebar?.focus();
+                        }}
                         focusRef={(focus) => focusers.set(key, focus)}
                         theme={theme.painted()}
                       />
