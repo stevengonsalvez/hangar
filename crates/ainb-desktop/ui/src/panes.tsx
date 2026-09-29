@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, Index, onCleanup, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, onCleanup, Show, type JSX } from "solid-js";
 import {
   geometry,
   groupOf,
@@ -17,6 +17,7 @@ import { dropAt, dropTab, type Drop } from "./panes.ts";
 import type { UiStatus } from "./status.ts";
 import type { Tab } from "./tabs.ts";
 import { TerminalTab } from "./terminal_tab.tsx";
+import { setVisibleTerminals } from "./transport.ts";
 
 interface Props {
   layout: Layout;
@@ -106,6 +107,20 @@ export function Panes(props: Props) {
   );
   const shape = createMemo(() => geometry(props.layout));
   const split = () => ids().length > 1;
+
+  // The terminals on screen, one per pane, told to the host on mount and on
+  // every change (a split, a close, a tab shown in a pane, a page over the
+  // panes): it keeps each attached past its cap, and lets each paste.
+  const onScreen = createMemo(
+    () => (props.shown ? all().flatMap((group) => (group.active === null ? [] : [group.active])) : []),
+    [],
+    { equals: (a, b) => a.length === b.length && a.every((key, at) => key === b[at]) },
+  );
+  createEffect(() => {
+    void setVisibleTerminals(onScreen()).catch((error: unknown) =>
+      console.warn("the terminals on screen did not reach the host", error),
+    );
+  });
 
   // A seam being dragged: the layout it would make, drawn by the seams alone
   // until the drag ends, so the panes (and the tmux grids behind them) are
