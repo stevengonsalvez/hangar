@@ -659,7 +659,7 @@ pub async fn shell_create_named(
             .stderr(std::process::Stdio::piped())
             // A wedged tmux is abandoned at the timeout, not left running.
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+        let out = match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
             Err(_) => {
@@ -669,7 +669,7 @@ pub async fn shell_create_named(
                 kill_own_shell(&name).await;
                 return Err(SpawnError::Failed(format!(
                     "tmux did not answer within {}s; the shell may still appear as {name}",
-                    SHELL_TMUX_TIMEOUT.as_secs()
+                    shell_tmux_timeout().as_secs()
                 )));
             }
         };
@@ -706,7 +706,7 @@ async fn kill_own_shell(name: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let _ = tokio::time::timeout(SHELL_TMUX_TIMEOUT, kill.status()).await;
+    let _ = tokio::time::timeout(shell_tmux_timeout(), kill.status()).await;
 }
 
 /// Every shell the daemon opened that is still running, by name. Only
@@ -830,7 +830,7 @@ impl TmuxError {
             Self::Spawn(e) => SpawnError::Failed(format!("could not run tmux: {e}")),
             Self::Timeout => SpawnError::Failed(format!(
                 "tmux did not answer within {}s",
-                SHELL_TMUX_TIMEOUT.as_secs()
+                shell_tmux_timeout().as_secs()
             )),
         }
     }
@@ -855,7 +855,7 @@ async fn run_tmux(args: &[&str]) -> Result<std::process::Output, TmuxError> {
     // `$TMUX` is inherited, so list and close reach the server the create
     // made its shells on.
     crate::tmux_session::strip_daemon_secrets(&mut tmux);
-    match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+    match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) => Err(TmuxError::Spawn(e)),
         Err(_) => Err(TmuxError::Timeout),
@@ -1128,6 +1128,34 @@ fn run_timeout() -> Duration {
 #[cfg(not(any(test, feature = "test-support")))]
 const fn run_timeout() -> Duration {
     RUN_TIMEOUT
+}
+
+/// Test seam: a shorter wait than [`SHELL_TMUX_TIMEOUT`], in milliseconds,
+/// or 0 for the real one, so a test of a wedged tmux does not sit through
+/// ten seconds of it.
+#[cfg(any(test, feature = "test-support"))]
+static SHELL_TMUX_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shorten the wait on the shell verbs' tmux, or restore it with `None`.
+/// Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_shell_tmux_timeout_for_test(timeout: Option<Duration>) {
+    let ms = timeout.map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    SHELL_TMUX_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn shell_tmux_timeout() -> Duration {
+    match SHELL_TMUX_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => SHELL_TMUX_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+/// Compiled out of a shipped daemon: always the real wait.
+#[cfg(not(any(test, feature = "test-support")))]
+const fn shell_tmux_timeout() -> Duration {
+    SHELL_TMUX_TIMEOUT
 }
 
 #[cfg(test)]
