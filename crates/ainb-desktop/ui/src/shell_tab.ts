@@ -1,21 +1,22 @@
 // A plain terminal in a worktree, opened the way Orca opens one: from the tab
 // strip or Mod+T, in the worktree in front of the person
 // (`orca:src/renderer/src/components/tab-bar/tab-create-menu-options.ts:88-91`).
-// The window names the selected session, never a folder: the host finds that
-// session's worktree and asks the daemon for the shell (`shell_open`), and
-// the tab arrives on the strip like every other. Closing a shell's tab ends
+// The window names the worktree by ids (`worktree_target.ts`), never a
+// folder: the host resolves it and asks the daemon for the shell
+// (`shell_open`), and the tab arrives on the strip like every other. Closing a shell's tab ends
 // the shell (`shell_close`), as Orca's close kills its PTY
 // (`orca:src/renderer/src/store/terminals/terminal-tab-close-providers.ts:33`).
 
 import { invoke } from "@tauri-apps/api/core";
 import { openRowIntent, rowOf, type Tab, type TabTarget } from "./tabs.ts";
+import type { WorktreeTarget } from "./worktree_target.ts";
 
 /** What a press says when there is no worktree to open in. */
-export const NO_SESSION = "Select a session first: a new terminal opens in its worktree.";
+export const NO_SESSION = "Select a session or a terminal tab first: a new terminal opens in its worktree.";
 
 export interface ShellTabDeps {
-  /** The session whose worktree a new terminal opens in: the sidebar's selection. */
-  session(): string | null;
+  /** The worktree a new terminal opens in (`worktreeTarget`). */
+  target(): WorktreeTarget | null;
   toast(message: string): void;
 }
 
@@ -25,15 +26,15 @@ export interface ShellTabDeps {
  * detail), and is shown as it came.
  */
 export function createShellTabs(deps: ShellTabDeps) {
-  /** A new shell in the selected session's worktree; the host opens its tab. */
+  /** A new shell in the target's worktree; the host opens its tab. */
   const open = async (): Promise<void> => {
-    const session = deps.session();
-    if (session === null) {
+    const target = deps.target();
+    if (target === null) {
       deps.toast(NO_SESSION);
       return;
     }
     try {
-      await invoke<string>("shell_open", { session });
+      await invoke<string>("shell_open", { target });
     } catch (error) {
       deps.toast(String(error));
     }
