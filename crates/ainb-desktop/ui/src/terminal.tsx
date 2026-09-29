@@ -6,7 +6,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
 import { tauriTransport } from "./transport.ts";
-import { TERMINAL_THEMES, type Theme } from "./theme/theme.ts";
+import { terminalAppearance, type Theme } from "./theme/theme.ts";
 
 interface Props {
   tab: Tab;
@@ -40,11 +40,13 @@ export function TerminalView(props: Props) {
       fontFamily: '"SF Mono", Menlo, "JetBrains Mono", ui-monospace, monospace',
       fontSize: 13,
       scrollback: 5000,
-      theme: TERMINAL_THEMES[props.theme],
+      ...terminalAppearance(props.theme),
     });
     // A theme switch repaints an open terminal at once, keeping its buffer.
     createEffect(() => {
-      term.options.theme = TERMINAL_THEMES[props.theme];
+      const appearance = terminalAppearance(props.theme);
+      term.options.theme = appearance.theme;
+      term.options.minimumContrastRatio = appearance.minimumContrastRatio;
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
