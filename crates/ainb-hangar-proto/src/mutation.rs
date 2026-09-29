@@ -1235,7 +1235,8 @@ pub static MUTATING_METHODS: &[MutatingMethod] = &[
     // Registered while still dark (METHOD_NOT_FOUND without the spawn
     // switch): the ledger is what makes a retried create return the shell
     // the first attempt made instead of opening a second one. A dark daemon
-    // records its METHOD_NOT_FOUND as the op id's answer like any refusal.
+    // does not record its METHOD_NOT_FOUND, so the same op id runs once the
+    // switch is on.
     mutating_method!(
         m::SHELL_CREATE,
         crate::spawn::ShellCreateParams,
