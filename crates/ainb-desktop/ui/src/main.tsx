@@ -294,10 +294,13 @@ function Shell() {
         // follow every other: left on the closed tab's session, the answer
         // banner's scope (`questionOver`) would hide this one's question.
         // Not under Settings or the Inbox: no terminal is shown there, and
-        // the reducer, on that page, refuses a session-list row.
+        // the reducer, on that page, refuses a session-list row. The host
+        // decides by its own screen, which a frame can trail (as `activate`'s
+        // `answer_home` allows for), so a refusal here is the strip tidying
+        // up on a page the frame has not shown yet: nobody asked, no toast.
         if (!settings() && !inboxOpen()) {
           const select = selectIntentFor(view.tabs, next);
-          if (select !== null) dispatch(select);
+          if (select !== null) void invoke<Refusal | null>("dispatch", { intent: select });
         }
         focusTab(next, true);
       }
