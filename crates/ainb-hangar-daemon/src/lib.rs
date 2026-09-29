@@ -595,11 +595,15 @@ const CODEX_APP_SERVER_DEFAULT: &str = "desktop";
 /// `ainb-core`: the TUI crate already depends on this one, so reaching back
 /// would be a cycle.
 fn codex_app_server_from_config() -> ConfigSetting {
-    let Ok(home) = hangar_dir() else {
-        return ConfigSetting::Absent;
-    };
-    let path = home.join("config").join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
+    hangar_dir().map_or(ConfigSetting::Absent, |home| {
+        codex_app_server_in(&crate::spawn::config_path_in(&home))
+    })
+}
+
+/// [`codex_app_server_from_config`] for the config file at `path`, so each
+/// file state is testable without touching `$AINB_HANGAR_HOME`.
+fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ConfigSetting::Absent;
@@ -641,6 +645,7 @@ fn codex_app_server_from_config() -> ConfigSetting {
 /// silently apply the `desktop` default, moving a user who had explicitly
 /// chosen `own` onto a shared app-server with Codex Desktop. Isolation must
 /// never be lost to an unrelated typo.
+#[derive(Debug, PartialEq, Eq)]
 enum ConfigSetting {
     Set(String),
     Absent,
@@ -1761,6 +1766,37 @@ mod tests {
             "absent section"
         );
         assert_eq!(read("[codex]\nother = 1\n"), None, "absent key");
+    }
+
+    /// What each state of the config file means for `[codex] app_server`.
+    ///
+    /// A missing file, and any read that finds nothing (a link to nowhere
+    /// too), is "not set"; anything present but unusable keeps Ainb's own
+    /// server, never the shared default.
+    #[test]
+    fn codex_app_server_follows_each_config_file_state() {
+        use super::ConfigSetting::{Absent, Set, Unreadable};
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        assert_eq!(super::codex_app_server_in(&path), Absent, "no file");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (text, want) in [
+            ("[codex]\napp_server = \"own\"\n", Set("own".into())),
+            ("[fleet]\nterminal = \"warp\"\n", Absent),
+            ("[codex]\napp_server = \"\"\n", Unreadable),
+            ("[codex]\napp_server = 1\n", Unreadable),
+            ("[codex\napp_server = \"own\"\n", Unreadable),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(super::codex_app_server_in(&path), want, "{text:?}");
+        }
+
+        let linked = home.path().join("linked.toml");
+        std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
+        assert_eq!(super::codex_app_server_in(&linked), Absent, "a link to nowhere");
+        let directory = home.path().join("directory.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        assert_eq!(super::codex_app_server_in(&directory), Unreadable, "a directory");
     }
 
     /// The resolver's value semantics.
