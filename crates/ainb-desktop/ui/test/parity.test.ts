@@ -132,11 +132,26 @@ test("the page's edit policy is the reducer's, row for row", () => {
   assert.deepEqual(wrong, [], "rows where the page and the reducer disagree");
 });
 
-test("every refusal the page draws is the reducer's own sentence", () => {
+/** Each `pub const NAME: &str = "...";` in `source`, by NAME. The sentences
+ * are plain text, so the Rust literal reads as a JSON string. */
+function rustStrConsts(source: string): Record<string, string> {
+  const consts: Record<string, string> = {};
+  for (const [, name, literal] of source.matchAll(/pub const ([A-Z_]+): &str =\s*("(?:[^"\\]|\\.)*");/g)) {
+    consts[name] = JSON.parse(literal);
+  }
+  return consts;
+}
+
+test("every refusal the page draws is the reducer's own sentence, under the same name", () => {
   // The page keeps a copy of each reason to draw a row inert without a round
-  // trip; `renderer_edit.rs` is where they are written.
-  const reducer = readFileSync(join(PARITY_DIR, "../../src/config/renderer_edit.rs"), "utf8");
-  for (const reason of [DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON]) {
-    assert.ok(reducer.includes(JSON.stringify(reason)), `renderer_edit.rs does not say: ${reason}`);
+  // trip; `renderer_edit.rs` is where they are written. Bound name to name,
+  // so two sentences swapped on either side fail here, not only in the
+  // page's own tests.
+  const reducer = rustStrConsts(readFileSync(join(PARITY_DIR, "../../src/config/renderer_edit.rs"), "utf8"));
+  const page: Record<string, string> = { DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON };
+  const rustReasons = Object.keys(reducer).filter((name) => name.endsWith("_REASON"));
+  assert.deepEqual(rustReasons.sort(), Object.keys(page).sort(), "the page copies every reason the reducer gives, and no other");
+  for (const [name, sentence] of Object.entries(page)) {
+    assert.equal(sentence, reducer[name], `settings.ts's ${name} is not renderer_edit.rs's ${name}`);
   }
 });
