@@ -831,7 +831,8 @@ impl DaemonClient {
     /// The daemon runs the CLI's own create path, which waits up to 30s for
     /// the agent's input box before sending the first prompt and bounds the
     /// whole run at 120s, so this call waits longer than the default. A daemon
-    /// without the spawn switch answers `METHOD_NOT_FOUND`.
+    /// started with `AINB_HANGAR_SPAWN=0`, or older than the verb, answers
+    /// `METHOD_NOT_FOUND`.
     pub async fn worktree_create(
         &self,
         params: &ainb_hangar_proto::spawn::WorktreeCreateParams,
@@ -843,8 +844,9 @@ impl DaemonClient {
     /// Add one agent session to an existing worktree (`worktree/agent_add`).
     ///
     /// The same CLI run as [`Self::worktree_create`] without the git work,
-    /// bounded the same way, so it waits as long. A daemon without the spawn
-    /// switch answers `METHOD_NOT_FOUND`.
+    /// bounded the same way, so it waits as long. A daemon started with
+    /// `AINB_HANGAR_SPAWN=0`, or older than the verb, answers
+    /// `METHOD_NOT_FOUND`.
     pub async fn worktree_agent_add(
         &self,
         params: &ainb_hangar_proto::spawn::WorktreeAgentAddParams,
@@ -858,8 +860,8 @@ impl DaemonClient {
     }
 
     /// Open a plain shell tmux session in a repository or an ainb worktree
-    /// (`shell/create`). A daemon without the spawn switch answers
-    /// `METHOD_NOT_FOUND`.
+    /// (`shell/create`). A daemon started with `AINB_HANGAR_SPAWN=0`, or
+    /// older than the verb, answers `METHOD_NOT_FOUND`.
     pub async fn shell_create(
         &self,
         params: &ainb_hangar_proto::spawn::ShellCreateParams,
@@ -868,7 +870,8 @@ impl DaemonClient {
     }
 
     /// The shells the daemon opened that are still running (`shell/list`).
-    /// A daemon without the spawn switch answers `METHOD_NOT_FOUND`.
+    /// A daemon started with `AINB_HANGAR_SPAWN=0`, or older than the verb,
+    /// answers `METHOD_NOT_FOUND`.
     pub async fn shell_list(
         &self,
     ) -> Result<ainb_hangar_proto::spawn::ShellListResult, DaemonError> {
@@ -880,7 +883,8 @@ impl DaemonClient {
     }
 
     /// End one shell the daemon opened, by its exact name (`shell/close`).
-    /// A daemon without the spawn switch answers `METHOD_NOT_FOUND`.
+    /// A daemon started with `AINB_HANGAR_SPAWN=0`, or older than the verb,
+    /// answers `METHOD_NOT_FOUND`.
     pub async fn shell_close(
         &self,
         params: &ainb_hangar_proto::spawn::ShellCloseParams,
