@@ -174,6 +174,13 @@ test("closing the shown tab shows the one shown before it, as Orca does", () => 
   assert.equal(tabAfterClose(strip("a", "b", "c"), strip("b", "c"), back, "a"), "b");
 });
 
+test("the tab shown before wins over the strip's first and both neighbours", () => {
+  // a b c d e open, b then d shown: closing d goes back to b, which is none of
+  // a (the strip's first), c (its left) or e (its right).
+  const recent = visited(visited([], "b"), "d");
+  assert.equal(tabAfterClose(strip("a", "b", "c", "d", "e"), strip("a", "b", "c", "e"), recent, "d"), "b");
+});
+
 test("with no other tab shown yet, closing one shows its right neighbour, else its left", () => {
   assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a", "c"), ["b"], "b"), "c");
   assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a", "b"), ["c"], "c"), "b");
