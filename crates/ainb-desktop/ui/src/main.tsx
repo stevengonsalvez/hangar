@@ -53,6 +53,8 @@ import {
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
 import { Composer } from "./composer.tsx";
+import { createDeleteFlow } from "./delete_dialog.ts";
+import { DeleteDialog } from "./delete_dialog.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { runRowPick } from "./row_menu.ts";
 import { Titlebar } from "./titlebar.tsx";
@@ -219,7 +221,7 @@ function Shell() {
    */
   const focusTab = (key: string, byHost: boolean) =>
     requestAnimationFrame(() => {
-      if (terminalMayTakeFocus({ palette: palette(), composer: composer.open(), byHost, active: document.activeElement })) {
+      if (terminalMayTakeFocus({ palette: palette(), composer: modalOpen(), byHost, active: document.activeElement })) {
         focusers.get(key)?.();
       }
     });
@@ -509,6 +511,10 @@ function Shell() {
     sessions: () => sessions(),
     select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
   });
+  // The row menu's Delete: a confirmation first, then the host's delete.
+  const deletion = createDeleteFlow({ toast: (message) => toast(message) });
+  /** A modal owns the keyboard: the composer, or the delete confirmation. */
+  const modalOpen = () => composer.open() || deletion.target() !== null;
 
   /** The Needs you card the last Cmd+U revealed, so the next press moves on. */
   let jumped: string | null = null;
@@ -545,7 +551,10 @@ function Shell() {
   const onAccelerator = (shell: Accelerator) => {
     // A modal owns the keyboard: no chord may switch or close a tab, or focus
     // a terminal, behind the open composer.
-    if (modalBlocks(shell, composer.open())) return;
+    if (modalBlocks(shell, modalOpen())) return;
+    // Under the delete confirmation not even the chords the composer lets
+    // through run: Mod+N would open a second modal over it.
+    if (deletion.target() !== null) return;
     switch (shell.kind) {
       case "tab": {
         const tab = inView()[shell.index];
@@ -605,7 +614,7 @@ function Shell() {
 
   // The accelerators work outside a terminal too; a terminal marks the ones
   // it handled, so they do not run twice.
-  const onKey = shellKeydown({ mac: MAC, modalOpen: () => composer.open(), run: onAccelerator });
+  const onKey = shellKeydown({ mac: MAC, modalOpen, run: onAccelerator });
   window.addEventListener("keydown", onKey);
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
@@ -741,12 +750,13 @@ function Shell() {
 
   return (
     <main class="shell">
-      {/* Everything but the composer and the toasts: inert while the
-          composer is open, so neither a click nor Tab can reach the shell
-          behind the modal. `display: contents` keeps the layout. */}
+      {/* Everything but the modals and the toasts: inert while the
+          composer or the delete confirmation is open, so neither a click nor
+          Tab can reach the shell behind the modal. `display: contents` keeps
+          the layout. */}
       <div
         class="shell-content"
-        ref={(element) => createEffect(() => element.toggleAttribute("inert", composer.open()))}
+        ref={(element) => createEffect(() => element.toggleAttribute("inert", modalOpen()))}
       >
         <Titlebar
           mac={MAC}
@@ -808,6 +818,7 @@ function Shell() {
                 run: (intents) => void answer(intents),
                 copy: (text) => void invoke("clipboard_write", { text }),
                 reselect: shownRowIntents,
+                confirmDelete: deletion.open,
               })
             }
             ref={(element) => (sidebar = element)}
@@ -1035,6 +1046,16 @@ function Shell() {
           onSubmit={composer.submit}
           onClose={composer.closeComposer}
         />
+      </Show>
+      <Show when={deletion.target()}>
+        {(target) => (
+          <DeleteDialog
+            target={target()}
+            state={deletion.state()}
+            onConfirm={deletion.confirm}
+            onClose={deletion.close}
+          />
+        )}
       </Show>
       <div class="toasts" aria-live="polite">
         <Show when={updateLine(updatePhase())}>{(line) => <div class="toast update-status">{line()}</div>}</Show>
