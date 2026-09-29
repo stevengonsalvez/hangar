@@ -21,7 +21,7 @@ use ainb_app::app::state::AppState;
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
 use ainb_hangar_proto::spawn::{
-    REPO_NOT_REGISTERED, ShellCloseParams, ShellCreateParams, ShellCreateResult,
+    REPO_NOT_REGISTERED, SPAWN_STARTED, ShellCloseParams, ShellCreateParams, ShellCreateResult,
 };
 use uuid::Uuid;
 
@@ -104,6 +104,12 @@ pub fn refusal_text(verb: Verb, error: &DaemonError) -> String {
         DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
             format!("{doing} failed: the daemon refused it: {message}")
         }
+        // tmux ran and did not settle: the shell may exist. The op id is
+        // spent, so a new press is a new shell, and a shell that did appear
+        // comes back as a tab on the next launch (`shell/list`).
+        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => format!(
+            "{doing} did not finish: {message}. If it appears, it opens as a tab on the next launch."
+        ),
         DaemonError::Rpc { message, .. } => format!("{doing} failed: {message}"),
         DaemonError::Timeout(_) => format!("{doing} failed: the daemon did not answer in time."),
         other => format!("{doing} failed: the daemon is not reachable: {other}"),
@@ -271,6 +277,20 @@ mod tests {
             message: "tmux could not start the shell".into(),
         };
         assert!(refusal_text(Verb::Open, &failed).ends_with("tmux could not start the shell"));
+        // tmux may have made the shell: not a failure, and not one to retry.
+        let started = DaemonError::Rpc {
+            code: SPAWN_STARTED,
+            message: "tmux did not answer within 10s; the shell may still appear as \
+                      ainb-dsh-0123abcd"
+                .into(),
+        };
+        let text = refusal_text(Verb::Open, &started);
+        assert!(!text.contains("failed"), "{text}");
+        assert!(
+            text.contains("may still appear as ainb-dsh-0123abcd"),
+            "{text}"
+        );
+        assert!(text.contains("next launch"), "{text}");
         let slow = DaemonError::Timeout(std::time::Duration::from_secs(30));
         assert!(refusal_text(Verb::Open, &slow).contains("did not answer in time"));
     }
