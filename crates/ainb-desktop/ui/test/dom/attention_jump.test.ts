@@ -4,9 +4,9 @@
 // does; anywhere else it shows the agent's tab, opening it when none is open.
 // Pressed again it moves down the column and wraps. From Settings it leaves
 // the page first (`answer_home`), so the host's screen gate refuses nothing.
-// With nothing waiting it does nothing and says nothing, as Orca's reveal
-// (`orca:src/renderer/src/components/dashboard/reveal-dashboard-agent.ts:13-22`)
-// returns without a word when there is nothing to reveal.
+// An ACP agent, which has no session row, opens its transcript. With nothing
+// waiting it sends nothing and toasts "Nobody needs you": Orca has no such
+// chord, so there is no silence to match, and a dead chord reads as broken.
 
 import "./window.ts";
 
@@ -68,8 +68,9 @@ const fleetBody = {
   attention_elsewhere: 0,
 };
 
-/** The host's agent status: `waiting` lists the provider ids blocked on a human. */
-function statusBody(waiting: string[]) {
+/** The host's agent status: `waiting` lists the provider ids blocked on a
+ * human; `acpWaiting` adds an ACP agent (no session row) blocked on one too. */
+function statusBody(waiting: string[], acpWaiting = false) {
   const card = (id: string) => ({
     session_key: `claude:${id}`,
     provider: "claude",
@@ -91,7 +92,10 @@ function statusBody(waiting: string[]) {
       received_at_ms: 1,
       head_revision: host.version,
       health: { kind: "live" },
-      cards: ["p-1", "p-2", "p-3"].map(card),
+      cards: [
+        ...["p-1", "p-2", "p-3"].map(card),
+        ...(acpWaiting ? [{ ...card("acp-1"), session_key: "acp:acp-1", provider: "acp", state: "waiting" }] : []),
+      ],
     },
   };
 }
@@ -280,19 +284,40 @@ test("with Settings open, Cmd+U leaves Settings first, and nothing is refused", 
   }
 });
 
-test("with nothing waiting, Cmd+U does nothing and says nothing", async () => {
+test("an ACP agent waiting on you, which has no session row, opens its transcript", async () => {
+  host.frames?.onmessage({ frames: [frame("agent_status", statusBody([], true))] });
+  await until(() => document.querySelector(".statusbar-needs")?.textContent === "1 need you", "the ACP agent in Needs you");
+  assert.equal(document.querySelector(".acp-card"), null, "no transcript before the press");
+  host.sent = [];
+  pressAttention();
+  await until(() => document.querySelector(".acp-card") !== null, "the ACP transcript card");
+  assert.equal(document.querySelector(".transcript-tab .tab-title")?.textContent, "acp:acp-1");
+  assert.equal(shownTerminal(), undefined, "the transcript holds the work area, not a terminal");
+  await drain();
+  assert.deepEqual(host.sent[0], { id: "answer_home" }, "home before the transcript is asked for");
+  assert.deepEqual(refusals(), []);
+  document.querySelector<HTMLElement>(".acp-close")!.click();
+  await until(() => document.querySelector(".acp-card") === null, "the transcript closed");
+});
+
+test("with nothing waiting, Cmd+U sends nothing and says so once", async () => {
   host.frames?.onmessage({ frames: [frame("agent_status", statusBody([]))] });
   await until(() => document.querySelector(".statusbar-needs") === null, "the footer to say nobody needs you");
+  const nobody = () => toasts().filter((text) => text === "Nobody needs you").length;
+  const before = toasts().length;
+  document.querySelector<HTMLElement>(".tab[data-state] .tab-title")!.click();
+  await until(() => shownTerminal() !== undefined, "a terminal shown");
+  await drain();
   const shown = shownTerminal();
-  const before = toasts();
   host.sent = [];
   pressAttention();
   await drain();
   assert.deepEqual(host.sent, [], "nothing sent");
   assert.equal(shownTerminal(), shown, "the same terminal still shown");
-  assert.deepEqual(toasts(), before, "no toast");
+  assert.equal(toasts().length, before + 1, "exactly one toast");
+  assert.equal(nobody(), 1, "and it says nobody needs you");
 
-  // The board too: no card takes focus.
+  // The board too: no card takes focus, and one more toast says the same.
   document.querySelector<HTMLElement>(".board-tab .tab-title")!.click();
   await until(() => boardShown() && needsCount() === "0", "the board with Needs you empty");
   host.sent = [];
@@ -300,5 +325,6 @@ test("with nothing waiting, Cmd+U does nothing and says nothing", async () => {
   await drain();
   assert.deepEqual(host.sent, []);
   assert.equal(focusedCard(), undefined);
-  assert.deepEqual(toasts(), before);
+  assert.equal(toasts().length, before + 2);
+  assert.equal(nobody(), 2);
 });
