@@ -165,6 +165,7 @@ body {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  overflow: hidden;
   padding: 0 4px;
   background: transparent;
   border: 0;
@@ -194,6 +195,16 @@ body {
 
 .statusbar-usage-warn {
   color: var(--gold);
+}
+
+/* A provider name can run to 120 characters on the wire: cut it, never the
+   figure beside it. */
+.statusbar-usage-provider {
+  display: inline-block;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
 }
 
 .banner {
