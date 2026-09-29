@@ -36,6 +36,20 @@ export interface DeleteCopy {
   confirm: string;
   /** Whether the confirm button may be pressed yet. */
   ready: boolean;
+  /** Dirty or uncounted work goes with the tree: Orca's Force Delete
+   * (`DeleteWorktreeDialogFooter.tsx:39-40`), and Cancel takes the keyboard
+   * so Enter never wipes it by reflex. */
+  force: boolean;
+}
+
+/** Whether deleting now takes work: a tree that goes holds uncommitted
+ * changes, or git could not count them. */
+export function forcesDelete(state: PreviewState): boolean {
+  return (
+    state.kind === "ready" &&
+    state.preview.tree === "removed" &&
+    (state.preview.changes === null || state.preview.changes > 0)
+  );
 }
 
 /** Orca's dirty line (`DeleteWorktreeDirtyChangeHint.tsx:15-18`) for
@@ -60,6 +74,7 @@ export function deleteCopy(name: string, state: PreviewState): DeleteCopy {
     after: " from git and delete its workspace folder.",
     confirm: "Delete Workspace",
     ready: true,
+    force: false,
   };
   if (state.kind === "checking") {
     return { ...removed, title: "Delete", before: "Checking what deleting ", after: " removes…", confirm: "Delete", ready: false };
@@ -72,7 +87,7 @@ export function deleteCopy(name: string, state: PreviewState): DeleteCopy {
   }
   switch (state.preview.tree) {
     case "removed":
-      return removed;
+      return forcesDelete(state) ? { ...removed, confirm: "Force Delete", force: true } : removed;
     case "shared":
       return {
         ...removed,
@@ -109,12 +124,23 @@ export interface DeleteTarget {
   path: string;
 }
 
+/** What the person confirmed, sent with the delete: the host counts again
+ * right before removing, and refuses if the fate moved or new changes
+ * appeared (a live agent still writing), forced or not. */
+export interface Confirmed {
+  expected: TreeFate;
+  /** The changes the dialog showed, `null` when uncounted. */
+  expectedChanges: number | null;
+  /** The person pressed Force Delete: shown dirty or uncounted work may go. */
+  force: boolean;
+}
+
 export interface DeleteFlowDeps {
   /** The host's `session_delete_preview`. */
   preview?(sessionId: string): Promise<DeletePreview>;
   /** The host's `session_delete`: the terminal's own delete, refused by the
-   * host unless what it removes is still `expected`, what the dialog said. */
-  remove?(sessionId: string, expected: TreeFate): Promise<void>;
+   * host unless what it removes is still what the dialog said. */
+  remove?(sessionId: string, confirmed: Confirmed): Promise<void>;
   /** Say a failed delete. */
   toast(text: string): void;
 }
@@ -133,7 +159,8 @@ export interface DeleteFlow {
 export function createDeleteFlow(deps: DeleteFlowDeps): DeleteFlow {
   const preview = deps.preview ?? ((id: string) => invoke<DeletePreview>("session_delete_preview", { sessionId: id }));
   const remove =
-    deps.remove ?? ((id: string, expected: TreeFate) => invoke<void>("session_delete", { sessionId: id, expected }));
+    deps.remove ??
+    ((id: string, confirmed: Confirmed) => invoke<void>("session_delete", { sessionId: id, ...confirmed }));
   const [target, setTarget] = createSignal<DeleteTarget | null>(null);
   const [state, setState] = createSignal<PreviewState>({ kind: "checking" });
   // Each opening's own token: a late answer for an earlier opening is dropped.
@@ -158,7 +185,12 @@ export function createDeleteFlow(deps: DeleteFlowDeps): DeleteFlow {
       if (at === null || now.kind !== "ready") return;
       opening += 1;
       setTarget(null);
-      remove(at.sessionId, now.preview.tree).catch((error: unknown) => deps.toast(String(error)));
+      const confirmed: Confirmed = {
+        expected: now.preview.tree,
+        expectedChanges: now.preview.changes,
+        force: forcesDelete(now),
+      };
+      remove(at.sessionId, confirmed).catch((error: unknown) => deps.toast(String(error)));
     },
     close() {
       opening += 1;
