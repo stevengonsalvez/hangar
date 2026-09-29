@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "ainb"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-acp",
  "ainb-app",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-app"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-cli",
  "ainb-fleet-core",
@@ -472,7 +472,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-hangar-daemon"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "agent-client-protocol",
  "ainb-acp",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-plugin-cts-v2"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-hangar-core",
  "ainb-hangar-secrets",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-plugin-hangar"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-hangar-core",
  "ainb-hangar-proto",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-plugin-notifyd"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-hangar-core",
  "ainb-hangar-proto",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "ainb-web"
-version = "1.28.2"
+version = "1.29.0-rc1"
 dependencies = [
  "ainb-app",
  "ainb-hangar-client",

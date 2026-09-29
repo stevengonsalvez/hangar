@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: `ainb run --existing-worktree` no longer auto-imports MCP servers from the worktree's `.mcp.json` into the shared pool; it pools only servers already in ainb's config. The first agent in a tree may have written that file, possibly with its permission prompts skipped
 - **daemon**: `shell/list` and `shell/close` read a shell's `@ainb_owner` option from the session only, so a global `set -g @ainb_owner daemon` no longer marks every `ainb-dsh-` session as the daemon's
 
+## [1.29.0] - Unreleased
+### Changed
+- **release**: releases now come from https://github.com/stevengonsalvez/hangar. The update manifest, the curated catalog index, the Fleet appcast and `install.sh` all fetch from hangar, and cargo-owned installs build from hangar's tag
+- **release**: installed copies of 1.28.x move to hangar on their next `ainb update`, through a one-time bridge release in the old repository
+
+### Added
+- **desktop**: the first release of the ainb desktop app, one bundle per platform (macOS Apple Silicon and Intel `.dmg`, Linux x86_64 `.AppImage` and `.deb`), each carrying its hangar daemon sidecar and updated through the signed release manifest
+
+
 ## [1.28.5] - 2026-09-13
 ### Fixed
 - expire stale sidebar run state
