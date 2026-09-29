@@ -10,11 +10,10 @@ import "./window.ts";
 
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import xterm from "@xterm/xterm";
+// `npm run test:dom` resolves xterm to its ES module build (`solid-dom.mjs`),
+// which has named exports only, the same way `terminal.tsx` imports it.
+import { Terminal } from "@xterm/xterm";
 import { TERMINAL_THEMES, terminalAppearance, type Theme } from "../../src/theme/theme.ts";
-
-// The package is CommonJS; under Node its named export is on the default.
-const { Terminal } = xterm as unknown as typeof import("@xterm/xterm");
 
 /** WCAG 2 relative luminance of a `#rrggbb` colour. */
 function luminance(hex: string): number {
