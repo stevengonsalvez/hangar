@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **cli**: `ainb run --existing-worktree <PATH>` is listed in `ainb run --help`: start one more agent in a worktree ainb created, on the branch it already has
 
 ### Changed
+- **daemon**: once `worktree/create` or `worktree/agent_add` has started `ainb run`, an outcome with no session (the run outlived its bound, failed, or printed no session) answers `SPAWN_STARTED` (-32011) instead of `-32603`, and so does a `shell/create` whose tmux may have made the shell (it did not answer in time, or failed after running). The mutation ledger records it: a retry with the same op id replays the answer instead of starting a second run or shell. `-32603` now means nothing was started
 - the session list (TUI and desktop) is now ordered newest first: projects and worktrees by their newest session, a worktree's sessions kept together, instead of tmux's alphabetical order; next/previous session walk the same order
 - **daemon**: `worktree/agent_add` and `shell/create` answer `REPO_NOT_REGISTERED` (-32010) for a repository outside every registered folder, as `worktree/create` does, instead of `INVALID_PARAMS`. That refusal leaves the request's op id free, so the same request retried after adding the project runs
 - **auth**: a claude login that exists only as `CLAUDE_CODE_OAUTH_TOKEN` exported in your shell no longer reaches agents the daemon starts, or agents started through ainb's tmux sessions (TUI and `ainb run`). A keychain or `~/.claude` login is unaffected (#216)
