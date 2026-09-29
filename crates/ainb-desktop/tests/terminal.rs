@@ -818,3 +818,22 @@ fn more_visible_panes_than_the_cap_are_all_kept_until_they_leave() {
     assert_eq!(state_of(&terminals, &names[0]), Some(TabState::Detached));
     assert_eq!(state_of(&terminals, &names[1]), Some(TabState::Detached));
 }
+
+/// A closed tab leaves the set in view: opened again under the same key, it
+/// is not in view until the webview names it.
+#[test]
+fn a_closed_tab_leaves_the_visible_set() {
+    let server = Server::new();
+    let (terminals, _recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(&server, &terminals, "d1c-gone", 2, 2);
+    assert!(terminals.set_visible(names.clone()));
+
+    terminals.close(&names[0]);
+    assert_eq!(terminals.open(tmux_tab(&names[0])), None);
+
+    assert!(
+        !terminals.showing(&names[0]),
+        "the reopened tab is not in view"
+    );
+    assert!(terminals.showing(&names[1]), "the other pane stays in view");
+}

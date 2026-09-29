@@ -704,6 +704,7 @@ impl Terminals {
         };
         let tab = tabs.remove(index);
         tab.flow.close();
+        self.forget_in_view(key);
         self.report(reports::attach_finished(
             &tab.target.attached_to(),
             &AttachOutcome::Detached,
@@ -898,11 +899,18 @@ impl Terminals {
         let tab = tabs.remove(index);
         tab.flow.close();
         let key = tab.target.tmux();
+        self.forget_in_view(key);
         self.inner.events.toast(format!("{key} ended; its tab closed"));
         reports::attach_finished(
             &tab.target.attached_to(),
             &AttachOutcome::TargetMissing(format!("tmux session `{key}` ended")),
         )
+    }
+
+    /// A tab that goes leaves the set in view with it, so a tab opened later
+    /// under the same key is not in view until the webview says so.
+    fn forget_in_view(&self, key: &str) {
+        lock(&self.inner.in_view).keys.remove(key);
     }
 
     fn report(&self, report: Intent) {
