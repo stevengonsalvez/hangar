@@ -4,8 +4,8 @@ interface Props {
   /** macOS draws traffic lights over the window's own top-left corner: the
    * bar pads around them instead of drawing the app name under them. */
   mac: boolean;
-  /** Open (or close) the command palette; the same action the
-   * Cmd/Ctrl+Shift+K accelerator sends. */
+  /** Open (or close) the command palette; the same action the Cmd+J
+   * (Ctrl+Shift+J) accelerator sends. */
   onSearch(): void;
   searchOpen: boolean;
   inboxOpen: boolean;
@@ -37,7 +37,7 @@ export function Titlebar(props: Props) {
         <button
           type="button"
           class="titlebar-search"
-          title="Search"
+          title={`Search (${props.mac ? "Cmd+J" : "Ctrl+Shift+J"})`}
           aria-label="Search"
           aria-pressed={props.searchOpen}
           onClick={() => props.onSearch()}
