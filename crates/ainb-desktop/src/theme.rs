@@ -103,6 +103,16 @@ impl Theme {
     }
 }
 
+/// The native window's background for `preference` while the window shows
+/// `shown` (under a System pick, the OS's own theme): the page's
+/// `--background` for the theme that resolves to. Every native paint takes its
+/// colour from here, whether a pick, the launch, or the OS switching theme
+/// under a System pick.
+#[must_use]
+pub fn window_paint(preference: ThemePreference, shown: Theme) -> [u8; 3] {
+    preference.resolve(shown).background()
+}
+
 /// The stored pick, or System when the file is missing, unreadable, or holds
 /// anything else: the page's own fallback (`readPreference`).
 #[must_use]
@@ -182,7 +192,7 @@ mod tests {
             let resolved = preference.resolve(system);
             assert_eq!(resolved, painted, "{preference:?} on a {system:?} OS");
             assert_eq!(
-                resolved.background(),
+                window_paint(preference, system),
                 background,
                 "{preference:?} on a {system:?} OS"
             );
