@@ -1,7 +1,7 @@
 import { NO_SESSION } from "./shell_tab.ts";
 
 interface Props {
-  /** Whether a session is selected, whose worktree the terminal opens in. */
+  /** Whether there is a worktree to open in (`worktreeTarget`). */
   ready: boolean;
   mac: boolean;
   onOpen(): void;
