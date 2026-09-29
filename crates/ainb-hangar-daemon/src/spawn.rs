@@ -79,8 +79,15 @@ pub enum SpawnError {
     /// layer answers [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] by
     /// type, whatever the message says.
     Unregistered(String),
-    /// `ainb run` ran and failed, or could not be run at all.
+    /// Nothing was started: `ainb run` could not be run at all, or tmux
+    /// could not make a shell.
     Failed(String),
+    /// `ainb run` was started and did not hand back a session: it outlived
+    /// the bound, its wait was lost, it failed, or its output was not a
+    /// session. The run settles its own effects, so the RPC layer answers
+    /// [`ainb_hangar_proto::spawn::SPAWN_STARTED`], which the ledger records:
+    /// a retry under the same op id must never start a second run.
+    Started(String),
 }
 
 /// The `ainb run` argument vector for `params`. Pure, so the mapping is
@@ -407,7 +414,7 @@ fn resolve_worktree(
         SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
-        failed @ SpawnError::Failed(_) => failed,
+        fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => fault,
     })?;
     Ok(canonical)
 }
@@ -441,8 +448,9 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 /// that is not a directory or not the top of a git repository, or a `branch`
 /// that already exists. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, or
-/// `ainb run` could not be started, failed, outlived the bound, or printed
-/// no result it could read.
+/// `ainb run` could not be started. [`SpawnError::Started`] when it was
+/// started and failed, outlived the bound, or printed no result it could
+/// read.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -474,8 +482,8 @@ pub async fn worktree_create(
 /// [`managed_worktrees`], not the top of a linked worktree, or whose source
 /// repository is otherwise refused. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, the
-/// worktree check could not finish, or `ainb run` failed as for
-/// [`worktree_create`].
+/// worktree check could not finish, or `ainb run` could not be started;
+/// [`SpawnError::Started`] as for [`worktree_create`].
 pub async fn worktree_agent_add(
     params: &WorktreeAgentAddParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -548,7 +556,7 @@ fn resolve_shell_dir(
         let (tree_why, tree_unregistered) = match error {
             SpawnError::Invalid(why) => (why, false),
             SpawnError::Unregistered(why) => (why, true),
-            failed @ SpawnError::Failed(_) => return failed,
+            fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => return fault,
         };
         let why = format!(
             "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
@@ -889,8 +897,8 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let timeout = run_timeout();
     let status = match tokio::time::timeout(timeout, &mut wait).await {
         Ok(Ok(Ok(status))) => status,
-        Ok(Ok(Err(e))) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
-        Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
+        Ok(Ok(Err(e))) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
+        Ok(Err(e)) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
         Err(_) => {
             // Nobody is waiting on the answer any more, so the run's own
             // outcome goes to the log, where an operator can find it.
@@ -913,7 +921,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
                 }
                 drop(logs);
             });
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "`ainb run` is still running after {}s: {pending}; check the sidebar",
                 timeout.as_secs()
             )));
@@ -923,12 +931,12 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let stderr = logs.read_stderr();
     drop(logs);
     if !status.success() {
-        return Err(SpawnError::Failed(format!(
+        return Err(SpawnError::Started(format!(
             "`ainb run` failed: {}",
             stderr_tail(&stderr)
         )));
     }
-    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Failed)
+    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Started)
 }
 
 /// Where one `ainb run` writes its stdout and stderr: two files under the
