@@ -35,3 +35,10 @@ test("with nothing selected, or a selection the frame no longer lists, it asks t
   assert.deepEqual(emptyPaneView(view("gone")), { kind: "choose" });
   assert.deepEqual(emptyPaneView(undefined), { kind: "choose" });
 });
+
+test("with the workspace shell selected, no session is chosen, whatever id the frame names", () => {
+  // The same reading of the selection as the answer banner's (`selectedSession`):
+  // a shell selection is not a session, so there is none to open.
+  const shell = { ...view("s-1"), shell_selected: true } as unknown as SessionsView_Serialize;
+  assert.deepEqual(emptyPaneView(shell), { kind: "choose" });
+});

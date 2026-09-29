@@ -266,4 +266,12 @@ test("the settings page draws Appearance > Theme when it is given a setter", asy
   assert.equal(panel.querySelector<HTMLInputElement>('[data-theme-choice="dark"] input')?.checked, true);
   panel.querySelector<HTMLInputElement>('[data-theme-choice="light"] input')!.click();
   assert.deepEqual(picked, ["light"]);
+  // Above the settings rows: the TUI theme row's refusal points the person
+  // to "Settings > Appearance above".
+  const body = container.querySelector(".settings-body");
+  assert.ok(body, "the settings rows");
+  assert.ok(
+    panel.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING,
+    "Appearance is drawn below the settings rows",
+  );
 });

@@ -10,6 +10,7 @@ import type {
   SessionsView_Serialize,
   Workspace_Serialize,
 } from "../../../ainb-app/bindings/AppState";
+import { unhandled } from "./status.ts";
 
 /** Precedence, tightest first, as `AttentionKind`'s `Ord` in Rust. */
 export const ATTENTION_ORDER: readonly AttentionKind[] = ["Ask", "Wait", "Approve", "Err", "Done"];
@@ -37,10 +38,28 @@ export function rowStatus(status: SessionStatus): RowStatus {
     case "Stopped":
       return "stopped";
     // A host at another version may send a status this build does not know:
-    // said as unknown, not guessed.
+    // said as unknown, not guessed, and warned about once.
     default:
-      return "unknown";
+      return unhandled(status as never, "unknown");
   }
+}
+
+/**
+ * The session list row the reducer has selected, when it is a session.
+ *
+ * Resolved by the id the frame names against the rows it carries (#1180): the
+ * frame holds only the rows its filter shows, so an index into the reducer's
+ * full list would name the wrong one. No selection when the frame names none,
+ * or names a row it does not carry.
+ */
+export function selectedSession(view: SessionsView_Serialize | undefined): Session_Serialize | undefined {
+  const id = view?.selected_session_id;
+  if (view === undefined || id === null || id === undefined || view.shell_selected) return undefined;
+  for (const workspace of view.workspaces) {
+    const session = workspace.sessions.find((row) => row.id === id);
+    if (session !== undefined) return session;
+  }
+  return undefined;
 }
 
 /**

@@ -40,3 +40,11 @@ test("the answer banner is remounted when the shown terminal changes", () => {
   // session's question over the next pane for its grace.
   assert.match(MAIN, /<For each=\{\[shownSession\(\)\]\}>\s*\{\(\) => <AnswerSlot /);
 });
+
+test("closing the shown tab shows the tab Orca would, not the strip's first", () => {
+  const showTabs = body("showTabs", "const report = ");
+  assert.match(showTabs, /tabAfterClose\(before, view\.tabs, recent, active\(\)\)/);
+  assert.doesNotMatch(showTabs, /view\.tabs\[0\]/);
+  const activate = body("activate", "const [hostAnswers");
+  assert.match(activate, /recent = visited\(recent, key\);/, "every shown tab is remembered");
+});

@@ -20,10 +20,10 @@ import {
   questionFor,
   questionOver,
   type Refusal,
-  selectedSession,
   sendInOrder,
   typedIntents,
 } from "./answer.ts";
+import { selectedSession } from "./sessions.ts";
 
 function mark(over: Partial<AttentionMark_Serialize> = {}): AttentionMark_Serialize {
   return {

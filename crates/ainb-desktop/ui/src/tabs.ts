@@ -247,3 +247,35 @@ export function stepTab(tabs: readonly Tab[], current: string | null, step: numb
   const from = at < 0 ? 0 : at;
   return tabs[(from + step + tabs.length) % tabs.length].key;
 }
+
+/** `recent` with `key` moved to its end, the most recently shown. */
+export function visited(recent: readonly string[], key: string): string[] {
+  return [...recent.filter((one) => one !== key), key];
+}
+
+/**
+ * The tab to show once `closing`, the shown tab, has left the strip `before`
+ * for `after`, picked as Orca picks it
+ * (`orca:src/renderer/src/store/slices/tab-group-state.ts:136-152`): the most
+ * recently shown tab still open (`recent`, oldest first), else the closed
+ * tab's right neighbour, else its left. With no shown tab to go from, the
+ * strip's first.
+ */
+export function tabAfterClose(
+  before: readonly Tab[],
+  after: readonly Tab[],
+  recent: readonly string[],
+  closing: string | null,
+): string | null {
+  const open = new Set(after.map((tab) => tab.key));
+  const back = [...recent].reverse().find((key) => key !== closing && open.has(key));
+  if (back !== undefined) return back;
+  const at = before.findIndex((tab) => tab.key === closing);
+  if (at >= 0) {
+    const right = before.slice(at + 1).find((tab) => open.has(tab.key));
+    const left = before.slice(0, at).reverse().find((tab) => open.has(tab.key));
+    const neighbour = right ?? left;
+    if (neighbour !== undefined) return neighbour.key;
+  }
+  return after[0]?.key ?? null;
+}
