@@ -661,7 +661,22 @@ pub fn hangar_config(path: &std::path::Path) -> Result<Option<toml::Table>, Hang
     };
     text.parse()
         .map(Some)
-        .map_err(|error: toml::de::Error| HangarConfigError::Parse(format!("{error}")))
+        .map_err(|error| HangarConfigError::Parse(toml_error_at(&error, &text)))
+}
+
+/// `error` as its message and a 1-based line and column in `text`.
+///
+/// Never toml's own `Display`: it quotes the offending source line, and a
+/// token on that line would land in the daemon log.
+fn toml_error_at(error: &toml::de::Error, text: &str) -> String {
+    let Some(span) = error.span() else {
+        return error.message().to_string();
+    };
+    let before = &text.as_bytes()[..span.start.min(text.len())];
+    let line_start = before.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+    let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column = String::from_utf8_lossy(&before[line_start..]).chars().count() + 1;
+    format!("{} at line {line}, column {column}", error.message())
 }
 
 /// Why [`hangar_config`] has no table to give.
@@ -1828,10 +1843,37 @@ mod tests {
 
         let linked = home.path().join("linked.toml");
         std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
-        assert_eq!(super::codex_app_server_in(&linked), Absent, "a link to nowhere");
+        assert_eq!(
+            super::codex_app_server_in(&linked),
+            Absent,
+            "a link to nowhere"
+        );
         let directory = home.path().join("directory.toml");
         std::fs::create_dir_all(&directory).unwrap();
-        assert_eq!(super::codex_app_server_in(&directory), Unreadable, "a directory");
+        assert_eq!(
+            super::codex_app_server_in(&directory),
+            Unreadable,
+            "a directory"
+        );
+    }
+
+    /// A parse error names where it is and never what the line holds: the
+    /// description goes to the daemon log, and the bad line may carry a token.
+    #[test]
+    fn a_config_parse_error_does_not_quote_the_offending_line() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[codex]\napp_server = \"own\"\ntoken = \"sk-secret-123\n",
+        )
+        .unwrap();
+        let Err(super::HangarConfigError::Parse(description)) = super::hangar_config(&path) else {
+            panic!("an unterminated string is a parse error");
+        };
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert_eq!(description, "invalid basic string at line 3, column 23");
     }
 
     /// The resolver's value semantics.
