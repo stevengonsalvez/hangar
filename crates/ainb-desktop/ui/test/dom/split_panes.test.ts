@@ -256,3 +256,18 @@ test("the tab chords count tabs in the order the panes draw them", async () => {
   await until(() => visible().includes("b"), "the first drawn tab, b, shown");
   assert.ok(panes().some((pane) => pane.endsWith("*b!")));
 });
+
+test("a set the host refuses is warned about, not dropped in silence", async () => {
+  const warned: unknown[][] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => void warned.push(args);
+  host.refuse = true;
+  try {
+    // The second drawn tab shown in its pane: a new set, which the host refuses.
+    window.dispatchEvent(new window.KeyboardEvent("keydown", { code: "Digit2", key: "2", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    await until(() => warned.some((args) => String(args[0]).includes("refused")), "a warning for the refused set");
+  } finally {
+    console.warn = warn;
+    host.refuse = false;
+  }
+});

@@ -32,6 +32,9 @@ export const host = {
    * these only (`Terminals::showing`). */
   inView: [] as string[],
   named: false,
+  /** Answer the next visible sets `false`, as the real host refuses one of
+   * more than `MAX_VISIBLE_TABS` keys, keeping the set it had. */
+  refuse: false,
   calls: [] as { command: string; args: Record<string, unknown> }[],
   events: new Map<string, Callback[]>(),
 };
@@ -75,6 +78,7 @@ let nextCallback = 1;
         // Taken a moment later, as across the real IPC: a read that does not
         // wait for the set is answered against the one before it.
         await new Promise((resolve) => setTimeout(resolve, 50));
+        if (host.refuse) return false;
         host.inView = [...(args.keys as string[])];
         host.named = true;
         return true;

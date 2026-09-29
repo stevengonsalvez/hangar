@@ -117,8 +117,13 @@ export function Panes(props: Props) {
     { equals: (a, b) => a.length === b.length && a.every((key, at) => key === b[at]) },
   );
   createEffect(() => {
-    void setVisibleTerminals(onScreen()).catch((error: unknown) =>
-      console.warn("the terminals on screen did not reach the host", error),
+    const keys = onScreen();
+    setVisibleTerminals(keys).then(
+      (taken) => {
+        // More panes than the host takes: it keeps the set it had.
+        if (!taken) console.warn(`the host refused ${keys.length} terminals on screen; it keeps its last set`);
+      },
+      (error: unknown) => console.warn("the terminals on screen did not reach the host", error),
     );
   });
 
