@@ -598,3 +598,13 @@ session_filter = "all"
 #   hangar_daemon.autostandup.max_concurrent   int 1..64    (default 1)
 #   hangar_daemon.card_agent.default           claude|codex|copilot (default claude)
 #   hangar_daemon.workspace.creation_disabled  bool         (default false)
+#
+# One daemon switch IS read from this file (the user-level one only), once at
+# daemon boot: the spawn verbs opt-out (worktree/create, worktree/agent_add,
+# shell/create, shell/list, shell/close). `false` keeps them off; so does
+# AINB_HANGAR_SPAWN=0, and either one saying off wins. Any value other than
+# `true`, or a file that does not parse, also keeps them off. Takes a daemon
+# restart. `ainb config set` does not write it.
+#
+# [hangar]
+# spawn = false

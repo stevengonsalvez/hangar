@@ -3,8 +3,9 @@
 //! creates work through one owner.
 //!
 //! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are served
-//! by default. A daemon started with `AINB_HANGAR_SPAWN=0` answers
-//! `METHOD_NOT_FOUND`, as one older than the verbs does. Their params carry
+//! by default. A daemon started with `AINB_HANGAR_SPAWN=0`, or with
+//! `[hangar] spawn = false` in its hangar home's `config/config.toml`,
+//! answers `METHOD_NOT_FOUND`, as one older than the verbs does. Their params carry
 //! the D18 envelope, and every one that changes the host (all but
 //! `shell/list`) is in the mutation registry, so the ledger at dispatch makes
 //! a retried op id replay its first answer (the same worktree, agent or

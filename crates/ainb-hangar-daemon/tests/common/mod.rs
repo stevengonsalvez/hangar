@@ -69,6 +69,9 @@ pub fn private_host() {
         // test goes on.
         std::env::set_var("HOME", home);
         std::env::remove_var("AINB_HOME");
+        // The spawn file key lives under the hangar home: an exported one
+        // with `[hangar] spawn = false` would turn the verbs off here.
+        std::env::remove_var("AINB_HANGAR_HOME");
         std::env::set_var("TMUX_TMPDIR", tmux_dir);
         std::env::remove_var("TMUX");
         std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
