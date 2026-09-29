@@ -422,7 +422,7 @@ async fn a_repo_outside_every_registered_folder_is_refused() {
 }
 
 #[tokio::test]
-async fn a_failed_run_is_an_internal_error_with_the_cli_message() {
+async fn a_failed_run_is_answered_as_started_with_the_cli_message() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let tools = tempfile::tempdir().unwrap();
     let repo = Registered::new();
@@ -435,6 +435,13 @@ async fn a_failed_run_is_an_internal_error_with_the_cli_message() {
     .await;
 
     assert!(response.get("result").is_none(), "{response}");
+    // The run started, so its failure is recorded against an op id, not
+    // freed like an INTERNAL raised before anything ran.
+    assert_eq!(
+        response["error"]["code"].as_i64(),
+        Some(i64::from(ainb_hangar_proto::spawn::SPAWN_STARTED)),
+        "{response}"
+    );
     let message = response["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("Failed to create worktree"), "{response}");
 }
@@ -785,4 +792,160 @@ async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree(
             "nothing ran for {path}"
         );
     }
+}
+
+/// A fake `ainb` that appends one line per run to `runs.txt` (its argv, space
+/// joined), holds until `release` exists (ten seconds at most), then answers
+/// like a create that finished and writes `done.txt`.
+fn slow_ainb(dir: &Path, release: &Path) -> std::path::PathBuf {
+    let bin = dir.join("ainb");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{runs}'\n\
+             n=0; while [ ! -e '{release}' ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done\n\
+             printf '%s\\n' '{{\"session_id\":\"11111111-1111-4111-8111-111111111111\",\"tmux_session_name\":\"app-11111111\",\"worktree_path\":\"/w/app\",\"branch\":\"feat/x\",\"claude_session_id\":null}}'\n\
+             echo \"$*\" >> '{done}'\n",
+            runs = dir.join("runs.txt").display(),
+            release = release.display(),
+            done = dir.join("done.txt").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn lines_in(path: &Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Call `method` with `params` twice under one op id, against a run that
+/// outlives the bound; release it and wait for every run to end. Returns
+/// both answers and every run's argv.
+async fn time_out_twice(
+    tools: &Path,
+    method: &str,
+    params: serde_json::Value,
+) -> (serde_json::Value, serde_json::Value, Vec<String>) {
+    /// Puts the real bound back even if a call panics, so no later test in
+    /// this binary inherits the short one.
+    struct RealBound;
+    impl Drop for RealBound {
+        fn drop(&mut self) {
+            ainb_hangar_daemon::spawn::set_run_timeout_for_test(None);
+        }
+    }
+
+    let release = tools.join("release.txt");
+    switch_on(&slow_ainb(tools, &release));
+    let dir = tempfile::tempdir().unwrap();
+    let bound = RealBound;
+    ainb_hangar_daemon::spawn::set_run_timeout_for_test(Some(std::time::Duration::from_millis(
+        300,
+    )));
+    let first = call_in(dir.path(), method, params.clone()).await;
+    let retry = call_in(dir.path(), method, params).await;
+    drop(bound);
+    // A loaded host may not have run the first child's first line yet; its
+    // `runs.txt` line is what the count below is read from.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while lines_in(&tools.join("runs.txt")).is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    std::fs::write(&release, "").unwrap();
+    while lines_in(&tools.join("done.txt")).len() < lines_in(&tools.join("runs.txt")).len()
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    (first, retry, lines_in(&tools.join("runs.txt")))
+}
+
+fn assert_still_running(response: &serde_json::Value, what: &str) {
+    assert_eq!(
+        response["error"]["code"].as_i64(),
+        Some(i64::from(ainb_hangar_proto::spawn::SPAWN_STARTED)),
+        "{what}: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("still running")),
+        "{what}: {response}"
+    );
+}
+
+/// A create that outlives the bound has started `ainb run`, which keeps
+/// going and may yet make the worktree. That is the op id's answer: a retry
+/// under the same op id hears it again and never starts a second run (a
+/// second branch and worktree).
+#[tokio::test]
+async fn a_timed_out_create_keeps_its_op_id_and_runs_once() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+
+    let (first, retry, runs) = time_out_twice(
+        tools.path(),
+        m::WORKTREE_CREATE,
+        serde_json::json!({
+            "repo_path": repo.repo(),
+            "agent": "claude",
+            "op_id": "op-slow-create",
+        }),
+    )
+    .await;
+
+    assert_eq!(runs.len(), 1, "one op id, one `ainb run`: {runs:?}");
+    assert!(
+        runs[0].starts_with("--format json run --worktree"),
+        "{runs:?}"
+    );
+    assert_still_running(&first, "the first call");
+    assert_still_running(&retry, "the retry");
+    assert_eq!(
+        retry["error"]["data"][ainb_hangar_proto::mutation::ACK_KEY]["outcome"],
+        "replayed",
+        "{retry}"
+    );
+}
+
+/// As for a create: an agent add that outlives the bound is answered, and
+/// the retry under its op id starts no second agent in the tree.
+#[tokio::test]
+async fn a_timed_out_agent_add_keeps_its_op_id_and_runs_once() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let registered = Registered::new();
+    let tree =
+        registered.managed_worktree(Path::new(&registered.repo()), "app--feat--5e6f7a8b", "feat");
+
+    let (first, retry, runs) = time_out_twice(
+        tools.path(),
+        m::WORKTREE_AGENT_ADD,
+        serde_json::json!({
+            "worktree_path": tree,
+            "agent": "codex",
+            "op_id": "op-slow-agent-add",
+        }),
+    )
+    .await;
+
+    assert_eq!(runs.len(), 1, "one op id, one `ainb run`: {runs:?}");
+    assert!(
+        runs[0].starts_with("--format json run --existing-worktree"),
+        "{runs:?}"
+    );
+    assert_still_running(&first, "the first call");
+    assert_still_running(&retry, "the retry");
+    assert_eq!(
+        retry["error"]["data"][ainb_hangar_proto::mutation::ACK_KEY]["outcome"],
+        "replayed",
+        "{retry}"
+    );
 }
