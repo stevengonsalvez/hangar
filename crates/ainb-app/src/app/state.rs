@@ -5835,6 +5835,12 @@ impl AppState {
         // session, so a stopped row keeps the same "<label> · <branch>" the
         // running row had instead of dropping back to a bare branch.
         session.display_name = labels.get(&metadata.tmux_session_name).cloned();
+        // The id the agent was launched under, as the live row projects it
+        // (`InteractiveSession::to_session_model`). Without it an agent that
+        // exited, and so left no tmux session, cannot be joined to its Fleet
+        // row: the window's card for it loses this row's name.
+        session.provider_session_id =
+            metadata.codex_thread_id.clone().or_else(|| metadata.claude_session_id.clone());
         session.status = SessionStatus::Stopped;
         session.created_at = metadata.created_at;
         session
