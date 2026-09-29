@@ -506,23 +506,19 @@ pub async fn shell_create_named(
         if !is_daemon_shell_name(&name) {
             return Err(SpawnError::Failed(format!("not a shell name: {name}")));
         }
+        // The one helper makes the session: `tmux -u`, the daemon's secrets
+        // kept out, the folder escaped, `$TMUX` followed as every other
+        // daemon tmux call follows it.
         let mut tmux = crate::tmux_session::tmux_new_session(&name, start_dir, &[], &[]);
         if let Some(op_id) = &op_id {
-            // `=name:` is the exact session as set-option's target wants it.
-            let exact = format!("={name}:");
-            tmux.args([
-                ";",
-                "set-option",
-                "-t",
-                exact.as_str(),
+            crate::tmux_session::set_session_option(
+                &mut tmux,
+                &name,
                 SHELL_OP_OPTION,
                 op_id.as_str(),
-            ]);
+            );
         }
-        // An inherited $TMUX would aim this at the daemon's own client
-        // context, as for `ainb run` below.
-        tmux.env_remove("TMUX")
-            .stdin(std::process::Stdio::null())
+        tmux.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             // A wedged tmux is abandoned at the timeout, not left running.
@@ -568,8 +564,7 @@ pub async fn shell_create_named(
 /// fresh name, by its exact name (`=name`, never a prefix match).
 async fn kill_own_shell(name: &str) {
     let mut kill = tokio::process::Command::new("tmux");
-    kill.env_remove("TMUX")
-        .args(["kill-session", "-t", &format!("={name}")])
+    kill.args(["kill-session", "-t", &format!("={name}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -680,11 +675,10 @@ async fn run_tmux(args: &[&str]) -> Result<std::process::Output, TmuxError> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        // An inherited $TMUX would aim this at the daemon's own client
-        // context, as for `ainb run` below.
-        .env_remove("TMUX")
         // A wedged tmux is abandoned at the timeout, not left running.
         .kill_on_drop(true);
+    // `$TMUX` is inherited, so list and close reach the server the create
+    // made its shells on.
     crate::tmux_session::strip_daemon_secrets(&mut tmux);
     match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
         Ok(Ok(out)) => Ok(out),
