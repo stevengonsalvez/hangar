@@ -10,7 +10,7 @@
 
 mod menu;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +25,7 @@ use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
-use ainb_desktop::theme::{self, Theme, ThemePreference};
+use ainb_desktop::theme::{self, Theme, ThemePick, ThemePreference};
 use ainb_desktop::updater::{self, Check, Install, Phase, Settings as UpdateSettings, Updater};
 use ainb_hangar_proto::agent_status::AgentState;
 use tauri::ipc::{Channel, InvokeResponseBody};
@@ -74,8 +74,9 @@ struct Window {
     /// The updater and the last check it made, which "install" acts on.
     updater: Arc<Mutex<Updater>>,
     last_check: Arc<Mutex<Option<Check>>>,
-    /// The host's copy of the theme a person picked (`theme_set`).
-    theme_file: PathBuf,
+    /// The theme a person picked (`theme_set`), shared with the window's
+    /// OS-theme repaint.
+    theme: Arc<ThemePick>,
 }
 
 /// Drain the host's queued session-store writes before this process ends
@@ -739,7 +740,7 @@ fn theme_set(
     webview: tauri::WebviewWindow,
     preference: ThemePreference,
 ) {
-    if let Err(error) = theme::store(&window.theme_file, preference) {
+    if let Err(error) = window.theme.set(preference) {
         tracing::warn!(%error, "theme pick not kept for the next launch");
     }
     paint_window_theme(&webview, preference);
@@ -755,9 +756,9 @@ fn theme_set(
 /// behind it is repainted here to match.
 fn open_main_window(
     app: &tauri::AppHandle,
-    theme_file: &Path,
+    theme: Arc<ThemePick>,
 ) -> tauri::Result<tauri::WebviewWindow> {
-    let preference = theme::load(theme_file);
+    let preference = theme.current();
     let config = app
         .config()
         .app
@@ -772,12 +773,11 @@ fn open_main_window(
         .build()?;
     paint_window_theme(&webview, preference);
     let painted = webview.clone();
-    let theme_file = theme_file.to_path_buf();
     webview.on_window_event(move |event| {
         if let tauri::WindowEvent::ThemeChanged(shown) = event {
-            // The file is the host's copy of the latest pick (`theme_set`
-            // stores before it paints), read only on this rare event.
-            paint_window_background(&painted, theme::load(&theme_file), our_theme(*shown));
+            // The pick in memory, not the file: a failed write or an edit
+            // behind the app's back must not move the window's paint.
+            paint_window_background(&painted, theme.current(), our_theme(*shown));
         }
     });
     if config.visible {
@@ -942,8 +942,8 @@ fn main() {
             init_logging(&hangar_home);
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
-            let theme_file = hangar_home.join(theme::THEME_FILE);
-            open_main_window(app.handle(), &theme_file)?;
+            let theme = Arc::new(ThemePick::load(hangar_home.join(theme::THEME_FILE)));
+            open_main_window(app.handle(), Arc::clone(&theme))?;
             // The desktop loads the user config itself and hands it to the
             // host, which reads nothing from disk for it.
             let config = AppConfig::load().unwrap_or_else(|error| {
@@ -1018,7 +1018,7 @@ fn main() {
                 sidecar_config,
                 updater,
                 last_check: Arc::new(Mutex::new(None)),
-                theme_file,
+                theme,
             });
 
             menu::install(app.handle());
