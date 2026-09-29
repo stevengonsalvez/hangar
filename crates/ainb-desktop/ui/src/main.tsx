@@ -71,6 +71,7 @@ import "@fontsource-variable/geist-mono";
 import "./theme/tokens.css";
 import "./shell.css";
 import { startTheme } from "./theme/theme.ts";
+import { startNotifications } from "./notifications.ts";
 
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
@@ -776,6 +777,8 @@ function Shell() {
                 onRefreshSetup={refreshSetup}
                 theme={theme.preference()}
                 onTheme={theme.set}
+                notifications={notifications.enabled()}
+                onNotifications={notifications.set}
                 onClose={() => {
                   closeSettings();
                   setPane("board");
@@ -860,4 +863,7 @@ function Shell() {
 // The host keeps a copy so the next launch's window opens in the pick; a copy
 // that fails to land costs that launch's first frame, nothing else.
 const theme = startTheme((preference) => void invoke("theme_set", { preference }).catch(() => {}));
+// The notifications toggle the settings page reads and sets (Notifications).
+// The host sends the notifications, so it is told now and on every change.
+const notifications = startNotifications((enabled) => void invoke("notifications_set", { enabled }).catch(() => {}));
 render(() => <Shell />, document.getElementById("root")!);
