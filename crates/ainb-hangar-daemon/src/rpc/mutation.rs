@@ -848,14 +848,17 @@ mod tests {
         assert_eq!(value[ACK_KEY]["status"], "accepted");
     }
 
-    /// Only the two retry-shaped codes and a verb not served yet abandon a
-    /// claim.
+    /// Only the two retry-shaped codes, a verb not served yet, and a
+    /// repository not registered yet abandon a claim.
     #[test]
-    fn exactly_three_codes_free_the_op_id() {
+    fn exactly_four_codes_free_the_op_id() {
         assert!(frees_the_op_id(super::super::STORE_UNAVAILABLE));
         assert!(frees_the_op_id(super::super::INTERNAL_ERROR));
         assert!(frees_the_op_id(super::super::METHOD_NOT_FOUND));
-        for code in [-32602, -32000, -32008, -32009, -32010] {
+        assert!(frees_the_op_id(
+            ainb_hangar_proto::spawn::REPO_NOT_REGISTERED
+        ));
+        for code in [-32602, -32000, -32008, -32009, -32011] {
             assert!(
                 !frees_the_op_id(code),
                 "{code} must be recorded, not abandoned"
