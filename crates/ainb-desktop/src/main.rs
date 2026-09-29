@@ -19,6 +19,7 @@ use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
 use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
+use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
@@ -356,6 +357,36 @@ async fn worktree_create(
         }
     }
     Ok(created)
+}
+
+/// What deleting a session would remove, for the delete dialog to say before
+/// anything goes. Read-only; a failure is the sentence the dialog shows.
+#[tauri::command]
+async fn session_delete_preview(session_id: String) -> Result<DeletePreview, String> {
+    ainb_desktop::delete::preview(&session_id)
+        .await
+        .map_err(|error| intent::toast_text(&error))
+}
+
+/// Delete a session as the terminal's `d` then Delete does, if it still
+/// removes what the dialog said (`expected`, and no more uncommitted changes
+/// than `expected_changes`; `force` accepts the dirty or uncounted work the
+/// dialog showed), then rescan so its row leaves the sidebar now rather than
+/// on the next cadence.
+#[tauri::command]
+async fn session_delete(
+    window: tauri::State<'_, Window>,
+    session_id: String,
+    expected: TreeFate,
+    expected_changes: Option<u32>,
+    force: bool,
+) -> Result<(), String> {
+    let outcome =
+        ainb_desktop::delete::delete(&session_id, expected, expected_changes, force).await;
+    // Rescanned either way: a removal that failed part-way may still have
+    // taken the session's tmux or its row.
+    window.shell.reload_workspaces();
+    outcome.map_err(|error| intent::toast_text(&error))
 }
 
 /// The composer's Project select: every repository in a folder the daemon
@@ -1156,6 +1187,8 @@ fn main() {
             terminal_clear,
             terminal_close,
             worktree_create,
+            session_delete_preview,
+            session_delete,
             projects_list,
             project_add,
             update_check,

@@ -12,7 +12,7 @@ import { allSessions } from "./sessions.ts";
 import { selectRowIntent, type RendererIntent } from "./tabs.ts";
 
 /** What a menu item does when chosen. */
-export type RowMenuAction = "open" | "editor" | "copy_path" | "copy_name";
+export type RowMenuAction = "open" | "editor" | "copy_path" | "copy_name" | "delete";
 
 export interface RowMenuItem {
   action: RowMenuAction;
@@ -21,27 +21,36 @@ export interface RowMenuItem {
   disabled: boolean;
   /** Why it is disabled, shown as the item's tooltip. */
   reason?: string;
+  /** Drawn as Orca's destructive item: it removes something. */
+  destructive?: boolean;
 }
 
 const NO_PATH = "This session has no worktree path";
+const LOCAL_ONLY = "Local only: this session runs on a remote host";
 
 /**
  * The items for `session`'s row, in Orca's order: Open in, Copy Path, Copy
- * Worktree Name. Open leads, as the row's own click does.
+ * Worktree Name, and Delete last, destructive (stablyai/orca@3c1af16,
+ * `WorktreeContextMenuView.tsx:344-387`). Open leads, as the row's own click
+ * does.
  *
  * A row with no worktree path has nothing to open or copy as a path. A remote
  * row's path is on another machine, so a local editor cannot open it: Orca's
  * Open in marks the same case "Local only" (`WorktreeOpenInMenu.tsx:63`).
+ * Delete runs the terminal's delete on this machine, so a remote row cannot
+ * take it either, nor a Boss row, whose container only the terminal removes.
  */
 export function rowMenuItems(session: Session_Serialize): RowMenuItem[] {
   const hasPath = session.workspace_path !== "";
   const remote = session.ssh_target != null;
-  const editorReason = !hasPath ? NO_PATH : remote ? "Local only: this session runs on a remote host" : undefined;
+  const editorReason = !hasPath ? NO_PATH : remote ? LOCAL_ONLY : undefined;
+  const deleteReason = remote ? LOCAL_ONLY : session.mode === "Boss" ? "A Boss session is deleted from the terminal" : undefined;
   return [
     { action: "open", label: "Open", disabled: false },
     { action: "editor", label: "Open in Editor", disabled: editorReason !== undefined, reason: editorReason },
     { action: "copy_path", label: "Copy Path", disabled: !hasPath, reason: hasPath ? undefined : NO_PATH },
     { action: "copy_name", label: "Copy Worktree Name", disabled: false },
+    { action: "delete", label: "Delete", disabled: deleteReason !== undefined, reason: deleteReason, destructive: true },
   ];
 }
 
@@ -111,6 +120,9 @@ export interface RowPickDeps {
   /** The intent that puts the session list's selection back on the row of
    * the terminal the window shows, or nothing when it shows none. */
   reselect(): RendererIntent[];
+  /** Open the delete confirmation on the row (`delete_dialog.ts`). Nothing
+   * is deleted until it is confirmed there. */
+  confirmDelete(pick: RowPick): void;
 }
 
 /** Run `pick` through the one existing action that serves it. */
@@ -126,5 +138,7 @@ export function runRowPick(pick: RowPick, deps: RowPickDeps): void {
       return deps.copy(pick.session.workspace_path);
     case "copy_name":
       return deps.copy(pick.name);
+    case "delete":
+      return deps.confirmDelete(pick);
   }
 }
