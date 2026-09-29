@@ -12,16 +12,19 @@ import {
   focusGroup,
   focusNext,
   focusPrevious,
+  geometry,
   groupOf,
   groups,
   initialLayout,
   LAYOUT_KEY,
   MAX_GROUPS,
+  MIN_SHARE,
   moveTab,
   parse,
   readLayout,
   reconcile,
   removeTab,
+  resize,
   serialize,
   splitGroup,
   writeLayout,
@@ -60,6 +63,8 @@ function assertInvariants(layout: Layout, live?: readonly string[]): void {
     assert.ok(node.ratios.every((ratio) => ratio > 0), "ratios are positive");
     const sum = node.ratios.reduce((total, ratio) => total + ratio, 0);
     assert.ok(Math.abs(sum - 1) < 1e-9, `ratios sum to 1, not ${sum}`);
+    const floor = Math.min(MIN_SHARE, 0.5 / node.ratios.length);
+    assert.ok(node.ratios.every((ratio) => ratio >= floor - 1e-12), `no pane under ${floor} of its split: ${node.ratios}`);
     for (const child of node.children) {
       if (child.kind === "split") assert.notEqual(child.axis, node.axis, "a split never nests one along its own axis");
       walk(child);
@@ -72,6 +77,14 @@ function assertInvariants(layout: Layout, live?: readonly string[]): void {
  * assert a whole layout's contents in one line. */
 function shape(layout: Layout): string[] {
   return groups(layout).map((group) => `${group.id}:${group.tabs.join(",")}*${group.active ?? ""}`);
+}
+
+/** Assert `actual` is `expected`, number by number, to within rounding. */
+function assertNear(actual: readonly number[] | null, expected: readonly number[], message?: string): void {
+  assert.ok(
+    actual !== null && actual.length === expected.length && actual.every((value, at) => Math.abs(value - expected[at]) < 1e-12),
+    `${message ?? "ratios"}: ${JSON.stringify(actual)} is not ${JSON.stringify(expected)}`,
+  );
 }
 
 /** The root split's ratios, or `null` for a lone group. */
@@ -184,6 +197,32 @@ test(`a layout stops splitting at ${MAX_GROUPS} groups, and that layout still ro
   assert.deepEqual(parse(serialize(layout)), layout);
 });
 
+test("splitting left or up puts the new group before the old one", () => {
+  const left = splitGroup(initialLayout(["a", "b"]), "g1", "left", "b");
+  assert.deepEqual(shape(left), ["g2:b*b", "g1:a*a"]);
+  assert.equal(left.root.kind === "split" && left.root.axis, "row");
+  assert.equal(left.focused, "g2");
+  const up = splitGroup(initialLayout(["a", "b"]), "g1", "up", "b");
+  assert.deepEqual(shape(up), ["g2:b*b", "g1:a*a"]);
+  assert.equal(up.root.kind === "split" && up.root.axis, "column");
+  assertInvariants(left, ["a", "b"]);
+  assertInvariants(up, ["a", "b"]);
+});
+
+test("a layout at the end of the id space stops splitting, and still loads", () => {
+  // The last id there is room for is g999999999; a stored layout may have
+  // reached it. Splitting further would mint a tenth digit, which `parse`
+  // refuses, and the whole layout would be lost on the next launch.
+  const at = (next: number) =>
+    parse(JSON.stringify({ version: 1, focused: "g1", next, root: { kind: "group", id: "g1", tabs: ["a", "b", "c"], active: "a" } }));
+  const last = splitGroup(at(999_999_999), "g1", "right", "b");
+  assert.deepEqual(shape(last), ["g1:a,c*a", "g999999999:b*b"], "the last id is still minted");
+  assert.deepEqual(parse(serialize(last)), last);
+  const full = parse(serialize(last));
+  assert.equal(splitGroup(full, "g1", "right", "c"), full, "no id is left to mint");
+  assert.deepEqual(parse(serialize(splitGroup(full, "g1", "right", "c"))), full);
+});
+
 // ---- closeGroup ----
 
 test("closing a group hands its tabs and its space to the sibling before it", () => {
@@ -245,6 +284,22 @@ test("a move to an unknown group, of an unknown tab, or to its own group changes
   assert.equal(moveTab(layout, "a", "g9"), layout);
   assert.equal(moveTab(layout, "zzz", "g1"), layout);
   assert.equal(moveTab(layout, "a", "g1"), layout);
+});
+
+test("a tab moved to an index lands there, within its group or another", () => {
+  const within = moveTab(initialLayout(["a", "b", "c"]), "a", "g1", 2);
+  assert.deepEqual(shape(within), ["g1:b,c,a*a"], "reordered, and shown");
+  assert.deepEqual(shape(moveTab(initialLayout(["a", "b", "c"]), "c", "g1", 0)), ["g1:c,a,b*c"]);
+  const across = moveTab(twoColumns(), "c", "g2", 0);
+  assert.deepEqual(shape(across), ["g1:a*a", "g2:c,b*c"]);
+  assert.equal(across.focused, "g2");
+  assert.deepEqual(shape(moveTab(twoColumns(), "c", "g2", 99)), ["g1:a*a", "g2:b,c*c"], "past the end is the end");
+  assert.deepEqual(shape(moveTab(twoColumns(), "c", "g2", -3)), ["g1:a*a", "g2:c,b*c"], "before the start is the start");
+  assert.deepEqual(shape(moveTab(twoColumns(), "c", "g2", Number.NaN)), ["g1:a*a", "g2:b,c*c"], "no number is the end");
+  const still = focusGroup(activateTab(initialLayout(["a", "b"]), "b"), "g1");
+  assert.equal(moveTab(still, "b", "g1", 1), still, "a tab dropped where it is changes nothing");
+  assertInvariants(within, ["a", "b", "c"]);
+  assertInvariants(across, ["a", "b", "c"]);
 });
 
 // ---- addTab ----
@@ -309,6 +364,92 @@ test("focus walks groups in reading order and wraps both ways", () => {
   assert.equal(focusGroup(layout, "g9"), layout, "an unknown group changes nothing");
   assert.equal(focusNext(initialLayout(["a"])).focused, "g1", "one group keeps the focus");
   assert.deepEqual(shape(focusNext(layout)), shape(layout), "focus moves nothing else");
+});
+
+// ---- resize, geometry ----
+
+test("resize moves the seam between two neighbours, never past the minimum share", () => {
+  const layout = twoColumns();
+  assertNear(rootRatios(resize(layout, [], 0, 0.7)), [0.7, 0.3]);
+  assertNear(rootRatios(resize(layout, [], 0, 0.99)), [1 - MIN_SHARE, MIN_SHARE], "clamped on the right");
+  assertNear(rootRatios(resize(layout, [], 0, -5)), [MIN_SHARE, 1 - MIN_SHARE], "clamped on the left");
+  for (const [path, index, share] of [
+    [[], 0, Number.NaN],
+    [[], 1, 0.5],
+    [[], -1, 0.5],
+    [[3], 0, 0.5],
+    [[0], 0, 0.5],
+  ] as const) {
+    assert.equal(resize(layout, path, index, share), layout, `path ${path} index ${index} share ${share}`);
+  }
+  const lone = initialLayout(["a"]);
+  assert.equal(resize(lone, [], 0, 0.3), lone, "a lone group has no seam");
+  for (const share of [0.3, 1e-9, 1, 0.5]) assertInvariants(resize(layout, [], 0, share), ["a", "b", "c"]);
+});
+
+test("resize reaches a nested split, and moves only the two panes beside the seam", () => {
+  const nested = resize(leftAndStack(), [1], 0, 0.25);
+  const column = nested.root.kind === "split" ? nested.root.children[1] : null;
+  assertNear(column?.kind === "split" ? column.ratios : null, [0.25, 0.75]);
+  assert.deepEqual(rootRatios(nested), [0.5, 0.5], "the outer split is untouched");
+
+  const three = splitGroup(twoColumns(), "g1", "right", "c");
+  assert.deepEqual(rootRatios(three), [0.25, 0.25, 0.5]);
+  const squeezed = resize(three, [], 0, 0);
+  assertNear(rootRatios(squeezed), [MIN_SHARE, 0.5 - MIN_SHARE, 0.5], "the third pane keeps its share");
+  assertInvariants(squeezed, ["a", "b", "c"]);
+});
+
+test("a seam still moves in a split of more panes than the minimum leaves room for", () => {
+  const count = 8;
+  const raw = JSON.stringify({
+    version: 1,
+    focused: "g1",
+    next: count + 1,
+    root: {
+      kind: "split",
+      axis: "row",
+      ratios: Array.from({ length: count }, () => 1),
+      children: Array.from({ length: count }, (_, at) => ({ kind: "group", id: `g${at + 1}`, tabs: [`k${at}`], active: `k${at}` })),
+    },
+  });
+  const layout = parse(raw);
+  const wider = resize(layout, [], 0, 0.9);
+  assert.notEqual(wider, layout, "the seam moved");
+  assert.ok(rootRatios(wider)![0] > 1 / count, `the first pane grew: ${rootRatios(wider)}`);
+  assertInvariants(wider);
+});
+
+test("a seam dragged against its stop, or a tab already shown, returns the layout as it was", () => {
+  const stopped = resize(twoColumns(), [], 0, 0.99);
+  assert.equal(resize(stopped, [], 0, 2), stopped, "nothing left to move");
+  const layout = twoColumns();
+  assert.equal(activateTab(layout, "b"), layout, "b is already shown in the focused group");
+});
+
+test("a stored sliver of a pane loads at the minimum share", () => {
+  const raw = serialize(twoColumns()).replace('"ratios":[0.5,0.5]', '"ratios":[1,5e-324]');
+  assert.ok(raw.includes("5e-324"), "the fixture edits the stored ratios");
+  const layout = parse(raw);
+  assert.deepEqual(shape(layout), ["g1:a,c*a", "g2:b*b"]);
+  assertNear(rootRatios(layout), [1 - MIN_SHARE, MIN_SHARE]);
+  assertInvariants(layout, ["a", "b", "c"]);
+  assert.deepEqual(parse(serialize(layout)), layout);
+});
+
+test("geometry places each group and each seam as a share of the window", () => {
+  const { groups: rects, dividers } = geometry(leftAndStack());
+  assert.deepEqual(Object.fromEntries(rects), {
+    g1: { x: 0, y: 0, w: 0.5, h: 1 },
+    g2: { x: 0.5, y: 0, w: 0.5, h: 0.5 },
+    g3: { x: 0.5, y: 0.5, w: 0.5, h: 0.5 },
+  });
+  assert.deepEqual(dividers, [
+    { path: [], index: 0, axis: "row", pair: { x: 0, y: 0, w: 1, h: 1 }, at: 0.5 },
+    { path: [1], index: 0, axis: "column", pair: { x: 0.5, y: 0, w: 0.5, h: 1 }, at: 0.5 },
+  ]);
+  assert.deepEqual(Object.fromEntries(geometry(initialLayout(["a"])).groups), { g1: { x: 0, y: 0, w: 1, h: 1 } });
+  assert.deepEqual(geometry(initialLayout(["a"])).dividers, []);
 });
 
 // ---- reconcile ----
@@ -427,7 +568,12 @@ test("parse restores a hand-edited but valid layout to its canonical shape", () 
   });
   const layout = parse(raw);
   assert.deepEqual(shape(layout), ["g5:a*a", "g2:b*b", "g3:c*c"]);
-  assert.deepEqual(rootRatios(layout), [0.5, 0.125, 0.375], "a row in a row is spliced, its shares scaled");
+  // Spliced and scaled, [0.5, 0.125, 0.375], then the sliver raised to the
+  // minimum share, paid for by the others in proportion to what they hold
+  // over it.
+  const ratios = rootRatios(layout)!;
+  assert.equal(ratios[1], MIN_SHARE, "a row in a row is spliced, and no pane is thinner than the minimum");
+  assert.ok(Math.abs((ratios[0] - MIN_SHARE) / (ratios[2] - MIN_SHARE) - (0.5 - MIN_SHARE) / (0.375 - MIN_SHARE)) < 1e-9);
   assert.equal(layout.next, 6, "never mints an id the tree holds");
   assertInvariants(layout, ["a", "b", "c"]);
 });
@@ -560,15 +706,15 @@ test("flow: a long random walk of every step keeps every invariant", () => {
   for (let step = 0; step < 3000; step += 1) {
     const ids = groups(layout).map((group) => group.id);
     const before = layout;
-    switch (Math.floor(random() * 10)) {
+    switch (Math.floor(random() * 11)) {
       case 0:
-        layout = splitGroup(layout, pick(ids), random() < 0.5 ? "right" : "down", random() < 0.5 ? pick(pool) : undefined);
+        layout = splitGroup(layout, pick(ids), pick(["right", "down", "left", "up"] as const), random() < 0.5 ? pick(pool) : undefined);
         break;
       case 1:
         layout = closeGroup(layout, pick(ids));
         break;
       case 2:
-        layout = moveTab(layout, pick(pool), pick(ids));
+        layout = moveTab(layout, pick(pool), pick(ids), random() < 0.5 ? Math.floor(random() * 5) - 1 : undefined);
         break;
       case 3:
         layout = activateTab(layout, pick(pool));
@@ -576,6 +722,15 @@ test("flow: a long random walk of every step keeps every invariant", () => {
       case 4:
         layout = random() < 0.5 ? focusGroup(layout, pick(ids)) : random() < 0.5 ? focusNext(layout) : focusPrevious(layout);
         break;
+      case 9: {
+        // A seam dragged anywhere, even off the window.
+        const seams = geometry(layout).dividers;
+        if (seams.length > 0) {
+          const seam = pick(seams);
+          layout = resize(layout, seam.path, seam.index, random() * 1.4 - 0.2);
+        }
+        break;
+      }
       case 5: {
         // The host opens one tab, told to the layout directly.
         const key = pick(pool);
