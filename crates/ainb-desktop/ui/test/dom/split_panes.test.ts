@@ -194,6 +194,30 @@ test("a paste sizes its pane first, so the host answers it for the pane in front
   );
 });
 
+test("the terminal menu's Paste in a split sizes its pane first too: one paste path", async () => {
+  host.calls = [];
+  // The other pane sized last again.
+  host.sized = "tmux_a";
+  const screen = document.querySelector<HTMLElement>('.terminal[data-tab="tmux_b"] .xterm-screen')!;
+  screen.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, clientX: 900, clientY: 300 }));
+  await until(() => document.querySelector(".terminal-menu") !== null, "the terminal menu");
+  const paste = [...document.querySelectorAll<HTMLElement>('.terminal-menu [role="menuitem"]')].find((row) =>
+    row.textContent?.startsWith("Paste"),
+  );
+  assert.ok(paste, "the menu has Paste");
+  paste.click();
+  await until(() => host.calls.some((call) => call.command === "clipboard_read"), "the menu paste's read");
+  const order = host.calls.filter((call) => call.command === "terminal_resize" || call.command === "clipboard_read");
+  const read = order.findIndex((call) => call.command === "clipboard_read");
+  assert.ok(read > 0 && order[read - 1].command === "terminal_resize", "a resize went before the read");
+  assert.equal(order[read - 1].args.key, "tmux_b");
+  assert.equal(order[read].args.key, "tmux_b");
+  await until(
+    () => host.calls.some((call) => call.command === "terminal_input" && call.args.key === "tmux_b" && String(call.args.data).includes("pasted")),
+    "the clipboard's text typed into b",
+  );
+});
+
 test("a tab strip landing mid-drag drops the seam drag, and keeps the new tab", async () => {
   measure();
   const before = JSON.stringify(stored().root.ratios);
