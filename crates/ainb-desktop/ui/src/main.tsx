@@ -497,6 +497,14 @@ function Shell() {
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
   const openSession = (id: string) => openRow({ session: id });
+  /** The select-only intent for the shown terminal's row, or none when no
+   * terminal is shown: what a sidebar row menu sends after it moves the
+   * selection, so the answer banner stays that terminal's. */
+  const shownRowIntents = (): RendererIntent[] => {
+    const key = active();
+    const back = showing("terminal") && key !== null ? selectIntentFor(tabs(), key) : null;
+    return back === null ? [] : [back];
+  };
 
   onMount(async () => {
     setSidecar(await invoke<SidecarState>("sidecar_state"));
@@ -684,6 +692,7 @@ function Shell() {
                 open: openSession,
                 run: (intents) => void run(intents),
                 copy: (text) => void invoke("clipboard_write", { text }),
+                reselect: shownRowIntents,
               })
             }
             ref={(element) => (sidebar = element)}
