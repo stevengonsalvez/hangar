@@ -4,8 +4,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { activateTab, focusGroup, groups, initialLayout, MAX_GROUPS, splitGroup, type Layout } from "./layout.ts";
-import { dropAt, dropTab, dropZone, followHost } from "./panes.ts";
+import { activateTab, focusGroup, groups, initialLayout, MAX_GROUPS, parse, splitGroup, type Layout } from "./layout.ts";
+import { beginRestore, dropAt, dropTab, dropZone, followHost, rebuild, RESTORE_MS, restoreDone } from "./panes.ts";
 
 /** Each group as `id:tabs*active`, in reading order. */
 function shape(layout: Layout): string[] {
@@ -51,6 +51,51 @@ test("following an unchanged strip returns the very same layout", () => {
   assert.equal(followHost(layout, ["d", "c", "b", "a"], ["a"]), layout);
   const once = followHost(layout, ["a", "d", "x"], ["a"]);
   assert.equal(followHost(once, ["a", "d", "x"], ["a"]), once);
+});
+
+// ---- beginRestore, rebuild, restoreDone ----
+
+/** Stored last time: a and c on the left, b on the right, focused. */
+const STORED = parse(
+  JSON.stringify({
+    version: 1,
+    focused: "g2",
+    next: 3,
+    root: {
+      kind: "split",
+      axis: "row",
+      ratios: [0.5, 0.5],
+      children: [
+        { kind: "group", id: "g1", tabs: ["a", "c"], active: "a" },
+        { kind: "group", id: "g2", tabs: ["b"], active: "b" },
+      ],
+    },
+  }),
+);
+
+test("a restore keeps each stored tab's place while the tabs reopen one by one", () => {
+  const restore = beginRestore(STORED, 1000);
+  assert.deepEqual(shape(rebuild(restore, ["a"], null)), ["g1:a*a"]);
+  assert.equal(restoreDone(restore, ["a"], 1000), false, "b and c are still to come");
+  const all = rebuild(restore, ["a", "b", "c"], null);
+  assert.deepEqual(shape(all), ["g1:a,c*a", "g2:b*b"]);
+  assert.equal(all.focused, "g2");
+  assert.equal(restoreDone(restore, ["c", "b", "a", "x"], 1000), true, "every stored tab is open");
+});
+
+test("the tab last activated in a restore stays shown and focused", () => {
+  const restore = beginRestore(STORED, 0);
+  const layout = rebuild(restore, ["a", "b", "c"], "c");
+  assert.deepEqual(shape(layout), ["g1:a,c*c", "g2:b*b"]);
+  assert.equal(layout.focused, "g1");
+  assert.deepEqual(shape(rebuild(restore, ["a", "b"], "c")), ["g1:a*a", "g2:b*b"], "not while it is closed");
+});
+
+test("a stored tab that never reopens holds the restore only until its time is up", () => {
+  const restore = beginRestore(STORED, 1000);
+  assert.equal(restoreDone(restore, ["a", "b"], 1000 + RESTORE_MS - 1), false);
+  assert.equal(restoreDone(restore, ["a", "b"], 1000 + RESTORE_MS), true);
+  assert.equal(restoreDone(beginRestore(initialLayout([]), 0), ["a"], 0), true, "nothing stored, nothing to wait for");
 });
 
 // ---- dropZone, dropAt ----
