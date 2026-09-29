@@ -8,6 +8,8 @@
 //!   failure report.
 //! - [`intent::RendererIntent`] is what the webview may send.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
+//! - [`links`] is the rule a terminal link passes before the host opens it:
+//!   an `http` or `https` URL and nothing else.
 //! - [`projects`] lists the repositories the composer may create into,
 //!   sessions or not.
 //! - [`setup`] is the desktop-native path for the onboarding writes the
@@ -35,6 +37,7 @@ pub mod daemons_panel;
 pub mod executor;
 pub mod host;
 pub mod intent;
+pub mod links;
 pub mod notify;
 pub mod projects;
 pub mod setup;

@@ -72,6 +72,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
 uuid = { version = "1.5", features = ["serde", "v4"] }
+# Parses the URL a terminal link click asks the host to open (`links.rs`).
+# Already in the build through tauri.
+url = "2"
 tauri = { version = "~2.11.5", optional = true }
 # The native confirmation in front of the onboarding writes (#1175): a message
 # dialog the OS draws, which the webview's script cannot click. Rust side only;
