@@ -334,7 +334,9 @@ async fn a_folder_name_that_reads_as_a_tmux_format_is_taken_literally() {
 }
 
 /// A directory outside every registered folder, or one reached through
-/// `..`, is refused before tmux runs: no session, not even a server.
+/// `..`, is refused before tmux runs: no session, not even a server. The
+/// unregistered one answers `REPO_NOT_REGISTERED`, as `worktree/create` does,
+/// so a client offers Add project by code.
 #[tokio::test]
 async fn a_path_outside_the_registered_folders_or_with_dots_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,15 +349,62 @@ async fn a_path_outside_the_registered_folders_or_with_dots_is_refused() {
     git(elsewhere.path(), &["init", "-q"]);
     let dotted = format!("{}/../app", world.repo());
 
-    for path in [elsewhere.path().display().to_string(), dotted] {
+    for (path, code) in [
+        (
+            elsewhere.path().display().to_string(),
+            ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+        ),
+        (dotted, -32602),
+    ] {
         let response = world.shell(&path).await;
         assert_eq!(
             response["error"]["code"].as_i64(),
-            Some(-32602),
+            Some(i64::from(code)),
             "{path}: {response}"
         );
     }
     assert!(world.sessions().is_empty(), "no session was made");
+}
+
+/// `REPO_NOT_REGISTERED` is answered before anything runs, so it is not the
+/// op id's answer: the same op id, retried once the person has added the
+/// folder, opens the shell instead of replaying the refusal.
+#[tokio::test]
+async fn an_unregistered_refusal_leaves_the_op_id_free_for_after_registering() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let later = world.home.path().join("later/app");
+    std::fs::create_dir_all(&later).unwrap();
+    git(&later, &["init", "-q", "-b", "main"]);
+    let later = canonical(&later);
+    let op_id = "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+
+    let refused = world.shell_with_op(&later, op_id).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(i64::from(ainb_hangar_proto::spawn::REPO_NOT_REGISTERED)),
+        "{refused}"
+    );
+    assert!(world.sessions().is_empty(), "no session was made");
+
+    let config = world.home.path().join(".agents-in-a-box/config");
+    std::fs::write(
+        config.join(ainb_hangar_daemon::spawn::PROJECTS_FILE),
+        format!("projects = [\"{later}\"]\n"),
+    )
+    .unwrap();
+
+    let retry = world.shell_with_op(&later, op_id).await;
+    assert_eq!(
+        retry["result"]["mutation"]["outcome"], "created",
+        "the retry ran, it did not replay the refusal: {retry}"
+    );
+    assert_eq!(retry["result"]["worktree_path"], later.as_str());
+    assert_eq!(world.sessions(), vec![shell_name(&retry)]);
 }
 
 /// A second shell is a second session: nothing reuses, attaches to or
