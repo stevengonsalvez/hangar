@@ -134,6 +134,9 @@ test("the selection is the row the frame names by id, not a position in its list
   assert.equal(questionFor(gone), null);
   const shell = { ...view, shell_selected: true } as unknown as SessionsView_Serialize;
   assert.equal(selectedSession(shell), undefined);
+  // The shell row is selected, not the session its id still names: no
+  // question, however `questionFor` finds the selected row.
+  assert.equal(questionFor(shell), null);
 });
 
 test("with two open questions on one session, the banner refuses when the reducer is on the other", () => {
