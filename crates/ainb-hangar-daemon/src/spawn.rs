@@ -189,7 +189,7 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
 
 /// The message of [`SpawnError::Unregistered`], the refusal for a repository
 /// in no registered folder and not an added project. The variant, not this
-/// text, is what `worktree/create` answers
+/// text, is what every spawn verb answers
 /// [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] for.
 pub const UNREGISTERED: &str = "repo_path is not under a registered workspace folder: add its \
                                 folder to workspace_defaults.workspace_scan_paths";
@@ -384,8 +384,13 @@ fn resolve_worktree(
     }
     let source = linked_worktree_source(&canonical)
         .map_err(|why| SpawnError::Invalid(format!("worktree_path {why}")))?;
+    // An unregistered source stays `Unregistered`: the fix (add the project)
+    // is the same as for `worktree/create`, so the code is too.
     resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
-        SpawnError::Invalid(why) | SpawnError::Unregistered(why) => SpawnError::Invalid(format!(
+        SpawnError::Invalid(why) => {
+            SpawnError::Invalid(format!("the worktree's source repository is refused: {why}"))
+        }
+        SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
         failed @ SpawnError::Failed(_) => failed,
@@ -416,8 +421,10 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 /// creating", not as a failure that already undid anything.
 ///
 /// # Errors
-/// [`SpawnError::Invalid`] for a request refused before anything ran,
-/// [`SpawnError::Failed`] when `ainb run` failed or outlived the bound.
+/// [`SpawnError::Unregistered`] for a repository no registered folder or
+/// project admits and [`SpawnError::Invalid`] for any other request refused,
+/// both before anything ran; [`SpawnError::Failed`] when `ainb run` failed
+/// or outlived the bound.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -487,6 +494,12 @@ const SHELL_OWNER: &str = "daemon";
 /// `worktree_path` as a directory a shell may open in: the top of a
 /// registered repository ([`resolve_repo`]) or a worktree ainb created
 /// ([`resolve_worktree`]), canonical, or why not.
+///
+/// The refusal is [`SpawnError::Unregistered`] when registering a project is
+/// the fix: a managed tree whose source repository is unregistered, or a
+/// folder outside the managed directory that no registered root or project
+/// admits. Anything else, a managed folder that is not a usable tree
+/// included, is [`SpawnError::Invalid`].
 fn resolve_shell_dir(
     worktree_path: &str,
     home: &Path,
@@ -497,18 +510,28 @@ fn resolve_shell_dir(
             "worktree_path must not contain . or .. components".into(),
         ));
     }
-    let repo_why = match resolve_repo(worktree_path, home) {
+    let (repo_why, repo_unregistered) = match resolve_repo(worktree_path, home) {
         Ok(dir) => return Ok(dir),
-        Err(SpawnError::Invalid(why) | SpawnError::Unregistered(why)) => why,
+        Err(SpawnError::Invalid(why)) => (why, false),
+        Err(SpawnError::Unregistered(why)) => (why, true),
         Err(failed) => return Err(failed),
     };
-    resolve_worktree(worktree_path, home, managed).map_err(|error| match error {
-        SpawnError::Invalid(tree_why) | SpawnError::Unregistered(tree_why) => {
-            SpawnError::Invalid(format!(
-                "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
-            ))
+    let in_managed = std::fs::canonicalize(worktree_path)
+        .is_ok_and(|canonical| is_managed_tree(&canonical, managed));
+    resolve_worktree(worktree_path, home, managed).map_err(|error| {
+        let (tree_why, tree_unregistered) = match error {
+            SpawnError::Invalid(why) => (why, false),
+            SpawnError::Unregistered(why) => (why, true),
+            failed @ SpawnError::Failed(_) => return failed,
+        };
+        let why = format!(
+            "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
+        );
+        if tree_unregistered || (repo_unregistered && !in_managed) {
+            SpawnError::Unregistered(why)
+        } else {
+            SpawnError::Invalid(why)
         }
-        failed @ SpawnError::Failed(_) => failed,
     })
 }
 
@@ -536,7 +559,9 @@ fn resolve_shell_dir(
 /// touched.
 ///
 /// # Errors
-/// [`SpawnError::Invalid`] for a directory or op id refused before tmux ran,
+/// [`SpawnError::Unregistered`] for a folder that registering a project
+/// would admit (see `resolve_shell_dir`) and [`SpawnError::Invalid`] for any
+/// other directory or op id refused, both before tmux ran;
 /// [`SpawnError::Failed`] when tmux could not make the session.
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
     shell_create_named(params, || {
@@ -1403,9 +1428,9 @@ mod tests {
         refused(&link, &managed, "directly in");
     }
 
-    #[test]
-    fn a_worktree_of_an_unregistered_repo_is_refused() {
-        let (home, _repo, managed, _tree) = world_with_worktree();
+    /// A managed tree cut from a repository outside every registered folder,
+    /// left in the managed directory next to `world_with_worktree`'s tree.
+    fn stray_tree(managed: &Path) -> (tempfile::TempDir, PathBuf) {
         let elsewhere = tempfile::tempdir().unwrap();
         git(elsewhere.path(), &["init", "-q", "-b", "main"]);
         git(
@@ -1424,11 +1449,20 @@ mod tests {
                 &stray.display().to_string(),
             ],
         );
+        (elsewhere, stray)
+    }
+
+    /// Unregistered, not Invalid: the fix is to add the project, as it is
+    /// for `worktree/create`, so every spawn verb answers the same code.
+    #[test]
+    fn a_worktree_of_an_unregistered_repo_is_refused_as_unregistered() {
+        let (home, _repo, managed, _tree) = world_with_worktree();
+        let (_elsewhere, stray) = stray_tree(&managed);
         match resolve_worktree(&stray.display().to_string(), home.path(), &managed) {
-            Err(SpawnError::Invalid(message)) => {
+            Err(SpawnError::Unregistered(message)) => {
                 assert!(message.contains("registered"), "{message}")
             }
-            other => panic!("expected Invalid, got {other:?}"),
+            other => panic!("expected Unregistered, got {other:?}"),
         }
     }
 
@@ -1448,13 +1482,31 @@ mod tests {
                 Err(SpawnError::Invalid(_))
             )
         };
+        let unregistered = |path: &Path| {
+            matches!(
+                resolve_shell_dir(&path.display().to_string(), home.path(), &managed),
+                Err(SpawnError::Unregistered(_))
+            )
+        };
         assert!(refused(&repo.join("../app")), "dot components");
         let sub = repo.join("src");
         std::fs::create_dir_all(&sub).unwrap();
         assert!(refused(&sub), "a subdirectory");
+        // A whole repository planted where a managed tree would be: adding a
+        // project would not make it a tree ainb made.
+        let planted = managed.join("planted--main--00000000");
+        std::fs::create_dir_all(&planted).unwrap();
+        git(&planted, &["init", "-q", "-b", "main"]);
+        assert!(refused(&planted), "a main checkout in the managed place");
+
         let elsewhere = tempfile::tempdir().unwrap();
         git(elsewhere.path(), &["init", "-q"]);
-        assert!(refused(elsewhere.path()), "an unregistered repository");
+        assert!(
+            unregistered(elsewhere.path()),
+            "an unregistered repository"
+        );
+        let (_source, stray) = stray_tree(&managed);
+        assert!(unregistered(&stray), "a tree of an unregistered repository");
     }
 
     #[test]
