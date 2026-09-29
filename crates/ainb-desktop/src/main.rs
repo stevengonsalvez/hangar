@@ -10,7 +10,7 @@
 
 mod menu;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -745,14 +745,19 @@ fn theme_set(
     paint_window_theme(&webview, preference);
 }
 
-/// Create the main window already in `preference`'s theme: its appearance
+/// Create the main window already in the stored pick's theme: its appearance
 /// forced before the webview exists, and its background the page's, set
 /// before it is first shown. `tauri.conf.json` declares the window with
 /// `create: false` so it is created here rather than before `setup`.
+///
+/// Under a System pick the OS can switch theme while the window is open; the
+/// page follows it through `prefers-color-scheme`, and the native background
+/// behind it is repainted here to match.
 fn open_main_window(
     app: &tauri::AppHandle,
-    preference: ThemePreference,
+    theme_file: &Path,
 ) -> tauri::Result<tauri::WebviewWindow> {
+    let preference = theme::load(theme_file);
     let config = app
         .config()
         .app
@@ -766,6 +771,15 @@ fn open_main_window(
         .visible(false)
         .build()?;
     paint_window_theme(&webview, preference);
+    let painted = webview.clone();
+    let theme_file = theme_file.to_path_buf();
+    webview.on_window_event(move |event| {
+        if let tauri::WindowEvent::ThemeChanged(shown) = event {
+            // The file is the host's copy of the latest pick (`theme_set`
+            // stores before it paints), read only on this rare event.
+            paint_window_background(&painted, theme::load(&theme_file), our_theme(*shown));
+        }
+    });
     if config.visible {
         webview.show()?;
     }
@@ -779,15 +793,32 @@ fn paint_window_theme(webview: &tauri::WebviewWindow, preference: ThemePreferenc
     if let Err(error) = webview.set_theme(preference.forced().map(tauri_theme)) {
         tracing::warn!(%error, "window appearance not set");
     }
-    // What the OS paints now; dark, the page's own default, when unknown.
-    let system = match webview.theme() {
-        Ok(tauri::Theme::Light) => Theme::Light,
-        _ => Theme::Dark,
-    };
-    let [red, green, blue] = preference.resolve(system).background();
+    // Read once held or released: released (System), it is the OS's own.
+    // Dark, the page's own default, when unknown.
+    let shown = webview.theme().map_or(Theme::Dark, our_theme);
+    paint_window_background(webview, preference, shown);
+}
+
+/// Set the window's background to `theme::window_paint`'s colour for
+/// `preference` while the window shows `shown`.
+fn paint_window_background(
+    webview: &tauri::WebviewWindow,
+    preference: ThemePreference,
+    shown: Theme,
+) {
+    let [red, green, blue] = theme::window_paint(preference, shown);
     let color = tauri::window::Color(red, green, blue, 255);
     if let Err(error) = webview.set_background_color(Some(color)) {
         tracing::warn!(%error, "window background not set");
+    }
+}
+
+/// Tauri's theme as ours; any theme it may add later reads as dark, the
+/// page's own default.
+fn our_theme(theme: tauri::Theme) -> Theme {
+    match theme {
+        tauri::Theme::Light => Theme::Light,
+        _ => Theme::Dark,
     }
 }
 
@@ -912,7 +943,7 @@ fn main() {
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme_file = hangar_home.join(theme::THEME_FILE);
-            open_main_window(app.handle(), theme::load(&theme_file))?;
+            open_main_window(app.handle(), &theme_file)?;
             // The desktop loads the user config itself and hands it to the
             // host, which reads nothing from disk for it.
             let config = AppConfig::load().unwrap_or_else(|error| {
