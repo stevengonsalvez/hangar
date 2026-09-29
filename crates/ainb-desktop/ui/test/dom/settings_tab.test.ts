@@ -23,6 +23,8 @@ const host = {
   screen: "config",
   version: 1,
   sent: [] as string[],
+  /** Each `select_row`'s arguments, in order, for the row menu tests. */
+  rows: [] as unknown[],
   frames: undefined as undefined | { onmessage: Callback },
   events: new Map<string, Callback[]>(),
 };
@@ -52,6 +54,7 @@ function dispatch(intent: Intent): unknown {
     return { command: id, reason: "it is not in context on this screen" };
   }
   if (id === "session_list.select_row") {
+    host.rows.push(intent.Command[1]);
     const row = (intent.Command[1] as { target: { session?: string } }).target;
     if (row.session !== undefined) host.frames?.onmessage(sessionsFrame(row.session));
   }
@@ -267,4 +270,41 @@ test("closing the shown tab before a page's frame lands draws no refusal", async
   await new Promise((resolve) => setTimeout(resolve, 150));
   assert.deepEqual(toasts().filter((text) => text.includes("is not run from the window")), []);
   show("session_list");
+});
+
+/** Right-click `session`'s sidebar row over `page` and pick `label`. */
+async function pickFromRowMenuOver(page: string, screen: string, shown: () => boolean, label: string): Promise<void> {
+  host.frames?.onmessage(sessionsFrame("u-1"));
+  show(screen);
+  await until(shown, `the ${page} page`);
+  const row = () => document.querySelector<HTMLElement>('.session-row[data-session="u-2"]');
+  await until(() => row() !== null, "the sidebar row");
+  host.sent = [];
+  host.rows = [];
+  row()!.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true }) as unknown as Event);
+  await until(() => document.querySelector('[role="menu"]') !== null, "the row menu");
+  const item = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((el) => el.textContent === label);
+  assert.ok(item, `the menu offers ${label}`);
+  item.click();
+  await until(() => !shown(), `${page} to close`);
+  // Let any refusal the pick drew come back and toast.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.deepEqual(
+    toasts().filter((text) => text.includes("is not run from the window")),
+    [],
+    `no refused intent: the window sent ${host.sent.join(", ")}`,
+  );
+}
+
+test("a row menu's Open from Settings closes Settings and opens the row, with no refusal", async () => {
+  await pickFromRowMenuOver("Settings", "config", settingsShown, "Open");
+  assert.deepEqual(host.sent, ["answer_home", "session_list.select_row"], "home first, then the row");
+  assert.deepEqual(host.rows, [{ target: { session: "u-2" }, open: true }], "the row is opened, not only selected");
+});
+
+test("a row menu's Open in Editor from the Inbox goes home first, with no refusal", async () => {
+  await pickFromRowMenuOver("Inbox", "inbox", inboxShown, "Open in Editor");
+  // No terminal was shown under the Inbox, so nothing is re-selected after.
+  assert.deepEqual(host.sent, ["answer_home", "session_list.select_row", "session_list.editor"]);
+  assert.deepEqual(host.rows, [{ target: { session: "u-2" }, open: false }]);
 });
