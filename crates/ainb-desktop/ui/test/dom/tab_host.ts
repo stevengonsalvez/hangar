@@ -1,5 +1,6 @@
 // A fake host that owns the terminal tab strip as the real one does
-// (`terminal_tabs`, `terminal_close`, the clipboard gate), installed as the
+// (`terminal_tabs`, `terminal_close`, the tabs in view and the clipboard gate
+// behind them), installed as the
 // window's Tauri bridge, and the readers the split-pane window tests share:
 // which tabs each pane's strip holds, which terminals show, what was sent.
 //
@@ -26,9 +27,11 @@ export const tab = (name: string): TabView => ({ key: `tmux_${name}`, target: { 
 /** The fake host: its tab strip, and every call the window made, in order. */
 export const host = {
   tabs: ["a", "b", "c", "d"].map(tab),
-  /** The tab sized last: the real host answers a clipboard read for that
-   * one only (`Terminals::showing`). */
-  sized: null as string | null,
+  /** The tabs in view: the set the panes named last, or, until they name
+   * one, the tab sized last. The real host answers a clipboard read for
+   * these only (`Terminals::showing`). */
+  inView: [] as string[],
+  named: false,
   calls: [] as { command: string; args: Record<string, unknown> }[],
   events: new Map<string, Callback[]>(),
 };
@@ -68,11 +71,15 @@ let nextCallback = 1;
         return null;
       case "subscribe":
         return HOST;
+      case "terminal_visible":
+        host.inView = [...(args.keys as string[])];
+        host.named = true;
+        return true;
       case "terminal_resize":
-        host.sized = args.key as string;
+        if (!host.named) host.inView = [args.key as string];
         return null;
       case "clipboard_read":
-        return args.key === host.sized ? "pasted" : "";
+        return host.inView.includes(args.key as string) ? "pasted" : "";
       default:
         return null;
     }
@@ -112,6 +119,11 @@ export function panes(): string[] {
     const shown = group.querySelector<HTMLElement>(".tab.active[data-key]")?.dataset.key?.slice(5) ?? "";
     return `${group.dataset.group}:${keys.join(",")}*${shown}${group.hasAttribute("data-focused") ? "!" : ""}`;
   });
+}
+
+/** The tabs the host holds in view, by session name. */
+export function inView(): string[] {
+  return host.inView.map((key) => key.slice(5)).sort();
 }
 
 /** The terminals on screen, by session name. */

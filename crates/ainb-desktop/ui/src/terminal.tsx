@@ -6,7 +6,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
 import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
-import { tauriTransport } from "./transport.ts";
+import { tauriTransport, visibleTerminalsSettled } from "./transport.ts";
 import { terminalAppearance, type Theme } from "./theme/theme.ts";
 import { findChord, TerminalSearch } from "./terminal_search.tsx";
 import { nextFontSize, TERMINAL_FONT_SIZE, zoomChord } from "./terminal_zoom.ts";
@@ -108,13 +108,13 @@ export function TerminalView(props: Props) {
     // paste in the bracketed-paste markers the pane asked for, so a
     // multi-line payload arrives as text rather than as lines the shell
     // runs one by one. The macOS menu's own paste takes the same path, and
-    // the host reads the clipboard only for a tab that is in view: the one
-    // it sized last (`Terminals::showing`). Split panes each size themselves,
-    // so the pane being pasted into sizes itself first, and reads once the
-    // host has taken that. The chord and the menu's Paste both come here.
+    // the host reads the clipboard only for a tab on screen, as the panes
+    // last told it (`Terminals::showing`). The read waits for that word to
+    // land, so a paste right after a layout change is answered for the panes
+    // now showing. The chord and the menu's Paste both come here.
     const paste = () => {
       const { key } = props.tab;
-      void invoke("terminal_resize", { key, cols: term.cols, rows: term.rows })
+      void visibleTerminalsSettled()
         .then(() => invoke<string>("clipboard_read", { key }))
         .then((text) => {
           if (text) term.paste(text);
