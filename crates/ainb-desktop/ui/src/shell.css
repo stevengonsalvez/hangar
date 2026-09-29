@@ -1178,6 +1178,17 @@ body {
   white-space: nowrap;
 }
 
+/* The branch tells apart cards with one name; a long one is cut, not wrapped,
+   so every card keeps its height. */
+.card-branch {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .card-chips {
   display: flex;
   gap: 4px;
