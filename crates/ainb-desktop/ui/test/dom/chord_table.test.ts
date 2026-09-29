@@ -1,7 +1,8 @@
 // The whole chord table, every key under every modifier set on both
 // platforms: no two actions answer one chord, and no chord takes a key the
 // terminal would have sent its pane. The table is what the window runs, the
-// shell's `accelerator` and the find chord, not a list kept beside them.
+// shell's `accelerator`, the find, zoom and menu chords, not a list kept
+// beside them.
 
 import "./window.ts";
 
@@ -10,6 +11,8 @@ import { test } from "node:test";
 import { Terminal } from "@xterm/xterm";
 import { accelerator } from "../../src/tabs.ts";
 import { findChord } from "../../src/terminal_search.tsx";
+import { zoomChord } from "../../src/terminal_zoom.ts";
+import { menuChord } from "../../src/terminal_menu.tsx";
 
 Object.defineProperty(globalThis, "ResizeObserver", {
   value: (window as unknown as { ResizeObserver: unknown }).ResizeObserver,
@@ -48,6 +51,10 @@ const KEYS: Record<string, [keyCode: number, key: string, shifted: string]> = {
   PageDown: [34, "PageDown", "PageDown"],
   Home: [36, "Home", "Home"],
   End: [35, "End", "End"],
+  NumpadAdd: [107, "+", "+"],
+  NumpadSubtract: [109, "-", "-"],
+  F10: [121, "F10", "F10"],
+  ContextMenu: [93, "ContextMenu", "ContextMenu"],
 };
 
 type Mods = { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean; altKey: boolean };
@@ -70,9 +77,16 @@ function claimed(mac: boolean): { code: string; mods: Mods; actions: string[] }[
   const out = [];
   for (const code of Object.keys(KEYS)) {
     for (const mods of MODS) {
-      const event = { code, ...mods };
+      const [, plain, shifted] = KEYS[code];
+      const event = { code, key: mods.shiftKey ? shifted : plain, ...mods };
       const shell = accelerator(event, mac);
-      const actions = [...(shell === null ? [] : [`shell:${shell.kind}`]), ...(findChord(event, mac) ? ["find"] : [])];
+      const zoom = zoomChord(event, mac);
+      const actions = [
+        ...(shell === null ? [] : [`shell:${shell.kind}`]),
+        ...(findChord(event, mac) ? ["find"] : []),
+        ...(zoom === null ? [] : [`zoom:${zoom}`]),
+        ...(menuChord(event) ? ["menu"] : []),
+      ];
       if (actions.length > 0) out.push({ code, mods, actions });
     }
   }
@@ -93,6 +107,11 @@ for (const mac of [true, false]) {
     const actions = new Set(claimed(mac).flatMap((chord) => chord.actions));
     const expected = [
       "find",
+      "zoom:in",
+      "zoom:out",
+      "zoom:reset",
+      "menu",
+      "shell:split",
       "shell:tab",
       "shell:prev",
       "shell:next",
@@ -111,11 +130,18 @@ for (const mac of [true, false]) {
 
 /**
  * Chords that do take a byte from the pane, each named with the byte, so a
- * new one fails here and this one is not forgotten. Ctrl+Shift+2 is Ctrl+@,
- * which xterm sends as NUL (emacs set-mark); the tab-2 chord has held it
- * since before the Orca chords, and Ctrl+Space sends the same NUL.
+ * new one fails here and none is forgotten.
  */
-const KNOWN_STOLEN: Record<string, string> = { "Ctrl+Shift+Digit2": "\x00" };
+const KNOWN_STOLEN: Record<string, string> = {
+  // Ctrl+@, which xterm sends as NUL (emacs set-mark); the tab-2 chord has
+  // held it since before the Orca chords, and Ctrl+Space sends the same NUL.
+  "Ctrl+Shift+Digit2": "\x00",
+  // Follows Orca split-down (orca `definitions-core-4.ts:33-44`): ESC D is
+  // readline's M-D, kill-word.
+  "Alt+Shift+KeyD": "\x1bD",
+  // The context menu's keyboard chord, the platform's own menu key (#258).
+  "Shift+F10": "\x1b[21;2~",
+};
 
 test("no chord in the table takes a key the terminal would send its pane", async () => {
   const host = document.createElement("div");
