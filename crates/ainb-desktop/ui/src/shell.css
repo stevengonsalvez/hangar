@@ -1025,13 +1025,13 @@ body {
   cursor: pointer;
 }
 
-.row-menu-item:hover:not(:disabled),
+.row-menu-item:hover:not([aria-disabled="true"]),
 .row-menu-item:focus-visible {
   background: var(--highlight);
   outline: none;
 }
 
-.row-menu-item:disabled {
+.row-menu-item[aria-disabled="true"] {
   color: var(--muted-foreground);
   cursor: default;
 }
