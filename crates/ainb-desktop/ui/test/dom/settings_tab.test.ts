@@ -51,9 +51,56 @@ function dispatch(intent: Intent): unknown {
   if (id === "session_list.select_row" && host.screen !== "session_list") {
     return { command: id, reason: "it is not in context on this screen" };
   }
+  if (id === "session_list.select_row") {
+    const row = (intent.Command[1] as { target: { session?: string } }).target;
+    if (row.session !== undefined) host.frames?.onmessage(sessionsFrame(row.session));
+  }
   const pages: Record<string, string> = { "home.config": "config", "home.inbox": "inbox", "home.sessions": "session_list" };
   if (id in pages) show(pages[id]);
   return null;
+}
+
+/** The second tab: a session blocked on a question, for the close tests. */
+const NEXT = { key: "tmux_web", target: { kind: "session", id: "u-2", tmux: "tmux_web" }, state: "attached" };
+
+/** The session list with `selected` selected: `u-2` (NEXT's session) is
+ * blocked on a question, so its banner draws once it is selected and shown. */
+function sessionsFrame(selected: string) {
+  host.version += 1;
+  const row = (id: string, name: string, attention: unknown[]) => ({
+    id,
+    name,
+    status: "Running",
+    branch_name: `ainb/${name}`,
+    workspace_path: "/repo",
+    attention,
+  });
+  const ask = { kind: "Ask", request: "ASK:2", route: "Daemon", detail: "pick one", options: [] };
+  return {
+    frames: [
+      {
+        section: "sessions",
+        version: host.version,
+        epoch: 1,
+        host_id: HOST,
+        daemon_read: null,
+        body: {
+          workspaces: [
+            { name: "repo", path: "/repo", shell_session: null, sessions: [row("u-1", "api", []), row("u-2", "web", [ask])] },
+          ],
+          selected_session_id: selected,
+          shell_selected: false,
+        },
+      },
+    ],
+  };
+}
+
+/** The host's tab strip changing on its own schedule: a tab opened or closed. */
+function tabsChanged(tabs: unknown[]): void {
+  for (const handler of host.events.get("terminal_tabs") ?? []) {
+    handler({ event: "terminal_tabs", id: 0, payload: { tabs, focus: null } });
+  }
 }
 
 /** Put the reducer on `screen` and frame it, as the host does after a move. */
@@ -160,4 +207,46 @@ test("a tab clicked from the Inbox closes the Inbox and shows the tab, with no r
   // The person opens the Inbox over the terminal the last test showed.
   show("inbox");
   await clickTabOver("Inbox", inboxShown);
+});
+
+test("closing the shown tab moves the sidebar to the next tab, and its question shows", async () => {
+  // The Inbox test left the reducer home with TAB's terminal shown.
+  tabsChanged([TAB, NEXT]);
+  await until(() => document.querySelectorAll(".tab[data-state]").length === 2, "the second tab in the strip");
+  host.sent = [];
+  tabsChanged([NEXT]);
+
+  await until(() => host.sent.includes("session_list.select_row"), "the next tab's row to be selected");
+  await until(
+    () => document.querySelector(".answer-banner")?.getAttribute("data-request") === "ASK:2",
+    "the next tab's own question over its terminal",
+  );
+  assert.equal(document.querySelector<HTMLElement>(`.terminal[data-tab="${NEXT.key}"]`)?.hidden, false);
+  assert.deepEqual(toasts().filter((text) => text.includes("is not run from the window")), []);
+});
+
+test("closing the shown tab under Settings or the Inbox selects no row and draws no refusal", async () => {
+  for (const [page, screen, shown] of [
+    ["Settings", "config", settingsShown],
+    ["Inbox", "inbox", inboxShown],
+  ] as const) {
+    // A second tab to fall back to, then the page over the shown one.
+    const shownKey = document.querySelector<HTMLElement>(".terminal:not([hidden])")?.dataset.tab;
+    const other = shownKey === TAB.key ? NEXT : TAB;
+    tabsChanged(shownKey === TAB.key ? [TAB, NEXT] : [NEXT, TAB]);
+    await until(() => document.querySelectorAll(".tab[data-state]").length === 2, `the second tab under ${page}`);
+    show(screen);
+    await until(shown, `the ${page} page`);
+    host.sent = [];
+    tabsChanged([other]);
+    await until(() => document.querySelectorAll(".tab[data-state]").length === 1, `the shown tab to close under ${page}`);
+    // Let anything the close sent come back and toast.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(host.sent, [], `no row sent under ${page}`);
+    assert.deepEqual(toasts().filter((text) => text.includes("is not run from the window")), [], `no refusal under ${page}`);
+    assert.ok(shown(), `${page} stays open`);
+    // Home again, as a person would click a tab, for the next page's round.
+    show("session_list");
+    await until(() => !shown(), `${page} to close`);
+  }
 });
