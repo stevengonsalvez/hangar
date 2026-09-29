@@ -33,6 +33,8 @@ export const host = {
   selected: null as string | null,
   tabs: [tabOf("u-1"), tabOf("u-2")] as TabShape[],
   sent: [] as Sent[],
+  /** Sessions whose open the host refuses, as its gate refuses a row. */
+  refuseOpen: new Set<string>(),
   frames: undefined as undefined | { onmessage: Callback },
   events: new Map<string, Callback[]>(),
 };
@@ -84,6 +86,9 @@ function dispatch(intent: Intent): unknown {
   host.sent.push({ id, session: target?.session, open });
   if (id === "session_list.select_row") {
     if (host.screen !== "session_list") return { command: id, reason: "it is not in context on this screen" };
+    if (open && target?.session !== undefined && host.refuseOpen.has(target.session)) {
+      return { command: id, reason: "the session is gone" };
+    }
     host.selected = target?.session ?? null;
     host.frames?.onmessage({ frames: [frame("sessions", sessionsBody())] });
     const session = target?.session;
