@@ -1,9 +1,11 @@
-// The whole window, mounted over a fake host: with Settings open, a click on
-// a terminal tab leaves Settings and shows that tab, as Orca's activation does
-// (it switches any page back to the terminal view before it activates the
-// worktree). The fake host keeps the reducer's screen and refuses a
-// session-list row while that screen is Config, as the real host's screen gate
-// does, so a click that sends the row first shows the refusal toast.
+// The whole window, mounted over a fake host: with Settings or the Inbox open,
+// a click on a terminal tab leaves the page and shows that tab, as Orca's
+// activation does (it switches any page back to the terminal view before it
+// activates the worktree). The fake host keeps the reducer's screen, refuses a
+// session-list row off the session list as the real host's screen gate does,
+// and walks home on `answer_home` as the real one does from any page
+// (`tests/shell.rs`, `the_banners_sequence_lands_from_any_page`). A click that
+// sends the row first shows the refusal toast.
 
 import "./window.ts";
 
@@ -49,10 +51,15 @@ function dispatch(intent: Intent): unknown {
   if (id === "session_list.select_row" && host.screen !== "session_list") {
     return { command: id, reason: "it is not in context on this screen" };
   }
-  if (id === "home.config") host.screen = "config";
-  if (id === "home.sessions") host.screen = "session_list";
-  if (id === "home.config" || id === "home.sessions") host.frames?.onmessage(shellFrame());
+  const pages: Record<string, string> = { "home.config": "config", "home.inbox": "inbox", "home.sessions": "session_list" };
+  if (id in pages) show(pages[id]);
   return null;
+}
+
+/** Put the reducer on `screen` and frame it, as the host does after a move. */
+function show(screen: string): void {
+  host.screen = screen;
+  host.frames?.onmessage(shellFrame());
 }
 
 const callbacks = new Map<number, Callback>();
@@ -81,6 +88,10 @@ let nextCallback = 1;
         return HOST;
       case "dispatch":
         return dispatch(args.intent as Intent);
+      case "answer_home":
+        host.sent.push("answer_home");
+        if (host.screen !== "session_list") show("session_list");
+        return null;
       default:
         return null;
     }
@@ -112,21 +123,20 @@ async function until(ready: () => boolean, what: string): Promise<void> {
 }
 
 const settingsShown = () => document.querySelector(".settings-page") !== null;
+const inboxShown = () => document.querySelector(".inbox") !== null;
 const toasts = () => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent ?? "");
 const terminal = () => document.querySelector<HTMLElement>(`.terminal[data-tab="${TAB.key}"]`);
 
-test("a tab clicked from Settings closes Settings and shows the tab, with no refusal", async () => {
-  const root = document.createElement("div");
-  root.id = "root";
-  document.body.appendChild(root);
-  await import("../../src/main.tsx");
-
-  await until(settingsShown, "the Settings page, the reducer being on Config");
+/** Click the terminal tab over `page` and check it leaves for the tab. */
+async function clickTabOver(page: string, shown: () => boolean): Promise<void> {
+  await until(shown, `the ${page} page, the reducer being on it`);
+  assert.equal(terminal()?.hidden, true, `the page holds the work area, not the tab`);
+  host.sent = [];
   const title = document.querySelector<HTMLElement>(".tab[data-state] .tab-title");
-  assert.ok(title, "the tab strip lists the tab under Settings");
+  assert.ok(title, `the tab strip lists the tab under ${page}`);
   title.click();
 
-  await until(() => !settingsShown(), "Settings to close");
+  await until(() => !shown(), `${page} to close`);
   await until(() => terminal()?.hidden === false, "the tab's terminal to show");
   // Let any refusal the click drew come back and toast.
   await new Promise((resolve) => setTimeout(resolve, 100));
@@ -135,8 +145,19 @@ test("a tab clicked from Settings closes Settings and shows the tab, with no ref
     [],
     `no refused intent: the window sent ${host.sent.join(", ")}`,
   );
-  assert.ok(
-    host.sent.indexOf("home.sessions") < host.sent.lastIndexOf("session_list.select_row"),
-    `the row is selected after the reducer leaves Config: ${host.sent.join(", ")}`,
-  );
+  assert.deepEqual(host.sent, ["answer_home", "session_list.select_row"], "home first, then the tab's row");
+}
+
+test("a tab clicked from Settings closes Settings and shows the tab, with no refusal", async () => {
+  const root = document.createElement("div");
+  root.id = "root";
+  document.body.appendChild(root);
+  await import("../../src/main.tsx");
+  await clickTabOver("Settings", settingsShown);
+});
+
+test("a tab clicked from the Inbox closes the Inbox and shows the tab, with no refusal", async () => {
+  // The person opens the Inbox over the terminal the last test showed.
+  show("inbox");
+  await clickTabOver("Inbox", inboxShown);
 });
