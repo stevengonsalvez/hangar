@@ -12,7 +12,7 @@
 //!                                     then a rescan
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ainb_app::git::WorktreeManager;
 use ainb_app::interactive::InteractiveSessionManager;
@@ -110,13 +110,35 @@ pub fn plan(
 ) -> Result<DeletePreview, String> {
     let (tree, path) = fate(manager, store, session)?;
     let changes = match (tree, path) {
-        (TreeFate::Removed, Some(path)) => WorktreeManager::uncommitted_file_count_at(&path)
-            .map_err(|error| tracing::warn!(%error, "delete preview: git status failed"))
-            .ok()
-            .map(|count| u32::try_from(count).unwrap_or(u32::MAX)),
+        (TreeFate::Removed, Some(path)) => changes_at(&path),
         _ => None,
     };
     Ok(DeletePreview { tree, changes })
+}
+
+/// Uncommitted and untracked files in `tree`, or `None` when git cannot say.
+fn changes_at(tree: &Path) -> Option<u32> {
+    WorktreeManager::uncommitted_file_count_at(tree)
+        .map_err(|error| tracing::warn!(%error, "delete: git status failed"))
+        .ok()
+        .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+}
+
+/// Why a removal of a tree the dialog counted `seen` changes in, and that
+/// holds `now` changes, must not run, or `None` when it may.
+///
+/// `force` is the person confirming what the dialog showed them: dirty or
+/// uncounted work. It never covers more than that: a file that appeared
+/// after the count (a live agent still writing) refuses the delete, forced
+/// or not, so nothing the person was not shown is wiped.
+fn changes_refusal(seen: Option<u32>, now: Option<u32>, force: bool) -> Option<&'static str> {
+    const GREW: &str = "New uncommitted changes appeared in this worktree since the dialog counted them. Nothing was deleted: open Delete again.";
+    const UNKNOWN: &str = "The uncommitted changes in this worktree could not be counted. Nothing was deleted: open Delete again.";
+    match (seen, now) {
+        (Some(seen), Some(now)) if now > seen => Some(GREW),
+        (_, None) | (None, Some(_)) if !force => Some(UNKNOWN),
+        _ => None,
+    }
 }
 
 /// Run `read` against the session store and the worktree folder as they are
@@ -149,19 +171,47 @@ pub async fn preview(raw: &str) -> Result<DeletePreview, String> {
 
 /// Delete `raw`'s session the way the terminal's `d` then Delete does, if
 /// what that removes is still what the dialog said: `expected`, the fate the
-/// person confirmed. Two sessions sharing a tree can both be confirmed while
-/// the first delete runs; the second must not then take the folder it
-/// promised to keep.
+/// person confirmed, and for a tree that goes, no more uncommitted changes
+/// than `expected_changes` ([`changes_refusal`]; `force` accepts the dirty or
+/// uncounted work the dialog showed). Two sessions sharing a tree can both be
+/// confirmed while the first delete runs, and an agent can write while the
+/// dialog is open: neither may take work the person was not shown.
+///
+/// The removal itself forces a dirty tree out (`git worktree remove --force`
+/// after a refusal), so these checks are the last word on what is lost.
 ///
 /// # Errors
-/// A sentence for a toast: a bad id, a fate that changed (nothing is
-/// deleted), a failed removal, or a folder the removal left behind.
-pub async fn delete(raw: &str, expected: TreeFate) -> Result<(), String> {
+/// A sentence for a toast: a bad id, a fate or a change count that moved
+/// (nothing is deleted), a failed removal, or a folder the removal left
+/// behind.
+pub async fn delete(
+    raw: &str,
+    expected: TreeFate,
+    expected_changes: Option<u32>,
+    force: bool,
+) -> Result<(), String> {
     let session = session_id(raw)?;
-    let (now, tree) = read_now(move |manager, store| fate(manager, store, session)).await?;
-    if now != expected {
-        return Err("What deleting this session removes has changed since the dialog asked. Nothing was deleted: open Delete again.".into());
-    }
+    let (now, tree) = read_now(move |manager, store| {
+        let (now, tree) = fate(manager, store, session)?;
+        // Counted in the same read, right before the removal.
+        let changes = match (now, &tree) {
+            (TreeFate::Removed, Some(tree)) => changes_at(tree),
+            _ => None,
+        };
+        Ok(((now, tree), changes))
+    })
+    .await
+    .and_then(|((now, tree), changes)| {
+        if now != expected {
+            return Err("What deleting this session removes has changed since the dialog asked. Nothing was deleted: open Delete again.".to_string());
+        }
+        if now == TreeFate::Removed {
+            if let Some(refusal) = changes_refusal(expected_changes, changes, force) {
+                return Err(refusal.to_string());
+            }
+        }
+        Ok((now, tree))
+    })?;
     let mut manager = InteractiveSessionManager::new()
         .map_err(|error| format!("The session was not deleted: {error}"))?;
     manager
@@ -178,4 +228,36 @@ pub async fn delete(raw: &str, expected: TreeFate) -> Result<(), String> {
     }
     tracing::info!(%session, ?now, "window deleted a session");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changes_refusal;
+
+    #[test]
+    fn a_clean_tree_that_stayed_clean_may_go() {
+        assert_eq!(changes_refusal(Some(0), Some(0), false), None);
+    }
+
+    #[test]
+    fn a_file_written_after_the_count_refuses_even_forced() {
+        assert!(changes_refusal(Some(0), Some(1), false).is_some());
+        assert!(changes_refusal(Some(2), Some(3), true).is_some());
+    }
+
+    #[test]
+    fn shown_dirty_work_goes_only_when_forced() {
+        assert_eq!(changes_refusal(Some(2), Some(2), true), None);
+        // Fewer is fine: the agent committed, nothing unseen is lost.
+        assert_eq!(changes_refusal(Some(2), Some(1), true), None);
+    }
+
+    #[test]
+    fn an_uncounted_tree_goes_only_when_forced() {
+        assert!(changes_refusal(None, None, false).is_some());
+        assert!(changes_refusal(Some(0), None, false).is_some());
+        assert!(changes_refusal(None, Some(4), false).is_some());
+        assert_eq!(changes_refusal(None, None, true), None);
+        assert_eq!(changes_refusal(Some(1), None, true), None);
+    }
 }
