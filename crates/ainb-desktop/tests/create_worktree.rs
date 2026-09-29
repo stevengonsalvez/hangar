@@ -2,8 +2,8 @@
 //! the desktop's request reaches `worktree/create`, the daemon runs `ainb`,
 //! and the created session comes back as the tab to attach.
 //!
-//! The daemon is booted by the sidecar in a private hangar home with the
-//! spawn switch on and `AINB_BIN` pointing at a stand-in `ainb` that records
+//! The daemon is booted by the sidecar in a private hangar home with its
+//! default spawn verbs and `AINB_BIN` pointing at a stand-in `ainb` that records
 //! its argv and answers like `ainb --format json run`. The real CLI half is
 //! proven in `crates/ainb-core/tests/run_json_worktree.rs`.
 //!
@@ -155,7 +155,8 @@ async fn the_window_creates_a_worktree_session_through_the_daemon() {
     // Inherited by the daemon the sidecar spawns. Edition 2021: safe.
     std::env::set_var("HOME", user_home.path());
     std::env::set_var("AINB_CODEX_MANAGED", "0");
-    std::env::set_var("AINB_HANGAR_SPAWN", "1");
+    // Unset: the spawn verbs are on by default, so the plain daemon creates.
+    std::env::remove_var("AINB_HANGAR_SPAWN");
     std::env::set_var("AINB_BIN", fake_ainb(tools.path()));
 
     let home = Home(tempfile::tempdir().expect("scratch home"));
