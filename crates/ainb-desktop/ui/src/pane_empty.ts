@@ -7,7 +7,7 @@
 // visibly chosen made the two halves of the window disagree (#193).
 
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
-import { allSessions, label } from "./sessions.ts";
+import { label, selectedSession } from "./sessions.ts";
 
 export type EmptyPane =
   | { kind: "choose" }
@@ -15,8 +15,7 @@ export type EmptyPane =
 
 /** The empty work area's content for the Sessions frame `view`. */
 export function emptyPaneView(view: SessionsView_Serialize | undefined): EmptyPane {
-  const selected = view?.selected_session_id ?? null;
-  const session = selected === null ? undefined : allSessions(view).find((row) => row.id === selected);
+  const session = selectedSession(view);
   if (session === undefined) return { kind: "choose" };
   return { kind: "selected", sessionId: session.id, name: label(session.name), branch: label(session.branch_name) };
 }
