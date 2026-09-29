@@ -157,6 +157,45 @@ body {
   font-style: italic;
 }
 
+/* The usage segment (Orca's provider segment): one borderless button over a
+   chip per provider, opening the stats tab. Quiet like the rest of the bar;
+   only the stale and failed marks take the amber. */
+.statusbar-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 4px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.statusbar-usage:hover {
+  background: var(--highlight);
+}
+
+.statusbar-usage-chip,
+.statusbar-usage-more {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.statusbar-usage-provider,
+.statusbar-usage-none,
+.statusbar-usage-pending {
+  color: var(--muted-foreground);
+}
+
+.statusbar-usage-warn {
+  color: var(--gold);
+}
+
 .banner {
   display: flex;
   align-items: center;
