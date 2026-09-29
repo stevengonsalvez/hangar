@@ -10,7 +10,7 @@ import type {
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "./acks.ts";
 import { cardForSession, statusForSession } from "./status.ts";
-import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, elsewhereCount, idleOnBoard, showIntents } from "./board.ts";
+import { agentStateCounts, attentionRows, boardColumns, boardHealth, COLUMNS, countIn, elsewhereCount, showIntents } from "./board.ts";
 
 function card(sessionKey: string, over: Partial<AgentCardFrame> = {}): AgentCardFrame {
   return {
@@ -322,8 +322,8 @@ test("the footer's idle count is the board's Idle column, even while the session
     NO_ACKS,
   );
   const idleColumn = columns.find((column) => column.state === "idle")!;
-  assert.equal(idleOnBoard(columns), 1);
-  assert.equal(idleOnBoard(columns), idleColumn.cards.length, "one list for the board and the footer");
+  assert.equal(countIn(columns, "idle"), 1);
+  assert.equal(countIn(columns, "idle"), idleColumn.cards.length, "one list for the board and the footer");
 });
 
 test("a waiting agent is counted in Needs, never also as idle", () => {
@@ -341,5 +341,15 @@ test("a waiting agent is counted in Needs, never also as idle", () => {
     columns.find((column) => column.state === "needs")!.cards.map((c) => c.key),
     ["claude:p-1"],
   );
-  assert.equal(idleOnBoard(columns), 1);
+  assert.equal(countIn(columns, "idle"), 1);
+});
+
+test("an idle agent whose row already rings Ask is counted once, in one of need-you and idle", () => {
+  // The chip path: the row's Ask ring merges on the attention cadence while
+  // the card still reads idle. Counted from two sources the footer read "1
+  // need you 1 idle" for one session; from the one list it is one or other.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  (sessions.workspaces[0].sessions[0] as { attention: unknown[] }).attention = [{ kind: "Ask", options: [], route: "Daemon" }];
+  const columns = boardColumns(status(card("claude:p-1", { state: "idle" })), fleet, sessions, NO_ACKS);
+  assert.equal(countIn(columns, "needs") + countIn(columns, "idle"), 1);
 });
