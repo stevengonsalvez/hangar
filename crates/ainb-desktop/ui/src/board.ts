@@ -4,7 +4,8 @@
 //
 //   agent_status.view.cards[] ──status.ts──▶ Orca's four buckets
 //   fleet.fleet_metadata[]    ──model, session_key──▶ the card's line
-//   sessions.workspaces[]     ──name, attention──▶ the card's title and chips
+//   sessions.workspaces[]     ──name, branch, attention──▶ the card's title,
+//                                branch line and chips
 //   acks.ts                  ──this viewer's Done acks──▶ Done vs Idle
 //
 // The bucket is `status.ts`'s own mapping of the host's `state`, never
@@ -52,6 +53,9 @@ export interface BoardCard {
   key: string;
   /** The sidebar's name for the row, when the window holds one. */
   title: string;
+  /** The row's branch, the line that tells apart two cards with one name,
+   * or `null` when there is nothing to draw (`cardBranch`). */
+  branch: string | null;
   /** The session list row a click selects, when this card has one. */
   sessionId: string | null;
   /** The operator vocabulary this card reads (`status.ts`). */
@@ -123,6 +127,24 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
 }
 
 /**
+ * The branch line a card draws under its title, as Orca's agent board card
+ * names its worktree under the session's own name
+ * (`orca:src/renderer/src/components/dashboard-popout/AgentKanbanCard.tsx:216-217,341`,
+ * stablyai/orca d17a17684b). Always drawn, not only when two names collide:
+ * a Done column of "claude" cards is only readable if every one says where it
+ * ran.
+ *
+ * `null` when the row has none (no row, an SSH row's empty branch) and when it
+ * would repeat the title, the way Orca's worktree card drops a branch equal to
+ * its name (`orca:src/renderer/src/components/sidebar/worktree-card-presentation.tsx:82-86`).
+ * Drawn through `label`, so a branch name cannot restyle the card.
+ */
+export function cardBranch(branchName: string | undefined, title: string): string | null {
+  const branch = label((branchName ?? "").trim());
+  return branch === "" || branch === title ? null : branch;
+}
+
+/**
  * `status`, onto the column it draws in. Every status has one, so every card
  * the board counts is a card it draws.
  *
@@ -180,6 +202,7 @@ export function boardColumns(
     const session = sessionForCard(card, rows, fleet?.fleet_metadata);
     const attention = chipsOf(session);
     const acked = isAcked(acks, card.session_key, card.evidence_observed_at);
+    const title = label(session?.name ?? keyLabel(card.session_key));
     const status = deriveStatus(card, {
       attention,
       elicitation: elicitationDetail(session?.attention ?? []),
@@ -187,7 +210,8 @@ export function boardColumns(
     });
     cards.push({
       key: card.session_key,
-      title: label(session?.name ?? keyLabel(card.session_key)),
+      title,
+      branch: cardBranch(session?.branch_name, title),
       sessionId: session?.id ?? null,
       status,
       column: columnOf(status, acked, session !== undefined || card.provider === "acp"),
