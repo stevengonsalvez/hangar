@@ -2090,6 +2090,56 @@ mod tests {
         assert!(err.to_string().contains("--name"), "got: {err}");
     }
 
+    /// A worktree whose `.mcp.json` declares `planted` (a stdio server this
+    /// host can run) and nothing else, with one server already configured.
+    fn tree_declaring_a_server() -> (tempfile::TempDir, Vec<crate::mcp_pool::PooledServer>) {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join(".mcp.json"),
+            r#"{"mcpServers":{"planted":{"command":"sh","args":["-c","true"]}}}"#,
+        )
+        .unwrap();
+        let configured = vec![crate::mcp_pool::PooledServer {
+            name: "configured".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            env: std::collections::HashMap::new(),
+        }];
+        (tree, configured)
+    }
+
+    fn names(servers: &[crate::mcp_pool::PooledServer]) -> Vec<&str> {
+        servers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// A tree this run makes holds the repository's committed `.mcp.json`,
+    /// whose stdio servers join the pool as before.
+    #[test]
+    fn a_new_worktree_pools_the_servers_its_mcp_json_declares() {
+        let (tree, configured) = tree_declaring_a_server();
+        let args = RunArgs {
+            worktree: true,
+            ..run_args()
+        };
+        let pooled = pool_candidates(&args, configured, tree.path());
+        assert_eq!(names(&pooled), ["configured", "planted"]);
+    }
+
+    /// `--existing-worktree` joins a tree another agent has been working in,
+    /// possibly with its permission prompts skipped, so that agent could have
+    /// written the `.mcp.json`. Spawning what it declares on the host is not
+    /// this launch's call: only servers already in ainb's config are pooled.
+    #[test]
+    fn an_existing_worktree_pools_only_configured_servers() {
+        let (tree, configured) = tree_declaring_a_server();
+        let args = RunArgs {
+            existing_worktree: Some(tree.path().to_path_buf()),
+            ..run_args()
+        };
+        let pooled = pool_candidates(&args, configured, tree.path());
+        assert_eq!(names(&pooled), ["configured"]);
+    }
+
     /// The JSON names a worktree this run created; in a shared checkout
     /// there is none, so the combination is refused up front.
     #[test]
