@@ -8,10 +8,7 @@ import assert from "node:assert/strict";
 import {
   activateTab,
   addTab,
-  closeGroup,
   focusGroup,
-  focusNext,
-  focusPrevious,
   geometry,
   groupOf,
   groups,
@@ -223,42 +220,36 @@ test("a layout at the end of the id space stops splitting, and still loads", () 
   assert.deepEqual(parse(serialize(splitGroup(full, "g1", "right", "c"))), full);
 });
 
-// ---- closeGroup ----
+// ---- a group closing ----
 
-test("closing a group hands its tabs and its space to the sibling before it", () => {
+test("a group its last tab left gives its space and the focus to the sibling before it", () => {
   // g1 split twice: g1 | g3 | g2, the newest beside the group it came from.
   const three = splitGroup(twoColumns(), "g1", "right", "c");
   assert.deepEqual(shape(three), ["g1:a*a", "g3:c*c", "g2:b*b"]);
   assert.deepEqual(rootRatios(three), [0.25, 0.25, 0.5]);
-  const closed = closeGroup(three, "g3");
-  assert.deepEqual(shape(closed), ["g1:a,c*a", "g2:b*b"], "tabs join after the sibling's own; it keeps its shown tab");
-  assert.equal(closed.focused, "g1", "the focus goes with the tabs");
+  const closed = removeTab(three, "c");
+  assert.deepEqual(shape(closed), ["g1:a*a", "g2:b*b"]);
+  assert.equal(closed.focused, "g1", "the focus goes where the space went");
   assert.deepEqual(rootRatios(closed), [0.5, 0.5]);
-  assertInvariants(closed, ["a", "b", "c"]);
+  assertInvariants(closed, ["a", "b"]);
 });
 
 test("the first group closes into the one after it, which takes the focus", () => {
-  const closed = closeGroup(focusGroup(twoColumns(), "g1"), "g1");
-  assert.deepEqual(shape(closed), ["g2:b,a,c*b"]);
+  const closed = reconcile(focusGroup(twoColumns(), "g1"), ["b"]);
+  assert.deepEqual(shape(closed), ["g2:b*b"]);
   assert.equal(closed.focused, "g2");
   assert.equal(closed.root.kind, "group", "a split of one child is that child");
-  assertInvariants(closed, ["a", "b", "c"]);
+  assertInvariants(closed, ["b"]);
 });
 
 test("a group closes into the nearest group of a split sibling, which takes its space", () => {
   const layout = leftAndStack();
   assert.deepEqual(shape(layout), ["g1:a*a", "g2:b*b", "g3:c*c"]);
-  const closed = closeGroup(layout, "g1");
-  assert.deepEqual(shape(closed), ["g2:b,a*b", "g3:c*c"]);
+  const closed = removeTab(layout, "a");
+  assert.deepEqual(shape(closed), ["g2:b*b", "g3:c*c"]);
   assert.equal(closed.root.kind === "split" && closed.root.axis, "column", "the stack fills the window");
   assert.equal(closed.focused, "g3", "an unfocused group's close leaves the focus");
-  assertInvariants(closed, ["a", "b", "c"]);
-});
-
-test("the last group cannot close, nor can an unknown one", () => {
-  const layout = initialLayout(["a"]);
-  assert.equal(closeGroup(layout, "g1"), layout);
-  assert.equal(closeGroup(layout, "g7"), layout);
+  assertInvariants(closed, ["b", "c"]);
 });
 
 // ---- moveTab ----
@@ -344,7 +335,7 @@ test("the last group stays when its last tab goes, empty for the next", () => {
   assert.equal(removeTab(layout, "zzz"), layout, "an unknown tab changes nothing");
 });
 
-// ---- activateTab, focusGroup, focusNext, focusPrevious ----
+// ---- activateTab, focusGroup ----
 
 test("activating a tab shows it and focuses its group", () => {
   const shown = activateTab(twoColumns(), "c");
@@ -354,16 +345,13 @@ test("activating a tab shows it and focuses its group", () => {
   assert.equal(activateTab(layout, "zzz"), layout);
 });
 
-test("focus walks groups in reading order and wraps both ways", () => {
-  const layout = focusGroup(leftAndStack(), "g1");
-  assert.deepEqual(groups(layout).map((group) => group.id), ["g1", "g2", "g3"]);
-  assert.equal(focusNext(layout).focused, "g2");
-  assert.equal(focusNext(focusNext(layout)).focused, "g3");
-  assert.equal(focusNext(focusNext(focusNext(layout))).focused, "g1", "wraps to the first");
-  assert.equal(focusPrevious(layout).focused, "g3", "wraps to the last");
-  assert.equal(focusGroup(layout, "g9"), layout, "an unknown group changes nothing");
-  assert.equal(focusNext(initialLayout(["a"])).focused, "g1", "one group keeps the focus");
-  assert.deepEqual(shape(focusNext(layout)), shape(layout), "focus moves nothing else");
+test("focusing a group moves nothing else; an unknown group or the focused one changes nothing", () => {
+  const layout = leftAndStack();
+  const moved = focusGroup(layout, "g1");
+  assert.equal(moved.focused, "g1");
+  assert.deepEqual(shape(moved), shape(layout));
+  assert.equal(focusGroup(layout, "g9"), layout);
+  assert.equal(focusGroup(layout, "g3"), layout);
 });
 
 // ---- resize, geometry ----
@@ -486,7 +474,8 @@ test("a layout survives a serialize and parse round trip", () => {
   assert.deepEqual(back, layout);
   assertInvariants(back, ["a", "b", "c", "d"]);
   // Ids keep counting from where they were, not from the highest left.
-  const closed = closeGroup(layout, "g3");
+  const closed = removeTab(layout, "c");
+  assert.equal(groupOf(closed, "c"), null, "g3, c's group, closed");
   assert.equal(parse(serialize(closed)).next, layout.next);
   // The one empty group a layout can have round trips too, id and all.
   const emptied = reconcile(layout, []);
@@ -638,7 +627,7 @@ test("missing, throwing or corrupt storage gives one group holding every live ta
 
 // ---- flows ----
 
-test("flow: split right, move a tab, close the left group, every tab still reachable", () => {
+test("flow: split right, move a tab, the left group's tabs end, every tab left still reachable", () => {
   const live = ["a", "b", "c", "d"];
   let layout = readLayout(undefined, live);
   layout = splitGroup(layout, "g1", "right", "b");
@@ -646,14 +635,14 @@ test("flow: split right, move a tab, close the left group, every tab still reach
   assert.deepEqual(shape(layout), ["g1:a,d*a", "g2:b,c*c"]);
   assert.equal(layout.focused, "g2");
 
-  layout = closeGroup(layout, "g1");
-  assert.deepEqual(shape(layout), ["g2:b,c,a,d*c"], "the right group takes the left's tabs and keeps its shown tab");
+  layout = reconcile(layout, ["b", "c", "e"]);
+  assert.deepEqual(shape(layout), ["g2:b,c,e*c"], "the right group takes the window, and the new tab");
   assert.equal(layout.focused, "g2");
-  for (const key of live) {
+  for (const key of ["b", "c", "e"]) {
     const shown = activateTab(layout, key);
     assert.equal(shown.focused, groupOf(shown, key), `${key} is reachable`);
   }
-  assertInvariants(layout, live);
+  assertInvariants(layout, ["b", "c", "e"]);
 });
 
 test("flow: open a second session and split it out beside the first, then it ends", () => {
@@ -710,9 +699,6 @@ test("flow: a long random walk of every step keeps every invariant", () => {
       case 0:
         layout = splitGroup(layout, pick(ids), pick(["right", "down", "left", "up"] as const), random() < 0.5 ? pick(pool) : undefined);
         break;
-      case 1:
-        layout = closeGroup(layout, pick(ids));
-        break;
       case 2:
         layout = moveTab(layout, pick(pool), pick(ids), random() < 0.5 ? Math.floor(random() * 5) - 1 : undefined);
         break;
@@ -720,7 +706,7 @@ test("flow: a long random walk of every step keeps every invariant", () => {
         layout = activateTab(layout, pick(pool));
         break;
       case 4:
-        layout = random() < 0.5 ? focusGroup(layout, pick(ids)) : random() < 0.5 ? focusNext(layout) : focusPrevious(layout);
+        layout = focusGroup(layout, pick(ids));
         break;
       case 9: {
         // A seam dragged anywhere, even off the window.
