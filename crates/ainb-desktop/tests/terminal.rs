@@ -627,3 +627,65 @@ fn the_tab_in_view_is_not_evicted_for_being_quiet() {
         1
     );
 }
+
+/// The history size tmux holds for the session's active pane.
+fn history_size(session: &Session<'_>) -> usize {
+    let output = session
+        .server
+        .command()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &format!("={}:", session.name),
+            "#{history_size}",
+        ])
+        .output()
+        .expect("display-message runs");
+    String::from_utf8_lossy(&output.stdout).trim().parse().expect("a history size")
+}
+
+/// Cmd+K: tmux drops the pane's scrollback and redraws the tab's client, and
+/// the screen the pane shows now (an agent's, say) is left as it is.
+#[test]
+fn clearing_a_tab_drops_its_tmux_history_and_keeps_its_screen() {
+    let server = Server::new();
+    let session = server.start(
+        "d1c-clear",
+        "sh -c 'seq 1 300; echo agent-screen-row; exec sh'",
+    );
+    let (terminals, recorder, _reports) = terminals(&server);
+    assert_eq!(
+        terminals.open(tmux_tab("d1c-clear")),
+        None,
+        "the tab opened"
+    );
+    let painted = Arc::new(Mutex::new(0usize));
+    assert!(terminals.attach_output("d1c-clear", counting_sink(&painted)));
+    wait_for("the pane's history", || history_size(&session) > 200);
+    wait_for("the first paint", || *painted.lock().unwrap() > 0);
+    // Let the attach's own redraw finish before counting the refresh's.
+    std::thread::sleep(Duration::from_millis(300));
+    let before = *painted.lock().unwrap();
+
+    assert!(terminals.clear("d1c-clear"), "tmux cleared");
+    assert_eq!(history_size(&session), 0, "the scrollback is gone");
+    assert!(
+        session.capture().contains("agent-screen-row"),
+        "the screen is untouched:\n{}",
+        session.capture()
+    );
+    wait_for("the client redrawn", || *painted.lock().unwrap() > before);
+    assert!(recorder.toasts.lock().unwrap().is_empty(), "no toast");
+}
+
+#[test]
+fn clearing_an_unknown_tab_runs_nothing() {
+    let server = Server::new();
+    let session = server.start("d1c-clear-other", "sh -c 'seq 1 300; exec sh'");
+    let (terminals, _recorder, _reports) = terminals(&server);
+    wait_for("the pane's history", || history_size(&session) > 200);
+    // A session with no tab is not a tab this window may clear.
+    assert!(!terminals.clear("d1c-clear-other"));
+    assert!(history_size(&session) > 200, "its history is untouched");
+}
