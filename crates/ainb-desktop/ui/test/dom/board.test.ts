@@ -16,6 +16,7 @@ import type {
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
 import { ackTurn, NO_ACKS, type AckMap } from "../../src/acks.ts";
+import { boardColumns } from "../../src/board.ts";
 import { Board } from "../../src/board.tsx";
 import type { RendererIntent } from "../../src/tabs.ts";
 
@@ -99,8 +100,8 @@ async function open(initial = frames({ a: "a", b: "b" })) {
         get sessions() {
           return view().sessions;
         },
-        get acks() {
-          return acks();
+        get columns() {
+          return boardColumns(view().agentStatus, view().fleet, view().sessions, acks());
         },
         elsewhere: 0,
         onChoose: (intent: RendererIntent) => chosen.push(intent),
