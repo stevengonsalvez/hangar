@@ -163,6 +163,30 @@ async fn a_file_written_after_the_preview_refuses_the_delete_and_survives() {
 }
 
 #[tokio::test]
+async fn dirty_work_without_force_is_refused_by_the_host() {
+    // The window asks for Force Delete on a dirty tree, but the host does not
+    // rely on it: a plain delete of shown dirty work deletes nothing.
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    save(&[row(session, &tree)]);
+    std::fs::write(tree.join("unsaved.txt"), "work\n").unwrap();
+    let shown = preview(&session.to_string()).await.expect("previewed");
+    assert_eq!(shown.changes, Some(1));
+
+    let error = delete(&session.to_string(), shown.tree, shown.changes, false)
+        .await
+        .expect_err("refused without force");
+
+    assert!(error.contains("Nothing was deleted"), "{error}");
+    assert!(
+        tree.join("unsaved.txt").is_file(),
+        "the dirty file survives"
+    );
+    assert!(listed(session));
+}
+
+#[tokio::test]
 async fn deleting_one_of_two_sessions_in_a_tree_keeps_the_tree_for_the_other() {
     let _one = STORE.lock().await;
     let base = home();
