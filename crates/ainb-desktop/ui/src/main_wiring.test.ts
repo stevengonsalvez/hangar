@@ -64,3 +64,13 @@ test("closing the shown tab moves the sidebar to the tab shown next", () => {
     /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*if \(!settings\(\) && !inboxOpen\(\)\) \{\s*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) void invoke<Refusal \| null>\("dispatch", \{ intent: select \}\);/,
   );
 });
+
+test("the host hears which session the work area shows, and the notifications toggle", () => {
+  const focused = body("focusedCard", "createEffect(on(focusedCard");
+  assert.match(focused, /transcriptKey\(\)/, "a transcript card is the session shown");
+  assert.match(focused, /showing\("terminal"\)/, "a terminal counts only while it is shown");
+  assert.match(focused, /cardForTabKey\(key\)\?\.session_key/, "named by the card key the host reads");
+  assert.ok(MAIN.includes('createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session })'));
+  assert.ok(MAIN.includes('invoke("notifications_set", { enabled })'));
+  assert.ok(MAIN.includes("onNotifications={notifications.set}"));
+});

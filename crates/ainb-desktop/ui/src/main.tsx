@@ -538,6 +538,17 @@ function Shell() {
   /** The session whose terminal the work area shows: `undefined` when no
    * terminal is shown, `null` for a tab of no session (`questionOver`). */
   const shownSession = createMemo(() => shownSessionOf(showing("terminal"), tabs(), active()));
+  /** The card key of the session the work area shows, its transcript card's
+   * or its terminal's, `null` for none: the host raises no OS notification
+   * for that session while this window has focus (`notify.rs`). */
+  const focusedCard = createMemo(() => {
+    if (settings() || inboxOpen()) return null;
+    const transcript = transcriptKey();
+    if (transcript !== null) return transcript;
+    const key = active();
+    return showing("terminal") && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
+  });
+  createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session }).catch(() => {})));
 
   // The reducer speaks through its notices: a refused send says why in the
   // reducer's own words (a daemon that is gone, a native picker, nothing typed),
