@@ -12,7 +12,20 @@ import { transformAsync } from "@babel/core";
 import solid from "babel-preset-solid";
 import ts from "typescript";
 
+// xterm ships CommonJS as `main` and ES modules as `module`, which is what
+// Vite bundles. Node reads only `main`, whose named exports it cannot see, so
+// a test that mounts the whole window (`terminal.tsx`) resolves xterm the way
+// the build does.
+export async function resolve(specifier, context, nextResolve) {
+  if (!specifier.startsWith("@xterm/")) return nextResolve(specifier, context);
+  const resolved = await nextResolve(specifier, context);
+  return { ...resolved, url: resolved.url.replace(/\.js$/, ".mjs"), format: "module" };
+}
+
 export async function load(url, context, nextLoad) {
+  // A stylesheet the window imports is the bundler's to inject; a DOM test
+  // reads markup and attributes, never computed styles, so it loads as empty.
+  if (url.endsWith(".css")) return { format: "module", source: "", shortCircuit: true };
   if (!url.endsWith(".tsx")) return nextLoad(url, context);
   const path = fileURLToPath(url);
   const source = await readFile(path, "utf8");
@@ -31,5 +44,7 @@ export async function load(url, context, nextLoad) {
     configFile: false,
     presets: [[solid, { generate: "dom" }]],
   });
-  return { format: "module", source: compiled.code, shortCircuit: true };
+  // Vite defines `import.meta.env` for the window; a test runs as a build does.
+  const env = "import.meta.env ??= { DEV: false, PROD: true, MODE: \"test\" };\n";
+  return { format: "module", source: env + compiled.code, shortCircuit: true };
 }

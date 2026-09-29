@@ -27,7 +27,11 @@ test("the answer banner only draws over the selected session's own terminal", ()
 test("every tab activation, a person's or the host's, selects that tab's row", () => {
   const activate = body("activate", "const [hostAnswers");
   assert.match(activate, /const select = selectIntentFor\(tabs\(\), key\);/);
-  assert.match(activate, /if \(select !== null\) dispatch\(select\);/);
+  // Only once the host has left any page (`test/dom/settings_tab.test.ts`).
+  assert.match(
+    activate,
+    /void invoke\("answer_home"\)\.then\(\(\) => run\(\[\.\.\.first, \.\.\.\(select === null \? \[\] : \[select\]\)\]\)\);/,
+  );
 });
 
 test("the create flow reads the window's session list and selects through the reducer", () => {

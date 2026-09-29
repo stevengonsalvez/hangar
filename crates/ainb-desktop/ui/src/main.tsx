@@ -229,17 +229,21 @@ function Shell() {
    * caller says which, since the difference decides whether the terminal may
    * take the keyboard from a text field (`terminalMayTakeFocus`).
    */
-  const activate = (key: string | null, byHost: boolean) => {
+  const activate = (key: string | null, byHost: boolean, first: RendererIntent[] = []) => {
     setActive(key);
     if (key !== null) {
       recent = visited(recent, key);
       // The session list follows the shown terminal, whoever showed it, so
       // the sidebar row and the answer banner are that session's.
       const select = selectIntentFor(tabs(), key);
-      if (select !== null) dispatch(select);
+      // Back to the session list first, as Orca leaves any page for the
+      // terminal before it activates a worktree: on Settings or the Inbox the
+      // reducer is on a screen whose gate refuses a session-list row. The host
+      // decides by the reducer's own screen (#121), which a frame can trail,
+      // and `first` and the row go only once it is back on the list.
+      void invoke("answer_home").then(() => run([...first, ...(select === null ? [] : [select])]));
       setPane("terminal");
       closeTranscript();
-      closeSettings();
       focusTab(key, byHost);
       // Opening a session acks the Done it shows, on every surface: its
       // card's turn, or, for a Done that is only a chip, the row itself.
@@ -364,10 +368,8 @@ function Shell() {
     if (key !== null) focusers.get(key)?.();
     else sidebar?.focus();
   };
-  const choose = (tab: Tab) => {
-    if (tab.state === "detached") openRow(rowOf(tab.target));
-    activate(tab.key, false);
-  };
+  const choose = (tab: Tab) =>
+    activate(tab.key, false, tab.state === "detached" ? [openRowIntent(rowOf(tab.target))] : []);
   /** Open the palette, or close it the way Esc does: the titlebar's search
    * button and the Cmd/Ctrl+Shift+K accelerator both send exactly this, so
    * there is one place that decides which way a press or a click goes. */
