@@ -230,8 +230,9 @@ function needOf(card: BoardCard | undefined): string | null {
  * other column. */
 function cardLine(card: BoardCard | undefined): string {
   if (card === undefined) return "";
-  // Only a card that can be opened says so: one with no row is disabled.
-  if (card.column === "done" && (card.sessionId !== null || card.acp)) return "click to open";
+  // Every Done card can be opened: `columnOf` (`board.ts`) sends one nobody
+  // can open to Idle, where it is disabled and says what it is instead.
+  if (card.column === "done") return "click to open";
   // The model is free text off the frame, drawn through the same rule as a
   // session name, so a bidi override or an escape cannot restyle the card.
   const parts = [

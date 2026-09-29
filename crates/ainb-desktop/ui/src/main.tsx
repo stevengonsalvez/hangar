@@ -497,9 +497,6 @@ function Shell() {
   const gitView = () => shellGitView(store, host());
   const usage = () => shellUsage(store, host());
   const usageStale = createMemo(() => ROOT_SELECTORS.usageStale(store, host()));
-  /** ASK + APPROVE + WAIT + ERR: the status bar's one "N need you" amber
-   * count. Each selector is its own memo first, so a drain that only moves
-   * one of the four still wakes just that one before the sum recomputes. */
   // The board's columns, projected ONCE and read by the board and by the
   // status bar's two counts, so the footer moves on the frame the board does
   // and a session is in exactly one of "need you" and "idle".

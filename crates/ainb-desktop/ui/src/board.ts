@@ -131,11 +131,15 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
  * `exited` follows Orca's retained agents (`orca:src/renderer/src/components/
  * sidebar/worktree-agent-rows.ts:242-267` keeps a closed agent as `done`;
  * `orca:src/shared/dashboard-snapshot.ts:40-47` settles an acknowledged one
- * into idle): Done until this viewer opens it, then Idle. One nobody can
- * open (`openable` false: no session row, not an ACP transcript) could never
- * be acked out of Done, so it goes straight to Idle. It leaves the board
- * when the daemon archives the row. Exhaustive: a new status fails to
- * compile here.
+ * into idle): Done until this viewer opens it, then Idle. It leaves the
+ * board when the daemon archives the row.
+ *
+ * Done means "finished, not yet read", and opening the card is the only way
+ * to read it (the ack). So a Done card nobody can open (`openable` false: no
+ * session row, not an ACP transcript), exited or a finished turn alike, could
+ * never leave Done: it goes straight to Idle, as an acked one would. Every
+ * card left in Done can therefore be opened. Exhaustive: a new status fails
+ * to compile here.
  */
 function columnOf(status: UiStatus, acked: boolean, openable: boolean): BoardColumnKind {
   switch (status.kind) {
@@ -144,7 +148,7 @@ function columnOf(status: UiStatus, acked: boolean, openable: boolean): BoardCol
     case "working":
       return "working";
     case "done":
-      return "done";
+      return openable ? "done" : "idle";
     case "idle":
     case "unverifiable":
       return "idle";
