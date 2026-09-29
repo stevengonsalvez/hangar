@@ -106,6 +106,7 @@ async fn every_mutating_method_replays_exactly_once() {
     let mut deduplicated = 0usize;
     let mut transient: Vec<&str> = Vec::new();
     let mut refused: Vec<&str> = Vec::new();
+    let mut dark: Vec<&str> = Vec::new();
 
     for (index, entry) in MUTATING_METHODS.iter().enumerate() {
         let mut params: serde_json::Value = serde_json::from_str(entry.sample_params)
@@ -175,6 +176,26 @@ async fn every_mutating_method_replays_exactly_once() {
             continue;
         }
 
+        if is_dark(&first) {
+            // A verb this daemon does not serve yet: nothing ran, and the op
+            // id stays free so the same retry executes once the switch is on.
+            // Like a transient answer, it carries no ack and is not replayed.
+            assert_eq!(
+                ack(&first),
+                serde_json::Value::Null,
+                "{} is dark and must not have recorded an ack: {first}",
+                entry.method
+            );
+            assert_eq!(
+                without_ack(second.clone()),
+                without_ack(first.clone()),
+                "{} did not answer its retry the same way",
+                entry.method
+            );
+            dark.push(entry.method);
+            continue;
+        }
+
         assert_eq!(
             ack(&first)["outcome"],
             "created",
@@ -204,7 +225,7 @@ async fn every_mutating_method_replays_exactly_once() {
     // started). A second silent hole fails the gate.
     eprintln!(
         "deduplicated {deduplicated} of {} mutating methods; \
-         transient: {transient:?}; refused: {refused:?}",
+         transient: {transient:?}; refused: {refused:?}; dark: {dark:?}",
         MUTATING_METHODS.len()
     );
     // NAMED, not counted. A count leaves room for one hole to close while
@@ -223,8 +244,14 @@ async fn every_mutating_method_replays_exactly_once() {
          to answer into; a refusal is not recorded, by design"
     );
     assert_eq!(
+        dark,
+        vec!["shell/create", "shell/close"],
+        "the only methods allowed to be dark are the spawn verbs, whose switch \
+         this fixture leaves off"
+    );
+    assert_eq!(
         deduplicated,
-        MUTATING_METHODS.len() - transient.len() - refused.len(),
+        MUTATING_METHODS.len() - transient.len() - refused.len() - dark.len(),
         "every other method must reach the ledger"
     );
 }
@@ -251,6 +278,12 @@ fn refusal(response: &serde_json::Value) -> Option<String> {
 fn is_transient(response: &serde_json::Value) -> bool {
     let code = response["error"]["code"].as_i64();
     code == Some(i64::from(ainb_hangar_proto::STORE_UNAVAILABLE)) || code == Some(-32603)
+}
+
+/// `METHOD_NOT_FOUND`: a verb this daemon does not serve, here the spawn
+/// verbs with their boot switch off.
+fn is_dark(response: &serde_json::Value) -> bool {
+    response["error"]["code"].as_i64() == Some(-32601)
 }
 
 /// Criterion 1, second half (amendment 15): a second principal replaying the
@@ -452,4 +485,74 @@ async fn an_op_id_claimed_before_the_mint_replays_after_it() {
     .await;
     assert_eq!(ack(&after)["outcome"], "created", "{after}");
     assert_eq!(host_of("op-minted").await, vec![host_id]);
+}
+
+/// A dark verb's refusal frees its op id: `shell/create` with op id X answers
+/// `METHOD_NOT_FOUND` while the spawn switch is off, and the same op id and
+/// body runs for real once the verb is served. Recorded instead, the retry
+/// after the flip would be replayed the old refusal and never open a shell.
+///
+/// The switch is read once per process, so "served" is the dispatcher's own
+/// guard with a handler that answers, the same seam `dispatch` drives.
+#[tokio::test]
+async fn a_dark_verb_leaves_its_op_id_free_for_the_flip() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    assert!(
+        std::env::var_os(ainb_hangar_daemon::spawn::SPAWN_ENV).is_none(),
+        "run with {} unset: the dark half is what is being proven",
+        ainb_hangar_daemon::spawn::SPAWN_ENV
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open_in(dir.path()).await.unwrap();
+    let broker = EventBroker::new();
+    let events = broker.sink();
+    let method = ainb_hangar_proto::methods::SHELL_CREATE;
+    let body = serde_json::json!({ "worktree_path": "/tmp", "op_id": "op-dark-flip" });
+
+    for attempt in ["first", "retry while dark"] {
+        let refused = dispatch(&store, &events, &Caller::Operator, method, body.clone()).await;
+        assert_eq!(
+            refused["error"]["code"].as_i64(),
+            Some(-32601),
+            "{attempt}: {refused}"
+        );
+        assert_eq!(
+            ack(&refused),
+            serde_json::Value::Null,
+            "{attempt}: {refused}"
+        );
+    }
+
+    let ran = AtomicBool::new(false);
+    let served = serde_json::json!({
+        "tmux_session_name": "ainb-dsh-0a1b2c3d",
+        "worktree_path": "/tmp",
+    });
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let after = rpc::mutation::guard(
+        store.pool(),
+        &request(method, body),
+        &Caller::Operator,
+        now_ms,
+        || async {
+            ran.store(true, Ordering::SeqCst);
+            Ok(served.clone())
+        },
+    )
+    .await
+    .expect("the served verb answers");
+
+    assert!(
+        ran.load(Ordering::SeqCst),
+        "the retry after the flip must execute"
+    );
+    assert_eq!(after[ACK_KEY]["outcome"], "created", "{after}");
+    assert_eq!(after["tmux_session_name"], "ainb-dsh-0a1b2c3d", "{after}");
 }
