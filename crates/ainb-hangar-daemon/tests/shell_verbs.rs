@@ -1,5 +1,6 @@
-//! `shell/create`, `shell/list` and `shell/close` with the switch on, end to
-//! end through dispatch, against real git and a real tmux server.
+//! `shell/create`, `shell/list` and `shell/close` as a daemon serves them by
+//! default, end to end through dispatch, against real git and a real tmux
+//! server.
 //!
 //! The server is PRIVATE: `TMUX_TMPDIR` points at a per-test directory and
 //! `TMUX` is removed, so the daemon's own `tmux new-session` lands on a server
@@ -7,8 +8,9 @@
 //! name (`=<name>`) on that server, never the server itself.
 //!
 //! Its own process: `AINB_HANGAR_SPAWN`, `HOME` and `TMUX_TMPDIR` are
-//! process-global and the switch is read once, so they are set before the
-//! first dispatch and the tests run serially on one lock.
+//! process-global and the switch is read once, so they are settled before
+//! the first dispatch and the tests run serially on one lock. The switch is
+//! left UNSET: the verbs are on by default.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -97,7 +99,8 @@ fn git(cwd: &Path, args: &[&str]) {
 /// One isolated world: a home whose config registers `<home>/code`, a
 /// repository at `<home>/code/app`, a linked worktree of it where
 /// `ainb run --worktree` puts them, and a private tmux server dir. Sets
-/// `HOME`, `TMUX_TMPDIR` and the switch for the daemon; held under `SERIAL`.
+/// `HOME` and `TMUX_TMPDIR` and clears the switch for the daemon; held under
+/// `SERIAL`.
 struct World {
     home: tempfile::TempDir,
     tmux_dir: PathBuf,
@@ -160,7 +163,7 @@ impl World {
         for locale in ["LANG", "LC_ALL", "LC_CTYPE"] {
             std::env::remove_var(locale);
         }
-        std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "1");
+        std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
         Self {
             home,
             tmux_dir,
