@@ -150,6 +150,9 @@ impl World {
         // Edition 2021: set_var is safe. Held under SERIAL for the whole test.
         std::env::set_var("HOME", home.path());
         std::env::remove_var("AINB_HOME");
+        // The spawn switch's file key is read from the hangar home: this one,
+        // not a developer's `$AINB_HANGAR_HOME`.
+        std::env::remove_var("AINB_HANGAR_HOME");
         std::env::set_var("TMUX_TMPDIR", &tmux_dir);
         std::env::remove_var("TMUX");
         // tmux reads `$XDG_CONFIG_HOME/tmux/tmux.conf` too; a developer's
