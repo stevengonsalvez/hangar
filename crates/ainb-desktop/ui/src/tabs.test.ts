@@ -6,6 +6,7 @@ import {
   accelerator,
   escEsc,
   keyboardTaken,
+  leftToFocus,
   openRowIntent,
   rowOf,
   selectIntentFor,
@@ -33,7 +34,8 @@ test("on macOS only cmd chords stay with the shell", () => {
   assert.deepEqual(accelerator(key("Digit3", { meta: true }), true), { kind: "tab", index: 2 });
   assert.deepEqual(accelerator(key("KeyW", { meta: true }), true), { kind: "close" });
   assert.deepEqual(accelerator(key("BracketLeft", { meta: true }), true), { kind: "prev" });
-  assert.deepEqual(accelerator(key("KeyK", { meta: true }), true), { kind: "palette" });
+  assert.deepEqual(accelerator(key("KeyK", { meta: true }), true), { kind: "clear" });
+  assert.deepEqual(accelerator(key("KeyJ", { meta: true }), true), { kind: "palette" });
   assert.deepEqual(accelerator(key("KeyH", { meta: true, shift: true }), true), { kind: "hosts" });
   // The pane keeps ctrl+c, ctrl+b, arrows, and cmd chords the spec does not list.
   assert.equal(accelerator(key("KeyC", { ctrl: true }), true), null);
@@ -64,6 +66,42 @@ test("the composer opens on Cmd+N on macOS and Ctrl+Shift+N elsewhere", () => {
   assert.equal(accelerator(key("KeyN", { ctrl: true }), true), null);
   assert.equal(accelerator(key("KeyN", { meta: true }), false), null);
   assert.equal(accelerator(key("KeyN"), true), null);
+});
+
+test("Orca's chords: Cmd+K clears, Cmd+J is the palette, Cmd+B the sidebar; Ctrl+Shift off macOS", () => {
+  for (const [code, shell] of [
+    ["KeyK", { kind: "clear" }],
+    ["KeyJ", { kind: "palette" }],
+    ["KeyB", { kind: "sidebar" }],
+  ] as const) {
+    assert.deepEqual(accelerator(key(code, { meta: true }), true), shell);
+    assert.deepEqual(accelerator(key(code, { ctrl: true, shift: true }), false), shell);
+    // Plain Ctrl is the pane's: Ctrl+K kill-line, Ctrl+J newline, Ctrl+B tmux's prefix.
+    assert.equal(accelerator(key(code, { ctrl: true }), false), null);
+    assert.equal(accelerator(key(code, { ctrl: true }), true), null);
+    assert.equal(accelerator(key(code, { meta: true, shift: true }), true), null);
+  }
+});
+
+test("worktree steps are Cmd+Shift+Up and Down on macOS, and the pane's keys elsewhere", () => {
+  assert.deepEqual(accelerator(key("ArrowUp", { meta: true, shift: true }), true), { kind: "worktree", step: -1 });
+  assert.deepEqual(accelerator(key("ArrowDown", { meta: true, shift: true }), true), { kind: "worktree", step: 1 });
+  assert.equal(accelerator(key("ArrowUp", { meta: true }), true), null);
+  assert.equal(accelerator(key("ArrowLeft", { meta: true, shift: true }), true), null);
+  // xterm sends Ctrl+Shift+Up as ESC [1;6A: the pane keeps it.
+  assert.equal(accelerator(key("ArrowUp", { ctrl: true, shift: true }), false), null);
+  assert.equal(accelerator(key("ArrowDown", { ctrl: true, shift: true }), false), null);
+});
+
+test("clear is always the focused pane's; a worktree step is a text field's own when one has the keyboard", () => {
+  const field = { tagName: "INPUT", className: "settings-search" };
+  const pane = { tagName: "TEXTAREA", className: "xterm-helper-textarea" };
+  assert.equal(leftToFocus({ kind: "clear" }, null), true);
+  assert.equal(leftToFocus({ kind: "clear" }, pane), true);
+  assert.equal(leftToFocus({ kind: "worktree", step: 1 }, field), true);
+  assert.equal(leftToFocus({ kind: "worktree", step: 1 }, pane), false);
+  assert.equal(leftToFocus({ kind: "worktree", step: -1 }, null), false);
+  assert.equal(leftToFocus({ kind: "palette" }, field), false, "every other chord is the window's");
 });
 
 test("copy and paste are the shell's only elsewhere, and native on macOS", () => {

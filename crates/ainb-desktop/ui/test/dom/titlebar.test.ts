@@ -52,6 +52,15 @@ test("the bar drags the window; it names the app only on macOS", async () => {
   assert.equal(document.querySelector(".titlebar-app"), null);
 });
 
+test("the Search button's title names the palette's chord for the platform", async () => {
+  await open({ mac: true });
+  assert.equal(document.querySelector(".titlebar-search")?.getAttribute("title"), "Search (Cmd+J)");
+  cleanup?.();
+  document.body.innerHTML = "";
+  await open({ mac: false });
+  assert.equal(document.querySelector(".titlebar-search")?.getAttribute("title"), "Search (Ctrl+Shift+J)");
+});
+
 test("macOS gets the traffic-light padding class; other platforms do not", async () => {
   await open({ mac: true });
   assert.equal(document.querySelector("header.titlebar")?.classList.contains("mac"), true);

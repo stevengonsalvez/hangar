@@ -9,6 +9,7 @@ import {
   formatGitChanges,
   projectGroups,
   readCollapsed,
+  stepWorktree,
   worktreeCards,
   writeCollapsed,
 } from "./sidebar_model.ts";
@@ -207,4 +208,40 @@ test("opening a session does not move its card: the order is the frame's", () =>
     worktreeCards(sessions, "/repo").map((card) => card.key),
     ["/repo/old", "/repo/new"],
   );
+});
+
+test("stepWorktree walks worktree cards in sidebar order, wrapping, landing on each card's newest session", () => {
+  const at = (day: number) => `2024-01-0${day}T00:00:00Z`;
+  const view = {
+    workspaces: [
+      workspace({
+        name: "a",
+        path: "/a",
+        sessions: [
+          session({ id: "one-old", workspace_path: "/a/one", created_at: at(1) }),
+          session({ id: "one-new", workspace_path: "/a/one", created_at: at(2) }),
+          session({ id: "two", workspace_path: "/a/two" }),
+        ],
+      }),
+      workspace({ name: "empty", path: "/empty", sessions: [] }),
+      workspace({ name: "b", path: "/b", sessions: [session({ id: "three", workspace_path: "/b/three" })] }),
+    ],
+    selected_session_id: null,
+  } as unknown as SessionsView_Serialize;
+  // Either session of a card is that card: its older agent row steps on too.
+  assert.equal(stepWorktree(view, "one-old", 1), "two");
+  assert.equal(stepWorktree(view, "one-new", 1), "two");
+  assert.equal(stepWorktree(view, "two", 1), "three", "across projects, past an empty one");
+  assert.equal(stepWorktree(view, "three", 1), "one-new", "wraps to the first card's newest session");
+  assert.equal(stepWorktree(view, "one-old", -1), "three", "and wraps going up");
+  // Nothing selected, or a session no card holds: in from the far end.
+  assert.equal(stepWorktree(view, null, 1), "one-new");
+  assert.equal(stepWorktree(view, "gone", -1), "three");
+  assert.equal(stepWorktree(undefined, null, 1), null, "no cards, nowhere to go");
+  // A collapsed project's cards are not drawn: stepped over, and a session
+  // inside one enters from the far end.
+  const collapsed = new Set(["/b"]);
+  assert.equal(stepWorktree(view, "two", 1, collapsed), "one-new", "past the collapsed project");
+  assert.equal(stepWorktree(view, "three", -1, collapsed), "two");
+  assert.equal(stepWorktree(view, null, 1, new Set(["/a", "/b"])), null, "every project collapsed");
 });
