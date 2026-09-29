@@ -118,3 +118,17 @@ test("a ready summary with no provider used is empty, drawn as such", () => {
   assert.equal(empty.state, "empty");
   assert.deepEqual(empty.chips, []);
 });
+
+test("a frame that cut every provider is not empty: +N counts them, as the stats tab does", () => {
+  const cut = usageSegment(view({ summary: summary({ providers: [], providers_cut: 4 }) }));
+  assert.equal(cut.state, "ready");
+  assert.deepEqual(cut.chips, []);
+  assert.equal(cut.more, 4);
+  assert.equal(cut.moreTitle, "Also: 4 not sent");
+});
+
+test("an empty or unavailable summary still carries the stale mark of a failed refresh", () => {
+  assert.equal(usageSegment(view({ summary: summary({ providers: [] }), failure: "timed out" })).stale, true);
+  assert.equal(usageSegment(view({ summary: summary({ providers: [] }) }), true).stale, true);
+  assert.equal(usageSegment(view({ summary: summary({ providers: [] }) })).stale, false);
+});
