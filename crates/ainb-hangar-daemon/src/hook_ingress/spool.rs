@@ -67,6 +67,7 @@ pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport
     let dir = hangar_home.join("hangar").join(SPOOL_DIR_NAME);
     let mut report = DrainReport::default();
     if !dir_is_ours(&dir) {
+        tracing::warn!(dir = %dir.display(), "hook spool: refusing a directory that is not ours or is writable by others");
         return report;
     }
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -117,19 +118,16 @@ pub async fn drain_spool(hangar_home: &Path, sink: &dyn HookSink) -> DrainReport
     report
 }
 
-/// The spool directory is a real directory this user owns that nobody else
-/// can write.
-fn dir_is_ours(dir: &Path) -> bool {
+/// Whether `dir` is a real directory (not a symlink) this user owns that
+/// nobody else can write. Shared with the `ainb run` output directory
+/// (`spawn::own_run_logs_dir`).
+pub(crate) fn dir_is_ours(dir: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(dir) else {
         return false;
     };
-    let ok = meta.file_type().is_dir()
+    meta.file_type().is_dir()
         && meta.uid() == nix::unistd::geteuid().as_raw()
-        && meta.mode() & 0o022 == 0;
-    if !ok {
-        tracing::warn!(dir = %dir.display(), "hook spool: refusing a directory that is not ours or is writable by others");
-    }
-    ok
+        && meta.mode() & 0o022 == 0
 }
 
 /// A spool file (`*.jsonl`) or one moved aside by an earlier start.
