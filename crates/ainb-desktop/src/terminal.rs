@@ -77,6 +77,10 @@ pub enum TabTarget {
     Session { id: Uuid, tmux: String },
     /// A tmux session ainb did not create.
     Tmux { tmux: String },
+    /// A plain shell the daemon opened (`shell/create`) in the worktree
+    /// `dir`. It has no session-list row: the tab is its only place, and
+    /// closing the tab ends it (`shell/close`).
+    Shell { tmux: String, dir: String },
 }
 
 impl TabTarget {
@@ -84,14 +88,14 @@ impl TabTarget {
     #[must_use]
     pub fn tmux(&self) -> &str {
         match self {
-            Self::Session { tmux, .. } | Self::Tmux { tmux } => tmux,
+            Self::Session { tmux, .. } | Self::Tmux { tmux } | Self::Shell { tmux, .. } => tmux,
         }
     }
 
     fn attached_to(&self) -> AttachedTo {
         match self {
             Self::Session { id, .. } => AttachedTo::Session(*id),
-            Self::Tmux { tmux } => AttachedTo::Tmux(tmux.clone()),
+            Self::Tmux { tmux } | Self::Shell { tmux, .. } => AttachedTo::Tmux(tmux.clone()),
         }
     }
 }
@@ -475,7 +479,25 @@ impl Terminals {
     /// Open a tab on `target`, or focus the one already open. `Some` is the
     /// failure report when the session is gone or tmux would not start.
     pub fn open(&self, target: TabTarget) -> Option<Intent> {
+        self.open_focusing(target, true)
+    }
+
+    /// [`Self::open`] without asking the window to show the tab: for tabs
+    /// the host restores on its own, which must not take the work area.
+    pub fn open_unfocused(&self, target: TabTarget) -> Option<Intent> {
+        self.open_focusing(target, false)
+    }
+
+    /// What the listed tab `key` is attached to.
+    #[must_use]
+    pub fn target(&self, key: &str) -> Option<TabTarget> {
+        let tabs = lock(&self.inner.tabs);
+        position(&tabs, key).map(|index| tabs[index].target.clone())
+    }
+
+    fn open_focusing(&self, target: TabTarget, focus: bool) -> Option<Intent> {
         let key = target.tmux().to_string();
+        let focus_key = focus.then(|| key.clone());
         // Probed before the tabs lock: it forks tmux, and a wedged tmux must
         // not freeze every tab (or the shell tick waiting on this call).
         let alive = has_session(&self.inner.tmux, &key);
@@ -489,7 +511,7 @@ impl Terminals {
                     return Some(report);
                 }
             }
-            self.emit(&tabs, Some(key));
+            self.emit(&tabs, focus_key);
             return None;
         }
         if !alive {
@@ -518,7 +540,7 @@ impl Terminals {
                     generation,
                     redials: 0,
                 });
-                self.emit(&tabs, Some(key));
+                self.emit(&tabs, focus_key);
                 None
             }
             Err(error) => Some(reports::attach_finished(
