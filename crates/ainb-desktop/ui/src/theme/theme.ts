@@ -185,3 +185,24 @@ export const TERMINAL_THEMES: Record<Theme, TerminalColors> = {
   },
 };
 
+
+/**
+ * The floor xterm holds text to against its cell, per painted theme: Orca's
+ * `LIGHT_BG_MIN_CONTRAST` (4.5, WCAG AA) and `DARK_BG_MIN_CONTRAST` (3)
+ * (`terminal-contrast-correction.ts`). Orca gates it by the background's
+ * luminance; each of these themes has one fixed background, so the theme
+ * decides it.
+ *
+ * Why a floor as well as the palette: an agent CLI in its own dark theme
+ * paints in 24-bit colour, which no palette slot reaches. Claude Code's dark
+ * theme sends bold headings as white and prompt lines on an rgb(55, 55, 55)
+ * bar in the default foreground; on the light background those read as
+ * nothing and as solid black bars. xterm lifts such text to the floor and
+ * leaves colours that already clear it as sent.
+ */
+export const TERMINAL_MIN_CONTRAST: Record<Theme, number> = { dark: 3, light: 4.5 };
+
+/** The xterm options that follow the painted theme: its palette and its floor. */
+export function terminalAppearance(theme: Theme): { theme: TerminalColors; minimumContrastRatio: number } {
+  return { theme: TERMINAL_THEMES[theme], minimumContrastRatio: TERMINAL_MIN_CONTRAST[theme] };
+}
