@@ -14,7 +14,7 @@
 //! stalled tab holds at most `WINDOW_BYTES + READ_QUEUE * CHUNK_BYTES`, about
 //! 8 MiB, so 64 MiB with [`MAX_ATTACHED_TABS`] attached.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
@@ -317,6 +317,16 @@ struct Client {
     input: mpsc::SyncSender<Vec<u8>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     attached_at: Instant,
+}
+
+impl Client {
+    /// The client's terminal, which is how tmux names the client.
+    fn tty(&self) -> Option<PathBuf> {
+        #[cfg(unix)]
+        return self.master.tty_name();
+        #[cfg(not(unix))]
+        return None;
+    }
 }
 
 impl Drop for Client {
@@ -647,6 +657,40 @@ impl Terminals {
         }
     }
 
+    /// Clear the tab's scrollback, Orca's `terminal.clear` (Cmd+K): tmux drops
+    /// the pane's history (`clear-history`) and redraws this tab's client
+    /// (`refresh-client`). The pane's screen is left as it is, so an agent's
+    /// screen survives; only what scrolled off it goes.
+    ///
+    /// `key` names a listed tab, and the tmux session is the one that tab is
+    /// attached to: the webview never names a session. `false` for an unknown
+    /// tab, or when tmux did not clear, which is also said in a toast.
+    pub fn clear(&self, key: &str) -> bool {
+        let (name, tty) = {
+            let tabs = lock(&self.inner.tabs);
+            let Some(tab) = position(&tabs, key).map(|index| &tabs[index]) else {
+                return false;
+            };
+            (
+                tab.target.tmux().to_string(),
+                tab.client.as_ref().and_then(Client::tty),
+            )
+        };
+        // Forked with no lock held, as `open` probes: a wedged tmux must not
+        // stall every other tab.
+        let cleared = succeeded(clear_history_command(&self.inner.tmux, &name));
+        if !cleared {
+            tracing::warn!(tab = key, "tmux clear-history failed");
+            self.inner.events.toast(format!("{key}: tmux did not clear its scrollback"));
+        }
+        if let Some(tty) = tty {
+            if !succeeded(refresh_client_command(&self.inner.tmux, &tty)) {
+                tracing::warn!(tab = key, "tmux refresh-client failed");
+            }
+        }
+        cleared
+    }
+
     /// Close the tab: its client goes, and the reducer hears the user left it.
     pub fn close(&self, key: &str) {
         let mut tabs = lock(&self.inner.tabs);
@@ -887,6 +931,37 @@ fn has_session(tmux: &Tmux, name: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// `tmux clear-history` for the active pane of exactly `name`: a pane
+/// target, `=` so a prefix never matches, `:` for the session's current
+/// window (tmux(1), TARGETS).
+fn clear_history_command(tmux: &Tmux, name: &str) -> Command {
+    let mut command = Command::new(&tmux.program);
+    command
+        .args(tmux.server_args())
+        .args(["clear-history", "-t", &format!("={name}:")]);
+    command
+}
+
+/// `tmux refresh-client` for the client on `tty`: tmux redraws that client
+/// alone (tmux(1), `refresh-client [-t target-client]`, a client named by
+/// its tty).
+fn refresh_client_command(tmux: &Tmux, tty: &Path) -> Command {
+    let mut command = Command::new(&tmux.program);
+    command.args(tmux.server_args()).arg("refresh-client").arg("-t").arg(tty);
+    command
+}
+
+/// Run `command` quietly, outside any tmux; whether it exited zero.
+fn succeeded(mut command: Command) -> bool {
+    command
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn attach_command(tmux: &Tmux, name: &str) -> CommandBuilder {
     let mut command = CommandBuilder::new(&tmux.program);
     command.args(tmux.server_args());
@@ -988,6 +1063,50 @@ mod tests {
             received as f64 / 1_048_576.0 / elapsed.as_secs_f64()
         );
         assert_eq!(received, TOTAL, "every byte the child wrote was delivered");
+    }
+
+    fn argv(command: &Command) -> Vec<String> {
+        std::iter::once(command.get_program())
+            .chain(command.get_args())
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn clear_history_targets_the_exact_sessions_active_pane() {
+        let tmux = Tmux::new(PathBuf::from("/opt/tmux")).on_socket(PathBuf::from("/tmp/t.sock"));
+        assert_eq!(
+            argv(&clear_history_command(&tmux, "ainb-api")),
+            [
+                "/opt/tmux",
+                "-S",
+                "/tmp/t.sock",
+                "clear-history",
+                "-t",
+                "=ainb-api:"
+            ]
+        );
+        let default_server = Tmux::new(PathBuf::from("tmux"));
+        assert_eq!(
+            argv(&clear_history_command(&default_server, "ainb-api")),
+            ["tmux", "clear-history", "-t", "=ainb-api:"]
+        );
+    }
+
+    #[test]
+    fn refresh_client_names_the_client_by_its_tty() {
+        let tmux = Tmux::new(PathBuf::from("/opt/tmux")).on_socket(PathBuf::from("/tmp/t.sock"));
+        assert_eq!(
+            argv(&refresh_client_command(&tmux, Path::new("/dev/pts/7"))),
+            [
+                "/opt/tmux",
+                "-S",
+                "/tmp/t.sock",
+                "refresh-client",
+                "-t",
+                "/dev/pts/7"
+            ]
+        );
     }
 
     fn env_of(command: &CommandBuilder, key: &str) -> Option<String> {
