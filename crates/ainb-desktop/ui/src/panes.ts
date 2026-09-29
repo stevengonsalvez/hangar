@@ -2,7 +2,8 @@
 // host's tab strip, and where a dragged tab lands. Pure, like the model it
 // drives, so `panes.test.ts` checks each rule without a window.
 //
-//   host TabsView ──▶ followHost ──▶ Layout ──▶ geometry ──▶ panes.tsx
+//   relaunch      ──▶ rebuild (until restoreDone) ─┐
+//   host TabsView ──▶ followHost ──────────────────┴▶ Layout ──▶ geometry ──▶ panes.tsx
 //   drag  (x, y)  ──▶ dropAt ──▶ Drop ──▶ dropTab ──▶ Layout
 
 import {
@@ -18,6 +19,47 @@ import {
   type SplitDirection,
 } from "./layout.ts";
 import { tabAfterClose } from "./tabs.ts";
+
+/**
+ * How long a relaunch keeps the stored layout for tabs not open yet, from
+ * the first tab that reopens: the bound on a stored tab that never comes
+ * back (its session was deleted, say), after which the window follows the
+ * host and stores what it has.
+ */
+export const RESTORE_MS = 5 * 60_000;
+
+/** A relaunch bringing the stored layout back as its tabs reopen, one by
+ * one: the host restores none, so they come back as a person opens them. */
+export interface Restore {
+  readonly stored: Layout;
+  /** Every tab the stored layout holds. */
+  readonly keys: readonly string[];
+  /** When the restore gives up on the tabs still missing. */
+  readonly until: number;
+}
+
+/** A restore of `stored` beginning at `now`. */
+export function beginRestore(stored: Layout, now: number): Restore {
+  return { stored, keys: groups(stored).flatMap((group) => group.tabs), until: now + RESTORE_MS };
+}
+
+/**
+ * The layout while `restore` runs: the stored one following `liveKeys`,
+ * rebuilt from the stored one each time, so a stored tab not open yet keeps
+ * its place for when it opens. `shown`, the tab last activated since the
+ * restore began, is shown and focused while it is open.
+ */
+export function rebuild(restore: Restore, liveKeys: readonly string[], shown: string | null): Layout {
+  const layout = reconcile(restore.stored, liveKeys);
+  return shown === null ? layout : activateTab(layout, shown);
+}
+
+/** Whether `restore` is over: every stored tab is open again, or its time
+ * (`RESTORE_MS`) is up. */
+export function restoreDone(restore: Restore, liveKeys: readonly string[], now: number): boolean {
+  const live = new Set(liveKeys);
+  return now >= restore.until || restore.keys.every((key) => live.has(key));
+}
 
 /**
  * `before` following the host's `liveKeys`: tabs that closed drop out, new
