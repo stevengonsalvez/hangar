@@ -29,11 +29,13 @@
 //! Everything deterministic, including `INVALID_PARAMS`: the same op id with
 //! the same body gets the same answer, and a client that fixes its params is
 //! sending a different body, which the fingerprint catches. Only `SQLite`
-//! contention, internal faults and `METHOD_NOT_FOUND` ABANDON the claim,
-//! because those are exactly the cases where the caller is supposed to retry
-//! and get a different answer. `METHOD_NOT_FOUND` is a verb this daemon does
-//! not serve yet (dark behind a boot switch, or an unadvertised capability):
-//! nothing ran, and the same op id must execute once the verb is served.
+//! contention, internal faults, `METHOD_NOT_FOUND` and `REPO_NOT_REGISTERED`
+//! ABANDON the claim, because those are exactly the cases where the caller
+//! is supposed to retry and get a different answer. `METHOD_NOT_FOUND` is a
+//! verb this daemon does not serve (turned off at boot, or an unadvertised
+//! capability): nothing ran, and the same op id must execute once the verb
+//! is served. `REPO_NOT_REGISTERED` is a spawn verb refused before it ran
+//! anything: the same op id must execute once the project is added.
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
@@ -314,16 +316,28 @@ fn store_error(error: &sqlx::Error) -> RpcError {
 /// Whether an error means "nothing happened, ask again" rather than "this is
 /// your answer".
 ///
-/// Three codes qualify. Recording a lock-contention failure would pin a
+/// Four codes qualify. Recording a lock-contention failure would pin a
 /// transient fault to an op id forever. Recording a `METHOD_NOT_FOUND` would
 /// replay a dark verb's refusal to the retry made after the switch is on, so
-/// that op id could never run. Recording an `INVALID_PARAMS` is correct,
-/// because the same body really does deserve the same answer, and so is a
-/// `PERMISSION_DENIED`: a refusal the handler reached by reading this actor.
+/// that op id could never run. Recording a `REPO_NOT_REGISTERED` would replay
+/// a spawn verb's refusal to the retry made after the person adds the
+/// project, the one retry that refusal asks for. Recording an
+/// `INVALID_PARAMS` is correct, because the same body really does deserve the
+/// same answer, and so is a `PERMISSION_DENIED`: a refusal the handler
+/// reached by reading this actor.
+///
+/// `METHOD_NOT_FOUND` and `REPO_NOT_REGISTERED` free the op id on the promise
+/// that they are raised BEFORE the handler has any effect: no row written,
+/// no process started, no tmux session made. A handler that answered either
+/// after an effect would have the retry run that effect a second time, so a
+/// handler may raise them only from its checks, never after it has started
+/// work. The spawn verbs refuse an unregistered repository while resolving
+/// the path, before `ainb run` or tmux runs.
 const fn frees_the_op_id(code: i32) -> bool {
     code == super::STORE_UNAVAILABLE
         || code == super::INTERNAL_ERROR
         || code == super::METHOD_NOT_FOUND
+        || code == ainb_hangar_proto::spawn::REPO_NOT_REGISTERED
 }
 
 /// The ledger tier token for a registry entry.
