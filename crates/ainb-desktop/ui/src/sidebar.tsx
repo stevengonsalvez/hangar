@@ -1,11 +1,11 @@
-import { createMemo, createSignal, For, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, Show } from "solid-js";
 import type { AgentCardFrame, FleetView_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
 import { isSelected, label } from "./sessions.ts";
 import { SidebarFilter } from "./sidebar_filter.tsx";
-import { filterProjectGroups } from "./sidebar_filter.ts";
+import { filterProjectGroups, hidesProject, hidesSession } from "./sidebar_filter.ts";
 import {
   agentLabel,
   formatGitChanges,
@@ -82,7 +82,34 @@ export function Sidebar(props: Props) {
   // list, as Orca's own search drops its query when its surface closes. It
   // only hides rows: the selection is the host's and stays where it was.
   const [query, setQuery] = createSignal("");
-  const groups = createMemo(() => keyedList(filterProjectGroups(allGroups(), query()), (group) => group.path));
+  const kept = createMemo(() => filterProjectGroups(allGroups(), query()));
+  const groups = createMemo(() => keyedList(kept(), (group) => group.path));
+  const cardCount = (from: readonly ProjectGroup[]) => from.reduce((sum, group) => sum + group.cards.length, 0);
+  const matched = () => (kept() === allGroups() ? null : cardCount(kept()));
+
+  // Orca lifts the sidebar filters hiding a workspace it activates
+  // (`worktree-activation.ts`), since a target that is not drawn cannot be
+  // revealed. The same here, on a CHANGE only: the host moving the selection
+  // to a row the query hides, or a create landing in a project it hides.
+  // Typing a query that hides the current selection is the person's own
+  // choice and stays. The memos pass on a value only when it changes, so a
+  // frame repeating the same selection does not count as a move.
+  const selectedId = createMemo(() => props.sessions?.selected_session_id ?? null);
+  createEffect(
+    on(
+      selectedId,
+      (id) => {
+        if (id !== null && hidesSession(allGroups(), query(), id)) setQuery("");
+      },
+      { defer: true },
+    ),
+  );
+  const pendingPath = createMemo(() => props.pending?.projectPath ?? null);
+  createEffect(
+    on(pendingPath, (path) => {
+      if (path !== null && hidesProject(allGroups(), query(), path)) setQuery("");
+    }),
+  );
   const groupKeys = createMemo(() => groups().keys, [], { equals: sameKeys });
   const [collapsed, setCollapsed] = createSignal(readCollapsed(safeStorage()));
   /** `<details>` already flipped its own `open` before `onToggle` fires:
@@ -118,7 +145,7 @@ export function Sidebar(props: Props) {
           <span class="stale">stale</span>
         </Show>
       </div>
-      <SidebarFilter query={query()} onQuery={setQuery} />
+      <SidebarFilter query={query()} onQuery={setQuery} matched={matched()} total={cardCount(allGroups())} />
       <Show when={groupKeys().length > 0} fallback={<p class="empty">{emptyText()}</p>}>
         <For each={groupKeys()}>
           {(groupKey) => {
