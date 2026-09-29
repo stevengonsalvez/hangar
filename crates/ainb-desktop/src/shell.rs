@@ -158,6 +158,21 @@ impl<S: FrameSink> Shell<S> {
         core.host.host_id().clone()
     }
 
+    /// Every session section 20 holds, for the notifier, when the section has
+    /// moved since the version in `seen` (which this updates); `None` when it
+    /// has not, or holds no read (a reconnect's reset), so a notifier keeps
+    /// what it last saw across the gap rather than forgetting every session.
+    pub fn agent_sessions_since(&self, seen: &mut u64) -> Option<Vec<crate::notify::Session>> {
+        let core = self.core();
+        let section = &core.host.state().agent_status;
+        if section.version() == *seen {
+            return None;
+        }
+        *seen = section.version();
+        let view = section.get().view.as_ref()?;
+        Some(view.cards().map(crate::notify::Session::of).collect())
+    }
+
     /// The host every frame names.
     pub fn host_id(&self) -> HostId {
         self.core().host.host_id().clone()
