@@ -15,8 +15,9 @@
 //! ```
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use serde::Deserialize;
 
@@ -153,6 +154,46 @@ pub fn store(path: &Path, preference: ThemePreference) -> io::Result<()> {
     written
 }
 
+/// The pick this window is in, held in memory, and its copy on disk for the
+/// next launch. Loaded once at start; every later pick is set here, and an
+/// OS theme switch repaints from `current`, never the file: a write that
+/// failed, or a file changed behind the app's back, must not repaint a window
+/// the page shows in another theme.
+#[derive(Debug)]
+pub struct ThemePick {
+    path: PathBuf,
+    current: Mutex<ThemePreference>,
+}
+
+impl ThemePick {
+    /// The pick stored at `path`, System when there is none (`load`).
+    #[must_use]
+    pub fn load(path: PathBuf) -> Self {
+        let current = Mutex::new(load(&path));
+        Self { path, current }
+    }
+
+    /// The pick the window is in.
+    #[must_use]
+    pub fn current(&self) -> ThemePreference {
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take `preference` as the window's pick, then keep it for the next
+    /// launch. The pick holds even when keeping it fails. The file is written
+    /// under the same lock, so two picks at once land on disk in the order
+    /// they were taken.
+    ///
+    /// # Errors
+    ///
+    /// When the pick cannot be stored (`store`).
+    pub fn set(&self, preference: ThemePreference) -> io::Result<()> {
+        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        *current = preference;
+        store(&self.path, preference)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +305,79 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, [THEME_FILE], "no staged file is left behind");
+    }
+
+    /// The names staged beside `THEME_FILE` in `dir` and not renamed over it.
+    fn staged_files(dir: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(&format!("{THEME_FILE}.")) && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
+    /// A write that fails at the rename (the target is a directory) returns
+    /// the error and takes its staged file with it.
+    #[test]
+    fn a_failed_rename_leaves_no_staged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(THEME_FILE);
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            store(&path, ThemePreference::Light).is_err(),
+            "a pick cannot be renamed over a directory"
+        );
+        assert!(path.is_dir(), "the target is untouched");
+        assert_eq!(
+            staged_files(dir.path()),
+            Vec::<std::ffi::OsString>::new(),
+            "no staged file is left behind"
+        );
+    }
+
+    /// An OS theme switch repaints from the pick the page told, not from the
+    /// file: neither a write that failed nor a file changed behind the app's
+    /// back moves it.
+    #[test]
+    fn an_os_theme_switch_repaints_the_pick_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(THEME_FILE);
+        store(&path, ThemePreference::Dark).unwrap();
+        let pick = ThemePick::load(path.clone());
+        assert_eq!(pick.current(), ThemePreference::Dark, "loaded at start");
+
+        // The write fails: the file still says dark.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(pick.set(ThemePreference::Light).is_err());
+        assert_eq!(pick.current(), ThemePreference::Light, "the pick holds");
+        assert_eq!(
+            window_paint(pick.current(), Theme::Dark),
+            Theme::Light.background()
+        );
+
+        // The file changes behind the app's back.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "dark").unwrap();
+        assert_eq!(
+            window_paint(pick.current(), Theme::Dark),
+            Theme::Light.background()
+        );
+        assert_eq!(
+            window_paint(pick.current(), Theme::Light),
+            Theme::Light.background()
+        );
+
+        // Under System the OS's own theme is painted, whatever the file says.
+        pick.set(ThemePreference::System).unwrap();
+        std::fs::write(&path, "light").unwrap();
+        assert_eq!(
+            window_paint(pick.current(), Theme::Dark),
+            Theme::Dark.background()
+        );
     }
 
     #[test]
