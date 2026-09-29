@@ -13,6 +13,7 @@ import {
   fromMenu,
   group,
   host,
+  inView,
   measure,
   panes,
   pointer,
@@ -54,6 +55,7 @@ test("a relaunch restores the stored panes, following the tabs the host has live
   document.body.appendChild(root);
   await import("../../src/main.tsx");
   await until(() => document.querySelectorAll(".pane-group").length === 2, "the two stored panes");
+  assert.ok(host.named, "the panes named their terminals in view as they mounted");
 
   assert.deepEqual(panes(), ["g1:a*a", "g2:b,c,d*b!"], "the gone tab dropped out; new ones joined the focused pane");
   const width = parseFloat(group("g2").style.width);
@@ -68,6 +70,7 @@ test("the panes show one terminal each, side by side", async () => {
   document.querySelector<HTMLElement>(".terminals-tab .tab-title")!.click();
   await until(() => visible().length === 2, "both panes' terminals");
   assert.deepEqual(visible(), ["a", "b"]);
+  await until(() => inView().join() === "a,b", "the host told both panes are on screen");
   const slot = (name: string) => document.querySelector<HTMLElement>(`.pane-slot[data-key="tmux_${name}"]`)!;
   assert.equal(slot("a").style.left, "0%");
   assert.ok(Math.abs(parseFloat(slot("b").style.left) - 85) < 1e-9, "the right pane's terminal sits over the right pane");
@@ -79,6 +82,7 @@ test("the host's focus shows its tab in that tab's pane and focuses the pane", a
   strip("tmux_c");
   await until(() => panes().includes("g2:b,c,d*c!"), "c shown in its pane");
   assert.deepEqual(visible(), ["a", "c"]);
+  assert.deepEqual(inView(), ["a", "c"], "the tab shown in a pane replaced the one it hid, at the host");
   await until(() => selected().includes("u-c"), "the sidebar following the shown session");
 });
 
@@ -86,6 +90,7 @@ test("a tab's menu splits it out beside its pane", async () => {
   await fromMenu("d", '[data-split="right"]');
   assert.deepEqual(panes(), ["g1:a*a", "g2:b,c*c", "g3:d*d!"]);
   assert.deepEqual(visible(), ["a", "c", "d"]);
+  assert.deepEqual(inView(), ["a", "c", "d"], "the split named its new pane to the host");
   assert.deepEqual(
     stored().root.children.map((child: { id: string }) => child.id),
     ["g1", "g2", "g3"],
@@ -154,6 +159,7 @@ test("closing a pane's last tab collapses the pane", async () => {
   await until(() => document.querySelector('.pane-group[data-group="g4"]') === null, "g4 to collapse");
   assert.deepEqual(closes(), ["d"]);
   assert.ok(!panes().some((pane) => pane.includes("d")));
+  assert.deepEqual(inView(), visible(), "the host no longer holds the closed pane in view");
 });
 
 test("Close split pane closes every terminal of the pane, and only those", async () => {
@@ -169,35 +175,35 @@ test("Close split pane closes every terminal of the pane, and only those", async
   assert.deepEqual(panes(), ["g1:a*a!"]);
 });
 
-test("a paste sizes its pane first, so the host answers it for the pane in front", async () => {
-  // Two panes again, a and b side by side, each sized by its own observer:
-  // the host answers a paste only for the pane it last sized.
+test("a split names both panes to the host, and a paste in either reads with no resize", async () => {
+  // a and b side by side, as the split leaves them.
   host.tabs = [...host.tabs, tab("b")];
   strip("tmux_b");
   await until(() => panes().length === 1 && panes()[0].includes("b"), "b opened");
-  await fromMenu("b", '[data-split="right"]');
   host.calls = [];
-  // The other pane's observer sized it last, as a window resize would.
-  host.sized = "tmux_a";
-  const textarea = document.querySelector<HTMLTextAreaElement>('.terminal[data-tab="tmux_b"] .xterm-helper-textarea')!;
-  textarea.dispatchEvent(new window.KeyboardEvent("keydown", { code: "KeyV", key: "V", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
-  await until(() => host.calls.some((call) => call.command === "clipboard_read"), "the paste's read");
-  const order = host.calls.filter((call) => call.command === "terminal_resize" || call.command === "clipboard_read");
-  const read = order.findIndex((call) => call.command === "clipboard_read");
-  assert.ok(read > 0, "a resize went before the read");
-  assert.deepEqual(order[read - 1], { command: "terminal_resize", args: order[read - 1].args });
-  assert.equal(order[read - 1].args.key, "tmux_b");
-  assert.equal(order[read].args.key, "tmux_b");
-  await until(
-    () => host.calls.some((call) => call.command === "terminal_input" && call.args.key === "tmux_b" && String(call.args.data).includes("pasted")),
-    "the clipboard's text typed into b",
+  await fromMenu("b", '[data-split="right"]');
+  const named = host.calls.filter((call) => call.command === "terminal_visible");
+  assert.deepEqual(named.at(-1)?.args, { keys: ["tmux_a", "tmux_b"] }, "the split named both panes");
+
+  // Ctrl+Shift+V in each pane, b first, then a: both are on screen, so the
+  // host answers both, and neither sizes itself to be answered.
+  host.calls = [];
+  for (const name of ["b", "a"]) {
+    const textarea = document.querySelector<HTMLTextAreaElement>(`.terminal[data-tab="tmux_${name}"] .xterm-helper-textarea`)!;
+    textarea.dispatchEvent(new window.KeyboardEvent("keydown", { code: "KeyV", key: "V", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+    await until(
+      () => host.calls.some((call) => call.command === "terminal_input" && call.args.key === `tmux_${name}` && String(call.args.data).includes("pasted")),
+      `the clipboard's text typed into ${name}`,
+    );
+  }
+  assert.deepEqual(
+    host.calls.filter((call) => call.command === "clipboard_read").map((call) => call.args),
+    [{ key: "tmux_b" }, { key: "tmux_a" }],
   );
+  assert.deepEqual(host.calls.filter((call) => call.command === "terminal_resize"), [], "no pane was sized to paste");
 });
 
-test("the terminal menu's Paste in a split sizes its pane first too: one paste path", async () => {
-  host.calls = [];
-  // The other pane sized last again.
-  host.sized = "tmux_a";
+test("the terminal menu's Paste reads with no resize too: one paste path", async () => {
   const screen = document.querySelector<HTMLElement>('.terminal[data-tab="tmux_b"] .xterm-screen')!;
   screen.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, clientX: 900, clientY: 300 }));
   await until(() => document.querySelector(".terminal-menu") !== null, "the terminal menu");
@@ -205,17 +211,13 @@ test("the terminal menu's Paste in a split sizes its pane first too: one paste p
     row.textContent?.startsWith("Paste"),
   );
   assert.ok(paste, "the menu has Paste");
+  host.calls = [];
   paste.click();
-  await until(() => host.calls.some((call) => call.command === "clipboard_read"), "the menu paste's read");
-  const order = host.calls.filter((call) => call.command === "terminal_resize" || call.command === "clipboard_read");
-  const read = order.findIndex((call) => call.command === "clipboard_read");
-  assert.ok(read > 0 && order[read - 1].command === "terminal_resize", "a resize went before the read");
-  assert.equal(order[read - 1].args.key, "tmux_b");
-  assert.equal(order[read].args.key, "tmux_b");
   await until(
     () => host.calls.some((call) => call.command === "terminal_input" && call.args.key === "tmux_b" && String(call.args.data).includes("pasted")),
     "the clipboard's text typed into b",
   );
+  assert.deepEqual(host.calls.filter((call) => call.command === "terminal_resize"), [], "no pane was sized to paste");
 });
 
 test("a tab strip landing mid-drag drops the seam drag, and keeps the new tab", async () => {
