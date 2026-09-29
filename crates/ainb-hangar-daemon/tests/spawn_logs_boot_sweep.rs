@@ -149,3 +149,25 @@ fn an_existing_open_spawn_dir_is_made_private_at_boot() {
     let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o700, "logs/spawn is {mode:o}");
 }
+
+/// A `logs/spawn` an older daemon made group-writable (`create_dir_all`
+/// under umask 002, Ubuntu's default) is still this user's: it is made `0700`
+/// and swept, not refused forever.
+#[test]
+fn an_existing_group_writable_spawn_dir_is_made_private_and_swept() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = spawn_logs(home.path());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    std::fs::write(dir.join(format!("{RUN}.stdout")), "left by a killed daemon").unwrap();
+
+    boot_once(home.path());
+
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "logs/spawn is {mode:o}");
+    assert_eq!(
+        names(&dir),
+        Vec::<String>::new(),
+        "the run output was not swept"
+    );
+}
