@@ -37,7 +37,7 @@ export function Titlebar(props: Props) {
         <button
           type="button"
           class="titlebar-search"
-          title="Search"
+          title={`Search (${props.mac ? "Cmd+J" : "Ctrl+Shift+J"})`}
           aria-label="Search"
           aria-pressed={props.searchOpen}
           onClick={() => props.onSearch()}
