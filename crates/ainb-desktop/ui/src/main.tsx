@@ -53,6 +53,8 @@ import {
 } from "./layout.ts";
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
+import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
+import { NewTerminalButton } from "./shell_tab.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
 import { runRowPick } from "./row_menu.ts";
@@ -448,11 +450,16 @@ function Shell() {
     if (key !== null) focusers.get(key)?.();
     else sidebar?.focus();
   };
-  const choose = (tab: Tab) =>
-    activate(tab.key, false, tab.state === "detached" ? [openRowIntent(rowOf(tab.target))] : []);
+  const choose = (tab: Tab) => {
+    // A shell has no row to re-attach through: the host re-attaches it.
+    const viaRow = tab.state === "detached" && tab.target.kind !== "shell";
+    if (tab.state === "detached" && !viaRow) reattach(tab);
+    activate(tab.key, false, viaRow ? [openRowIntent(rowOf(tab.target))] : []);
+  };
   /** Close `tab`: its terminal goes, and the host's next strip drops it
-   * from its group, closing the group if it was the last. */
-  const closeTab = (tab: Tab) => void invoke("terminal_close", { key: tab.key });
+   * from its group, closing the group if it was the last. A shell's tab
+   * also ends its shell (`shell_tab.ts`). */
+  const closeTab = (tab: Tab) => shellTabs.close(tab);
   /** The Terminals entry: back to the panes, on the tab they show. */
   const showTerminals = () => {
     const tab = tabs().find((candidate) => candidate.key === active());
@@ -603,6 +610,9 @@ function Shell() {
         else applyLayout(next);
         return;
       }
+      case "terminal":
+        void shellTabs.open();
+        return;
       case "attention":
         jumpToAttention();
         return;
@@ -648,6 +658,9 @@ function Shell() {
     setToasts((shown) => [...shown, { id, text: label(text) }]);
     setTimeout(() => setToasts((shown) => shown.filter((entry) => entry.id !== id)), TOAST_MS);
   };
+
+  // "New terminal" and every tab close: a shell's tab ends its shell.
+  const shellTabs = createShellTabs({ session: () => sessions()?.selected_session_id ?? null, toast });
 
   // The accelerators work outside a terminal too; a terminal marks the ones
   // it handled, so they do not run twice.
@@ -779,6 +792,7 @@ function Shell() {
   /** A tab's title: its session's name when the sidebar knows it. */
   const title = (tab: Tab) => {
     const target = tab.target;
+    if (target.kind === "shell") return label(shellTitle(target));
     const session = target.kind === "session" ? allSessions(sessions()).find((row) => row.id === target.id) : undefined;
     return label(session?.name ?? target.tmux);
   };
@@ -948,6 +962,11 @@ function Shell() {
                   </span>
                 )}
               </Show>
+              <NewTerminalButton
+                ready={sessions()?.selected_session_id != null}
+                mac={MAC}
+                onOpen={() => void shellTabs.open()}
+              />
             </nav>
             {/* One banner per open request, latched for a short grace across
                 frames that carry none (#1266): `AnswerSlot`. */}
