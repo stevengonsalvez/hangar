@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch } from "solid-js";
+import { createMemo, For, Match, Show, Switch } from "solid-js";
 import type { UsageView } from "../../../ainb-app/bindings/AppState";
 import { usageSegment } from "./usage_segment.ts";
 
@@ -20,7 +20,7 @@ interface Props {
  * the accessor the stats tab reads, so both move on the same frame.
  */
 export function UsageSegment(props: Props) {
-  const view = () => usageSegment(props.usage, props.stale);
+  const view = createMemo(() => usageSegment(props.usage, props.stale));
   return (
     <button
       type="button"
@@ -55,16 +55,18 @@ export function UsageSegment(props: Props) {
           <Show when={view().more > 0}>
             <span class="statusbar-usage-more" title={view().moreTitle}>
               +{view().more}
-            </span>
-          </Show>
-          <Show when={view().stale}>
-            <span class="statusbar-usage-stale">
-              <Warn />
-              <span class="visually-hidden">stale</span>
+              <span class="visually-hidden">{view().moreTitle}</span>
             </span>
           </Show>
         </Match>
       </Switch>
+      <Show when={view().stale}>
+        <span class="statusbar-usage-stale">
+          <Warn />
+          <span class="visually-hidden">not current</span>
+        </span>
+      </Show>
+      <span class="visually-hidden">, open Stats</span>
     </button>
   );
 }
