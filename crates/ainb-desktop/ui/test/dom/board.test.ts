@@ -216,7 +216,17 @@ test("the columns are Orca's own words, and a needs-you card carries its need", 
 function idleWorld() {
   const sessions = {
     workspaces: [
-      { name: "repo", sessions: [session("idle-row"), session("unv-row"), session("done-row"), session("gone-row")] },
+      {
+        name: "repo",
+        sessions: [
+          session("idle-row"),
+          session("unv-row"),
+          session("done-row"),
+          session("gone-row"),
+          session("wait-row"),
+          session("work-row"),
+        ],
+      },
     ],
     selected_session_id: null,
   } as unknown as SessionsView_Serialize;
@@ -226,6 +236,8 @@ function idleWorld() {
       "unv-row": { provider_session_id: "p-unv" },
       "done-row": { provider_session_id: "p-done" },
       "gone-row": { provider_session_id: "p-gone" },
+      "wait-row": { provider_session_id: "p-wait" },
+      "work-row": { provider_session_id: "p-work" },
     },
     fleet_snapshot: [],
     daemon_attention: { by_session_id: {} },
@@ -284,6 +296,42 @@ function idleWorld() {
           tier: "hook",
           evidence_observed_at: 7,
         },
+        {
+          session_key: "claude:p-wait",
+          state: "waiting",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: "ask",
+          has_open_request: true,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 3,
+        },
+        {
+          session_key: "claude:p-work",
+          state: "working",
+          provider: "claude",
+          lifecycle: "running",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 3,
+        },
+        {
+          session_key: "claude:p-orphan",
+          state: "exited",
+          provider: "claude",
+          lifecycle: "exited",
+          transport_health: "ok",
+          wait_kind: null,
+          has_open_request: false,
+          turn_complete: false,
+          tier: "hook",
+          evidence_observed_at: 3,
+        },
       ],
     },
   } as unknown as AgentStatusView;
@@ -300,8 +348,10 @@ test("every column draws exactly the cards its count says, Idle and exited agent
     assert.equal(count, cards.length, `the ${column.dataset.state} column's count is its own cards`);
     drawn[column.dataset.state!] = cards;
   }
-  assert.deepEqual(drawn.idle, ["claude:p-idle", "claude:p-unv"]);
+  assert.deepEqual(drawn.needs, ["claude:p-wait"]);
+  assert.deepEqual(drawn.working, ["claude:p-work"]);
   assert.deepEqual(drawn.done, ["claude:p-done", "claude:p-gone"], "an exited agent is kept, in Done");
+  assert.deepEqual(drawn.idle, ["claude:p-orphan", "claude:p-idle", "claude:p-unv"], "the row-less exited agent too");
   const unverifiable = board.card("claude:p-unv")!;
   assert.equal(unverifiable.dataset.status, "unverifiable");
   assert.ok(unverifiable.querySelector(".badge-unverifiable"), "the card carries the unverifiable badge");
@@ -320,6 +370,15 @@ test("an exited agent reads Exited in Done, and once opened settles into Idle", 
   const after = board.card("claude:p-gone")!;
   assert.ok(board.column("idle")!.contains(after), "opened: it settles into Idle, still drawn");
   assert.ok(after.querySelector(".badge-exited"), "and still says it exited");
+});
+
+test("an exited agent with no row waits in Idle, disabled, and never says click to open", async () => {
+  const board = await open(idleWorld());
+  const orphan = board.card("claude:p-orphan")! as HTMLButtonElement;
+  assert.ok(board.column("idle")!.contains(orphan));
+  assert.equal(orphan.disabled, true);
+  assert.notEqual(orphan.querySelector(".card-line")?.textContent, "click to open");
+  assert.ok(orphan.querySelector(".badge-exited"));
 });
 
 test("a Done card says click to open, and clicking it acks the turn and moves it to Idle", async () => {
