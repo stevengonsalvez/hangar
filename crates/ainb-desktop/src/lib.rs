@@ -7,6 +7,8 @@
 //!   and answers the ones this shell cannot run yet with their documented
 //!   failure report.
 //! - [`intent::RendererIntent`] is what the webview may send.
+//! - [`worktree_target`] is how the page names a worktree for the strip's
+//!   "+", and how the host resolves it.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
 //! - [`projects`] lists the repositories the composer may create into,
 //!   sessions or not.
@@ -43,3 +45,4 @@ pub mod sidecar;
 pub mod terminal;
 pub mod theme;
 pub mod updater;
+pub mod worktree_target;
