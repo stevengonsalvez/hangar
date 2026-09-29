@@ -97,40 +97,54 @@ pub fn served_by(value: Option<&std::ffi::OsStr>) -> bool {
 /// Whether the config file at `path` lets the spawn verbs be served.
 ///
 /// The file twin of [`served_by`]: only a missing file, no `[hangar]`
-/// section, no `spawn` key in it, or `spawn = true` serves them. `false`,
-/// any other value (`"0"`, `0`, `"off"`), a `hangar` that is not a table, a
-/// file that cannot be read and one that is not valid TOML all keep them
-/// off, with a warning, so a mistyped opt-out fails closed.
+/// section, an empty one, or `spawn = true` serves them. Everything else
+/// keeps them off, with a warning, so a mistyped opt-out fails closed:
+/// `false` or any other value (`"0"`, `0`, `"off"`), any other key under
+/// `[hangar]` (it holds this one key, so another is a typo of it), a
+/// `hangar` that is not a table, `spawn` under `[hangar_daemon]` (a section
+/// this file does not feed), a link to nowhere, and a file that cannot be
+/// read or is not valid TOML.
 #[must_use]
 pub fn served_by_config(path: &Path) -> bool {
+    let off = |why: &str| {
+        tracing::warn!(path = %path.display(), "{why}; spawn verbs kept off");
+        false
+    };
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "cannot read hangar config; spawn verbs kept off");
-            return false;
+        // A dangling link (a dotfiles checkout that is not there) is not
+        // "no file": the opt-out may be behind it.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            return true;
         }
+        Err(error) => return off(&format!("cannot read hangar config: {error}")),
     };
-    let parsed: toml::Value = match text.parse() {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "hangar config is not valid TOML; spawn verbs kept off");
-            return false;
-        }
+    let table: toml::Table = match text.parse() {
+        Ok(table) => table,
+        Err(error) => return off(&format!("hangar config is not valid TOML: {error}")),
     };
-    let Some(section) = parsed.get("hangar") else {
+    if table.get("hangar_daemon").and_then(|section| section.get("spawn")).is_some() {
+        return off(&format!(
+            "`hangar_daemon.spawn` is not read from this file; the key is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    let Some(section) = table.get("hangar") else {
         return true;
     };
-    match section.as_table().map(|table| table.get("spawn")) {
-        Some(None) => true,
-        Some(Some(toml::Value::Boolean(on))) => *on,
-        _ => {
-            tracing::warn!(
-                path = %path.display(),
-                "`{SPAWN_CONFIG_KEY}` must be true or false; spawn verbs kept off"
-            );
-            false
-        }
+    let Some(section) = section.as_table() else {
+        return off("`hangar` must be a table");
+    };
+    if let Some(other) = section.keys().find(|key| *key != "spawn") {
+        return off(&format!(
+            "`hangar.{other}` is not a key; the spawn opt-out is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    match section.get("spawn") {
+        None => true,
+        Some(toml::Value::Boolean(on)) => *on,
+        Some(_) => off(&format!("`{SPAWN_CONFIG_KEY}` must be true or false")),
     }
 }
 
@@ -1607,6 +1621,7 @@ mod tests {
         for on in [
             "",
             "[other]\nkey = 1\n",
+            "[hangar_daemon]\nautostandup = 1\n",
             "[hangar]\n",
             "[hangar]\nspawn = true\n",
         ] {
@@ -1621,6 +1636,9 @@ mod tests {
             "[hangar]\nspawn = 1\n",
             "hangar = \"off\"\n",
             "[hangar\nspawn = true\n",
+            "[hangar]\nspawn_verbs = false\n",
+            "[hangar]\nspawn = true\nspwan = false\n",
+            "[hangar_daemon]\nspawn = false\n",
         ] {
             std::fs::write(&path, off).unwrap();
             assert!(!served_by_config(&path), "{off:?} keeps them off");
@@ -1635,6 +1653,13 @@ mod tests {
         // A directory where the file should be: present, but never readable.
         std::fs::create_dir_all(&path).unwrap();
         assert!(!served_by_config(&path));
+
+        let linked = home.path().join("linked.toml");
+        std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
+        assert!(
+            !served_by_config(&linked),
+            "a link to nowhere is not a missing file"
+        );
     }
 
     #[test]
