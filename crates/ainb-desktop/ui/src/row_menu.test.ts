@@ -80,6 +80,7 @@ test("each pick runs the window's existing action for it, and only that one", ()
         open: (id: string) => calls.push(["open", id]),
         run: (intents: RendererIntent[]) => calls.push(["run", intents]),
         copy: (text: string) => calls.push(["copy", text]),
+        reselect: () => [],
       },
     );
     return calls;
@@ -88,4 +89,16 @@ test("each pick runs the window's existing action for it, and only that one", ()
   assert.deepEqual(ran("editor"), [["run", editorIntents("s-1")]]);
   assert.deepEqual(ran("copy_path"), [["copy", "/repo/wt-a"]]);
   assert.deepEqual(ran("copy_name"), [["copy", "wt-a"]]);
+});
+
+test("open in editor puts the selection back on the shown terminal's row after it", () => {
+  const back: RendererIntent = { Command: ["session_list.select_row", { target: { session: "shown" }, open: false }] };
+  const sent: RendererIntent[][] = [];
+  runRowPick(
+    { action: "editor", session: session(), name: "wt-a" },
+    { open: () => undefined, run: (intents) => sent.push(intents), copy: () => undefined, reselect: () => [back] },
+  );
+  // Else the sidebar selection, which scopes the answer banner, stays on the
+  // row the editor opened and hides the shown terminal's own question.
+  assert.deepEqual(sent, [[...editorIntents("s-1"), back]]);
 });
