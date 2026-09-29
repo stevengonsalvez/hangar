@@ -895,6 +895,143 @@ body {
   background: var(--border);
 }
 
+/* The split panes: each group a box placed by `layout.ts`'s geometry, its
+   own tab strip on top; each terminal a box of its own over its group's
+   body, so a tab moving between groups is only a new position. */
+.panes {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--terminal-bg);
+}
+
+.pane-group {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The strip's border inside its height, so the terminal placed right under
+   it (`var(--h-tabs)` down) never covers the focused pane's mark. */
+.pane-strip {
+  box-sizing: border-box;
+}
+
+/* Of several panes, the focused one's strip carries the ring's colour on its
+   bottom edge, as Orca marks its focused group; the others dim a little. */
+.panes:not([data-groups="1"]) .pane-group[data-focused] .pane-strip {
+  border-bottom-color: var(--ring);
+}
+
+.panes:not([data-groups="1"]) .pane-group:not([data-focused]) .pane-strip {
+  opacity: 0.8;
+}
+
+.pane-actions {
+  margin-left: auto;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pane-slot {
+  position: absolute;
+}
+
+.pane-slot > .terminal {
+  position: absolute;
+  inset: 0;
+}
+
+/* A seam's handle: a band wide enough to grab, drawn as a hairline. */
+.pane-divider {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+
+.pane-divider[data-axis="row"] {
+  width: 6px;
+  margin-left: -3px;
+  cursor: col-resize;
+}
+
+.pane-divider[data-axis="column"] {
+  height: 6px;
+  margin-top: -3px;
+  cursor: row-resize;
+}
+
+.pane-divider::after {
+  content: "";
+  position: absolute;
+  background: var(--border);
+}
+
+.pane-divider[data-axis="row"]::after {
+  inset: 0 2px 0 3px;
+}
+
+.pane-divider[data-axis="column"]::after {
+  inset: 3px 0 2px 0;
+}
+
+.pane-divider:hover::after,
+.pane-divider[data-dragging]::after {
+  background: var(--ring);
+}
+
+/* Where a dragged tab would land. */
+.pane-drop {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--ring) 16%, transparent);
+  outline: 1px solid var(--ring);
+  outline-offset: -1px;
+}
+
+.pane-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--popover);
+  box-shadow: var(--float-shadow);
+}
+
+.pane-menu-heading {
+  padding: 4px 8px;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+}
+
+.pane-menu button {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-menu button:hover,
+.pane-menu button:focus-visible {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  outline: none;
+}
+
 .toasts {
   position: fixed;
   right: 16px;
