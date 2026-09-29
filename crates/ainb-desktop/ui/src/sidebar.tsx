@@ -1,9 +1,16 @@
 import { createEffect, createMemo, createSignal, For, on, Show } from "solid-js";
-import type { AgentCardFrame, FleetView_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
+import type {
+  AgentCardFrame,
+  FleetView_Serialize,
+  Session_Serialize,
+  SessionsView_Serialize,
+} from "../../../ainb-app/bindings/AppState";
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
-import { isSelected, label } from "./sessions.ts";
+import { opensRowMenu, rowMenuItems, type RowPick } from "./row_menu.ts";
+import { RowMenu } from "./row_menu.tsx";
+import { allSessions, isSelected, label } from "./sessions.ts";
 import { SidebarFilter } from "./sidebar_filter.tsx";
 import { filterProjectGroups, hidesProject, hidesSession } from "./sidebar_filter.ts";
 import {
@@ -42,8 +49,24 @@ interface Props {
   onOpen(sessionId: string): void;
   /** Mod+N, or the button: open the new-worktree composer. */
   onNew(): void;
+  /** An item was chosen in a row's context menu (`row_menu.ts`). Without
+   * it a right-click on a row is left to the webview. */
+  onRowPick?(pick: RowPick): void;
   /** The sidebar element, for Esc Esc to return focus to. */
   ref(element: HTMLElement): void;
+}
+
+/** Where a row's context menu is open, on which session, and the row to give
+ * the keyboard back to when it closes. */
+interface MenuAt {
+  session: Session_Serialize;
+  /** The worktree's name as its card shows it: what Copy Worktree Name copies. */
+  name: string;
+  x: number;
+  y: number;
+  row: HTMLElement;
+  /** The sidebar, for the keyboard when the row itself is gone. */
+  sidebar: HTMLElement | null;
 }
 
 /**
@@ -134,6 +157,29 @@ export function Sidebar(props: Props) {
     return props.loading || !props.sessions ? "Loading sessions" : "No sessions";
   };
 
+  // One row menu at a time, Orca's `CLOSE_ALL_CONTEXT_MENUS_EVENT` without the
+  // event: a second right-click replaces the first.
+  const [menu, setMenu] = createSignal<MenuAt | null>(null);
+  const openMenu = (at: MenuAt) => setMenu(at);
+  /** Close the menu and give the keyboard back to the row, as Orca's
+   * `handleCloseAutoFocus` keeps it on the sidebar rather than the body. */
+  const closeMenu = () => {
+    const at = menu();
+    setMenu(null);
+    at?.row.focus();
+  };
+  // A menu outlives no drain that drops its row: Open in Editor selects the
+  // row first and the editor opens whatever is selected, so a pick on a row
+  // that is gone could open another session's worktree. The row is gone with
+  // it, so the keyboard goes back to the sidebar itself.
+  createEffect(() => {
+    const at = menu();
+    if (at && !allSessions(props.sessions).some((session) => session.id === at.session.id)) {
+      setMenu(null);
+      at.sidebar?.focus();
+    }
+  });
+
   return (
     <aside class="sidebar" aria-label="Sessions" tabIndex={-1} ref={props.ref}>
       <div class="sidebar-head">
@@ -192,6 +238,7 @@ export function Sidebar(props: Props) {
                                 fleetMetadata={props.fleetMetadata}
                                 acks={props.acks}
                                 onOpen={props.onOpen}
+                                onMenu={props.onRowPick ? openMenu : undefined}
                               />
                             )}
                           </Show>
@@ -205,6 +252,23 @@ export function Sidebar(props: Props) {
           }}
         </For>
       </Show>
+      {/* Keyed by the opening, so each one mounts fresh and focuses its first
+          item, and a second right-click moves the menu rather than adding one. */}
+      <For each={menu() ? [menu()!] : []}>
+        {(at) => (
+          <RowMenu
+            x={at.x}
+            y={at.y}
+            label={`${label(at.name)} actions`}
+            items={rowMenuItems(at.session)}
+            onClose={closeMenu}
+            onPick={(action) => {
+              closeMenu();
+              props.onRowPick?.({ action, session: at.session, name: at.name });
+            }}
+          />
+        )}
+      </For>
     </aside>
   );
 }
@@ -218,11 +282,33 @@ function Card(props: {
   fleetMetadata?: FleetView_Serialize["fleet_metadata"];
   acks?: AckMap;
   onOpen(sessionId: string): void;
+  onMenu?(at: MenuAt): void;
 }) {
   const rows = createMemo(() => keyedList(props.card.sessions, (session) => session.id));
   const rowKeys = createMemo(() => rows().keys, [], { equals: sameKeys });
+  const menuFor = (row: HTMLElement, x: number, y: number) => {
+    const session = props.card.sessions.find((candidate) => candidate.id === row.dataset.session);
+    if (!props.onMenu || !session) return false;
+    props.onMenu({ session, name: props.card.title, x, y, row, sidebar: row.closest<HTMLElement>(".sidebar") });
+    return true;
+  };
+  /** A right-click anywhere on the card, as on Orca's: on a row it acts on
+   * that row's session, elsewhere on the card's first. */
+  const onContextMenu = (event: MouseEvent) => {
+    const card = event.currentTarget as HTMLElement;
+    const row =
+      (event.target as Element).closest<HTMLElement>(".session-row") ?? card.querySelector<HTMLElement>(".session-row");
+    if (row && menuFor(row, event.clientX, event.clientY)) event.preventDefault();
+  };
+  /** The keyboard's way in: the menu opens under the focused row. */
+  const onRowKeyDown = (event: KeyboardEvent) => {
+    if (!opensRowMenu(event)) return;
+    const row = event.currentTarget as HTMLElement;
+    const rect = row.getBoundingClientRect();
+    if (menuFor(row, rect.left, rect.bottom)) event.preventDefault();
+  };
   return (
-    <li class="worktree-card">
+    <li class="worktree-card" onContextMenu={onContextMenu}>
       <div class="worktree-card-title">{label(props.card.title)}</div>
       <div class="worktree-card-meta">
         <span class="branch">{label(props.card.branch)}</span>
@@ -251,6 +337,7 @@ function Card(props: {
                       data-session={session().id}
                       aria-current={selected() ? "true" : undefined}
                       onClick={() => props.onOpen(session().id)}
+                      onKeyDown={onRowKeyDown}
                     >
                       <StatusGlyph status={status()} />
                       <span class="agent-type">{agentLabel(session().agent_type)}</span>
