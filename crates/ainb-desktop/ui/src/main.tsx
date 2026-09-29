@@ -289,7 +289,14 @@ function Shell() {
       const next = tabAfterClose(before, view.tabs, recent, active());
       setActive(next);
       if (next !== null) recent = visited(recent, next);
-      if (next !== null && pane() === "terminal") focusTab(next, true);
+      if (next !== null && pane() === "terminal") {
+        // The sidebar follows the terminal now shown, as `activate` has it
+        // follow every other: left on the closed tab's session, the answer
+        // banner's scope (`questionOver`) would hide this one's question.
+        const select = selectIntentFor(view.tabs, next);
+        if (select !== null) dispatch(select);
+        focusTab(next, true);
+      }
     }
   };
   // A refused intent comes back with the row and the reason: say so, or a
