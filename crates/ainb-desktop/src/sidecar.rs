@@ -48,6 +48,10 @@ pub struct SidecarConfig {
     /// The wait before each reconnect after the daemon is lost; a loss past
     /// the last step leaves the app degraded.
     pub reconnect_backoff: Vec<Duration>,
+    /// The app's `AINB_HANGAR_SPAWN` as it launched, set on every daemon this
+    /// supervisor starts (a respawn too), or removed when the app had none,
+    /// so an opt-out never depends on what the child happens to inherit.
+    pub spawn_switch: Option<std::ffi::OsString>,
 }
 
 impl SidecarConfig {
@@ -64,6 +68,7 @@ impl SidecarConfig {
             hello_budget: Duration::from_secs(180),
             max_spawn_attempts: 3,
             reconnect_backoff: RECONNECT_BACKOFF.to_vec(),
+            spawn_switch: std::env::var_os(SPAWN_ENV),
         }
     }
 
@@ -536,6 +541,10 @@ fn spawn_daemon(config: &SidecarConfig) -> Result<Child, String> {
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr);
+    match &config.spawn_switch {
+        Some(value) => command.env(SPAWN_ENV, value),
+        None => command.env_remove(SPAWN_ENV),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -556,6 +565,9 @@ fn spawn_daemon(config: &SidecarConfig) -> Result<Child, String> {
 
 /// The variable the daemon resolves its home from.
 const HANGAR_HOME_ENV: &str = "AINB_HANGAR_HOME";
+
+/// The daemon's boot-time spawn opt-out, passed through from the app.
+const SPAWN_ENV: &str = ainb_hangar_daemon::spawn::SPAWN_ENV;
 
 async fn hello(config: &SidecarConfig) -> Result<HelloResult, DaemonError> {
     config.client()?.hello().await
