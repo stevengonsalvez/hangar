@@ -228,7 +228,7 @@ async fn the_window_adds_an_agent_to_a_listed_worktree_through_the_daemon() {
         .expect_err("the main checkout is not a worktree ainb made");
     assert!(
         refused.starts_with(
-            "The daemon refused the new agent: worktree_path is not a worktree ainb created"
+            "Adding the agent failed: the daemon refused it: worktree_path is not a worktree ainb created"
         ),
         "{refused}"
     );
@@ -238,7 +238,7 @@ async fn the_window_adds_an_agent_to_a_listed_worktree_through_the_daemon() {
     let refused = request(&client, unregistered, SpawnAgent::Claude)
         .await
         .expect_err("an unregistered source repository is refused");
-    assert!(refused.contains("use Add project"), "{refused}");
+    assert!(refused.contains("Add project"), "{refused}");
     assert!(
         !tools.path().join("argv.txt").exists(),
         "no refusal ran ainb"
