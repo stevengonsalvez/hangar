@@ -195,16 +195,28 @@ export function boardColumns(
 }
 
 /**
- * How many cards the board's Idle column holds: the status bar's idle count.
+ * How many cards the board's `state` column holds: the status bar's "need
+ * you" (Needs) and "idle" (Idle) counts.
  *
  * Read off the board's own projection, never off the session list's rows: a
  * row's `status` is projected from the Fleet snapshot, which the attention
- * poller refreshes on its five-second clock, while the board's cards follow
- * every Fleet revision. Counted from the session list, the footer trailed the
- * board by up to that clock on every session start.
+ * poller refreshes on its five-second clock, and its rings merge on their own
+ * cadence, while the board's cards follow every Fleet revision. Counted from
+ * the rows, the footer trailed the board by up to that clock, and counting
+ * one from the rows and the other from the board counted a session twice.
+ * Both from the one list, every card is in exactly one count.
  */
-export function idleOnBoard(columns: readonly BoardColumn[]): number {
-  return columns.find((column) => column.state === "idle")?.cards.length ?? 0;
+export function countIn(columns: readonly BoardColumn[], state: BoardColumnKind): number {
+  return columns.find((column) => column.state === state)?.cards.length ?? 0;
+}
+
+/**
+ * Whether two projections draw the same board. A drain that touches Sessions,
+ * Fleet or agent_status recomputes the columns; without this every card button
+ * would be rebuilt, and a keyboard user's focus dropped, on every one.
+ */
+export function sameColumns(a: BoardColumn[], b: BoardColumn[]): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /** What the board can say about the picture it is drawing. */
