@@ -55,10 +55,12 @@ test("closing the shown tab shows the tab Orca would, not the strip's first", ()
 
 test("closing the shown tab moves the sidebar to the tab shown next", () => {
   // Else the selection stays on the closed tab's session, and `questionOver`
-  // hides the new terminal's own question as another session's.
+  // hides the new terminal's own question as another session's. Not under
+  // Settings or the Inbox, whose screen refuses the row
+  // (`test/dom/settings_tab.test.ts`).
   const showTabs = body("showTabs", "const report = ");
   assert.match(
     showTabs,
-    /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) dispatch\(select\);/,
+    /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*if \(!settings\(\) && !inboxOpen\(\)\) \{\s*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) dispatch\(select\);/,
   );
 });
