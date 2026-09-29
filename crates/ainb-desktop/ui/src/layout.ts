@@ -19,7 +19,8 @@
 //   - no group is empty, except the only one;
 //   - a group's active key is one of its tabs, or null exactly when it is empty;
 //   - a split has two or more children, none a split along its own axis, and
-//     its ratios are positive and sum to 1;
+//     its ratios sum to 1, none under `MIN_SHARE` (or half an even share,
+//     when the split has more children than that leaves room for);
 //   - group ids are unique and never reused while the layout lives, and there
 //     are at most `MAX_GROUPS` of them.
 //
@@ -65,8 +66,9 @@ export interface Layout {
   readonly next: number;
 }
 
-/** Where a split puts the new group: after the old one, along this axis. */
-export type SplitDirection = "right" | "down";
+/** Where a split puts the new group: beside the old one (`right`, `left`)
+ * or over or under it (`up`, `down`). */
+export type SplitDirection = "right" | "down" | "left" | "up";
 
 /**
  * The most groups a layout holds. Far more panes than a window can show, and
@@ -75,6 +77,20 @@ export type SplitDirection = "right" | "down";
  */
 export const MAX_GROUPS = 64;
 
+/**
+ * The least share of its split a pane keeps, dragged or stored: Orca clamps
+ * its seams to the same 15%
+ * (`orca:src/renderer/src/components/tab-group/TabGroupSplitLayout.tsx:11-12`).
+ * A split of more panes than that leaves room for keeps half an even share,
+ * so its seams still move.
+ */
+export const MIN_SHARE = 0.15;
+
+/** The least share any child of a split of `count` keeps. */
+function floorFor(count: number): number {
+  return Math.min(MIN_SHARE, 0.5 / count);
+}
+
 /** One group holding `keys`, in order, the first one shown. */
 export function initialLayout(keys: readonly string[]): Layout {
   const tabs = [...new Set(keys)];
@@ -82,7 +98,7 @@ export function initialLayout(keys: readonly string[]): Layout {
 }
 
 /** Every group, in reading order: depth first, so left before right and top
- * before bottom. This is the order `focusNext` walks. */
+ * before bottom. */
 export function groups(layout: Layout): Group[] {
   return leaves(layout.root);
 }
@@ -117,7 +133,7 @@ function withoutTab(group: Group, key: string): Group {
 }
 
 /** The sibling that inherits from the child at `at` when it goes: the one
- * before it, else the one after. The one rule both a closing group's tabs
+ * before it, else the one after. The one rule both a closing group's focus
  * (`recipientOf`) and its space (`withoutGroup`) follow, so the two never
  * go to different siblings. */
 function heirIndex(at: number): number {
@@ -125,7 +141,7 @@ function heirIndex(at: number): number {
 }
 
 /**
- * The group a closing group hands its tabs to: its heir in the parent. When
+ * The group a closing group hands the focus to: its heir in the parent. When
  * that sibling is itself split, the group of it nearest the closing one: its
  * last group when it came before, its first when it came after.
  */
@@ -180,72 +196,100 @@ function tidy(node: LayoutNode): LayoutNode {
     }
   });
   if (children.length === 1) return children[0];
-  const sum = ratios.reduce((total, ratio) => total + ratio, 0);
-  return { ...node, children, ratios: ratios.map((ratio) => ratio / sum) };
+  return { ...node, children, ratios: floored(normalized(ratios)) };
 }
 
-/** `layout` after a tab left `groupId`: the group closes into its sibling
- * when that left it empty, unless it is the last. */
-function closeIfEmpty(layout: Layout, groupId: GroupId): Layout {
-  return findGroup(layout, groupId)?.tabs.length === 0 ? closeGroup(layout, groupId) : layout;
+/** `ratios` rescaled to sum to 1. Left as they are when they already do,
+ * to within rounding, so a tidy layout tidies to itself bit for bit and
+ * round trips through storage unchanged. */
+function normalized(ratios: readonly number[]): readonly number[] {
+  const sum = ratios.reduce((total, ratio) => total + ratio, 0);
+  return Math.abs(sum - 1) < 1e-12 ? ratios : ratios.map((ratio) => ratio / sum);
 }
 
 /**
- * Split `groupId` in two: a new group to its right or below it, taking half
- * its space, the focus, and `movedTabKey` (the group's shown tab when none
- * is named), shown there.
+ * `ratios`, which sum to 1, with every one under the floor raised to it and
+ * the rest paying for that in proportion to what each holds above it: a
+ * stored `[1, 5e-324]` loads as a pane that can be seen and grabbed. Ratios
+ * already on or over the floor come back as they are.
+ */
+function floored(ratios: readonly number[]): readonly number[] {
+  const floor = floorFor(ratios.length);
+  if (ratios.every((ratio) => ratio >= floor)) return ratios;
+  const spare = ratios.reduce((total, ratio) => total + Math.max(0, ratio - floor), 0);
+  const scale = (1 - ratios.length * floor) / spare;
+  return ratios.map((ratio) => (ratio <= floor ? floor : floor + (ratio - floor) * scale));
+}
+
+/**
+ * `layout` after a tab left `groupId`: when that left the group empty, it
+ * closes, unless it is the last. Its sibling before it (after it, for a
+ * first child) takes its space, and the focus when it had it. A group only
+ * ever closes this way: its tabs are the host's, so a pane's tabs are closed
+ * and the pane follows.
+ */
+function closeIfEmpty(layout: Layout, groupId: GroupId): Layout {
+  const recipient = recipientOf(layout.root, groupId);
+  if (findGroup(layout, groupId)?.tabs.length !== 0 || recipient === null) return layout;
+  const focused = layout.focused === groupId ? recipient : layout.focused;
+  return { ...layout, root: tidy(withoutGroup(layout.root, groupId)!), focused };
+}
+
+/**
+ * Split `groupId` in two: a new group on the `direction` side of it, taking
+ * half its space, the focus, and `movedTabKey` (the group's shown tab when
+ * none is named), shown there.
  *
  * A split that would leave a group empty is not made: a group of one tab,
  * or of none, stays as it is. So does an unknown group, a `movedTabKey` the
- * group does not hold, and a layout already at `MAX_GROUPS`.
+ * group does not hold, a layout already at `MAX_GROUPS`, and one that has
+ * minted every id there is (`MAX_NEXT`).
  */
 export function splitGroup(layout: Layout, groupId: GroupId, direction: SplitDirection, movedTabKey?: string): Layout {
   const source = findGroup(layout, groupId);
   const moved = movedTabKey ?? source?.active;
   if (source === undefined || moved == null || source.tabs.length < 2 || !source.tabs.includes(moved)) return layout;
-  if (groups(layout).length >= MAX_GROUPS) return layout;
+  if (groups(layout).length >= MAX_GROUPS || layout.next >= MAX_NEXT) return layout;
   const id = `g${layout.next}`;
   const fresh: Group = { kind: "group", id, tabs: [moved], active: moved };
-  const axis: Axis = direction === "right" ? "row" : "column";
+  const axis: Axis = direction === "right" || direction === "left" ? "row" : "column";
+  const kept = withoutTab(source, moved);
+  const children = direction === "right" || direction === "down" ? [kept, fresh] : [fresh, kept];
   const root = mapGroups(layout.root, (group) =>
-    group.id === groupId
-      ? { kind: "split", axis, children: [withoutTab(source, moved), fresh], ratios: [0.5, 0.5] }
-      : group,
+    group.id === groupId ? { kind: "split", axis, children, ratios: [0.5, 0.5] } : group,
   );
   return { root: tidy(root), focused: id, next: layout.next + 1 };
 }
 
-/**
- * Close `groupId`. Its tabs are not closed (the host owns those): they join
- * the end of the sibling group before it (after it, for a first child), which
- * also takes its space, and the focus when the closed group had it. The last
- * group cannot close.
- */
-export function closeGroup(layout: Layout, groupId: GroupId): Layout {
-  const closing = findGroup(layout, groupId);
-  const recipient = recipientOf(layout.root, groupId);
-  if (closing === undefined || recipient === null) return layout;
-  const merged = mapGroups(layout.root, (group) =>
-    group.id === recipient
-      ? { ...group, tabs: [...group.tabs, ...closing.tabs], active: group.active ?? closing.active }
-      : group,
-  );
-  const focused = layout.focused === groupId ? recipient : layout.focused;
-  return { ...layout, root: tidy(withoutGroup(merged, groupId)!), focused };
+/** `tabs` with `key` placed at `index`, clamped to the strip; the end when
+ * `index` is not a number. */
+function insertAt(tabs: readonly string[], key: string, index: number | undefined): string[] {
+  const at = index !== undefined && Number.isFinite(index) ? Math.max(0, Math.min(tabs.length, Math.floor(index))) : tabs.length;
+  return [...tabs.slice(0, at), key, ...tabs.slice(at)];
 }
 
 /**
- * Move `key` to the end of `toGroup`, shown there, with the focus following
- * it: dragging a tab is choosing to look at it. A group the move empties
- * closes. Unknown key or group, or a move into the group it is already in,
- * returns `layout` as it was.
+ * Move `key` into `toGroup` at `index` (its end when none is given), shown
+ * there, with the focus following it: dragging a tab is choosing to look at
+ * it. Within its own group an `index` reorders the strip, as a drag along it
+ * does. A group the move empties closes. Unknown key or group, a move into
+ * its own group with no index, or one that changes nothing, returns
+ * `layout` as it was.
  */
-export function moveTab(layout: Layout, key: string, toGroup: GroupId): Layout {
+export function moveTab(layout: Layout, key: string, toGroup: GroupId, index?: number): Layout {
   const from = groupOf(layout, key);
-  if (from === null || from === toGroup || findGroup(layout, toGroup) === undefined) return layout;
+  const target = findGroup(layout, toGroup);
+  if (from === null || target === undefined || (from === toGroup && index === undefined)) return layout;
+  if (from === toGroup) {
+    const tabs = insertAt(target.tabs.filter((tab) => tab !== key), key, index);
+    const same = tabs.every((tab, at) => tab === target.tabs[at]);
+    if (same && target.active === key && layout.focused === toGroup) return layout;
+    const root = mapGroups(layout.root, (group) => (group.id === toGroup ? { ...group, tabs, active: key } : group));
+    return { ...layout, root, focused: toGroup };
+  }
   const root = mapGroups(layout.root, (group) => {
     if (group.id === from) return withoutTab(group, key);
-    if (group.id === toGroup) return { ...group, tabs: [...group.tabs, key], active: key };
+    if (group.id === toGroup) return { ...group, tabs: insertAt(group.tabs, key, index), active: key };
     return group;
   });
   return closeIfEmpty({ ...layout, root, focused: toGroup }, from);
@@ -281,36 +325,112 @@ export function removeTab(layout: Layout, key: string): Layout {
 }
 
 /** Show `key` in its group and focus that group: a click on its tab, or the
- * host focusing it. An unknown key returns `layout` as it was. */
+ * host focusing it. An unknown key, or one already shown in the focused
+ * group, returns `layout` as it was. */
 export function activateTab(layout: Layout, key: string): Layout {
   const at = groupOf(layout, key);
   if (at === null) return layout;
+  if (at === layout.focused && findGroup(layout, at)?.active === key) return layout;
   const root = mapGroups(layout.root, (group) => (group.id === at ? { ...group, active: key } : group));
   return { ...layout, root, focused: at };
 }
 
-/** Give `groupId` the focus. An unknown group returns `layout` as it was. */
+/** Give `groupId` the focus. An unknown group, or the one already focused,
+ * returns `layout` as it was. */
 export function focusGroup(layout: Layout, groupId: GroupId): Layout {
-  if (findGroup(layout, groupId) === undefined) return layout;
+  if (findGroup(layout, groupId) === undefined || layout.focused === groupId) return layout;
   return { ...layout, focused: groupId };
 }
 
-/** Focus the group `step` places from the focused one in reading order,
- * wrapping, as `stepTab` does for tabs. */
-function focusStep(layout: Layout, step: number): Layout {
-  const all = groups(layout);
-  const at = all.findIndex((group) => group.id === layout.focused);
-  return focusGroup(layout, all[(at + step + all.length) % all.length].id);
+/**
+ * Move the seam after child `index` of the split at `path` (child indices
+ * from the root) so that child takes `share` of what it and its next sibling
+ * hold together: a drag of the handle between them. Only those two change,
+ * and neither goes under `MIN_SHARE` of the split. An unknown split or seam,
+ * a `share` that is not a number, or one the stop leaves where it was,
+ * returns `layout` as it was.
+ */
+export function resize(layout: Layout, path: readonly number[], index: number, share: number): Layout {
+  if (!Number.isFinite(share)) return layout;
+  const edit = (node: LayoutNode, depth: number): LayoutNode | null => {
+    if (node.kind !== "split") return null;
+    if (depth < path.length) {
+      const at = path[depth];
+      const child = node.children[at];
+      const edited = child === undefined ? null : edit(child, depth + 1);
+      return edited === null ? null : { ...node, children: node.children.map((one, which) => (which === at ? edited : one)) };
+    }
+    if (!Number.isInteger(index) || index < 0 || index + 1 >= node.children.length) return null;
+    const pair = node.ratios[index] + node.ratios[index + 1];
+    const floor = Math.min(floorFor(node.children.length), pair / 2);
+    const first = Math.min(pair - floor, Math.max(floor, share * pair));
+    // A seam dragged against its stop moves nothing.
+    if (first === node.ratios[index]) return null;
+    const ratios = node.ratios.map((ratio, which) => (which === index ? first : which === index + 1 ? pair - first : ratio));
+    return { ...node, ratios };
+  };
+  const root = edit(layout.root, 0);
+  return root === null ? layout : { ...layout, root: tidy(root) };
 }
 
-/** Focus the next group in reading order, wrapping to the first. */
-export function focusNext(layout: Layout): Layout {
-  return focusStep(layout, 1);
+/** A box as shares of the window: `x` and `w` across, `y` and `h` down. */
+export interface Rect {
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
 }
 
-/** Focus the previous group in reading order, wrapping to the last. */
-export function focusPrevious(layout: Layout): Layout {
-  return focusStep(layout, -1);
+/** The handle between child `index` and the next of the split at `path`:
+ * `pair` is the box the two share, `at` the seam's place along `axis`. */
+export interface Divider {
+  readonly path: readonly number[];
+  readonly index: number;
+  readonly axis: Axis;
+  readonly pair: Rect;
+  readonly at: number;
+}
+
+/** Where everything in a layout is drawn. */
+export interface Geometry {
+  readonly groups: ReadonlyMap<GroupId, Rect>;
+  readonly dividers: readonly Divider[];
+}
+
+/**
+ * Where each group and each seam of `layout` is drawn, as shares of the
+ * window: the window positions every pane from this alone, measuring
+ * nothing, so a pane moves between groups by changing its box, never by
+ * being mounted again.
+ */
+export function geometry(layout: Layout): Geometry {
+  const rects = new Map<GroupId, Rect>();
+  const dividers: Divider[] = [];
+  const walk = (node: LayoutNode, rect: Rect, path: readonly number[]): void => {
+    if (node.kind === "group") {
+      rects.set(node.id, rect);
+      return;
+    }
+    const row = node.axis === "row";
+    const extent = row ? rect.w : rect.h;
+    const boxes: Rect[] = [];
+    let start = row ? rect.x : rect.y;
+    for (const ratio of node.ratios) {
+      const size = ratio * extent;
+      boxes.push(row ? { x: start, y: rect.y, w: size, h: rect.h } : { x: rect.x, y: start, w: rect.w, h: size });
+      start += size;
+    }
+    for (let index = 0; index + 1 < boxes.length; index += 1) {
+      const [first, second] = [boxes[index], boxes[index + 1]];
+      const pair = row
+        ? { x: first.x, y: rect.y, w: first.w + second.w, h: rect.h }
+        : { x: rect.x, y: first.y, w: rect.w, h: first.h + second.h };
+      dividers.push({ path, index, axis: node.axis, pair, at: row ? second.x : second.y });
+    }
+    node.children.forEach((child, index) => walk(child, boxes[index], [...path, index]));
+  };
+  walk(layout.root, { x: 0, y: 0, w: 1, h: 1 }, []);
+  return { groups: rects, dividers };
 }
 
 /**
@@ -339,7 +459,9 @@ export function serialize(layout: Layout): string {
 }
 
 /** A group id: at most nine digits, so every id and `next` stays an exact
- * integer and a minted id can never collide with a stored one. */
+ * integer and a minted id can never collide with a stored one. A layout
+ * whose `next` has reached `MAX_NEXT` has minted every id there is: it
+ * loads, and splits no further (`splitGroup`). */
 const GROUP_ID = /^g([1-9][0-9]{0,8})$/;
 const MAX_NEXT = 1_000_000_000;
 
@@ -424,19 +546,27 @@ export interface LayoutStorage {
 export const LAYOUT_KEY = "ainb.layout";
 
 /**
- * The stored layout, following the host's `liveKeys`: tabs that closed while
- * the window was away drop out and new ones join the focused group. Storage
- * that is absent, throws (a private window, blocked site data) or holds
- * anything `parse` rejects gives one group holding every live tab.
+ * The layout as stored, tabs and all, whichever of them are open now: one
+ * empty group for storage that is absent, throws (a private window, blocked
+ * site data) or holds anything `parse` rejects.
  */
-export function readLayout(storage: LayoutStorage | undefined, liveKeys: readonly string[]): Layout {
+export function readStored(storage: LayoutStorage | undefined): Layout {
   let raw: string | null | undefined;
   try {
     raw = storage?.getItem(LAYOUT_KEY);
   } catch {
     raw = null;
   }
-  return reconcile(raw ? parse(raw) : initialLayout([]), liveKeys);
+  return raw ? parse(raw) : initialLayout([]);
+}
+
+/**
+ * The stored layout, following the host's `liveKeys`: tabs that closed while
+ * the window was away drop out and new ones join the focused group. Storage
+ * with no layout gives one group holding every live tab.
+ */
+export function readLayout(storage: LayoutStorage | undefined, liveKeys: readonly string[]): Layout {
+  return reconcile(readStored(storage), liveKeys);
 }
 
 /** Store `layout`; a storage that throws only loses the memory of it for

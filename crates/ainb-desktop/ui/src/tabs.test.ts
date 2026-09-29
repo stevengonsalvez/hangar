@@ -14,6 +14,7 @@ import {
   stepTab,
   tabAfterClose,
   acceleratorAllowedUnderModal,
+  modalBlocks,
   type Accelerator,
   terminalMayTakeFocus,
   type Tab,
@@ -74,6 +75,27 @@ test("copy and paste are the shell's only elsewhere, and native on macOS", () =>
   // macOS: the Edit menu copies and pastes, so the shell claims neither.
   assert.equal(accelerator(key("KeyC", { meta: true }), true), null);
   assert.equal(accelerator(key("KeyV", { meta: true }), true), null);
+});
+
+test("the split chords are Orca's: Cmd+D and Cmd+Shift+D, Ctrl+Shift+D and Alt+Shift+D elsewhere", () => {
+  // orca:src/shared/keybindings/definitions-core-4.ts:22-42
+  assert.deepEqual(accelerator(key("KeyD", { meta: true }), true), { kind: "split", direction: "right" });
+  assert.deepEqual(accelerator(key("KeyD", { meta: true, shift: true }), true), { kind: "split", direction: "down" });
+  assert.deepEqual(accelerator(key("KeyD", { ctrl: true, shift: true }), false), { kind: "split", direction: "right" });
+  assert.deepEqual(accelerator(key("KeyD", { alt: true, shift: true }), false), { kind: "split", direction: "down" });
+  // The pane keeps the rest: ctrl+d is end-of-file, alt+d kills a word.
+  // Alt+Shift+D off macOS is Orca's split down, and is taken from the pane
+  // as Orca takes it.
+  assert.equal(accelerator(key("KeyD", { ctrl: true }), false), null);
+  assert.equal(accelerator(key("KeyD", { ctrl: true }), true), null);
+  assert.equal(accelerator(key("KeyD", { alt: true }), false), null);
+  assert.equal(accelerator(key("KeyD", { alt: true, shift: true }), true), null);
+  assert.equal(accelerator(key("KeyD", { meta: true, alt: true }), true), null);
+});
+
+test("a split chord is refused under the composer, like every chord but new", () => {
+  assert.equal(modalBlocks({ kind: "split", direction: "right" }, true), true);
+  assert.equal(modalBlocks({ kind: "split", direction: "down" }, false), false);
 });
 
 test("Esc twice within 300 ms leaves the terminal; a slower pair does not", () => {

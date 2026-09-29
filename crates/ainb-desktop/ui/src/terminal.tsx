@@ -108,11 +108,17 @@ export function TerminalView(props: Props) {
     // paste in the bracketed-paste markers the pane asked for, so a
     // multi-line payload arrives as text rather than as lines the shell
     // runs one by one. The macOS menu's own paste takes the same path, and
-    // the host reads the clipboard only for a tab that is in view.
+    // the host reads the clipboard only for a tab that is in view: the one
+    // it sized last (`Terminals::showing`). Split panes each size themselves,
+    // so the pane being pasted into sizes itself first, and reads once the
+    // host has taken that. The chord and the menu's Paste both come here.
     const paste = () => {
-      void invoke<string>("clipboard_read", { key: props.tab.key }).then((text) => {
-        if (text) term.paste(text);
-      });
+      const { key } = props.tab;
+      void invoke("terminal_resize", { key, cols: term.cols, rows: term.rows })
+        .then(() => invoke<string>("clipboard_read", { key }))
+        .then((text) => {
+          if (text) term.paste(text);
+        });
     };
     // Orca's rows in Orca's order, the ones this window can do today. Find
     // is ours: Orca's menu has none, the pane's find bar is one chord away.

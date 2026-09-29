@@ -1,5 +1,6 @@
 // The whole window, mounted over a fake host: with Settings or the Inbox open,
-// a click on a terminal tab leaves the page and shows that tab, as Orca's
+// a click on the Terminals tab leaves the page and shows the terminal the
+// panes show, as Orca's
 // activation does (it switches any page back to the terminal view before it
 // activates the worktree). The fake host keeps the reducer's screen, refuses a
 // session-list row off the session list as the real host's screen gate does,
@@ -177,13 +178,15 @@ const inboxShown = () => document.querySelector(".inbox") !== null;
 const toasts = () => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent ?? "");
 const terminal = () => document.querySelector<HTMLElement>(`.terminal[data-tab="${TAB.key}"]`);
 
-/** Click the terminal tab over `page` and check it leaves for the tab. */
+/** Click the Terminals tab over `page` and check it leaves for the tab. */
 async function clickTabOver(page: string, shown: () => boolean): Promise<void> {
   await until(shown, `the ${page} page, the reducer being on it`);
   assert.equal(terminal()?.hidden, true, `the page holds the work area, not the tab`);
   host.sent = [];
-  const title = document.querySelector<HTMLElement>(".tab[data-state] .tab-title");
-  assert.ok(title, `the tab strip lists the tab under ${page}`);
+  // The terminal tabs are in the panes' own strips, under the page; the top
+  // strip's Terminals tab is the way back to them.
+  const title = document.querySelector<HTMLElement>(".terminals-tab .tab-title");
+  assert.ok(title, `the top strip offers Terminals under ${page}`);
   title.click();
 
   await until(() => !shown(), `${page} to close`);
@@ -198,7 +201,7 @@ async function clickTabOver(page: string, shown: () => boolean): Promise<void> {
   assert.deepEqual(host.sent, ["answer_home", "session_list.select_row"], "home first, then the tab's row");
 }
 
-test("a tab clicked from Settings closes Settings and shows the tab, with no refusal", async () => {
+test("Terminals clicked from Settings closes Settings and shows the tab, with no refusal", async () => {
   const root = document.createElement("div");
   root.id = "root";
   document.body.appendChild(root);
@@ -206,7 +209,7 @@ test("a tab clicked from Settings closes Settings and shows the tab, with no ref
   await clickTabOver("Settings", settingsShown);
 });
 
-test("a tab clicked from the Inbox closes the Inbox and shows the tab, with no refusal", async () => {
+test("Terminals clicked from the Inbox closes the Inbox and shows the tab, with no refusal", async () => {
   // The person opens the Inbox over the terminal the last test showed.
   show("inbox");
   await clickTabOver("Inbox", inboxShown);
