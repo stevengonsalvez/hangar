@@ -139,6 +139,30 @@ export function projectGroups(view: SessionsView_Serialize | undefined): Project
     }));
 }
 
+/**
+ * The session Orca's `worktree.navigateUp` / `worktree.navigateDown` shows: the
+ * worktree card `step` places from the one holding `selected`, in sidebar
+ * order and wrapping, and that card's own session (the one its title names).
+ * Cards in a `collapsed` project are not drawn, so they are skipped, as Orca
+ * skips them (`worktree-keyboard-cycle.ts:47-48`). With no drawn card holding
+ * `selected` it enters from the end the step points away from
+ * (`worktree-keyboard-cycle.ts:87-92`). `null` with no cards.
+ */
+export function stepWorktree(
+  view: SessionsView_Serialize | undefined,
+  selected: string | null,
+  step: 1 | -1,
+  collapsed: ReadonlySet<string> = new Set(),
+): string | null {
+  const cards = projectGroups(view)
+    .filter((group) => !collapsed.has(group.path))
+    .flatMap((group) => group.cards);
+  if (cards.length === 0) return null;
+  const at = cards.findIndex((card) => card.sessions.some((session) => session.id === selected));
+  const next = at < 0 ? cards[step > 0 ? 0 : cards.length - 1] : cards[(at + step + cards.length) % cards.length];
+  return primaryOf(next.sessions).id;
+}
+
 /** `+added ~modified -deleted`, each part only while it is non-zero: a card
  * with nothing dirty draws no line at all (`sidebar.tsx` gates on `null`). */
 export function formatGitChanges(changes: GitChanges): string {

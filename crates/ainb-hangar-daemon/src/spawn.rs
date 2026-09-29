@@ -163,8 +163,16 @@ pub enum SpawnError {
     /// layer answers [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] by
     /// type, whatever the message says.
     Unregistered(String),
-    /// `ainb run` ran and failed, or could not be run at all.
+    /// Nothing was started: `ainb run` or tmux could not be run at all, or
+    /// every fresh shell name was taken.
     Failed(String),
+    /// `ainb run`, or a shell's `tmux new-session`, was started and did not
+    /// hand back a session: it outlived the bound, its wait was lost, it
+    /// failed, or its output was not a session. What it made is its own
+    /// (a slow run keeps going, a shell may still appear), so the RPC layer
+    /// answers [`ainb_hangar_proto::spawn::SPAWN_STARTED`], which the ledger
+    /// records: a retry under the same op id must never start a second one.
+    Started(String),
 }
 
 /// The `ainb run` argument vector for `params`. Pure, so the mapping is
@@ -491,7 +499,7 @@ fn resolve_worktree(
         SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
-        failed @ SpawnError::Failed(_) => failed,
+        fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => fault,
     })?;
     Ok(canonical)
 }
@@ -525,8 +533,9 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 /// that is not a directory or not the top of a git repository, or a `branch`
 /// that already exists. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, or
-/// `ainb run` could not be started, failed, outlived the bound, or printed
-/// no result it could read.
+/// `ainb run` could not be started. [`SpawnError::Started`] when it was
+/// started and failed, outlived the bound, or printed no result it could
+/// read.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -558,8 +567,8 @@ pub async fn worktree_create(
 /// [`managed_worktrees`], not the top of a linked worktree, or whose source
 /// repository is otherwise refused. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, the
-/// worktree check could not finish, or `ainb run` failed as for
-/// [`worktree_create`].
+/// worktree check could not finish, or `ainb run` could not be started;
+/// [`SpawnError::Started`] as for [`worktree_create`].
 pub async fn worktree_agent_add(
     params: &WorktreeAgentAddParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -632,7 +641,7 @@ fn resolve_shell_dir(
         let (tree_why, tree_unregistered) = match error {
             SpawnError::Invalid(why) => (why, false),
             SpawnError::Unregistered(why) => (why, true),
-            failed @ SpawnError::Failed(_) => return failed,
+            fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => return fault,
         };
         let why = format!(
             "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
@@ -672,7 +681,9 @@ fn resolve_shell_dir(
 /// [`SpawnError::Unregistered`] for a folder that registering a project
 /// would admit (see `resolve_shell_dir`) and [`SpawnError::Invalid`] for any
 /// other directory or op id refused, both before tmux ran;
-/// [`SpawnError::Failed`] when tmux could not make the session.
+/// [`SpawnError::Failed`] when tmux could not be run or every fresh name was
+/// taken; [`SpawnError::Started`] when `new-session` ran and may have made
+/// the shell (it did not answer in time, or failed after running).
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
     shell_create_named(params, || {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
@@ -735,7 +746,7 @@ pub async fn shell_create_named(
             .stderr(std::process::Stdio::piped())
             // A wedged tmux is abandoned at the timeout, not left running.
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+        let out = match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
             Err(_) => {
@@ -743,9 +754,9 @@ pub async fn shell_create_named(
                 // try to take it back. The server may still make it after its
                 // client is gone, so name it too: nothing else would find it.
                 kill_own_shell(&name).await;
-                return Err(SpawnError::Failed(format!(
+                return Err(SpawnError::Started(format!(
                     "tmux did not answer within {}s; the shell may still appear as {name}",
-                    SHELL_TMUX_TIMEOUT.as_secs()
+                    shell_tmux_timeout().as_secs()
                 )));
             }
         };
@@ -761,8 +772,9 @@ pub async fn shell_create_named(
             // session under it now is the one this command made before the
             // steps after it (secret scrub, owner and op id labels) failed:
             // take it back.
+            // The take-back is best-effort, so the session may outlive it.
             kill_own_shell(&name).await;
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "tmux could not start the shell {name}: {}",
                 stderr_tail(&out.stderr)
             )));
@@ -782,7 +794,7 @@ async fn kill_own_shell(name: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let _ = tokio::time::timeout(SHELL_TMUX_TIMEOUT, kill.status()).await;
+    let _ = tokio::time::timeout(shell_tmux_timeout(), kill.status()).await;
 }
 
 /// Every shell the daemon opened that is still running, by name. Only
@@ -906,7 +918,7 @@ impl TmuxError {
             Self::Spawn(e) => SpawnError::Failed(format!("could not run tmux: {e}")),
             Self::Timeout => SpawnError::Failed(format!(
                 "tmux did not answer within {}s",
-                SHELL_TMUX_TIMEOUT.as_secs()
+                shell_tmux_timeout().as_secs()
             )),
         }
     }
@@ -931,7 +943,7 @@ async fn run_tmux(args: &[&str]) -> Result<std::process::Output, TmuxError> {
     // `$TMUX` is inherited, so list and close reach the server the create
     // made its shells on.
     crate::tmux_session::strip_daemon_secrets(&mut tmux);
-    match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+    match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) => Err(TmuxError::Spawn(e)),
         Err(_) => Err(TmuxError::Timeout),
@@ -973,8 +985,8 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let timeout = run_timeout();
     let status = match tokio::time::timeout(timeout, &mut wait).await {
         Ok(Ok(Ok(status))) => status,
-        Ok(Ok(Err(e))) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
-        Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
+        Ok(Ok(Err(e))) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
+        Ok(Err(e)) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
         Err(_) => {
             // Nobody is waiting on the answer any more, so the run's own
             // outcome goes to the log, where an operator can find it.
@@ -997,7 +1009,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
                 }
                 drop(logs);
             });
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "`ainb run` is still running after {}s: {pending}; check the sidebar",
                 timeout.as_secs()
             )));
@@ -1007,12 +1019,12 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let stderr = logs.read_stderr();
     drop(logs);
     if !status.success() {
-        return Err(SpawnError::Failed(format!(
+        return Err(SpawnError::Started(format!(
             "`ainb run` failed: {}",
             stderr_tail(&stderr)
         )));
     }
-    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Failed)
+    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Started)
 }
 
 /// Where one `ainb run` writes its stdout and stderr: two files under the
@@ -1204,6 +1216,34 @@ fn run_timeout() -> Duration {
 #[cfg(not(any(test, feature = "test-support")))]
 const fn run_timeout() -> Duration {
     RUN_TIMEOUT
+}
+
+/// Test seam: a shorter wait than [`SHELL_TMUX_TIMEOUT`], in milliseconds,
+/// or 0 for the real one, so a test of a wedged tmux does not sit through
+/// ten seconds of it.
+#[cfg(any(test, feature = "test-support"))]
+static SHELL_TMUX_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shorten the wait on the shell verbs' tmux, or restore it with `None`.
+/// Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_shell_tmux_timeout_for_test(timeout: Option<Duration>) {
+    let ms = timeout.map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    SHELL_TMUX_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn shell_tmux_timeout() -> Duration {
+    match SHELL_TMUX_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => SHELL_TMUX_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+/// Compiled out of a shipped daemon: always the real wait.
+#[cfg(not(any(test, feature = "test-support")))]
+const fn shell_tmux_timeout() -> Duration {
+    SHELL_TMUX_TIMEOUT
 }
 
 #[cfg(test)]
