@@ -161,12 +161,13 @@ export function Sidebar(props: Props) {
   // event: a second right-click replaces the first.
   const [menu, setMenu] = createSignal<MenuAt | null>(null);
   const openMenu = (at: MenuAt) => setMenu(at);
-  /** Close the menu and give the keyboard back to the row, as Orca's
-   * `handleCloseAutoFocus` keeps it on the sidebar rather than the body. */
-  const closeMenu = () => {
+  /** Close the menu. With `restore`, give the keyboard back to the row (the
+   * sidebar when the row is gone), as Orca's `handleCloseAutoFocus` keeps it
+   * on the sidebar rather than the body. */
+  const closeMenu = (restore: boolean) => {
     const at = menu();
     setMenu(null);
-    at?.row.focus();
+    if (at && restore) (at.row.isConnected ? at.row : at.sidebar)?.focus();
   };
   // A menu outlives no drain that drops its row: Open in Editor selects the
   // row first and the editor opens whatever is selected, so a pick on a row
@@ -263,8 +264,11 @@ export function Sidebar(props: Props) {
             items={rowMenuItems(at.session)}
             onClose={closeMenu}
             onPick={(action) => {
-              closeMenu();
-              props.onRowPick?.({ action, session: at.session, name: at.name });
+              closeMenu(true);
+              // The session as the latest frame has it, not as it was when
+              // the menu opened.
+              const session = allSessions(props.sessions).find((one) => one.id === at.session.id) ?? at.session;
+              props.onRowPick?.({ action, session, name: at.name });
             }}
           />
         )}
@@ -338,6 +342,7 @@ function Card(props: {
                       aria-current={selected() ? "true" : undefined}
                       onClick={() => props.onOpen(session().id)}
                       onKeyDown={onRowKeyDown}
+                      aria-haspopup="menu"
                     >
                       <StatusGlyph status={status()} />
                       <span class="agent-type">{agentLabel(session().agent_type)}</span>
