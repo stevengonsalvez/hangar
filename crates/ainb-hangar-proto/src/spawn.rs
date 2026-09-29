@@ -5,8 +5,11 @@
 //! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are dark until
 //! their flip PR: the daemon answers `METHOD_NOT_FOUND` unless
 //! `AINB_HANGAR_SPAWN` is set at boot, so a daemon built from main behaves
-//! exactly as v1.29.0 does. None is in the mutation registry while dark; their
-//! params already carry the D18 envelope so the flip only registers them.
+//! exactly as v1.29.0 does. Their params carry the D18 envelope.
+//! `shell/create` and `shell/close` are already in the mutation registry, so
+//! the ledger at dispatch makes a retried op id replay its first answer (the
+//! same shell) rather than run again; the worktree verbs are registered by
+//! their flip PR.
 //!
 //! ```text
 //!  desktop ──worktree/create──▶ daemon ──`ainb --format json run --worktree`──▶ git + tmux + agent
@@ -126,7 +129,9 @@ pub struct ShellCreateParams {
     /// repository's top, or a worktree ainb created.
     pub worktree_path: String,
     /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
-    /// Unused while the method is dark.
+    /// Its `op_id` is deduplicated by the ledger at dispatch: a retry with
+    /// the same op id and body gets the first create's answer, the same
+    /// shell.
     #[serde(flatten)]
     pub mutation: crate::mutation::MutationEnvelope,
 }
@@ -143,9 +148,9 @@ pub struct ShellCreateResult {
 /// The tmux session prefix of every shell the daemon opens: `ainb-dsh-`
 /// and eight lowercase hex digits.
 ///
-/// Its own prefix, not the TUI's `ainb-sh-`: the TUI filters and sweeps its
-/// own shells by that one, so a daemon shell under it was neither listed nor
-/// closed by anything. `shell/list` and `shell/close` act on this prefix
+/// Its own prefix, not the TUI's `ainb-sh-`: the TUI filters its own shells
+/// out of its tmux list by that one, so a daemon shell under it could not be
+/// told from the TUI's and was neither listed nor closed by anything. `shell/list` and `shell/close` act on this prefix
 /// alone.
 pub const DAEMON_SHELL_PREFIX: &str = "ainb-dsh-";
 
@@ -176,8 +181,8 @@ pub struct ShellListResult {
 pub struct ShellCloseParams {
     /// The shell's tmux session, as `shell/create` or `shell/list` named it.
     pub tmux_session_name: String,
-    /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
-    /// Unused while the method is dark.
+    /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`],
+    /// deduplicated by the ledger at dispatch.
     #[serde(flatten)]
     pub mutation: crate::mutation::MutationEnvelope,
 }
