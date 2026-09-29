@@ -789,6 +789,20 @@ body {
   }
 }
 
+/* "New terminal": the strip's own +, after its last tab, as Orca's is. */
+.tab-new-terminal {
+  padding: 2px 10px;
+  color: var(--muted-foreground);
+}
+
+.tab-new-terminal:hover:not(:disabled) {
+  color: var(--foreground);
+}
+
+.tab-new-terminal:disabled {
+  opacity: 0.4;
+}
+
 .terminal {
   position: relative;
   flex: 1;
