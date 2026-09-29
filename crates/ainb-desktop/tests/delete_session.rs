@@ -116,10 +116,50 @@ async fn deleting_the_only_session_in_a_tree_takes_the_tree_and_its_row() {
             changes: Some(1),
         })
     );
-    delete(&session.to_string(), TreeFate::Removed).await.expect("deleted");
+    delete(&session.to_string(), TreeFate::Removed, Some(1), true)
+        .await
+        .expect("deleted");
 
     assert!(!tree.exists(), "the worktree folder is gone");
     assert!(!listed(session), "the row is gone");
+}
+
+#[tokio::test]
+async fn a_file_written_after_the_preview_refuses_the_delete_and_survives() {
+    // A live agent writes while the dialog is open: the tree was clean when
+    // counted, the confirm is a plain Delete, and the new file must not go.
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    save(&[row(session, &tree)]);
+    let shown = preview(&session.to_string()).await.expect("previewed");
+    assert_eq!(
+        shown,
+        DeletePreview {
+            tree: TreeFate::Removed,
+            changes: Some(0)
+        }
+    );
+
+    std::fs::write(tree.join("agent-wrote.txt"), "fresh work\n").unwrap();
+    let error = delete(&session.to_string(), shown.tree, shown.changes, false)
+        .await
+        .expect_err("refused");
+
+    assert!(error.contains("Nothing was deleted"), "{error}");
+    assert!(
+        tree.join("agent-wrote.txt").is_file(),
+        "the new file survives"
+    );
+    assert!(listed(session), "the session is untouched");
+
+    // Nor does Force Delete cover a file the person was never shown.
+    std::fs::write(tree.join("more.txt"), "more\n").unwrap();
+    let error = delete(&session.to_string(), TreeFate::Removed, Some(1), true)
+        .await
+        .expect_err("refused even forced");
+    assert!(error.contains("Nothing was deleted"), "{error}");
+    assert!(tree.join("more.txt").is_file());
 }
 
 #[tokio::test]
@@ -137,7 +177,9 @@ async fn deleting_one_of_two_sessions_in_a_tree_keeps_the_tree_for_the_other() {
             changes: None,
         })
     );
-    delete(&session.to_string(), TreeFate::Shared).await.expect("deleted");
+    delete(&session.to_string(), TreeFate::Shared, None, false)
+        .await
+        .expect("deleted");
 
     assert!(tree.is_dir(), "the other session's tree stays");
     assert!(!listed(session), "this session's row is gone");
@@ -160,8 +202,10 @@ async fn a_shared_tree_confirmed_as_kept_is_not_taken_once_the_other_session_has
         Ok(TreeFate::Shared)
     );
 
-    delete(&first.to_string(), TreeFate::Shared).await.expect("first deleted");
-    let error = delete(&second.to_string(), TreeFate::Shared)
+    delete(&first.to_string(), TreeFate::Shared, None, false)
+        .await
+        .expect("first deleted");
+    let error = delete(&second.to_string(), TreeFate::Shared, None, false)
         .await
         .expect_err("the fate changed under the dialog");
 
@@ -189,7 +233,7 @@ async fn deleting_a_session_in_the_persons_own_checkout_leaves_the_checkout() {
         preview(&joined.to_string()).await.map(|p| p.tree),
         Ok(TreeFate::Kept)
     );
-    delete(&joined.to_string(), TreeFate::Kept).await.expect("deleted");
+    delete(&joined.to_string(), TreeFate::Kept, None, false).await.expect("deleted");
 
     assert!(own.is_dir(), "the person's own folder stays");
     assert!(!listed(joined));
@@ -204,7 +248,9 @@ async fn a_session_the_list_does_not_hold_is_refused_and_its_tree_left() {
     let (boss, tree) = managed_tree(&base);
 
     assert!(preview(&boss.to_string()).await.is_err());
-    let error = delete(&boss.to_string(), TreeFate::Removed).await.expect_err("refused");
+    let error = delete(&boss.to_string(), TreeFate::Removed, Some(0), false)
+        .await
+        .expect_err("refused");
     assert!(
         error.contains("not in this machine's session list"),
         "{error}"
@@ -214,7 +260,7 @@ async fn a_session_the_list_does_not_hold_is_refused_and_its_tree_left() {
 
 #[tokio::test]
 async fn a_bad_session_id_is_refused_before_anything_runs() {
-    let error = delete("../etc", TreeFate::Removed).await.expect_err("refused");
+    let error = delete("../etc", TreeFate::Removed, Some(0), false).await.expect_err("refused");
     assert!(error.contains("not a session id"), "{error}");
     assert!(preview("").await.is_err());
 }
