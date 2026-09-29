@@ -191,6 +191,8 @@ hangar/issue_run                     allow    allow         allow   deny        
 worktree/create                      allow    allow         allow   deny        deny
 worktree/agent_add                   allow    allow         allow   deny        deny
 shell/create                         allow    allow         allow   deny        deny
+shell/list                           allow    allow         allow   deny        deny
+shell/close                          allow    allow         allow   deny        deny
 #
 event workspace                      allow    allow         allow   deny        deny
 event task_stream                    allow    allow         allow   deny        deny

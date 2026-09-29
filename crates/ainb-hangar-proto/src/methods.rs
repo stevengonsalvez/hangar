@@ -1843,12 +1843,34 @@ pub const WORKTREE_AGENT_ADD: &str = "worktree/agent_add";
 /// repository or a worktree ainb created.
 ///
 /// Dark, like [`WORKTREE_CREATE`]: `METHOD_NOT_FOUND` unless
-/// `AINB_HANGAR_SPAWN` is set at boot, and not in the mutation registry
-/// until its flip PR.
+/// `AINB_HANGAR_SPAWN` is set at boot. In the mutation registry already, so
+/// a retried op id replays the first create instead of opening a second
+/// shell.
 ///
 /// Params: [`crate::spawn::ShellCreateParams`].
 /// Result: [`crate::spawn::ShellCreateResult`].
 pub const SHELL_CREATE: &str = "shell/create";
+
+/// `shell/list`: every shell the daemon opened (`ainb-dsh-*`) that is still
+/// running. Never the TUI's shells or any other tmux session.
+///
+/// Dark, like [`SHELL_CREATE`]: `METHOD_NOT_FOUND` unless
+/// `AINB_HANGAR_SPAWN` is set at boot.
+///
+/// Params: [`crate::spawn::ShellListParams`].
+/// Result: [`crate::spawn::ShellListResult`].
+pub const SHELL_LIST: &str = "shell/list";
+
+/// `shell/close`: end one shell the daemon opened, by its exact session
+/// name. Any other name is refused before tmux runs.
+///
+/// Dark, like [`SHELL_CREATE`]: `METHOD_NOT_FOUND` unless
+/// `AINB_HANGAR_SPAWN` is set at boot. In the mutation registry, like
+/// [`SHELL_CREATE`].
+///
+/// Params: [`crate::spawn::ShellCloseParams`].
+/// Result: [`crate::spawn::ShellCloseResult`].
+pub const SHELL_CLOSE: &str = "shell/close";
 
 /// Every daemon method name, in declaration order.
 ///
@@ -2089,6 +2111,8 @@ pub const ALL_METHODS: &[&str] = &[
     WORKTREE_CREATE,
     WORKTREE_AGENT_ADD,
     SHELL_CREATE,
+    SHELL_LIST,
+    SHELL_CLOSE,
 ];
 
 #[cfg(test)]
@@ -2434,6 +2458,8 @@ mod tests {
             WORKTREE_CREATE,
             WORKTREE_AGENT_ADD,
             SHELL_CREATE,
+            SHELL_LIST,
+            SHELL_CLOSE,
         ];
         for m in declared {
             assert!(
