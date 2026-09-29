@@ -20,7 +20,8 @@
 //! `shell/create` needs no CLI hop: a plain shell is one `tmux new-session`,
 //! which the daemon runs itself (there is no `ainb shell` to call).
 //! `shell/list` and `shell/close` find and end those shells by their own
-//! prefix, [`DAEMON_SHELL_PREFIX`].
+//! prefix, [`DAEMON_SHELL_PREFIX`], and the owner option every one of them
+//! carries, [`SHELL_OWNER_OPTION`].
 //!
 //! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
 //! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
@@ -474,6 +475,15 @@ const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
 /// D18 ledger's (see [`shell_create`]).
 const SHELL_OP_OPTION: &str = "@ainb_op_id";
 
+/// The tmux user option every shell the daemon opens carries, set to
+/// [`SHELL_OWNER`] as the session is made. `shell/list` and `shell/close`
+/// act only on a session that has it: a user's session that happens to use
+/// [`DAEMON_SHELL_PREFIX`] is never listed or closed.
+const SHELL_OWNER_OPTION: &str = "@ainb_owner";
+
+/// The value of [`SHELL_OWNER_OPTION`] on a daemon shell.
+const SHELL_OWNER: &str = "daemon";
+
 /// `worktree_path` as a directory a shell may open in: the top of a
 /// registered repository ([`resolve_repo`]) or a worktree ainb created
 /// ([`resolve_worktree`]), canonical, or why not.
@@ -517,6 +527,8 @@ fn resolve_shell_dir(
 /// dispatch (`shell/create` is in `MUTATING_METHODS`): a retry with the same
 /// op id and body replays the first reply, the same shell, and runs nothing.
 /// The op id is also set on the session as [`SHELL_OP_OPTION`], a label only.
+/// Every shell is marked [`SHELL_OWNER_OPTION`] in the same tmux command, so
+/// no daemon shell exists without it.
 ///
 /// Never `-A` (attach to a same-named session), and the only kill is of a
 /// session this call just made under a fresh name and failed to finish: a
@@ -574,6 +586,7 @@ pub async fn shell_create_named(
         // kept out, the folder escaped, `$TMUX` followed as every other
         // daemon tmux call follows it.
         let mut tmux = crate::tmux_session::tmux_new_session(&name, start_dir, &[], &[]);
+        crate::tmux_session::set_session_option(&mut tmux, &name, SHELL_OWNER_OPTION, SHELL_OWNER);
         if let Some(op_id) = &op_id {
             crate::tmux_session::set_session_option(
                 &mut tmux,
@@ -611,7 +624,8 @@ pub async fn shell_create_named(
         if !stderr.contains("duplicate session") {
             // The name was free (tmux says so as `duplicate session`), so a
             // session under it now is the one this command made before the
-            // steps after it (secret scrub, op id label) failed: take it back.
+            // steps after it (secret scrub, owner and op id labels) failed:
+            // take it back.
             kill_own_shell(&name).await;
             return Err(SpawnError::Failed(format!(
                 "tmux could not start the shell {name}: {}",
@@ -637,8 +651,9 @@ async fn kill_own_shell(name: &str) {
 }
 
 /// Every shell the daemon opened that is still running, by name. Only
-/// [`DAEMON_SHELL_PREFIX`] sessions: the TUI's shells, agents' sessions and
-/// the user's own are never listed. No tmux server running is no shells.
+/// [`DAEMON_SHELL_PREFIX`] sessions marked [`SHELL_OWNER_OPTION`]: the TUI's
+/// shells, agents' sessions and the user's own, whatever they are named, are
+/// never listed. No tmux server running is no shells.
 ///
 /// # Errors
 /// [`SpawnError::Failed`] when tmux could not be asked.
@@ -650,13 +665,22 @@ pub async fn shell_list() -> Result<ShellListResult, SpawnError> {
 
 /// End one shell the daemon opened, by its exact name (`=<name>`, never a
 /// prefix match). Any name that is not a daemon shell's is refused before
-/// tmux runs. A shell already gone answers `closed: false`.
+/// tmux runs. A shell already gone answers `closed: false`, and so does a
+/// session under a daemon shell's name that [`shell_list`] would not list
+/// (no [`SHELL_OWNER_OPTION`]): it is not one of the daemon's, and stays.
 ///
 /// # Errors
 /// [`SpawnError::Invalid`] for a name that is not a daemon shell's,
 /// [`SpawnError::Failed`] when tmux could not end a running one.
 pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, SpawnError> {
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
+    let ours = daemon_shells()
+        .await?
+        .iter()
+        .any(|shell| shell.tmux_session_name == params.tmux_session_name);
+    if !ours {
+        return Ok(ShellCloseResult { closed: false });
+    }
     let exact = format!("={}", params.tmux_session_name);
     let killed = run_tmux(&["kill-session", "-t", &exact]).await.map_err(|e| e.failed())?;
     if killed.status.success() {
@@ -672,11 +696,12 @@ pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, 
     )))
 }
 
-/// Every running [`DAEMON_SHELL_PREFIX`] session with its start folder.
+/// Every running [`DAEMON_SHELL_PREFIX`] session marked
+/// [`SHELL_OWNER_OPTION`], with its start folder.
 async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
     // The path goes last: it is the one field that could hold a tab.
-    let format = "#{session_name}\t#{session_path}";
-    let out = run_tmux(&["list-sessions", "-F", format]).await.map_err(|e| e.failed())?;
+    let format = format!("#{{session_name}}\t#{{{SHELL_OWNER_OPTION}}}\t#{{session_path}}");
+    let out = run_tmux(&["list-sessions", "-F", &format]).await.map_err(|e| e.failed())?;
     if !out.status.success() {
         if no_such_session(&out.stderr) {
             return Ok(Vec::new());
@@ -689,8 +714,9 @@ async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
     Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
-            let (name, path) = line.split_once('\t')?;
-            is_daemon_shell_name(name).then(|| ShellCreateResult {
+            let (name, rest) = line.split_once('\t')?;
+            let (owner, path) = rest.split_once('\t')?;
+            (is_daemon_shell_name(name) && owner == SHELL_OWNER).then(|| ShellCreateResult {
                 tmux_session_name: name.to_string(),
                 worktree_path: path.to_string(),
             })

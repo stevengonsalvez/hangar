@@ -654,6 +654,69 @@ async fn a_close_never_reaches_a_session_the_daemon_did_not_open() {
     }
 }
 
+/// A session under a daemon shell's exact name that the daemon did not open
+/// (no `@ainb_owner`) is neither listed nor closed; the daemon's own shell,
+/// which carries the option from the moment it exists, is both.
+#[tokio::test]
+async fn a_same_prefix_session_without_the_owner_is_neither_listed_nor_closed() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let tree = world.worktree();
+    let ours = shell_name(&world.shell(&tree).await);
+    world.foreign("ainb-dsh-0a1b2c3d");
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::json!([{ "tmux_session_name": ours, "worktree_path": tree }]),
+        "{listed}"
+    );
+
+    let refused = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": "ainb-dsh-0a1b2c3d" }),
+    )
+    .await;
+    assert_eq!(
+        refused["result"],
+        serde_json::json!({ "closed": false }),
+        "{refused}"
+    );
+    assert!(
+        world.alive("ainb-dsh-0a1b2c3d"),
+        "the user's session was closed"
+    );
+
+    let owner = world.tmux(&[
+        "show-options",
+        "-qv",
+        "-t",
+        &format!("={ours}:"),
+        "@ainb_owner",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&owner.stdout).trim(),
+        "daemon",
+        "{owner:?}"
+    );
+
+    let closed = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": ours }),
+    )
+    .await;
+    assert_eq!(
+        closed["result"],
+        serde_json::json!({ "closed": true }),
+        "{closed}"
+    );
+    assert!(!world.alive(&ours));
+}
+
 /// A create retried with the same op id (a lost reply) replays the shell the
 /// first attempt made, through the D18 ledger, and opens no second one. The
 /// same op id for another folder is rejected; a new op id is a new shell.
