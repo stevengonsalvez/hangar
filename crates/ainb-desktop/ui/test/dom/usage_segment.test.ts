@@ -163,3 +163,36 @@ test("the segment makes no host call of its own: it rides the window's subscript
   await settle();
   assert.deepEqual([...hostCalls.keys()], [], "no subscribe, no poll, no read");
 });
+
+test("a failed read with nothing held draws the warning and Orca's label", async () => {
+  const store = await mount();
+  send(store, { absent: null, failure: "socket closed", summary: null });
+  await settle();
+  assert.equal(segment()?.dataset.state, "failed");
+  assert.ok(segment()?.querySelector(".statusbar-usage-warn"));
+  assert.match(segment()?.textContent ?? "", /Refresh failed/);
+});
+
+test("past three providers the rest fold into +N, named for a screen reader too", async () => {
+  const store = await mount();
+  send(store, ready([["claude", 1], ["codex", 2], ["cursor", 3], ["gemini", 4]]));
+  await settle();
+  assert.equal(chips().length, 3);
+  const more = document.querySelector(".statusbar-usage-more");
+  assert.match(more?.textContent ?? "", /\+1/);
+  assert.equal(more?.getAttribute("title"), "Also: gemini $4.00");
+  assert.match(more?.textContent ?? "", /Also: gemini \$4\.00/, "not only in a hover title");
+});
+
+test("an empty summary after a failed refresh keeps the stale mark", async () => {
+  const store = await mount();
+  send(store, { ...ready([]), failure: "timed out" });
+  await settle();
+  assert.equal(segment()?.dataset.state, "empty");
+  assert.ok(document.querySelector(".statusbar-usage-stale"));
+});
+
+test("the button says it opens Stats, whatever state it draws", async () => {
+  await mount();
+  assert.match(segment()?.textContent ?? "", /open Stats/);
+});
