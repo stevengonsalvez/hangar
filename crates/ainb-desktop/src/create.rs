@@ -105,7 +105,8 @@ pub fn mint_op_id() -> OpId {
 pub fn refusal_text(error: &DaemonError) -> String {
     match error {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
-            "This daemon does not create worktrees yet: start it with AINB_HANGAR_SPAWN=1.".into()
+            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0. Update it, or start it without that setting."
+                .into()
         }
         DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => {
             "This repository is not in a registered project folder: use Add project to pick its folder, then create again."
