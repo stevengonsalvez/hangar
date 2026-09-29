@@ -401,9 +401,9 @@ fn resolve_worktree(
     // An unregistered source stays `Unregistered`: the fix (add the project)
     // is the same as for `worktree/create`, so the code is too.
     resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
-        SpawnError::Invalid(why) => {
-            SpawnError::Invalid(format!("the worktree's source repository is refused: {why}"))
-        }
+        SpawnError::Invalid(why) => SpawnError::Invalid(format!(
+            "the worktree's source repository is refused: {why}"
+        )),
         SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
@@ -1515,10 +1515,7 @@ mod tests {
 
         let elsewhere = tempfile::tempdir().unwrap();
         git(elsewhere.path(), &["init", "-q"]);
-        assert!(
-            unregistered(elsewhere.path()),
-            "an unregistered repository"
-        );
+        assert!(unregistered(elsewhere.path()), "an unregistered repository");
         let (_source, stray) = stray_tree(&managed);
         assert!(unregistered(&stray), "a tree of an unregistered repository");
     }
