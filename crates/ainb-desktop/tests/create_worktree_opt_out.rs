@@ -1,9 +1,10 @@
-//! A daemon started without the spawn switch does not serve `worktree/create`,
-//! and the window says what to do about it instead of failing blankly.
+//! A daemon started with the spawn opt-out (`AINB_HANGAR_SPAWN=0`) does not
+//! serve `worktree/create`, and the window says what to do about it instead
+//! of failing blankly.
 //!
-//! Its own process: the spawn switch is an environment variable the daemon
-//! reads at boot, and `create_worktree.rs` turns it on. The daemon is killed
-//! by its exact pid when the test ends.
+//! Its own process: the opt-out is an environment variable the daemon reads
+//! at boot, and `create_worktree.rs` leaves it unset. The daemon is killed by
+//! its exact pid when the test ends.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,9 +39,9 @@ impl Drop for Home {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_daemon_without_the_switch_is_named_as_the_reason() {
+async fn a_daemon_started_with_the_opt_out_is_named_as_the_reason() {
     std::env::set_var("AINB_CODEX_MANAGED", "0");
-    std::env::remove_var("AINB_HANGAR_SPAWN");
+    std::env::set_var("AINB_HANGAR_SPAWN", "0");
     let home = Home(tempfile::tempdir().unwrap());
     let hangar = home.0.path().join(".agents-in-a-box");
     let mut config = SidecarConfig::new(hangar.clone(), daemon_bin());
@@ -76,7 +77,7 @@ async fn a_daemon_without_the_switch_is_named_as_the_reason() {
         },
     )
     .await
-    .expect_err("the verb is dark without the switch");
-    assert!(refusal.contains("AINB_HANGAR_SPAWN=1"), "{refusal}");
+    .expect_err("the verb is dark with the opt-out");
+    assert!(refusal.contains("AINB_HANGAR_SPAWN=0"), "{refusal}");
     drop(sidecar);
 }
