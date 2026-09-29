@@ -333,6 +333,17 @@ test("the window losing focus or resizing closes the menu", async () => {
   }
 });
 
+test("scrolling the sidebar closes the menu, which would no longer sit at its row", async () => {
+  await mount();
+  await rightClick(row("claude-1"));
+  assert.ok(menu(), "open before the scroll");
+  // A scroll does not bubble: the menu hears it by capture on the document.
+  document.querySelector(".sidebar")!.dispatchEvent(new window.Event("scroll") as unknown as Event);
+  await settle();
+  assert.ok(menu() === null, "the scroll closes it");
+  assert.ok(document.activeElement !== row("claude-1"), "without pulling the keyboard to the row");
+});
+
 test("a right-click near the window's corner keeps the whole menu on screen", async () => {
   const proto = window.HTMLElement.prototype as unknown as { getBoundingClientRect(): unknown };
   const real = proto.getBoundingClientRect;
