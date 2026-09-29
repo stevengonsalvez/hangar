@@ -131,11 +131,13 @@ function chipsOf(session: Session_Serialize | undefined): AttentionKind[] {
  * `exited` follows Orca's retained agents (`orca:src/renderer/src/components/
  * sidebar/worktree-agent-rows.ts:242-267` keeps a closed agent as `done`;
  * `orca:src/shared/dashboard-snapshot.ts:40-47` settles an acknowledged one
- * into idle): Done until this viewer opens it, then Idle. It leaves the
- * board when the daemon archives the row. Exhaustive: a new status fails to
+ * into idle): Done until this viewer opens it, then Idle. One nobody can
+ * open (`openable` false: no session row, not an ACP transcript) could never
+ * be acked out of Done, so it goes straight to Idle. It leaves the board
+ * when the daemon archives the row. Exhaustive: a new status fails to
  * compile here.
  */
-function columnOf(status: UiStatus, acked: boolean): BoardColumnKind {
+function columnOf(status: UiStatus, acked: boolean, openable: boolean): BoardColumnKind {
   switch (status.kind) {
     case "needs":
       return "needs";
@@ -147,7 +149,7 @@ function columnOf(status: UiStatus, acked: boolean): BoardColumnKind {
     case "unverifiable":
       return "idle";
     case "exited":
-      return acked ? "idle" : "done";
+      return acked || !openable ? "idle" : "done";
     default:
       return unhandled(status, "idle");
   }
@@ -184,7 +186,7 @@ export function boardColumns(
       title: label(session?.name ?? keyLabel(card.session_key)),
       sessionId: session?.id ?? null,
       status,
-      column: columnOf(status, acked),
+      column: columnOf(status, acked, session !== undefined || card.provider === "acp"),
       evidenceObservedAt: card.evidence_observed_at,
       provider: card.provider,
       model: models.get(card.session_key) ?? null,
