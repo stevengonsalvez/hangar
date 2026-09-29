@@ -2,14 +2,13 @@
 //! sessions in them, so every surface (desktop, TUI, a paired device later)
 //! creates work through one owner.
 //!
-//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are dark until
-//! their flip PR: the daemon answers `METHOD_NOT_FOUND` unless
-//! `AINB_HANGAR_SPAWN` is set at boot, so a daemon built from main behaves
-//! exactly as v1.29.0 does. Their params carry the D18 envelope.
-//! `shell/create` and `shell/close` are already in the mutation registry, so
-//! the ledger at dispatch makes a retried op id replay its first answer (the
-//! same shell) rather than run again; the worktree verbs are registered by
-//! their flip PR.
+//! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are served
+//! by default. A daemon started with `AINB_HANGAR_SPAWN=0` answers
+//! `METHOD_NOT_FOUND`, as one older than the verbs does. Their params carry
+//! the D18 envelope, and every one that changes the host (all but
+//! `shell/list`) is in the mutation registry, so the ledger at dispatch makes
+//! a retried op id replay its first answer (the same worktree, agent or
+//! shell) rather than run again.
 //!
 //! ```text
 //!  desktop ──worktree/create──▶ daemon ──`ainb --format json run --worktree`──▶ git + tmux + agent
@@ -63,10 +62,15 @@ pub const SPAWN_FIELD_MAX: usize = 200;
 /// Longest accepted first prompt, in bytes.
 pub const SPAWN_PROMPT_MAX: usize = 64 * 1024;
 
-/// JSON-RPC error code for a `worktree/create` whose repository is in no
+/// JSON-RPC error code for a spawn verb (`worktree/create`,
+/// `worktree/agent_add`, `shell/create`) whose repository is in no
 /// registered workspace folder and is not an added project. Distinct from
 /// `INVALID_PARAMS` so a client can offer the fix (add the project) by code,
 /// never by matching the message.
+///
+/// Raised before the verb runs anything, so it is not the op id's answer:
+/// the ledger leaves the op id free, and the same request retried after the
+/// project is added runs.
 pub const REPO_NOT_REGISTERED: i32 = -32010;
 
 /// Parameters for `worktree/create`: a new git worktree on a new branch, with
@@ -93,7 +97,8 @@ pub struct WorktreeCreateParams {
     #[serde(default)]
     pub skip_permissions: bool,
     /// The D18 mutation envelope, flattened so the wire object stays
-    /// `{ ..fields.., op_id?, fence? }`. Unused while the method is dark.
+    /// `{ ..fields.., op_id?, fence? }`. Its `op_id` is deduplicated by the
+    /// ledger at dispatch.
     #[serde(flatten)]
     pub mutation: crate::mutation::MutationEnvelope,
 }
@@ -122,7 +127,7 @@ pub struct WorktreeAgentAddParams {
     #[serde(default)]
     pub skip_permissions: bool,
     /// The D18 mutation envelope, flattened as on [`WorktreeCreateParams`].
-    /// Unused while the method is dark.
+    /// Its `op_id` is deduplicated by the ledger at dispatch.
     #[serde(flatten)]
     pub mutation: crate::mutation::MutationEnvelope,
 }

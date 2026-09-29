@@ -3491,6 +3491,16 @@ mod tests {
         }
     }
 
+    /// `worktree/agent_add` is served by default, and it is this flag, so
+    /// `run --help` (and the generated CLI reference) lists it.
+    #[test]
+    fn run_help_lists_existing_worktree() {
+        let mut app = CommandRegistry::built_ins().build_clap(root());
+        let run = app.find_subcommand_mut("run").expect("run subcommand");
+        let help = run.render_long_help().to_string();
+        assert!(help.contains("--existing-worktree <PATH>"), "{help}");
+    }
+
     #[test]
     fn label_command_parses_set_and_clear() {
         let app = CommandRegistry::built_ins().build_clap(root());

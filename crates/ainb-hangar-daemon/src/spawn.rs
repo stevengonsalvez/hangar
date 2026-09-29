@@ -23,10 +23,11 @@
 //! prefix, [`DAEMON_SHELL_PREFIX`], and the owner option every one of them
 //! carries, [`SHELL_OWNER_OPTION`].
 //!
-//! Dark by default: served only when [`SPAWN_ENV`] is `1` at boot. Off, the
-//! methods answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
-//! daemon. An environment variable, never a `daemon_config` key, so no
-//! connected surface can switch it on.
+//! Served by default. [`SPAWN_ENV`] set at boot to anything but `1`
+//! (`AINB_HANGAR_SPAWN=0`) turns them off, and they answer
+//! `METHOD_NOT_FOUND`, which a client cannot tell from an older daemon. An
+//! environment variable, never a `daemon_config` key, so no connected
+//! surface can switch it either way.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -38,7 +39,8 @@ use ainb_hangar_proto::spawn::{
     is_daemon_shell_name,
 };
 
-/// The boot-time switch: `AINB_HANGAR_SPAWN=1` serves the spawn verbs.
+/// The boot-time switch for the spawn verbs: unset or `1` serves them,
+/// `0` (or any other value) keeps them off. See [`served_by`].
 pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 
 /// Upper bound on one `ainb run`. It waits up to 30s for the agent's input
@@ -51,7 +53,19 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var(SPAWN_ENV).is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| served_by(std::env::var_os(SPAWN_ENV).as_deref()))
+}
+
+/// Whether a daemon whose [`SPAWN_ENV`] is `value` serves the spawn verbs.
+///
+/// Only an unset variable changes meaning with the flip: unset now serves
+/// them, and every value keeps the answer it had while they were opt-in
+/// (`1` on, anything else off). So `AINB_HANGAR_SPAWN=0`, `=false` or `=`
+/// is an opt-out, and a typo in one fails closed rather than silently
+/// turning the verbs on.
+#[must_use]
+pub fn served_by(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|value| value == "1")
 }
 
 /// Why a create failed, split so the RPC layer can tell a bad request from a
@@ -189,7 +203,7 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
 
 /// The message of [`SpawnError::Unregistered`], the refusal for a repository
 /// in no registered folder and not an added project. The variant, not this
-/// text, is what `worktree/create` answers
+/// text, is what every spawn verb answers
 /// [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] for.
 pub const UNREGISTERED: &str = "repo_path is not under a registered workspace folder: add its \
                                 folder to workspace_defaults.workspace_scan_paths";
@@ -384,8 +398,13 @@ fn resolve_worktree(
     }
     let source = linked_worktree_source(&canonical)
         .map_err(|why| SpawnError::Invalid(format!("worktree_path {why}")))?;
+    // An unregistered source stays `Unregistered`: the fix (add the project)
+    // is the same as for `worktree/create`, so the code is too.
     resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
-        SpawnError::Invalid(why) | SpawnError::Unregistered(why) => SpawnError::Invalid(format!(
+        SpawnError::Invalid(why) => SpawnError::Invalid(format!(
+            "the worktree's source repository is refused: {why}"
+        )),
+        SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
         failed @ SpawnError::Failed(_) => failed,
@@ -416,8 +435,10 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 /// creating", not as a failure that already undid anything.
 ///
 /// # Errors
-/// [`SpawnError::Invalid`] for a request refused before anything ran,
-/// [`SpawnError::Failed`] when `ainb run` failed or outlived the bound.
+/// [`SpawnError::Unregistered`] for a repository no registered folder or
+/// project admits and [`SpawnError::Invalid`] for any other request refused,
+/// both before anything ran; [`SpawnError::Failed`] when `ainb run` failed
+/// or outlived the bound.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -487,6 +508,12 @@ const SHELL_OWNER: &str = "daemon";
 /// `worktree_path` as a directory a shell may open in: the top of a
 /// registered repository ([`resolve_repo`]) or a worktree ainb created
 /// ([`resolve_worktree`]), canonical, or why not.
+///
+/// The refusal is [`SpawnError::Unregistered`] when registering a project is
+/// the fix: a managed tree whose source repository is unregistered, or a
+/// folder outside the managed directory that no registered root or project
+/// admits. Anything else, a managed folder that is not a usable tree
+/// included, is [`SpawnError::Invalid`].
 fn resolve_shell_dir(
     worktree_path: &str,
     home: &Path,
@@ -497,18 +524,28 @@ fn resolve_shell_dir(
             "worktree_path must not contain . or .. components".into(),
         ));
     }
-    let repo_why = match resolve_repo(worktree_path, home) {
+    let (repo_why, repo_unregistered) = match resolve_repo(worktree_path, home) {
         Ok(dir) => return Ok(dir),
-        Err(SpawnError::Invalid(why) | SpawnError::Unregistered(why)) => why,
+        Err(SpawnError::Invalid(why)) => (why, false),
+        Err(SpawnError::Unregistered(why)) => (why, true),
         Err(failed) => return Err(failed),
     };
-    resolve_worktree(worktree_path, home, managed).map_err(|error| match error {
-        SpawnError::Invalid(tree_why) | SpawnError::Unregistered(tree_why) => {
-            SpawnError::Invalid(format!(
-                "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
-            ))
+    let in_managed = std::fs::canonicalize(worktree_path)
+        .is_ok_and(|canonical| is_managed_tree(&canonical, managed));
+    resolve_worktree(worktree_path, home, managed).map_err(|error| {
+        let (tree_why, tree_unregistered) = match error {
+            SpawnError::Invalid(why) => (why, false),
+            SpawnError::Unregistered(why) => (why, true),
+            failed @ SpawnError::Failed(_) => return failed,
+        };
+        let why = format!(
+            "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
+        );
+        if tree_unregistered || (repo_unregistered && !in_managed) {
+            SpawnError::Unregistered(why)
+        } else {
+            SpawnError::Invalid(why)
         }
-        failed @ SpawnError::Failed(_) => failed,
     })
 }
 
@@ -536,7 +573,9 @@ fn resolve_shell_dir(
 /// touched.
 ///
 /// # Errors
-/// [`SpawnError::Invalid`] for a directory or op id refused before tmux ran,
+/// [`SpawnError::Unregistered`] for a folder that registering a project
+/// would admit (see `resolve_shell_dir`) and [`SpawnError::Invalid`] for any
+/// other directory or op id refused, both before tmux ran;
 /// [`SpawnError::Failed`] when tmux could not make the session.
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
     shell_create_named(params, || {
@@ -674,11 +713,7 @@ pub async fn shell_list() -> Result<ShellListResult, SpawnError> {
 /// [`SpawnError::Failed`] when tmux could not end a running one.
 pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, SpawnError> {
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
-    let ours = daemon_shells()
-        .await?
-        .iter()
-        .any(|shell| shell.tmux_session_name == params.tmux_session_name);
-    if !ours {
+    if !owned_by_the_daemon(&params.tmux_session_name).await? {
         return Ok(ShellCloseResult { closed: false });
     }
     let exact = format!("={}", params.tmux_session_name);
@@ -698,10 +733,16 @@ pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, 
 
 /// Every running [`DAEMON_SHELL_PREFIX`] session marked
 /// [`SHELL_OWNER_OPTION`], with its start folder.
+///
+/// The owner is read per candidate by [`owned_by_the_daemon`], not with a
+/// `#{@ainb_owner}` column here: a format falls back to the global option,
+/// so one `set -g @ainb_owner daemon` would claim every prefixed session.
+/// One more tmux call per prefixed session, a handful at most.
 async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
     // The path goes last: it is the one field that could hold a tab.
-    let format = format!("#{{session_name}}\t#{{{SHELL_OWNER_OPTION}}}\t#{{session_path}}");
-    let out = run_tmux(&["list-sessions", "-F", &format]).await.map_err(|e| e.failed())?;
+    let out = run_tmux(&["list-sessions", "-F", "#{session_name}\t#{session_path}"])
+        .await
+        .map_err(|e| e.failed())?;
     if !out.status.success() {
         if no_such_session(&out.stderr) {
             return Ok(Vec::new());
@@ -711,17 +752,41 @@ async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
             stderr_tail(&out.stderr)
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (name, rest) = line.split_once('\t')?;
-            let (owner, path) = rest.split_once('\t')?;
-            (is_daemon_shell_name(name) && owner == SHELL_OWNER).then(|| ShellCreateResult {
+    let mut shells = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((name, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if is_daemon_shell_name(name) && owned_by_the_daemon(name).await? {
+            shells.push(ShellCreateResult {
                 tmux_session_name: name.to_string(),
                 worktree_path: path.to_string(),
-            })
-        })
-        .collect())
+            });
+        }
+    }
+    Ok(shells)
+}
+
+/// Whether the session named exactly `name` carries [`SHELL_OWNER_OPTION`]
+/// set to [`SHELL_OWNER`] as its OWN option. `show-options` without `-g` or
+/// `-A` reads the session's options only, never the global value a format
+/// or an inherited lookup would fall back to. A session that is gone, or
+/// no server at all, is not the daemon's.
+async fn owned_by_the_daemon(name: &str) -> Result<bool, SpawnError> {
+    let exact = format!("={name}:");
+    let out = run_tmux(&["show-options", "-qv", "-t", &exact, SHELL_OWNER_OPTION])
+        .await
+        .map_err(|e| e.failed())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim_end() == SHELL_OWNER);
+    }
+    if no_such_session(&out.stderr) {
+        return Ok(false);
+    }
+    Err(SpawnError::Failed(format!(
+        "tmux could not read {name}'s owner: {}",
+        stderr_tail(&out.stderr)
+    )))
 }
 
 /// Whether tmux's `stderr` says the session, or the whole server, is not
@@ -1377,9 +1442,9 @@ mod tests {
         refused(&link, &managed, "directly in");
     }
 
-    #[test]
-    fn a_worktree_of_an_unregistered_repo_is_refused() {
-        let (home, _repo, managed, _tree) = world_with_worktree();
+    /// A managed tree cut from a repository outside every registered folder,
+    /// left in the managed directory next to `world_with_worktree`'s tree.
+    fn stray_tree(managed: &Path) -> (tempfile::TempDir, PathBuf) {
         let elsewhere = tempfile::tempdir().unwrap();
         git(elsewhere.path(), &["init", "-q", "-b", "main"]);
         git(
@@ -1398,11 +1463,20 @@ mod tests {
                 &stray.display().to_string(),
             ],
         );
+        (elsewhere, stray)
+    }
+
+    /// Unregistered, not Invalid: the fix is to add the project, as it is
+    /// for `worktree/create`, so every spawn verb answers the same code.
+    #[test]
+    fn a_worktree_of_an_unregistered_repo_is_refused_as_unregistered() {
+        let (home, _repo, managed, _tree) = world_with_worktree();
+        let (_elsewhere, stray) = stray_tree(&managed);
         match resolve_worktree(&stray.display().to_string(), home.path(), &managed) {
-            Err(SpawnError::Invalid(message)) => {
+            Err(SpawnError::Unregistered(message)) => {
                 assert!(message.contains("registered"), "{message}")
             }
-            other => panic!("expected Invalid, got {other:?}"),
+            other => panic!("expected Unregistered, got {other:?}"),
         }
     }
 
@@ -1422,13 +1496,39 @@ mod tests {
                 Err(SpawnError::Invalid(_))
             )
         };
+        let unregistered = |path: &Path| {
+            matches!(
+                resolve_shell_dir(&path.display().to_string(), home.path(), &managed),
+                Err(SpawnError::Unregistered(_))
+            )
+        };
         assert!(refused(&repo.join("../app")), "dot components");
         let sub = repo.join("src");
         std::fs::create_dir_all(&sub).unwrap();
         assert!(refused(&sub), "a subdirectory");
+        // A whole repository planted where a managed tree would be: adding a
+        // project would not make it a tree ainb made.
+        let planted = managed.join("planted--main--00000000");
+        std::fs::create_dir_all(&planted).unwrap();
+        git(&planted, &["init", "-q", "-b", "main"]);
+        assert!(refused(&planted), "a main checkout in the managed place");
+
         let elsewhere = tempfile::tempdir().unwrap();
         git(elsewhere.path(), &["init", "-q"]);
-        assert!(refused(elsewhere.path()), "an unregistered repository");
+        assert!(unregistered(elsewhere.path()), "an unregistered repository");
+        let (_source, stray) = stray_tree(&managed);
+        assert!(unregistered(&stray), "a tree of an unregistered repository");
+    }
+
+    /// On unless the operator set the variable to something other than `1`.
+    #[test]
+    fn the_spawn_verbs_are_served_unless_opted_out() {
+        use std::ffi::OsStr;
+        assert!(served_by(None), "unset serves them: the default");
+        assert!(served_by(Some(OsStr::new("1"))));
+        for off in ["0", "", "false", "off", "no", "true", " 1"] {
+            assert!(!served_by(Some(OsStr::new(off))), "{off:?} keeps them off");
+        }
     }
 
     #[test]

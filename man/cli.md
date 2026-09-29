@@ -128,6 +128,7 @@ Options:
       --create-branch <CREATE_BRANCH>  Create a new branch with this name
       --worktree                       Use git worktree for isolation
       --base <REF>                     Base ref the new worktree branch starts from (needs --worktree or --create-branch)
+      --existing-worktree <PATH>       Start the session in this existing ainb worktree, on its current branch
       --tool <TOOL>                    AI tool to use [default: claude] [possible values: claude, codex, gemini, copilot, antigravity]
       --model <MODEL>                  Provider model ID to pass through unchanged
   -p, --prompt <PROMPT>                Initial prompt to send
@@ -146,6 +147,7 @@ EXAMPLES:
   ainb run --remote-repo owner/repo --worktree       Clone a GitHub repo first, then isolate
   ainb run --repo . --worktree --tool codex          Use Codex instead of Claude
   ainb run --repo . --worktree --attach              Drop into tmux after creating
+  ainb run --existing-worktree <path>                One more agent in a worktree ainb made
   ainb run --repo .                                  Shared checkout, NO isolation
 
 Without --worktree (or --create-branch) the session runs directly in the

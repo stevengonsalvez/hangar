@@ -1,5 +1,6 @@
-//! `shell/create`, `shell/list` and `shell/close` with the switch on, end to
-//! end through dispatch, against real git and a real tmux server.
+//! `shell/create`, `shell/list` and `shell/close` as a daemon serves them by
+//! default, end to end through dispatch, against real git and a real tmux
+//! server.
 //!
 //! The server is PRIVATE: `TMUX_TMPDIR` points at a per-test directory and
 //! `TMUX` is removed, so the daemon's own `tmux new-session` lands on a server
@@ -7,8 +8,9 @@
 //! name (`=<name>`) on that server, never the server itself.
 //!
 //! Its own process: `AINB_HANGAR_SPAWN`, `HOME` and `TMUX_TMPDIR` are
-//! process-global and the switch is read once, so they are set before the
-//! first dispatch and the tests run serially on one lock.
+//! process-global and the switch is read once, so they are settled before
+//! the first dispatch and the tests run serially on one lock. The switch is
+//! left UNSET: the verbs are on by default.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -97,7 +99,8 @@ fn git(cwd: &Path, args: &[&str]) {
 /// One isolated world: a home whose config registers `<home>/code`, a
 /// repository at `<home>/code/app`, a linked worktree of it where
 /// `ainb run --worktree` puts them, and a private tmux server dir. Sets
-/// `HOME`, `TMUX_TMPDIR` and the switch for the daemon; held under `SERIAL`.
+/// `HOME` and `TMUX_TMPDIR` and clears the switch for the daemon; held under
+/// `SERIAL`.
 struct World {
     home: tempfile::TempDir,
     tmux_dir: PathBuf,
@@ -160,7 +163,7 @@ impl World {
         for locale in ["LANG", "LC_ALL", "LC_CTYPE"] {
             std::env::remove_var(locale);
         }
-        std::env::set_var(ainb_hangar_daemon::spawn::SPAWN_ENV, "1");
+        std::env::remove_var(ainb_hangar_daemon::spawn::SPAWN_ENV);
         Self {
             home,
             tmux_dir,
@@ -334,7 +337,9 @@ async fn a_folder_name_that_reads_as_a_tmux_format_is_taken_literally() {
 }
 
 /// A directory outside every registered folder, or one reached through
-/// `..`, is refused before tmux runs: no session, not even a server.
+/// `..`, is refused before tmux runs: no session, not even a server. The
+/// unregistered one answers `REPO_NOT_REGISTERED`, as `worktree/create` does,
+/// so a client offers Add project by code.
 #[tokio::test]
 async fn a_path_outside_the_registered_folders_or_with_dots_is_refused() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -347,15 +352,62 @@ async fn a_path_outside_the_registered_folders_or_with_dots_is_refused() {
     git(elsewhere.path(), &["init", "-q"]);
     let dotted = format!("{}/../app", world.repo());
 
-    for path in [elsewhere.path().display().to_string(), dotted] {
+    for (path, code) in [
+        (
+            elsewhere.path().display().to_string(),
+            ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+        ),
+        (dotted, -32602),
+    ] {
         let response = world.shell(&path).await;
         assert_eq!(
             response["error"]["code"].as_i64(),
-            Some(-32602),
+            Some(i64::from(code)),
             "{path}: {response}"
         );
     }
     assert!(world.sessions().is_empty(), "no session was made");
+}
+
+/// `REPO_NOT_REGISTERED` is answered before anything runs, so it is not the
+/// op id's answer: the same op id, retried once the person has added the
+/// folder, opens the shell instead of replaying the refusal.
+#[tokio::test]
+async fn an_unregistered_refusal_leaves_the_op_id_free_for_after_registering() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let later = world.home.path().join("later/app");
+    std::fs::create_dir_all(&later).unwrap();
+    git(&later, &["init", "-q", "-b", "main"]);
+    let later = canonical(&later);
+    let op_id = "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
+
+    let refused = world.shell_with_op(&later, op_id).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(i64::from(ainb_hangar_proto::spawn::REPO_NOT_REGISTERED)),
+        "{refused}"
+    );
+    assert!(world.sessions().is_empty(), "no session was made");
+
+    let config = world.home.path().join(".agents-in-a-box/config");
+    std::fs::write(
+        config.join(ainb_hangar_daemon::spawn::PROJECTS_FILE),
+        format!("projects = [\"{later}\"]\n"),
+    )
+    .unwrap();
+
+    let retry = world.shell_with_op(&later, op_id).await;
+    assert_eq!(
+        retry["result"]["mutation"]["outcome"], "created",
+        "the retry ran, it did not replay the refusal: {retry}"
+    );
+    assert_eq!(retry["result"]["worktree_path"], later.as_str());
+    assert_eq!(world.sessions(), vec![shell_name(&retry)]);
 }
 
 /// A second shell is a second session: nothing reuses, attaches to or
@@ -715,6 +767,47 @@ async fn a_same_prefix_session_without_the_owner_is_neither_listed_nor_closed() 
         "{closed}"
     );
     assert!(!world.alive(&ours));
+}
+
+/// The owner is read from the session itself. A `set -g @ainb_owner daemon`
+/// (a tmux.conf line, or any other tool on the server) is a global option,
+/// which a `#{@ainb_owner}` format falls back to: read that way it would
+/// mark every `ainb-dsh-` session on the server as the daemon's.
+#[tokio::test]
+async fn a_global_owner_option_does_not_make_a_foreign_shell_ours() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !tmux_available() {
+        eprintln!("skipping: tmux not available");
+        return;
+    }
+    let mut world = World::new();
+    let tree = world.worktree();
+    let ours = shell_name(&world.shell(&tree).await);
+    world.foreign("ainb-dsh-0a1b2c3d");
+    let global = world.tmux(&["set-option", "-g", "@ainb_owner", "daemon"]);
+    assert!(global.status.success(), "{global:?}");
+
+    let listed = call_method(m::SHELL_LIST, serde_json::json!({})).await;
+    assert_eq!(
+        listed["result"]["shells"],
+        serde_json::json!([{ "tmux_session_name": ours, "worktree_path": tree }]),
+        "{listed}"
+    );
+
+    let refused = call_method(
+        m::SHELL_CLOSE,
+        serde_json::json!({ "tmux_session_name": "ainb-dsh-0a1b2c3d" }),
+    )
+    .await;
+    assert_eq!(
+        refused["result"],
+        serde_json::json!({ "closed": false }),
+        "{refused}"
+    );
+    assert!(
+        world.alive("ainb-dsh-0a1b2c3d"),
+        "a session marked only by the global option was closed"
+    );
 }
 
 /// A create retried with the same op id (a lost reply) replays the shell the

@@ -105,7 +105,8 @@ pub fn mint_op_id() -> OpId {
 pub fn refusal_text(error: &DaemonError) -> String {
     match error {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
-            "This daemon does not create worktrees yet: start it with AINB_HANGAR_SPAWN=1.".into()
+            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0. Update it, or start it without that setting."
+                .into()
         }
         DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => {
             "This repository is not in a registered project folder: use Add project to pick its folder, then create again."
@@ -194,7 +195,11 @@ mod tests {
             code: METHOD_NOT_FOUND,
             message: "unknown method: worktree/create".into(),
         };
-        assert!(refusal_text(&dark).contains("AINB_HANGAR_SPAWN=1"));
+        // The verbs are on by default: a daemon that does not serve one is
+        // older than this app, or was started with the opt-out.
+        let dark = refusal_text(&dark);
+        assert!(dark.contains("AINB_HANGAR_SPAWN=0"), "{dark}");
+        assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
         let bad = DaemonError::Rpc {
             code: INVALID_PARAMS,
             message: "base is not a valid git ref name".into(),

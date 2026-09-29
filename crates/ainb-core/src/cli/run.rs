@@ -189,7 +189,7 @@ pub async fn execute(args: RunArgs) -> Result<()> {
     // .mcp.json so pooled servers point at the `ainb mcp proxy` shim.
     // Any failure falls back to today's per-session behavior.
     if matches!(args.tool.to_cli_provider(), CliProvider::Claude) {
-        setup_mcp_pool(&work_dir, &session_name, args.json);
+        setup_mcp_pool(&args, &work_dir, &session_name);
     }
 
     // Step 6: Allocate the daemon-owned remote thread before tmux starts.
@@ -609,35 +609,16 @@ fn resolve_existing_worktree(path: &std::path::Path) -> Result<ExistingWorktree>
 /// eligible servers, daemon spawn failure, or .mcp.json write failure all
 /// degrade to per-session MCP spawning — a session must never fail to start
 /// because of the pool.
-fn setup_mcp_pool(work_dir: &std::path::Path, session_name: &str, json: bool) {
+fn setup_mcp_pool(args: &RunArgs, work_dir: &std::path::Path, session_name: &str) {
     use crate::config::AppConfig;
     use crate::mcp_pool;
 
+    let json = args.json;
     let config = AppConfig::load().unwrap_or_default();
     if !config.mcp_pool.enabled {
         return;
     }
-    let mut pooled = mcp_pool::pooled_servers(&config);
-
-    // Auto-import: stdio servers already declared in the worktree's
-    // .mcp.json join the pool too (config entries win on name conflict).
-    // Users who never touched ainb config still get pooling for free.
-    // Auto-import runs whatever a repo's .mcp.json declares as a pooled
-    // (and later spawned) process. That matches Claude Code's own
-    // project-.mcp.json trust model, but log the exact command/args loudly
-    // so it's auditable — a freshly-cloned repo could declare anything.
-    let known: std::collections::HashSet<String> = pooled.iter().map(|s| s.name.clone()).collect();
-    for server in mcp_pool::mcp_json::parse_stdio_servers(&work_dir.join(".mcp.json")) {
-        if !known.contains(&server.name) && server.resolvable_on_host() {
-            warn!(
-                "mcp pool: auto-importing '{}' from project .mcp.json — will pool+spawn: {} {}",
-                server.name,
-                server.command,
-                server.args.join(" ")
-            );
-            pooled.push(server);
-        }
-    }
+    let pooled = pool_candidates(args, mcp_pool::pooled_servers(&config), work_dir);
     if pooled.is_empty() {
         return;
     }
@@ -666,6 +647,46 @@ fn setup_mcp_pool(work_dir: &std::path::Path, session_name: &str, json: bool) {
         Ok(_) => {}
         Err(e) => warn!("mcp pool: could not write .mcp.json: {e}"),
     }
+}
+
+/// The servers a launch pools: every `configured` one, then the stdio
+/// servers the worktree's own `.mcp.json` declares, unless the launch joins
+/// an existing worktree.
+///
+/// `--existing-worktree` (the daemon's `worktree/agent_add`) runs in a tree
+/// another agent has been working in, maybe with its permission prompts
+/// skipped, so that agent could have written the `.mcp.json`. Pooling a
+/// server spawns it on the host, and that is not the file's call: such a
+/// launch pools only what is already in ainb's config.
+fn pool_candidates(
+    args: &RunArgs,
+    configured: Vec<crate::mcp_pool::PooledServer>,
+    work_dir: &std::path::Path,
+) -> Vec<crate::mcp_pool::PooledServer> {
+    let mut pooled = configured;
+    if args.existing_worktree.is_some() {
+        return pooled;
+    }
+    // Auto-import: stdio servers already declared in the worktree's
+    // .mcp.json join the pool too (config entries win on name conflict).
+    // Users who never touched ainb config still get pooling for free.
+    // Auto-import runs whatever a repo's .mcp.json declares as a pooled
+    // (and later spawned) process. That matches Claude Code's own
+    // project-.mcp.json trust model, but log the exact command/args loudly
+    // so it's auditable: a freshly-cloned repo could declare anything.
+    let known: std::collections::HashSet<String> = pooled.iter().map(|s| s.name.clone()).collect();
+    for server in crate::mcp_pool::mcp_json::parse_stdio_servers(&work_dir.join(".mcp.json")) {
+        if !known.contains(&server.name) && server.resolvable_on_host() {
+            warn!(
+                "mcp pool: auto-importing '{}' from project .mcp.json, will pool+spawn: {} {}",
+                server.name,
+                server.command,
+                server.args.join(" ")
+            );
+            pooled.push(server);
+        }
+    }
+    pooled
 }
 
 /// Resolve the repository path from args or current directory
@@ -2077,6 +2098,56 @@ mod tests {
         };
         let err = validate_run_flags(&args).expect_err("--name must be refused");
         assert!(err.to_string().contains("--name"), "got: {err}");
+    }
+
+    /// A worktree whose `.mcp.json` declares `planted` (a stdio server this
+    /// host can run) and nothing else, with one server already configured.
+    fn tree_declaring_a_server() -> (tempfile::TempDir, Vec<crate::mcp_pool::PooledServer>) {
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tree.path().join(".mcp.json"),
+            r#"{"mcpServers":{"planted":{"command":"sh","args":["-c","true"]}}}"#,
+        )
+        .unwrap();
+        let configured = vec![crate::mcp_pool::PooledServer {
+            name: "configured".into(),
+            command: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            env: std::collections::HashMap::new(),
+        }];
+        (tree, configured)
+    }
+
+    fn names(servers: &[crate::mcp_pool::PooledServer]) -> Vec<&str> {
+        servers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// A tree this run makes holds the repository's committed `.mcp.json`,
+    /// whose stdio servers join the pool as before.
+    #[test]
+    fn a_new_worktree_pools_the_servers_its_mcp_json_declares() {
+        let (tree, configured) = tree_declaring_a_server();
+        let args = RunArgs {
+            worktree: true,
+            ..run_args()
+        };
+        let pooled = pool_candidates(&args, configured, tree.path());
+        assert_eq!(names(&pooled), ["configured", "planted"]);
+    }
+
+    /// `--existing-worktree` joins a tree another agent has been working in,
+    /// possibly with its permission prompts skipped, so that agent could have
+    /// written the `.mcp.json`. Spawning what it declares on the host is not
+    /// this launch's call: only servers already in ainb's config are pooled.
+    #[test]
+    fn an_existing_worktree_pools_only_configured_servers() {
+        let (tree, configured) = tree_declaring_a_server();
+        let args = RunArgs {
+            existing_worktree: Some(tree.path().to_path_buf()),
+            ..run_args()
+        };
+        let pooled = pool_candidates(&args, configured, tree.path());
+        assert_eq!(names(&pooled), ["configured"]);
     }
 
     /// The JSON names a worktree this run created; in a shared checkout
