@@ -75,6 +75,8 @@ export function Composer(props: Props) {
     initialValue: [],
   });
   const projects = createMemo(() => projectChoices(props.sessions, registered()));
+  // Nothing to pick, once the host has answered.
+  const empty = () => projects().length === 0 && !registered.loading;
   createEffect(() => {
     const first = projects()[0]?.path;
     if (first !== undefined && untrack(fields).projectPath === "") set("projectPath", first);
@@ -207,11 +209,11 @@ export function Composer(props: Props) {
           <Show when={addError()}>{(message) => <p class="composer-error composer-add-error">{message()}</p>}</Show>
           {/* Nothing to pick, once the host has answered: say how to register
               a folder rather than leaving only "Choose a project." */}
-          <Show when={projects().length === 0 && !registered.loading}>
+          <Show when={empty()}>
             <div class="composer-hint composer-empty-projects">
               <p>
-                No projects yet. Add a repository folder here, or add your repositories' folder to
-                workspace_defaults.workspace_scan_paths, then reopen. For example (this replaces the whole list, so
+                No projects yet. Add one repository with Add folder, or add your repositories' folder to
+                workspace_defaults.workspace_scan_paths and reopen. For example (this replaces the whole list, so
                 include any folder already in it):{" "}
                 <code>{REGISTER_FOLDER_COMMAND}</code>
               </p>
@@ -226,14 +228,17 @@ export function Composer(props: Props) {
             </div>
           </Show>
         </label>
-        <button
-          type="button"
-          class="composer-add-project"
-          disabled={creating() || adding()}
-          onClick={onAddProject}
-        >
-          Add project…
-        </button>
+        {/* The empty state carries its own Add folder: one add button at a time. */}
+        <Show when={!empty()}>
+          <button
+            type="button"
+            class="composer-add-project"
+            disabled={creating() || adding()}
+            onClick={onAddProject}
+          >
+            Add project…
+          </button>
+        </Show>
 
         <label class="composer-field">
           <span class="composer-label">Name</span>
