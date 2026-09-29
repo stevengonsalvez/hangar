@@ -1231,6 +1231,25 @@ pub static MUTATING_METHODS: &[MutatingMethod] = &[
         Fk::None,
         r#"{"slug":"harness","tier":"standard"}"#
     ),
+    // ── daemon shells ────────────────────────────────────────────────────
+    // Registered while still dark (METHOD_NOT_FOUND without the spawn
+    // switch): the ledger is what makes a retried create return the shell
+    // the first attempt made instead of opening a second one. A dark daemon
+    // records its METHOD_NOT_FOUND as the op id's answer like any refusal.
+    mutating_method!(
+        m::SHELL_CREATE,
+        crate::spawn::ShellCreateParams,
+        Dedupe,
+        Fk::None,
+        r#"{"worktree_path":"/tmp"}"#
+    ),
+    mutating_method!(
+        m::SHELL_CLOSE,
+        crate::spawn::ShellCloseParams,
+        Dedupe,
+        Fk::None,
+        r#"{"tmux_session_name":"ainb-dsh-0a1b2c3d"}"#
+    ),
 ];
 
 #[cfg(test)]
