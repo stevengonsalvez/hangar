@@ -688,9 +688,11 @@ function Shell() {
             onOpen={openSession}
             onNew={composer.openComposer}
             onRowPick={(pick) =>
+              // Through `answer`, home first: the sidebar is drawn over
+              // Settings and the Inbox, whose screens refuse a row.
               runRowPick(pick, {
-                open: openSession,
-                run: (intents) => void run(intents),
+                open: (id) => void answer([openRowIntent({ session: id })]),
+                run: (intents) => void answer(intents),
                 copy: (text) => void invoke("clipboard_write", { text }),
                 reselect: shownRowIntents,
               })
