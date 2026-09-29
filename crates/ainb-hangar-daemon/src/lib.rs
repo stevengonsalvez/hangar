@@ -664,19 +664,21 @@ pub fn hangar_config(path: &std::path::Path) -> Result<Option<toml::Table>, Hang
         .map_err(|error| HangarConfigError::Parse(toml_error_at(&error, &text)))
 }
 
-/// `error` as its message and a 1-based line and column in `text`.
+/// `error` as its message and a 1-based line and column in `text`, on one
+/// line (a multi-line message is joined with `; `).
 ///
 /// Never toml's own `Display`: it quotes the offending source line, and a
 /// token on that line would land in the daemon log.
 fn toml_error_at(error: &toml::de::Error, text: &str) -> String {
+    let message = error.message().trim_end().replace('\n', "; ");
     let Some(span) = error.span() else {
-        return error.message().to_string();
+        return message;
     };
     let before = &text.as_bytes()[..span.start.min(text.len())];
     let line_start = before.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
     let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
     let column = String::from_utf8_lossy(&before[line_start..]).chars().count() + 1;
-    format!("{} at line {line}, column {column}", error.message())
+    format!("{message} at line {line}, column {column}")
 }
 
 /// Why [`hangar_config`] has no table to give.
@@ -1923,6 +1925,20 @@ mod tests {
         };
         assert!(!description.contains("sk-secret"), "{description}");
         assert_eq!(description, "invalid basic string at line 3, column 23");
+
+        // A multi-line message (what was wrong, then what was expected) is
+        // one log line.
+        std::fs::write(&path, "token = sk-secret-123\n").unwrap();
+        let Err(super::HangarConfigError::Parse(description)) = super::hangar_config(&path) else {
+            panic!("an unquoted string is a parse error");
+        };
+        assert!(!description.contains('\n'), "{description:?}");
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert!(description.contains("; expected "), "{description}");
+        assert!(
+            description.ends_with(" at line 1, column 9"),
+            "{description}"
+        );
     }
 
     /// The resolver's value semantics.
