@@ -12,20 +12,29 @@ interface Props {
   status: UiStatus | null;
   onChoose(): void;
   onClose(): void;
+  /** A right-click on the tab: its group's menu (split, move, close). */
+  onMenu?(event: MouseEvent): void;
 }
 
 /**
  * One terminal tab in the strip: its session's status glyph before the
  * title, the same glyph and words its sidebar row shows. `data-status` rides
- * on the tab too, for the tab's own tint and for tests to read.
+ * on the tab too, for the tab's own tint and for tests to read, and
+ * `data-key` names the tab for a drag to carry.
  */
 export function TerminalTab(props: Props) {
   return (
     <span
       class="tab"
       classList={{ active: props.active }}
+      data-key={props.tab.key}
       data-state={props.tab.state}
       data-status={props.status ? statusKey(props.status) : undefined}
+      onContextMenu={(event) => {
+        if (!props.onMenu) return;
+        event.preventDefault();
+        props.onMenu(event);
+      }}
     >
       <button
         type="button"
