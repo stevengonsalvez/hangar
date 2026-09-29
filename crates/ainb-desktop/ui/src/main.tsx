@@ -54,6 +54,8 @@ import {
   selectRowIntent,
   shownSessionOf,
   stepTab,
+  tabAfterClose,
+  visited,
   modalBlocks,
   shellKeydown,
   terminalMayTakeFocus,
@@ -132,6 +134,9 @@ function Shell() {
   // Terminal tabs: the strip is the Rust side's; which tab shows is ours.
   const [tabs, setTabs] = createSignal<Tab[]>([]);
   const [active, setActive] = createSignal<string | null>(null);
+  // Tab keys in the order they were shown, most recent last: which tab to
+  // show when the shown one closes. Read only then, so not a signal.
+  let recent: string[] = [];
   // The board is the window's landing surface: what every agent is doing, and
   // what is waiting on a human. A terminal takes the work area while it is
   // chosen, and the board is one click back.
@@ -232,6 +237,7 @@ function Shell() {
   const activate = (key: string | null, byHost: boolean) => {
     setActive(key);
     if (key !== null) {
+      recent = visited(recent, key);
       // The session list follows the shown terminal, whoever showed it, so
       // the sidebar row and the answer banner are that session's.
       const select = selectIntentFor(tabs(), key);
@@ -269,17 +275,21 @@ function Shell() {
   const showTabs = (view: TabsView) => {
     setHostAnswers((n) => n + 1);
     setHostFocus(view.focus ?? "");
+    const before = tabs();
     setTabs(view.tabs);
+    recent = recent.filter((key) => view.tabs.some((tab) => tab.key === key));
     for (const key of focusers.keys()) {
       if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
     }
     if (view.focus !== null) activate(view.focus, true);
     else if (!view.tabs.some((tab) => tab.key === active())) {
-      // The shown tab ended (an unrelated tmux session died, say): point at
-      // the next one WITHOUT leaving the board. `activate` means a person chose
-      // a terminal; this is the strip tidying up after itself.
-      const next = view.tabs[0]?.key ?? null;
+      // The shown tab closed or ended (its tmux session died, say): point at
+      // the one Orca would show next WITHOUT leaving the board. `activate`
+      // means a person chose a terminal; this is the strip tidying up after
+      // itself.
+      const next = tabAfterClose(before, view.tabs, recent, active());
       setActive(next);
+      if (next !== null) recent = visited(recent, next);
       if (next !== null && pane() === "terminal") focusTab(next, true);
     }
   };
