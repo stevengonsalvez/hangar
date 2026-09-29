@@ -12,10 +12,12 @@ import {
   selectRowIntent,
   shownSessionOf,
   stepTab,
+  tabAfterClose,
   acceleratorAllowedUnderModal,
   type Accelerator,
   terminalMayTakeFocus,
   type Tab,
+  visited,
 } from "./tabs.ts";
 
 const key = (code: string, mods: Partial<{ meta: boolean; ctrl: boolean; shift: boolean; alt: boolean }> = {}) => ({
@@ -158,3 +160,36 @@ test("the shown session is the active tab's, only while a terminal is shown", ()
   assert.deepEqual(selectIntentFor(tabs, "k-2"), selectRowIntent({ other_tmux: "bare" }));
   assert.equal(selectIntentFor(tabs, "gone"), null);
 });
+
+const strip = (...keys: string[]) =>
+  keys.map((k) => ({ key: k, target: { kind: "tmux", tmux: k }, state: "attached" }) as Tab);
+
+test("closing the shown tab shows the one shown before it, as Orca does", () => {
+  // a b c open, a then c shown: closing c goes back to a, not to its neighbour b
+  // and not to the strip's first tab by accident.
+  const recent = visited(visited([], "a"), "c");
+  assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a", "b"), recent, "c"), "a");
+  // The most recent other tab wins, wherever it sits on the strip.
+  const back = visited(visited(visited([], "c"), "b"), "a");
+  assert.equal(tabAfterClose(strip("a", "b", "c"), strip("b", "c"), back, "a"), "b");
+});
+
+test("with no other tab shown yet, closing one shows its right neighbour, else its left", () => {
+  assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a", "c"), ["b"], "b"), "c");
+  assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a", "b"), ["c"], "c"), "b");
+  assert.equal(tabAfterClose(strip("a"), strip(), ["a"], "a"), null);
+});
+
+test("a tab shown before but closed since is never picked", () => {
+  const recent = visited(visited(visited([], "a"), "b"), "c");
+  assert.equal(tabAfterClose(strip("a", "b", "c"), strip("a"), recent, "c"), "a");
+});
+
+test("with no shown tab to close, the strip's first tab is shown", () => {
+  assert.equal(tabAfterClose(strip(), strip("x", "y"), [], null), "x");
+});
+
+test("a tab shown again moves to the most recent end, once", () => {
+  assert.deepEqual(visited(["a", "b", "c"], "a"), ["b", "c", "a"]);
+});
+
