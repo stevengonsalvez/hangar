@@ -61,6 +61,6 @@ test("closing the shown tab moves the sidebar to the tab shown next", () => {
   const showTabs = body("showTabs", "const report = ");
   assert.match(
     showTabs,
-    /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*if \(!settings\(\) && !inboxOpen\(\)\) \{\s*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) dispatch\(select\);/,
+    /if \(next !== null && pane\(\) === "terminal"\) \{[^}]*if \(!settings\(\) && !inboxOpen\(\)\) \{\s*const select = selectIntentFor\(view\.tabs, next\);\s*if \(select !== null\) void invoke<Refusal \| null>\("dispatch", \{ intent: select \}\);/,
   );
 });
