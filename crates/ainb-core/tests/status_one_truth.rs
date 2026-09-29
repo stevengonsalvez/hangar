@@ -535,6 +535,67 @@ fn an_ambiguous_directory_leaves_the_row_unstamped() {
     );
 }
 
+/// The daemon holds the cwd as the agent reported it, canonical, and the local
+/// row holds the path ainb was given, through a symlink. Counted as two
+/// directories, each side looked unique and the agent's state could stamp a
+/// row that only shared the spelling; counted as one, the two agents in it
+/// are ambiguous and neither is stamped, while a single agent still is.
+#[test]
+fn two_spellings_of_one_directory_count_as_one() {
+    use ainb_hangar_proto::agent_status::{AgentState, AgentStatusRow, Provenance, Tier};
+    use ainb_hangar_proto::fleet::FleetProvider;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let canonical = std::fs::canonicalize(&real).unwrap().to_string_lossy().into_owned();
+    let given = link.to_string_lossy().into_owned();
+
+    let row = |id: &str, state: AgentState| AgentStatusRow {
+        session_key: format!("claude:{id}"),
+        provider: FleetProvider::Claude,
+        cwd: canonical.clone(),
+        display_name: None,
+        state,
+        provenance: Provenance::Hook,
+        tier: Tier::Hook,
+        evidence_observed_at: 10,
+        has_open_request: false,
+        pane_unbound: false,
+        pane_unbound_detail: None,
+        host_id: ainb_hangar_proto::agent_status::LOCAL_HOST_ID.to_string(),
+        turn_complete: false,
+        wait_kind: None,
+        attachment: ainb_hangar_proto::agent_status::Attachment::None,
+    };
+
+    // One local row by the given path, one daemon row by the canonical path,
+    // ids that do not match: the directory is 1:1 on both sides, so it stamps.
+    let mut rows = vec![local_row("local-only", &given)];
+    ainb::cli::fleet::needs::stamp_rows(&mut rows, &[row("daemon-a", AgentState::Working)]);
+    assert!(
+        rows[0].session_key.is_some(),
+        "one agent per side in one directory stamps through the symlink"
+    );
+
+    // Two daemon rows in the canonical spelling: the directory is not 1:1, and
+    // the local row in the other spelling is left alone.
+    let mut rows = vec![local_row("local-only", &given)];
+    ainb::cli::fleet::needs::stamp_rows(
+        &mut rows,
+        &[
+            row("daemon-a", AgentState::Working),
+            row("daemon-b", AgentState::Waiting),
+        ],
+    );
+    assert!(
+        rows[0].session_key.is_none(),
+        "two agents in the directory, spelled either way, stamp nothing"
+    );
+}
+
 /// A tier-0 `waiting` followed by a tier-5 `idle` for the SAME pane stays
 /// `waiting`, on hook provenance.
 ///

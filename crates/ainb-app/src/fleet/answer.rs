@@ -462,10 +462,11 @@ impl AskState {
     ///
     /// Returns the reason nothing was sent — no answer chosen, a send already
     /// outstanding, or no transport at all.
-    pub fn send(
+    pub fn send_to(
         &mut self,
         chip: &SessionAttention,
         session_id: &str,
+        pane: crate::fleet::send::PaneHint,
         surface: ainb_hangar_proto::connections::SurfaceKind,
     ) -> Result<(), String> {
         // One outstanding send at a time. Key-repeat on Enter would otherwise
@@ -495,7 +496,7 @@ impl AskState {
                     crate::fleet::control::answer_via_daemon_blocking(attention_id, sent, surface)
                 }
                 Answerable::Tmux => {
-                    crate::fleet::control::answer_via_tmux_blocking(&session_id, &sent)
+                    crate::fleet::control::answer_via_tmux_blocking_at(&session_id, &pane, &sent)
                 }
                 Answerable::Broker {
                     session_id: waiter, ..
@@ -774,7 +775,9 @@ mod tests {
         let mut state = AskState::default();
         state.push_char('y');
         state.focus = AskFocus::FreeText;
-        let refused = state.send(&chip, "s", SurfaceKind::Tui).expect_err("must refuse");
+        let refused = state
+            .send_to(&chip, "s", Default::default(), SurfaceKind::Tui)
+            .expect_err("must refuse");
         assert!(
             refused.contains("attention/answer"),
             "and name the call that is unavailable: {refused}"
@@ -796,7 +799,7 @@ mod tests {
         // is filed under the question, not under whatever the pane shows.
         latch(&mut state, &chip, None);
         assert_eq!(
-            state.send(&chip, "s", SurfaceKind::Tui),
+            state.send_to(&chip, "s", Default::default(), SurfaceKind::Tui),
             Err("an answer is already in flight".to_string())
         );
     }
@@ -929,7 +932,7 @@ mod tests {
             "returning to A must still refuse a second send"
         );
         assert_eq!(
-            state.send(&a, "sid", SurfaceKind::Tui).unwrap_err(),
+            state.send_to(&a, "sid", Default::default(), SurfaceKind::Tui).unwrap_err(),
             "an answer is already in flight"
         );
     }

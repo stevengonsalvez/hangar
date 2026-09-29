@@ -3437,20 +3437,16 @@ impl InteractiveSessionManager {
                 .collect::<Vec<_>>()
                 .join(" ");
             let full_line = format!("{env_setup}exec {escaped_cmd}");
-            Command::new("tmux")
-                .args([
-                    "respawn-pane",
-                    "-k",
-                    "-c",
-                    &working_dir,
-                    "-t",
-                    &target,
-                    "sh",
-                    "-c",
-                    &full_line,
-                ])
-                .output()
-                .await?
+            let mut tmux_args: Vec<String> = vec![
+                "respawn-pane".to_string(),
+                "-k".to_string(),
+                "-c".to_string(),
+                working_dir.clone(),
+                "-t".to_string(),
+                target.clone(),
+            ];
+            tmux_args.extend(["sh".to_string(), "-c".to_string(), full_line]);
+            Command::new("tmux").args(&tmux_args).output().await?
         };
 
         if !output.status.success() {
@@ -3696,7 +3692,6 @@ fn wire_rtk_project_hook_with_cmd(worktree: &std::path::Path, cmd: &str) -> anyh
 
 #[cfg(test)]
 mod tests {
-
     /// `capture_failed_launch_pane` itself must return the program's output.
     ///
     /// Deliberately calls the FUNCTION rather than re-issuing its tmux command:
