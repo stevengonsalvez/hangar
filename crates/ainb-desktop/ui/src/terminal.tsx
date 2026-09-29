@@ -10,6 +10,7 @@ import { tauriTransport } from "./transport.ts";
 import { terminalAppearance, type Theme } from "./theme/theme.ts";
 import { findChord, TerminalSearch } from "./terminal_search.tsx";
 import { nextFontSize, TERMINAL_FONT_SIZE, zoomChord } from "./terminal_zoom.ts";
+import { menuChord, TerminalMenu, type MenuEntry, type MenuPoint } from "./terminal_menu.tsx";
 
 interface Props {
   tab: Tab;
@@ -30,6 +31,7 @@ interface Props {
  * another is active, so its buffer survives a tab switch and a reconnect.
  */
 export function TerminalView(props: Props) {
+  let pane!: HTMLDivElement;
   let host!: HTMLDivElement;
   const attempt = () => (props.tab.state === "reconnecting" ? props.tab.attempt : 0);
   // Bytes this pane has painted, kept on the element. It says the pane is
@@ -41,6 +43,18 @@ export function TerminalView(props: Props) {
   const [finding, setFinding] = createSignal(false);
   let findInput: HTMLInputElement | undefined;
   let focusTerminal = () => {};
+  // The right-click menu (Orca's `TerminalContextMenu`): where it is open.
+  const [menuAt, setMenuAt] = createSignal<MenuPoint | null>(null);
+  const [menuEntries, setMenuEntries] = createSignal<MenuEntry[]>([]);
+  // A tab switch hides the pane, and its menu with it: closed, not left open behind.
+  createEffect(() => {
+    if (!props.active) setMenuAt(null);
+  });
+  const openFind = () => {
+    setFinding(true);
+    findInput?.focus();
+    findInput?.select();
+  };
 
   onMount(() => {
     const term = new Terminal({
@@ -86,6 +100,51 @@ export function TerminalView(props: Props) {
     );
     term.onData((data) => transport.send(data));
 
+    const copy = () => {
+      const selection = term.getSelection();
+      if (selection) void invoke("clipboard_write", { text: selection });
+    };
+    // Through xterm, not straight to the transport: the terminal wraps a
+    // paste in the bracketed-paste markers the pane asked for, so a
+    // multi-line payload arrives as text rather than as lines the shell
+    // runs one by one. The macOS menu's own paste takes the same path, and
+    // the host reads the clipboard only for a tab that is in view.
+    const paste = () => {
+      void invoke<string>("clipboard_read", { key: props.tab.key }).then((text) => {
+        if (text) term.paste(text);
+      });
+    };
+    // Orca's rows in Orca's order, the ones this window can do today. Find
+    // is ours: Orca's menu has none, the pane's find bar is one chord away.
+    setMenuEntries([
+      { label: "Copy", shortcut: props.mac ? "\u2318C" : "Ctrl+Shift+C", run: copy },
+      { label: "Select All", run: () => term.selectAll() },
+      { label: "Paste", shortcut: props.mac ? "\u2318V" : "Ctrl+Shift+V", run: paste },
+      { label: "Find\u2026", shortcut: props.mac ? "\u2318F" : "Ctrl+Shift+F", run: openFind },
+    ]);
+
+    // The right button is the menu's, taken before xterm sees it: the pane is
+    // a tmux client with tmux's mouse on, so a right-click xterm reported
+    // would open tmux's own menu inside the pane, under this one. The find
+    // bar and the overlay keep the webview's menu for their own text.
+    const inTerminal = (event: Event) =>
+      !(event.target as Element).closest(".terminal-search, .terminal-overlay, .terminal-menu");
+    const rightButton = (event: MouseEvent) => {
+      if (event.button === 2 && inTerminal(event)) event.stopPropagation();
+    };
+    pane.addEventListener("mousedown", rightButton, true);
+    pane.addEventListener("mouseup", rightButton, true);
+    pane.addEventListener(
+      "contextmenu",
+      (event) => {
+        if (!inTerminal(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        setMenuAt({ x: event.clientX, y: event.clientY });
+      },
+      true,
+    );
+
     // Focus rules: the shell accelerators stay with the shell, Esc Esc leaves,
     // everything else (ctrl+c, ctrl+b, arrows) goes to the pane.
     const leave = escEsc();
@@ -97,27 +156,27 @@ export function TerminalView(props: Props) {
         event.preventDefault();
         // Copy and paste act on this pane, so they are answered here; the rest
         // is the shell's.
-        if (shell.kind === "copy") {
-          const selection = term.getSelection();
-          if (selection) void invoke("clipboard_write", { text: selection });
-        } else if (shell.kind === "paste") {
-          // Through xterm, not straight to the transport: the terminal wraps a
-          // paste in the bracketed-paste markers the pane asked for, so a
-          // multi-line payload arrives as text rather than as lines the shell
-          // runs one by one. The macOS menu's own paste takes the same path.
-          void invoke<string>("clipboard_read", { key: props.tab.key }).then((text) => {
-            if (text) term.paste(text);
-          });
-        } else {
-          props.onAccelerator(shell);
-        }
+        if (shell.kind === "copy") copy();
+        else if (shell.kind === "paste") paste();
+        else props.onAccelerator(shell);
         return false;
       }
       if (findChord(event, props.mac)) {
         event.preventDefault();
-        setFinding(true);
-        findInput?.focus();
-        findInput?.select();
+        openFind();
+        return false;
+      }
+      if (menuChord(event)) {
+        event.preventDefault();
+        // At the cursor, where xterm keeps its keyboard target, held inside
+        // the pane: before its first cursor sync that target sits off-screen.
+        const bounds = host.getBoundingClientRect();
+        const cursor = term.textarea?.getBoundingClientRect() ?? bounds;
+        const within = (value: number, low: number, high: number) => Math.min(Math.max(value, low), high);
+        setMenuAt({
+          x: within(cursor.left, bounds.left, bounds.right),
+          y: within(cursor.bottom, bounds.top, bounds.bottom),
+        });
         return false;
       }
       const zoom = zoomChord(event, props.mac);
@@ -157,8 +216,16 @@ export function TerminalView(props: Props) {
   });
 
   return (
-    <div class="terminal" hidden={!props.active} data-tab={props.tab.key} data-painted={painted()}>
+    <div class="terminal" ref={pane} hidden={!props.active} data-tab={props.tab.key} data-painted={painted()}>
       <div class="xterm-host" ref={host} />
+      <TerminalMenu
+        at={menuAt()}
+        entries={menuEntries()}
+        onClose={(refocus) => {
+          setMenuAt(null);
+          if (refocus) focusTerminal();
+        }}
+      />
       <Show when={search()}>
         {(addon) => (
           <TerminalSearch
