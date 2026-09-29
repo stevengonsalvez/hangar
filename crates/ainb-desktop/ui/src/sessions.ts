@@ -45,6 +45,24 @@ export function rowStatus(status: SessionStatus): RowStatus {
 }
 
 /**
+ * The session list row the reducer has selected, when it is a session.
+ *
+ * Resolved by the id the frame names against the rows it carries (#1180): the
+ * frame holds only the rows its filter shows, so an index into the reducer's
+ * full list would name the wrong one. No selection when the frame names none,
+ * or names a row it does not carry.
+ */
+export function selectedSession(view: SessionsView_Serialize | undefined): Session_Serialize | undefined {
+  const id = view?.selected_session_id;
+  if (view === undefined || id === null || id === undefined || view.shell_selected) return undefined;
+  for (const workspace of view.workspaces) {
+    const session = workspace.sessions.find((row) => row.id === id);
+    if (session !== undefined) return session;
+  }
+  return undefined;
+}
+
+/**
  * The attention ring a row paints, or `null` for none: the tightest kind of the
  * merged attention its frame row carries. The host merged it (daemon rows by
  * exact provider id, local hook events, the session's own error, an attached
