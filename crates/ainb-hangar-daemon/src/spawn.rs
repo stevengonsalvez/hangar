@@ -674,11 +674,7 @@ pub async fn shell_list() -> Result<ShellListResult, SpawnError> {
 /// [`SpawnError::Failed`] when tmux could not end a running one.
 pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, SpawnError> {
     params.validate().map_err(|e| SpawnError::Invalid(e.to_string()))?;
-    let ours = daemon_shells()
-        .await?
-        .iter()
-        .any(|shell| shell.tmux_session_name == params.tmux_session_name);
-    if !ours {
+    if !owned_by_the_daemon(&params.tmux_session_name).await? {
         return Ok(ShellCloseResult { closed: false });
     }
     let exact = format!("={}", params.tmux_session_name);
@@ -698,10 +694,16 @@ pub async fn shell_close(params: &ShellCloseParams) -> Result<ShellCloseResult, 
 
 /// Every running [`DAEMON_SHELL_PREFIX`] session marked
 /// [`SHELL_OWNER_OPTION`], with its start folder.
+///
+/// The owner is read per candidate by [`owned_by_the_daemon`], not with a
+/// `#{@ainb_owner}` column here: a format falls back to the global option,
+/// so one `set -g @ainb_owner daemon` would claim every prefixed session.
+/// One more tmux call per prefixed session, a handful at most.
 async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
     // The path goes last: it is the one field that could hold a tab.
-    let format = format!("#{{session_name}}\t#{{{SHELL_OWNER_OPTION}}}\t#{{session_path}}");
-    let out = run_tmux(&["list-sessions", "-F", &format]).await.map_err(|e| e.failed())?;
+    let out = run_tmux(&["list-sessions", "-F", "#{session_name}\t#{session_path}"])
+        .await
+        .map_err(|e| e.failed())?;
     if !out.status.success() {
         if no_such_session(&out.stderr) {
             return Ok(Vec::new());
@@ -711,17 +713,41 @@ async fn daemon_shells() -> Result<Vec<ShellCreateResult>, SpawnError> {
             stderr_tail(&out.stderr)
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let (name, rest) = line.split_once('\t')?;
-            let (owner, path) = rest.split_once('\t')?;
-            (is_daemon_shell_name(name) && owner == SHELL_OWNER).then(|| ShellCreateResult {
+    let mut shells = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((name, path)) = line.split_once('\t') else {
+            continue;
+        };
+        if is_daemon_shell_name(name) && owned_by_the_daemon(name).await? {
+            shells.push(ShellCreateResult {
                 tmux_session_name: name.to_string(),
                 worktree_path: path.to_string(),
-            })
-        })
-        .collect())
+            });
+        }
+    }
+    Ok(shells)
+}
+
+/// Whether the session named exactly `name` carries [`SHELL_OWNER_OPTION`]
+/// set to [`SHELL_OWNER`] as its OWN option. `show-options` without `-g` or
+/// `-A` reads the session's options only, never the global value a format
+/// or an inherited lookup would fall back to. A session that is gone, or
+/// no server at all, is not the daemon's.
+async fn owned_by_the_daemon(name: &str) -> Result<bool, SpawnError> {
+    let exact = format!("={name}:");
+    let out = run_tmux(&["show-options", "-qv", "-t", &exact, SHELL_OWNER_OPTION])
+        .await
+        .map_err(|e| e.failed())?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim_end() == SHELL_OWNER);
+    }
+    if no_such_session(&out.stderr) {
+        return Ok(false);
+    }
+    Err(SpawnError::Failed(format!(
+        "tmux could not read {name}'s owner: {}",
+        stderr_tail(&out.stderr)
+    )))
 }
 
 /// Whether tmux's `stderr` says the session, or the whole server, is not
