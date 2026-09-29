@@ -546,19 +546,27 @@ export interface LayoutStorage {
 export const LAYOUT_KEY = "ainb.layout";
 
 /**
- * The stored layout, following the host's `liveKeys`: tabs that closed while
- * the window was away drop out and new ones join the focused group. Storage
- * that is absent, throws (a private window, blocked site data) or holds
- * anything `parse` rejects gives one group holding every live tab.
+ * The layout as stored, tabs and all, whichever of them are open now: one
+ * empty group for storage that is absent, throws (a private window, blocked
+ * site data) or holds anything `parse` rejects.
  */
-export function readLayout(storage: LayoutStorage | undefined, liveKeys: readonly string[]): Layout {
+export function readStored(storage: LayoutStorage | undefined): Layout {
   let raw: string | null | undefined;
   try {
     raw = storage?.getItem(LAYOUT_KEY);
   } catch {
     raw = null;
   }
-  return reconcile(raw ? parse(raw) : initialLayout([]), liveKeys);
+  return raw ? parse(raw) : initialLayout([]);
+}
+
+/**
+ * The stored layout, following the host's `liveKeys`: tabs that closed while
+ * the window was away drop out and new ones join the focused group. Storage
+ * with no layout gives one group holding every live tab.
+ */
+export function readLayout(storage: LayoutStorage | undefined, liveKeys: readonly string[]): Layout {
+  return reconcile(readStored(storage), liveKeys);
 }
 
 /** Store `layout`; a storage that throws only loses the memory of it for
