@@ -450,6 +450,29 @@ async fn a_late_write_after_timeout_lands_in_the_file() {
     );
 }
 
+/// An `ainb` that cannot be started still had its output files opened for it;
+/// the error arm removes them, or every failed create would leave two behind.
+#[tokio::test]
+async fn a_run_that_cannot_start_leaves_no_run_output_behind() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    switch_on(&tools.path().join("no-such-ainb"));
+
+    let response = call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude" })).await;
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("could not run")),
+        "{response}"
+    );
+    assert_eq!(
+        run_output(repo.home.path()),
+        Vec::<(String, u32)>::new(),
+        "a failed spawn left its output files"
+    );
+}
+
 /// A `name` from an older client is not a field any more: it never reaches
 /// `ainb run` as `--name`, which would kill a live tmux session of that name.
 #[tokio::test]
