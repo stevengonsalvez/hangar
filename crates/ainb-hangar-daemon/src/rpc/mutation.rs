@@ -29,8 +29,11 @@
 //! Everything deterministic, including `INVALID_PARAMS`: the same op id with
 //! the same body gets the same answer, and a client that fixes its params is
 //! sending a different body, which the fingerprint catches. Only `SQLite`
-//! contention and internal faults ABANDON the claim, because those are exactly
-//! the cases where the caller is supposed to retry and get a different answer.
+//! contention, internal faults and `METHOD_NOT_FOUND` ABANDON the claim,
+//! because those are exactly the cases where the caller is supposed to retry
+//! and get a different answer. `METHOD_NOT_FOUND` is a verb this daemon does
+//! not serve yet (dark behind a boot switch, or an unadvertised capability):
+//! nothing ran, and the same op id must execute once the verb is served.
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
@@ -311,11 +314,16 @@ fn store_error(error: &sqlx::Error) -> RpcError {
 /// Whether an error means "nothing happened, ask again" rather than "this is
 /// your answer".
 ///
-/// Only two codes qualify. Recording a lock-contention failure would pin a
-/// transient fault to an op id forever; recording an `INVALID_PARAMS` is
-/// correct, because the same body really does deserve the same answer.
-const fn is_transient(code: i32) -> bool {
-    code == super::STORE_UNAVAILABLE || code == super::INTERNAL_ERROR
+/// Three codes qualify. Recording a lock-contention failure would pin a
+/// transient fault to an op id forever. Recording a `METHOD_NOT_FOUND` would
+/// replay a dark verb's refusal to the retry made after the switch is on, so
+/// that op id could never run. Recording an `INVALID_PARAMS` is correct,
+/// because the same body really does deserve the same answer, and so is a
+/// `PERMISSION_DENIED`: a refusal the handler reached by reading this actor.
+const fn frees_the_op_id(code: i32) -> bool {
+    code == super::STORE_UNAVAILABLE
+        || code == super::INTERNAL_ERROR
+        || code == super::METHOD_NOT_FOUND
 }
 
 /// The ledger tier token for a registry entry.
@@ -625,7 +633,7 @@ where
             };
             Ok(with_ack(value.clone(), &ack))
         }
-        Err(error) if is_transient(error.code) => {
+        Err(error) if frees_the_op_id(error.code) => {
             // Nothing ran to completion, so the retry the caller is about to
             // make should be a real retry, but only if nothing can have left.
             // `abandon` refuses to drop a row whose receipt reached `writing`
@@ -840,14 +848,16 @@ mod tests {
         assert_eq!(value[ACK_KEY]["status"], "accepted");
     }
 
-    /// Only the two retry-shaped codes abandon a claim.
+    /// Only the two retry-shaped codes and a verb not served yet abandon a
+    /// claim.
     #[test]
-    fn transient_codes_are_exactly_the_retryable_two() {
-        assert!(is_transient(super::super::STORE_UNAVAILABLE));
-        assert!(is_transient(super::super::INTERNAL_ERROR));
-        for code in [-32602, -32601, -32000, -32008, -32009] {
+    fn exactly_three_codes_free_the_op_id() {
+        assert!(frees_the_op_id(super::super::STORE_UNAVAILABLE));
+        assert!(frees_the_op_id(super::super::INTERNAL_ERROR));
+        assert!(frees_the_op_id(super::super::METHOD_NOT_FOUND));
+        for code in [-32602, -32000, -32008, -32009, -32010] {
             assert!(
-                !is_transient(code),
+                !frees_the_op_id(code),
                 "{code} must be recorded, not abandoned"
             );
         }
