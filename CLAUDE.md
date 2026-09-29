@@ -299,7 +299,7 @@ answer `METHOD_NOT_FOUND`, exactly as a daemon from before them does:
 | Switch | Off | On |
 |--------|-----|----|
 | env `AINB_HANGAR_SPAWN` | `0`, or any value but `1` | unset or `1` |
-| file key `spawn` under `[hangar]` in `<hangar home>/config/config.toml` | `false`, any other value, a file that cannot be read or does not parse | no file, no key, or `true` |
+| file key `spawn` under `[hangar]` in `<hangar home>/config/config.toml` | `false`, any other value, any other key under `[hangar]`, `spawn` under `[hangar_daemon]`, a file that cannot be read or does not parse | no file, no key, or `true` |
 
 ```toml
 # ~/.agents-in-a-box/config/config.toml ($AINB_HANGAR_HOME/config/config.toml when set)
@@ -321,8 +321,10 @@ macOS does not see your shell's environment; give it the variable with
 daemon that is already running keeps what it read at its own boot and
 outlives the app, so stop it too (`ainb hangar daemon stop`) and the
 relaunched app starts a fresh one. `launchctl unsetenv AINB_HANGAR_SPAWN`
-undoes it, again after a relaunch. The file key needs no `launchctl`: it
-applies however the app or daemon was launched, at the daemon's next boot.
+undoes it, again after a relaunch. `launchctl setenv` lasts only for the
+login session, and a daemon started from a terminal (the TUI, `ainb run`)
+never sees it. The file key is the durable opt-out: it applies however the
+app or daemon was launched, at the daemon's next boot.
 
 ## Conventions (paths & plugins)
 
