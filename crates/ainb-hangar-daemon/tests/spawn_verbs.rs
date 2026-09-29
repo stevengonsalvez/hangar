@@ -473,6 +473,31 @@ async fn a_run_that_cannot_start_leaves_no_run_output_behind() {
     );
 }
 
+/// `logs/spawn` swapped for a symlink to another directory: the create is
+/// refused with a clear error before `ainb` runs, and nothing is written
+/// where the link points.
+#[tokio::test]
+async fn a_create_refuses_a_spawn_log_dir_that_is_a_symlink() {
+    let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tools = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let repo = Registered::new();
+    let logs = repo.home.path().join(".agents-in-a-box/hangar/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), logs.join("spawn")).unwrap();
+    switch_on(&fake_ainb(tools.path(), true));
+
+    let response = call(serde_json::json!({ "repo_path": repo.repo(), "agent": "claude" })).await;
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("not a private directory"), "{response}");
+    assert!(!tools.path().join("argv.txt").exists(), "ainb ran anyway");
+    let written: Vec<_> = std::fs::read_dir(elsewhere.path()).unwrap().collect();
+    assert!(
+        written.is_empty(),
+        "run output went through the link: {written:?}"
+    );
+}
+
 /// A `name` from an older client is not a field any more: it never reaches
 /// `ainb run` as `--name`, which would kill a live tmux session of that name.
 #[tokio::test]
