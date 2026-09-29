@@ -116,7 +116,6 @@ deny plugins.enabled
 deny presets.file
 deny skills.catalog_release
 deny ui_preferences.preferred_editor
-deny ui_preferences.theme
 deny usage.currency.code
 deny usage.currency.symbol
 deny usage.currency.usd_rate
@@ -137,3 +136,4 @@ secret fleet.bridge.slack.app_token
 secret fleet.bridge.slack.bot_token
 secret fleet.bridge.telegram.token
 secret skills.api_key
+theme ui_preferences.theme
