@@ -65,12 +65,19 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let env = served_by(std::env::var_os(SPAWN_ENV).as_deref());
         // No home, no file to read: the variable alone decides.
         let file =
             crate::hangar_dir().map_or(true, |home| served_by_config(&config_path_in(&home)));
-        env && file
+        served(std::env::var_os(SPAWN_ENV).as_deref(), file)
     })
+}
+
+/// [`enabled`]'s decision: [`SPAWN_ENV`] is `env`, and the config file
+/// serves the verbs when `file` (see [`served_by_config`]). Either switch
+/// saying off wins.
+#[must_use]
+pub fn served(env: Option<&std::ffi::OsStr>, file: bool) -> bool {
+    served_by(env) && file
 }
 
 /// The file [`SPAWN_CONFIG_KEY`] is read from: `<hangar home>/config/config.toml`.
@@ -1617,6 +1624,26 @@ mod tests {
         assert!(served_by(Some(OsStr::new("1"))));
         for off in ["0", "", "false", "off", "no", "true", " 1"] {
             assert!(!served_by(Some(OsStr::new(off))), "{off:?} keeps them off");
+        }
+    }
+
+    /// Served only when neither switch opts out: `=1` does not undo the file.
+    #[test]
+    fn either_switch_saying_off_keeps_the_spawn_verbs_off() {
+        use std::ffi::OsStr;
+        for (env, file, want) in [
+            (None, true, true),
+            (Some("1"), true, true),
+            (None, false, false),
+            (Some("1"), false, false),
+            (Some("0"), true, false),
+            (Some("0"), false, false),
+        ] {
+            assert_eq!(
+                served(env.map(OsStr::new), file),
+                want,
+                "env {env:?}, file serves {file}"
+            );
         }
     }
 
