@@ -250,3 +250,21 @@ test("closing the shown tab under Settings or the Inbox selects no row and draws
     await until(() => !shown(), `${page} to close`);
   }
 });
+
+test("closing the shown tab before a page's frame lands draws no refusal", async () => {
+  // The reducer has moved to Settings, and its frame has not reached the
+  // window: the window still reads home, so the select goes out, and the
+  // host, deciding by its own screen, refuses it. The strip was tidying up;
+  // nobody asked, so nothing is toasted.
+  const shownKey = document.querySelector<HTMLElement>(".terminal:not([hidden])")?.dataset.tab;
+  const other = shownKey === TAB.key ? NEXT : TAB;
+  tabsChanged(shownKey === TAB.key ? [TAB, NEXT] : [NEXT, TAB]);
+  await until(() => document.querySelectorAll(".tab[data-state]").length === 2, "the second tab");
+  host.screen = "config";
+  host.sent = [];
+  tabsChanged([other]);
+  await until(() => host.sent.includes("session_list.select_row"), "the select the window still sends");
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(toasts().filter((text) => text.includes("is not run from the window")), []);
+  show("session_list");
+});
