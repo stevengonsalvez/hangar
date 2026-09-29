@@ -22,6 +22,7 @@ use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
+use ainb_desktop::notify::{self, Gate, Notice, Notifier};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
@@ -76,6 +77,46 @@ struct Window {
     last_check: Arc<Mutex<Option<Check>>>,
     /// The host's copy of the theme a person picked (`theme_set`).
     theme_file: PathBuf,
+}
+
+/// What holds an OS notification back, as the page and the window last said
+/// (`notify::decide`). Managed before the main window exists, so the window's
+/// first focus event has somewhere to land.
+struct Notifications {
+    /// The host's copy of the Settings toggle (`notifications_set`).
+    file: PathBuf,
+    enabled: AtomicBool,
+    /// The card key of the session the work area shows (`notify_focus`).
+    shown: Mutex<Option<String>>,
+    window_focused: AtomicBool,
+}
+
+impl Notifications {
+    fn gate(&self) -> Gate {
+        Gate {
+            enabled: self.enabled.load(Ordering::Relaxed),
+            focused_session: self
+                .shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            window_focused: self.window_focused.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Hand `notice` to the OS as a notification, from the host: the webview
+/// never sends one. The plugin delivers it on a task of its own and drops a
+/// delivery error, so what is logged here is the hand-off.
+fn show_notice(handle: &tauri::AppHandle, notice: &Notice) {
+    use tauri_plugin_notification::NotificationExt;
+    let shown = handle.notification().builder().title(&notice.title).body(&notice.body).show();
+    match shown {
+        Ok(()) => tracing::info!(session = %notice.session_key, "OS notification handed to the OS"),
+        Err(error) => {
+            tracing::warn!(%error, session = %notice.session_key, "OS notification not sent");
+        }
+    }
 }
 
 /// Drain the host's queued session-store writes before this process ends
@@ -745,6 +786,24 @@ fn theme_set(
     paint_window_theme(&webview, preference);
 }
 
+/// The page's notifications toggle, told on every change and once at start:
+/// kept for the next launch, and obeyed from the next tick.
+#[tauri::command]
+fn notifications_set(notifications: tauri::State<'_, Notifications>, enabled: bool) {
+    notifications.enabled.store(enabled, Ordering::Relaxed);
+    if let Err(error) = notify::store(&notifications.file, enabled) {
+        tracing::warn!(%error, "notifications toggle not kept for the next launch");
+    }
+}
+
+/// The card key of the session the work area shows (its terminal, or its ACP
+/// transcript), `None` for none, told whenever it changes: that session is not
+/// announced while the window has focus.
+#[tauri::command]
+fn notify_focus(notifications: tauri::State<'_, Notifications>, session: Option<String>) {
+    *notifications.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = session;
+}
+
 /// Create the main window already in the stored pick's theme: its appearance
 /// forced before the webview exists, and its background the page's, set
 /// before it is first shown. `tauri.conf.json` declares the window with
@@ -932,6 +991,8 @@ compile_error!("a release build must carry `bundled`, or the window loads build.
 fn main() {
     // The native confirmation in front of the onboarding writes (#1175).
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    // The OS notification a session's move into Needs or Done raises.
+    let builder = builder.plugin(tauri_plugin_notification::init());
     // Only a `wdio` build carries the embedded WebDriver the journey drives.
     #[cfg(feature = "wdio")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
@@ -940,10 +1001,21 @@ fn main() {
             let hangar_home = ainb_hangar_core::hangar_home()
                 .ok_or("the hangar home cannot be resolved: set AINB_HANGAR_HOME")?;
             init_logging(&hangar_home);
+            let notifications_file = hangar_home.join(notify::NOTIFICATIONS_FILE);
+            app.manage(Notifications {
+                enabled: AtomicBool::new(notify::load(&notifications_file)),
+                file: notifications_file,
+                shown: Mutex::new(None),
+                window_focused: AtomicBool::new(false),
+            });
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme_file = hangar_home.join(theme::THEME_FILE);
-            open_main_window(app.handle(), &theme_file)?;
+            let main_window = open_main_window(app.handle(), &theme_file)?;
+            // Focus events keep it current from here (`on_window_event`).
+            app.state::<Notifications>()
+                .window_focused
+                .store(main_window.is_focused().unwrap_or(false), Ordering::Relaxed);
             // The desktop loads the user config itself and hands it to the
             // host, which reads nothing from disk for it.
             let config = AppConfig::load().unwrap_or_else(|error| {
@@ -1106,12 +1178,31 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(tick);
+                // Section 20's version the notifier last read, and the phase
+                // it last saw of every session.
+                let mut seen = 0;
+                let mut notifier = Notifier::default();
                 loop {
                     interval.tick().await;
-                    handle.state::<Window>().shell.tick();
+                    let window = handle.state::<Window>();
+                    window.shell.tick();
+                    if let Some(sessions) = window.shell.agent_sessions_since(&mut seen) {
+                        let gate = handle.state::<Notifications>().gate();
+                        let now = ainb_app::fleet::daemons::heartbeat::now_ms();
+                        for notice in notifier.observe(sessions, &gate, now) {
+                            show_notice(&handle, &notice);
+                        }
+                    }
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if let Some(notifications) = window.try_state::<Notifications>() {
+                    notifications.window_focused.store(*focused, Ordering::Relaxed);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             subscribe,
@@ -1138,7 +1229,9 @@ fn main() {
             update_check,
             update_apply,
             update_settings,
-            theme_set
+            theme_set,
+            notifications_set,
+            notify_focus
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {

@@ -26,7 +26,7 @@ required-features = ["app"]
 
 [features]
 default = []
-app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
+app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-notification", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
 # The window serves `ui/dist` over its own protocol instead of the dev server
 # at `build.devUrl`. A plain `cargo build` keeps the dev server, which is what
 # `tauri dev` and the frontend's hot reload want; every build that has to run
@@ -77,6 +77,11 @@ tauri = { version = "~2.11.5", optional = true }
 # dialog the OS draws, which the webview's script cannot click. Rust side only;
 # the webview never calls the plugin, so it needs no capability.
 tauri-plugin-dialog = { version = "2.7", optional = true }
+# The OS notification a session's move into Needs or Done raises
+# (`notify.rs`), sent by the host only. Its page shim still asks
+# `is_permission_granted` on every load, so the capability allows that one
+# read and not `notify`. `~2.4`: 2.5 wants tauri 2.12, past this crate's pin.
+tauri-plugin-notification = { version = "~2.4", optional = true }
 tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
 # Pinned to the same releases `ainb-app` renders its frame contract with, so
 # both files are produced by one version of specta.
