@@ -45,3 +45,18 @@ test("an unclosed block is caught at the rule that opens inside it", () => {
   assert.equal(firstNestedRule(".a {\n  color: red;\n"), "1 block(s) still open at the end of the sheet");
   assert.equal(firstNestedRule("@media (x) {\n.a {\n  color: red;\n}\n}\n.b {\n}\n"), null);
 });
+
+/** The declarations of the rule whose selector list names `selector`, or `null`. */
+function declarationsFor(css: string, selector: string): string | null {
+  for (const [, selectors, body] of css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (selectors.split(",").some((one) => one.trim() === selector)) return body.trim();
+  }
+  return null;
+}
+
+test("the empty pane's Open terminal button is drawn like the banner's buttons, not WebKit's default", () => {
+  const css = readFileSync(SHEET, "utf8");
+  const banner = declarationsFor(css, ".banner button");
+  assert.ok(banner !== null && banner.includes("border"), "the banner's buttons have their own look");
+  assert.equal(declarationsFor(css, ".empty-selected .empty-open"), banner);
+});
