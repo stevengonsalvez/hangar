@@ -100,7 +100,12 @@ pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsS
     let mut tmux = Command::new("tmux");
     strip_daemon_secrets(&mut tmux);
     let start_dir = tmux_literal_dir(start_dir);
-    tmux.args(["new-session", "-d", "-s", name, "-c", &start_dir]).args(extra);
+    // `-u`: a daemon started without a UTF-8 locale (launchd sets none)
+    // would otherwise have tmux read and print every tab and non-ASCII byte
+    // in names, paths and formats as `_`.
+    tmux.arg("-u")
+        .args(["new-session", "-d", "-s", name, "-c", &start_dir])
+        .args(extra);
     if !argv.is_empty() {
         tmux.args(["--", "env"]);
         for secret in DAEMON_SECRETS {
@@ -116,6 +121,15 @@ pub fn tmux_new_session(name: &str, start_dir: &str, extra: &[&str], argv: &[OsS
         tmux.args([";", "respawn-pane", "-k", "-t", &format!("{session}:")]);
     }
     tmux
+}
+
+/// Chain `; set-option -t =<name>: <key> <value>` onto a
+/// [`tmux_new_session`] command, so the session carries a user option from
+/// the moment it exists (`=name:` is the exact session as `set-option`'s
+/// target wants it). If it fails, tmux exits non-zero with the session
+/// already made, so the caller must remove it.
+pub fn set_session_option(tmux: &mut Command, name: &str, key: &str, value: &str) {
+    tmux.args([";", "set-option", "-t", &format!("={name}:"), key, value]);
 }
 
 /// `dir` as tmux reads it back literally in `-c`. tmux expands formats
@@ -168,6 +182,7 @@ mod tests {
         assert_eq!(
             args(&cmd),
             [
+                "-u",
                 "new-session",
                 "-d",
                 "-s",
@@ -204,7 +219,7 @@ mod tests {
     fn a_shell_drops_the_secrets_from_its_session_and_respawns() {
         let cmd = tmux_new_session("ainb-sh-0a1b2c3d", "/w/app", &[], &[]);
         assert_eq!(
-            args(&cmd)[6..],
+            args(&cmd)[7..],
             [
                 ";",
                 "set-environment",
@@ -265,6 +280,25 @@ mod tests {
             without_daemon_secrets("export A='x' && claude --model opus"),
             "env -u HANGAR_CLAUDE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN /bin/sh -c \
              'export A='\\''x'\\'' && claude --model opus'"
+        );
+    }
+
+    #[test]
+    fn a_session_option_is_chained_on_the_exact_session() {
+        let mut cmd = tmux_new_session("ainb-dsh-0a1b2c3d", "/w", &[], &[]);
+        set_session_option(&mut cmd, "ainb-dsh-0a1b2c3d", "@ainb_op_id", "op-1");
+        let args = args(&cmd);
+        assert_eq!(args[0], "-u", "the client reads UTF-8 whatever the locale");
+        assert_eq!(
+            args[args.len() - 6..],
+            [
+                ";",
+                "set-option",
+                "-t",
+                "=ainb-dsh-0a1b2c3d:",
+                "@ainb_op_id",
+                "op-1"
+            ]
         );
     }
 
