@@ -218,6 +218,31 @@ test("Add project registers the picked folder and selects it", async () => {
   assert.equal(select.value, "/code/fresh", "the new project is the one picked");
 });
 
+test("a refetch that drops the picked project clears it: Create is disabled and nothing is sent", async () => {
+  hostReplies.set("worktree_create", {
+    session_id: "u-1",
+    tmux_session_name: "repo-abcd1234",
+    worktree_path: "/repo/.worktrees/abcd1234",
+    branch: "ainb/fix-login",
+  });
+  const container = await open();
+  // The host registers the folder, then its own list no longer carries it.
+  hostReplies.set("project_add", { name: "gone", path: "/code/gone" });
+  hostReplies.set("projects_list", []);
+  container.querySelector<HTMLButtonElement>(".composer-add-project")!.click();
+  await settle();
+
+  fill(container, ".composer-name", "Fix login");
+  await settle();
+  const select = container.querySelector<HTMLSelectElement>(".composer-project")!;
+  assert.equal(select.value, "", "the select shows no project, not a repository nobody picked");
+  assert.equal(container.querySelector(".composer-error")?.textContent, "Choose a project.");
+  assert.equal(submitButton(container).disabled, true);
+  submitButton(container).click();
+  await settle();
+  assert.equal(hostCalls.get("worktree_create"), undefined, "no worktree in a repository nobody chose");
+});
+
 test("a cancelled picker changes nothing, a refused folder says why", async () => {
   hostReplies.set("project_add", null);
   const container = await open();

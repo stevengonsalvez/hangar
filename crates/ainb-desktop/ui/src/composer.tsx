@@ -12,6 +12,7 @@ import {
   type ComposerFields,
   type ComposerFieldName,
   type CreateState,
+  type ProjectChoice,
 } from "./composer.ts";
 
 interface Props {
@@ -20,8 +21,9 @@ interface Props {
   /** The in-flight request's own progress, held above this component so a
    * Cancel that only closes the overlay does not lose it (`composer.ts`). */
   state: CreateState;
-  /** Submit `fields`; the caller checks `validate` again before it sends. */
-  onSubmit(fields: ComposerFields): void;
+  /** Submit `fields`, picked from `projects`; the caller checks `validate`
+   * again before it sends. */
+  onSubmit(fields: ComposerFields, projects: readonly ProjectChoice[]): void;
   /** Esc, a click outside, or Cancel: close the overlay. The request behind
    * `state`, if any, is not this component's to stop. */
   onClose(): void;
@@ -48,10 +50,6 @@ export function Composer(props: Props) {
   const set = <K extends keyof ComposerFields>(key: K, value: ComposerFields[K]) =>
     setFields((current) => ({ ...current, [key]: value }));
 
-  const errors = createMemo(() => validate(fields()));
-  const errorFor = (field: ComposerFieldName) => errors().find((error) => error.field === field)?.message ?? null;
-  const invalid = (field: ComposerFieldName) => errorFor(field) !== null;
-
   const creating = () => props.state.kind === "creating";
   const failure = () => (props.state.kind === "failed" ? props.state.message : null);
   const canSubmit = () => !creating() && errors().length === 0;
@@ -70,16 +68,25 @@ export function Composer(props: Props) {
 
   // Read per open (this is mounted only while open), so a folder registered
   // since the last open is offered. It lands after the first paint: a blank
-  // project is filled then, a picked one is left alone.
+  // project is filled then, and a listed pick is left alone. A pick the new
+  // rows no longer carry is cleared, never moved to another row: Create is
+  // then refused ("Choose a project.") rather than sent to a repository the
+  // person never chose.
   const [registered, { mutate: setRegistered, refetch: refetchRegistered }] = createResource(loadRegisteredProjects, {
     initialValue: [],
   });
   const projects = createMemo(() => projectChoices(props.sessions, registered()));
+  const errors = createMemo(() => validate(fields(), projects()));
+  const errorFor = (field: ComposerFieldName) => errors().find((error) => error.field === field)?.message ?? null;
+  const invalid = (field: ComposerFieldName) => errorFor(field) !== null;
   // Nothing to pick, once the host has answered.
   const empty = () => projects().length === 0 && !registered.loading;
   createEffect(() => {
-    const first = projects()[0]?.path;
-    if (first !== undefined && untrack(fields).projectPath === "") set("projectPath", first);
+    const rows = projects();
+    const pick = untrack(fields).projectPath;
+    if (rows.some((project) => project.path === pick)) return;
+    const next = pick === "" ? (rows[0]?.path ?? "") : "";
+    if (next !== pick) set("projectPath", next);
   });
   const preview = createMemo(() => branchPreview(fields().name));
 
@@ -111,7 +118,7 @@ export function Composer(props: Props) {
 
   const submit = (event: Event) => {
     event.preventDefault();
-    if (canSubmit()) props.onSubmit(fields());
+    if (canSubmit()) props.onSubmit(fields(), projects());
   };
 
   // Mod+Enter submits from the prompt textarea, where a plain Enter is a
@@ -197,6 +204,13 @@ export function Composer(props: Props) {
             {/* `selected` per option, not only the select's value: a refetched
                 list replaces the options, and a replaced option would
                 otherwise drop the choice back to the first row. */}
+            {/* Without it a select with no pick shows its first row, which
+                is not what Create would send. */}
+            <Show when={fields().projectPath === "" && projects().length > 0}>
+              <option value="" selected disabled>
+                Choose a project
+              </option>
+            </Show>
             <For each={projects()}>
               {(project) => (
                 <option value={project.path} selected={project.path === fields().projectPath}>

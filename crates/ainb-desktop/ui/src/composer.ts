@@ -3,7 +3,7 @@
 // is caught before a round trip rather than after (`composer.tsx` draws
 // this; it keeps none of its own).
 //
-//   ComposerFields ──validate──▶ FieldError[] (empty = may submit)
+//   ComposerFields + ProjectChoice[] ──validate──▶ FieldError[] (empty = may submit)
 //                  ──toArgs────▶ CreateWorktreeArgs ──invoke("worktree_create")──▶ daemon
 //
 // `CreateWorktreeArgs`, `CreatedWorktree` and `SpawnAgent` are generated
@@ -226,14 +226,18 @@ export interface FieldError {
  * Every field that would make the daemon refuse `worktree/create`, mirroring
  * `WorktreeCreateParams::validate` (`ainb_hangar_proto::spawn`) over the
  * fields as `toArgs` would send them: a blank optional is never checked,
- * since it reaches the daemon as `null`, not as itself.
+ * since it reaches the daemon as `null`, not as itself. The project must
+ * also be one of `projects` (the Project select's rows): a path a refetch
+ * dropped is not one a person can see they picked.
  */
-export function validate(fields: ComposerFields): FieldError[] {
+export function validate(fields: ComposerFields, projects: readonly ProjectChoice[]): FieldError[] {
   const errors: FieldError[] = [];
   if (fields.projectPath.trim() === "") {
     errors.push({ field: "projectPath", message: "Choose a project." });
   } else if (!fields.projectPath.startsWith("/")) {
     errors.push({ field: "projectPath", message: "The project path must be absolute." });
+  } else if (!projects.some((project) => project.path === fields.projectPath)) {
+    errors.push({ field: "projectPath", message: "Choose a listed project." });
   }
   // Checked as sent: `toArgs` trims these, so padding a person typed around a
   // value must not refuse what the daemon would accept.
@@ -274,7 +278,7 @@ function promptOrNull(value: string): string | null {
 }
 
 /** `fields` as the `worktree_create` command's payload. Never checks
- * validity itself; a caller gates on `validate(fields).length === 0` first,
+ * validity itself; a caller gates on `validate(fields, projects).length === 0` first,
  * the same way the Create button does. */
 export function toArgs(fields: ComposerFields): CreateWorktreeArgs {
   return {
@@ -343,7 +347,8 @@ export interface ComposerFlow {
   pending: Accessor<PendingWorktree | null>;
   openComposer(): void;
   closeComposer(): void;
-  submit(fields: ComposerFields): void;
+  /** Send `fields` unless `validate` refuses them against `projects`. */
+  submit(fields: ComposerFields, projects: readonly ProjectChoice[]): void;
 }
 
 /**
@@ -398,10 +403,10 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
       setOpen(true);
     },
     closeComposer,
-    submit(fields) {
+    submit(fields, projects) {
       // The view disables Create while invalid; this is the same check, so a
       // stray Enter can never send what the daemon would refuse.
-      if (state().kind === "creating" || validate(fields).length > 0) return;
+      if (state().kind === "creating" || validate(fields, projects).length > 0) return;
       setPending({ projectPath: fields.projectPath, name: fields.name.trim() || "New worktree" });
       setState({ kind: "creating" });
       create(toArgs(fields)).then(

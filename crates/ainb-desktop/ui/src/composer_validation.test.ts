@@ -79,7 +79,9 @@ test("a blank optional field is sent as not given, never as the blank the daemon
 test("every shared case matches the composer's validator", () => {
   const wrong = cases.filter((c) => !sentAsNull(c)).flatMap((c) => {
     const { fields, field } = fieldsFor(c);
-    const accepted = !validate(fields).some((error) => error.field === field);
+    // Listed, so the daemon's own rules are the only ones deciding.
+    const listed = [{ name: "case", path: fields.projectPath }];
+    const accepted = !validate(fields, listed).some((error) => error.field === field);
     return accepted === c.ok ? [] : [`${c.field}=${JSON.stringify(c.value.slice(0, 40))} expected ok=${c.ok} (${c.why})`];
   });
   assert.deepEqual(wrong, [], `composer validator disagrees with the shared cases:\n${wrong.join("\n")}`);
