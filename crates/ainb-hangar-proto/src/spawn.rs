@@ -3,8 +3,9 @@
 //! creates work through one owner.
 //!
 //! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs are served
-//! by default. A daemon started with `AINB_HANGAR_SPAWN=0` answers
-//! `METHOD_NOT_FOUND`, as one older than the verbs does. Their params carry
+//! by default. A daemon started with `AINB_HANGAR_SPAWN=0`, or with
+//! `[hangar] spawn = false` in its hangar home's `config/config.toml`,
+//! answers `METHOD_NOT_FOUND`, as one older than the verbs does. Their params carry
 //! the D18 envelope, and every one that changes the host (all but
 //! `shell/list`) is in the mutation registry, so the ledger at dispatch makes
 //! a retried op id replay its first answer (the same worktree, agent or
@@ -72,6 +73,21 @@ pub const SPAWN_PROMPT_MAX: usize = 64 * 1024;
 /// the ledger leaves the op id free, and the same request retried after the
 /// project is added runs.
 pub const REPO_NOT_REGISTERED: i32 = -32010;
+
+/// JSON-RPC error code for a spawn verb that started its work and got no
+/// session back: `worktree/create` or `worktree/agent_add` when `ainb run`
+/// is still running past the daemon's bound, the daemon lost its wait on
+/// it, it failed, or its output was not a session; `shell/create` when
+/// `tmux new-session` did not answer in time, or failed after running, and
+/// the shell may still exist.
+///
+/// What was started settles its own effects (a slow run keeps going and may
+/// still make the session, a failed one ran its own rollback, a shell may
+/// still appear), so this IS the op id's answer: the ledger records it, and
+/// a retry with the same op id replays it rather than starting a second run
+/// or shell. A new attempt is a new op id. Distinct from the spec's
+/// `-32603`, which frees the op id.
+pub const SPAWN_STARTED: i32 = -32011;
 
 /// Parameters for `worktree/create`: a new git worktree on a new branch, with
 /// one agent session running in it.
@@ -596,5 +612,23 @@ mod tests {
     fn tool_args_match_ainb_run() {
         assert_eq!(SpawnAgent::Claude.tool_arg(), "claude");
         assert_eq!(SpawnAgent::Antigravity.tool_arg(), "antigravity");
+    }
+
+    /// The spawn codes sit in the server-error range and collide with no
+    /// other code the daemon answers.
+    #[test]
+    fn spawn_codes_are_distinct_server_errors() {
+        let others = [
+            crate::auth::UNAUTHORIZED,
+            crate::STORE_UNAVAILABLE,
+            crate::protocol::PROTOCOL_INCOMPATIBLE,
+            crate::mutation::MUTATION_REJECTED,
+            crate::mutation::MUTATION_UNKNOWN,
+        ];
+        for code in [REPO_NOT_REGISTERED, SPAWN_STARTED] {
+            assert!((-32099..=-32000).contains(&code), "{code}");
+            assert!(!others.contains(&code), "{code} is taken");
+        }
+        assert_ne!(REPO_NOT_REGISTERED, SPAWN_STARTED);
     }
 }

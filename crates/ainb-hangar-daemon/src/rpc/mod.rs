@@ -1969,6 +1969,11 @@ fn spawn_error(error: crate::spawn::SpawnError) -> RpcError {
         },
         crate::spawn::SpawnError::Invalid(message) => invalid_params(&message),
         crate::spawn::SpawnError::Failed(message) => internal(&message),
+        crate::spawn::SpawnError::Started(message) => RpcError {
+            code: ainb_hangar_proto::spawn::SPAWN_STARTED,
+            message,
+            data: None,
+        },
     }
 }
 

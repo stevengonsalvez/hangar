@@ -56,3 +56,12 @@ test("the daemon dot names the sidecar's own state", async () => {
   // A live region with no text announces nothing: the state is spelled out.
   assert.match(dot?.textContent ?? "", /Daemon degraded/);
 });
+
+test("the usage segment the window hands in draws after the daemon dot, before the counts", async () => {
+  const segment = document.createElement("button");
+  segment.className = "statusbar-usage";
+  await open({ children: segment });
+  const bar = document.querySelector("footer.statusbar");
+  const order = [...(bar?.children ?? [])].map((child) => child.className.split(" ")[0]);
+  assert.deepEqual(order, ["statusbar-host", "statusbar-daemon-dot", "statusbar-usage", "statusbar-counts"]);
+});

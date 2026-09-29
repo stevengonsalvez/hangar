@@ -23,11 +23,13 @@
 //! prefix, [`DAEMON_SHELL_PREFIX`], and the owner option every one of them
 //! carries, [`SHELL_OWNER_OPTION`].
 //!
-//! Served by default. [`SPAWN_ENV`] set at boot to anything but `1`
-//! (`AINB_HANGAR_SPAWN=0`) turns them off, and they answer
-//! `METHOD_NOT_FOUND`, which a client cannot tell from an older daemon. An
-//! environment variable, never a `daemon_config` key, so no connected
-//! surface can switch it either way.
+//! Served by default. Two boot-time switches turn them off, and they then
+//! answer `METHOD_NOT_FOUND`, which a client cannot tell from an older
+//! daemon: [`SPAWN_ENV`] set to anything but `1` (`AINB_HANGAR_SPAWN=0`), or
+//! [`SPAWN_CONFIG_KEY`] (`[hangar] spawn = false`) in the hangar home's
+//! `config/config.toml`. Either one saying off wins. An environment variable
+//! and a file the daemon only reads, never a `daemon_config` key, so no
+//! connected surface can switch them either way.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -43,17 +45,41 @@ use ainb_hangar_proto::spawn::{
 /// `0` (or any other value) keeps them off. See [`served_by`].
 pub const SPAWN_ENV: &str = "AINB_HANGAR_SPAWN";
 
+/// The same switch as a file key: `spawn` under `[hangar]` in
+/// [`config_path_in`]. Absent or `true` serves them, `false` keeps them off.
+/// See [`served_by_config`].
+pub const SPAWN_CONFIG_KEY: &str = "hangar.spawn";
+
 /// Upper bound on one `ainb run`. It waits up to 30s for the agent's input
 /// box before sending the prompt, and a first-run Codex thread claim can add
 /// more; past this the create is reported failed rather than hanging a caller.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Whether the spawn verbs are served, read once so a later `set_var` cannot
-/// flip a running daemon.
+/// Whether the spawn verbs are served, read once so a later `set_var` or
+/// config edit cannot flip a running daemon.
+///
+/// Served only when both switches serve them: an opt-out in either one wins,
+/// so `AINB_HANGAR_SPAWN=1` does not undo `[hangar] spawn = false`, and an
+/// app launched without the variable still honours the file.
 #[must_use]
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| served_by(std::env::var_os(SPAWN_ENV).as_deref()))
+    *ON.get_or_init(|| {
+        let env = served_by(std::env::var_os(SPAWN_ENV).as_deref());
+        // No home, no file to read: the variable alone decides.
+        let file =
+            crate::hangar_dir().map_or(true, |home| served_by_config(&config_path_in(&home)));
+        env && file
+    })
+}
+
+/// The file [`SPAWN_CONFIG_KEY`] is read from: `<hangar home>/config/config.toml`.
+///
+/// The user config, which the daemon also reads `[codex] app_server` from. A
+/// project's `.ainb/config.toml` never reaches the daemon.
+#[must_use]
+pub fn config_path_in(hangar_home: &Path) -> PathBuf {
+    hangar_home.join("config").join("config.toml")
 }
 
 /// Whether a daemon whose [`SPAWN_ENV`] is `value` serves the spawn verbs.
@@ -68,6 +94,60 @@ pub fn served_by(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_none_or(|value| value == "1")
 }
 
+/// Whether the config file at `path` lets the spawn verbs be served.
+///
+/// The file twin of [`served_by`]: only a missing file, no `[hangar]`
+/// section, an empty one, or `spawn = true` serves them. Everything else
+/// keeps them off, with a warning, so a mistyped opt-out fails closed:
+/// `false` or any other value (`"0"`, `0`, `"off"`), any other key under
+/// `[hangar]` (it holds this one key, so another is a typo of it), a
+/// `hangar` that is not a table, `spawn` under `[hangar_daemon]` (a section
+/// this file does not feed), a link to nowhere, and a file that cannot be
+/// read or is not valid TOML.
+#[must_use]
+pub fn served_by_config(path: &Path) -> bool {
+    let off = |why: &str| {
+        tracing::warn!(path = %path.display(), "{why}; spawn verbs kept off");
+        false
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // A dangling link (a dotfiles checkout that is not there) is not
+        // "no file": the opt-out may be behind it.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            return true;
+        }
+        Err(error) => return off(&format!("cannot read hangar config: {error}")),
+    };
+    let table: toml::Table = match text.parse() {
+        Ok(table) => table,
+        Err(error) => return off(&format!("hangar config is not valid TOML: {error}")),
+    };
+    if table.get("hangar_daemon").and_then(|section| section.get("spawn")).is_some() {
+        return off(&format!(
+            "`hangar_daemon.spawn` is not read from this file; the key is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    let Some(section) = table.get("hangar") else {
+        return true;
+    };
+    let Some(section) = section.as_table() else {
+        return off("`hangar` must be a table");
+    };
+    if let Some(other) = section.keys().find(|key| *key != "spawn") {
+        return off(&format!(
+            "`hangar.{other}` is not a key; the spawn opt-out is `{SPAWN_CONFIG_KEY}`"
+        ));
+    }
+    match section.get("spawn") {
+        None => true,
+        Some(toml::Value::Boolean(on)) => *on,
+        Some(_) => off(&format!("`{SPAWN_CONFIG_KEY}` must be true or false")),
+    }
+}
+
 /// Why a create failed, split so the RPC layer can tell a bad request from a
 /// host fault.
 #[derive(Debug)]
@@ -79,8 +159,16 @@ pub enum SpawnError {
     /// layer answers [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] by
     /// type, whatever the message says.
     Unregistered(String),
-    /// `ainb run` ran and failed, or could not be run at all.
+    /// Nothing was started: `ainb run` or tmux could not be run at all, or
+    /// every fresh shell name was taken.
     Failed(String),
+    /// `ainb run`, or a shell's `tmux new-session`, was started and did not
+    /// hand back a session: it outlived the bound, its wait was lost, it
+    /// failed, or its output was not a session. What it made is its own
+    /// (a slow run keeps going, a shell may still appear), so the RPC layer
+    /// answers [`ainb_hangar_proto::spawn::SPAWN_STARTED`], which the ledger
+    /// records: a retry under the same op id must never start a second one.
+    Started(String),
 }
 
 /// The `ainb run` argument vector for `params`. Pure, so the mapping is
@@ -407,7 +495,7 @@ fn resolve_worktree(
         SpawnError::Unregistered(why) => SpawnError::Unregistered(format!(
             "the worktree's source repository is refused: {why}"
         )),
-        failed @ SpawnError::Failed(_) => failed,
+        fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => fault,
     })?;
     Ok(canonical)
 }
@@ -441,8 +529,9 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 /// that is not a directory or not the top of a git repository, or a `branch`
 /// that already exists. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, or
-/// `ainb run` could not be started, failed, outlived the bound, or printed
-/// no result it could read.
+/// `ainb run` could not be started. [`SpawnError::Started`] when it was
+/// started and failed, outlived the bound, or printed no result it could
+/// read.
 pub async fn worktree_create(
     params: &WorktreeCreateParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -474,8 +563,8 @@ pub async fn worktree_create(
 /// [`managed_worktrees`], not the top of a linked worktree, or whose source
 /// repository is otherwise refused. Both are answered before `ainb run` ran.
 /// [`SpawnError::Failed`] when the daemon has no home directory, the
-/// worktree check could not finish, or `ainb run` failed as for
-/// [`worktree_create`].
+/// worktree check could not finish, or `ainb run` could not be started;
+/// [`SpawnError::Started`] as for [`worktree_create`].
 pub async fn worktree_agent_add(
     params: &WorktreeAgentAddParams,
 ) -> Result<WorktreeCreateResult, SpawnError> {
@@ -548,7 +637,7 @@ fn resolve_shell_dir(
         let (tree_why, tree_unregistered) = match error {
             SpawnError::Invalid(why) => (why, false),
             SpawnError::Unregistered(why) => (why, true),
-            failed @ SpawnError::Failed(_) => return failed,
+            fault @ (SpawnError::Failed(_) | SpawnError::Started(_)) => return fault,
         };
         let why = format!(
             "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
@@ -588,7 +677,9 @@ fn resolve_shell_dir(
 /// [`SpawnError::Unregistered`] for a folder that registering a project
 /// would admit (see `resolve_shell_dir`) and [`SpawnError::Invalid`] for any
 /// other directory or op id refused, both before tmux ran;
-/// [`SpawnError::Failed`] when tmux could not make the session.
+/// [`SpawnError::Failed`] when tmux could not be run or every fresh name was
+/// taken; [`SpawnError::Started`] when `new-session` ran and may have made
+/// the shell (it did not answer in time, or failed after running).
 pub async fn shell_create(params: &ShellCreateParams) -> Result<ShellCreateResult, SpawnError> {
     shell_create_named(params, || {
         uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
@@ -651,7 +742,7 @@ pub async fn shell_create_named(
             .stderr(std::process::Stdio::piped())
             // A wedged tmux is abandoned at the timeout, not left running.
             .kill_on_drop(true);
-        let out = match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+        let out = match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
             Ok(Ok(out)) => out,
             Ok(Err(e)) => return Err(SpawnError::Failed(format!("could not run tmux: {e}"))),
             Err(_) => {
@@ -659,9 +750,9 @@ pub async fn shell_create_named(
                 // try to take it back. The server may still make it after its
                 // client is gone, so name it too: nothing else would find it.
                 kill_own_shell(&name).await;
-                return Err(SpawnError::Failed(format!(
+                return Err(SpawnError::Started(format!(
                     "tmux did not answer within {}s; the shell may still appear as {name}",
-                    SHELL_TMUX_TIMEOUT.as_secs()
+                    shell_tmux_timeout().as_secs()
                 )));
             }
         };
@@ -677,8 +768,9 @@ pub async fn shell_create_named(
             // session under it now is the one this command made before the
             // steps after it (secret scrub, owner and op id labels) failed:
             // take it back.
+            // The take-back is best-effort, so the session may outlive it.
             kill_own_shell(&name).await;
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "tmux could not start the shell {name}: {}",
                 stderr_tail(&out.stderr)
             )));
@@ -698,7 +790,7 @@ async fn kill_own_shell(name: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let _ = tokio::time::timeout(SHELL_TMUX_TIMEOUT, kill.status()).await;
+    let _ = tokio::time::timeout(shell_tmux_timeout(), kill.status()).await;
 }
 
 /// Every shell the daemon opened that is still running, by name. Only
@@ -822,7 +914,7 @@ impl TmuxError {
             Self::Spawn(e) => SpawnError::Failed(format!("could not run tmux: {e}")),
             Self::Timeout => SpawnError::Failed(format!(
                 "tmux did not answer within {}s",
-                SHELL_TMUX_TIMEOUT.as_secs()
+                shell_tmux_timeout().as_secs()
             )),
         }
     }
@@ -847,7 +939,7 @@ async fn run_tmux(args: &[&str]) -> Result<std::process::Output, TmuxError> {
     // `$TMUX` is inherited, so list and close reach the server the create
     // made its shells on.
     crate::tmux_session::strip_daemon_secrets(&mut tmux);
-    match tokio::time::timeout(SHELL_TMUX_TIMEOUT, tmux.output()).await {
+    match tokio::time::timeout(shell_tmux_timeout(), tmux.output()).await {
         Ok(Ok(out)) => Ok(out),
         Ok(Err(e)) => Err(TmuxError::Spawn(e)),
         Err(_) => Err(TmuxError::Timeout),
@@ -889,8 +981,8 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let timeout = run_timeout();
     let status = match tokio::time::timeout(timeout, &mut wait).await {
         Ok(Ok(Ok(status))) => status,
-        Ok(Ok(Err(e))) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
-        Ok(Err(e)) => return Err(SpawnError::Failed(format!("waiting on {bin}: {e}"))),
+        Ok(Ok(Err(e))) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
+        Ok(Err(e)) => return Err(SpawnError::Started(format!("waiting on {bin}: {e}"))),
         Err(_) => {
             // Nobody is waiting on the answer any more, so the run's own
             // outcome goes to the log, where an operator can find it.
@@ -913,7 +1005,7 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
                 }
                 drop(logs);
             });
-            return Err(SpawnError::Failed(format!(
+            return Err(SpawnError::Started(format!(
                 "`ainb run` is still running after {}s: {pending}; check the sidebar",
                 timeout.as_secs()
             )));
@@ -923,12 +1015,12 @@ async fn run_ainb(argv: Vec<String>, pending: &str) -> Result<WorktreeCreateResu
     let stderr = logs.read_stderr();
     drop(logs);
     if !status.success() {
-        return Err(SpawnError::Failed(format!(
+        return Err(SpawnError::Started(format!(
             "`ainb run` failed: {}",
             stderr_tail(&stderr)
         )));
     }
-    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Failed)
+    parse_run_output(&String::from_utf8_lossy(&stdout)).map_err(SpawnError::Started)
 }
 
 /// Where one `ainb run` writes its stdout and stderr: two files under the
@@ -1120,6 +1212,34 @@ fn run_timeout() -> Duration {
 #[cfg(not(any(test, feature = "test-support")))]
 const fn run_timeout() -> Duration {
     RUN_TIMEOUT
+}
+
+/// Test seam: a shorter wait than [`SHELL_TMUX_TIMEOUT`], in milliseconds,
+/// or 0 for the real one, so a test of a wedged tmux does not sit through
+/// ten seconds of it.
+#[cfg(any(test, feature = "test-support"))]
+static SHELL_TMUX_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shorten the wait on the shell verbs' tmux, or restore it with `None`.
+/// Test-only.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_shell_tmux_timeout_for_test(timeout: Option<Duration>) {
+    let ms = timeout.map_or(0, |t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX));
+    SHELL_TMUX_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn shell_tmux_timeout() -> Duration {
+    match SHELL_TMUX_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => SHELL_TMUX_TIMEOUT,
+        ms => Duration::from_millis(ms),
+    }
+}
+
+/// Compiled out of a shipped daemon: always the real wait.
+#[cfg(not(any(test, feature = "test-support")))]
+const fn shell_tmux_timeout() -> Duration {
+    SHELL_TMUX_TIMEOUT
 }
 
 #[cfg(test)]
@@ -1541,6 +1661,57 @@ mod tests {
         for off in ["0", "", "false", "off", "no", "true", " 1"] {
             assert!(!served_by(Some(OsStr::new(off))), "{off:?} keeps them off");
         }
+    }
+
+    /// On unless the file opts out; anything it cannot read as `true` is off.
+    #[test]
+    fn the_config_file_serves_the_spawn_verbs_unless_opted_out() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_path_in(home.path());
+        assert!(served_by_config(&path), "no file serves them: the default");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for on in [
+            "",
+            "[other]\nkey = 1\n",
+            "[hangar_daemon]\nautostandup = 1\n",
+            "[hangar]\n",
+            "[hangar]\nspawn = true\n",
+        ] {
+            std::fs::write(&path, on).unwrap();
+            assert!(served_by_config(&path), "{on:?} serves them");
+        }
+        for off in [
+            "[hangar]\nspawn = false\n",
+            "hangar.spawn = false\n",
+            "[hangar]\nspawn = \"0\"\n",
+            "[hangar]\nspawn = \"true\"\n",
+            "[hangar]\nspawn = 1\n",
+            "hangar = \"off\"\n",
+            "[hangar\nspawn = true\n",
+            "[hangar]\nspawn_verbs = false\n",
+            "[hangar]\nspawn = true\nspwan = false\n",
+            "[hangar_daemon]\nspawn = false\n",
+        ] {
+            std::fs::write(&path, off).unwrap();
+            assert!(!served_by_config(&path), "{off:?} keeps them off");
+        }
+    }
+
+    /// A config file the daemon cannot read is not taken as "no opt-out".
+    #[test]
+    fn an_unreadable_config_file_keeps_the_spawn_verbs_off() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_path_in(home.path());
+        // A directory where the file should be: present, but never readable.
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(!served_by_config(&path));
+
+        let linked = home.path().join("linked.toml");
+        std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
+        assert!(
+            !served_by_config(&linked),
+            "a link to nowhere is not a missing file"
+        );
     }
 
     #[test]

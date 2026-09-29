@@ -47,7 +47,8 @@ test("the answer banner is remounted when the shown terminal changes", () => {
 
 test("closing the shown tab shows the tab Orca would, not the strip's first", () => {
   const showTabs = body("showTabs", "const report = ");
-  assert.match(showTabs, /tabAfterClose\(before, view\.tabs, recent, active\(\)\)/);
+  // Group by group, in `followHost` (`panes.test.ts`).
+  assert.match(showTabs, /followHost\(layout\(\), keys, recent\)/);
   assert.doesNotMatch(showTabs, /view\.tabs\[0\]/);
   const activate = body("activate", "const [hostAnswers");
   assert.match(activate, /recent = visited\(recent, key\);/, "every shown tab is remembered");
@@ -73,4 +74,16 @@ test("the host hears which session the work area shows, and the notifications to
   assert.ok(MAIN.includes('createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session })'));
   assert.ok(MAIN.includes('invoke("notifications_set", { enabled })'));
   assert.ok(MAIN.includes("onNotifications={notifications.set}"));
+});
+
+test("a sidebar row's menu runs through the window's own open, ordered dispatch and clipboard", () => {
+  // `test/dom/sidebar_menu.test.ts` proves the menu hands `runRowPick` the
+  // right pick; this is the one place those deps become real host calls.
+  assert.match(
+    MAIN,
+    /onRowPick=\{\(pick\) =>(?:\s*\/\/[^\n]*)*\s*runRowPick\(pick, \{\s*open: \(id\) => void answer\(\[openRowIntent\(\{ session: id \}\)\]\),\s*run: \(intents\) => void answer\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*reselect: shownRowIntents,\s*\}\)\s*\}/,
+  );
+  // The row that goes back is the shown terminal's, and only while one is shown.
+  const shown = body("shownRowIntents", "onMount(");
+  assert.match(shown, /showing\("terminal"\) && key !== null \? selectIntentFor\(tabs\(\), key\) : null/);
 });

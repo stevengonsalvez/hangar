@@ -1,4 +1,4 @@
-import { Show } from "solid-js";
+import { type JSX, Show } from "solid-js";
 import type { HostId } from "../../../ainb-app/bindings/AppState";
 import type { SidecarState } from "./sidecar.ts";
 import { daemonDotState } from "./statusbar.ts";
@@ -12,6 +12,8 @@ interface Props {
   idle: number;
   /** Frames the store refused (#1132): a development build only. */
   framesIgnored?: number;
+  /** The usage segment (`usage_segment.tsx`), after the daemon dot. */
+  children?: JSX.Element;
 }
 
 /**
@@ -34,6 +36,7 @@ export function Statusbar(props: Props) {
       >
         <span class="visually-hidden">Daemon {props.sidecar.state}</span>
       </span>
+      {props.children}
       <span class="statusbar-counts" aria-label="Attention">
         <Show when={props.needsYou > 0}>
           <span class="statusbar-needs">{props.needsYou} need you</span>

@@ -95,6 +95,7 @@ export type Accelerator =
   | { kind: "close" }
   | { kind: "palette" }
   | { kind: "new" }
+  | { kind: "split"; direction: "right" | "down" }
   | { kind: "attention" }
   | { kind: "hosts" }
   | { kind: "copy" }
@@ -116,9 +117,16 @@ interface KeyLike {
  * spec's cmd+shift+h is Ctrl+Shift+H.
  */
 export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
+  // Split down is Orca's Alt+Shift+D off macOS
+  // (`orca:src/shared/keybindings/definitions-core-4.ts:34-42`): the one chord
+  // here without the Ctrl+Shift, so it is matched first.
+  if (!mac && event.altKey && event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === "KeyD") {
+    return { kind: "split", direction: "down" };
+  }
   const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey && !event.metaKey;
   if (!mod || event.altKey) return null;
   if (event.code === "KeyH" && (!mac || event.shiftKey)) return { kind: "hosts" };
+  if (mac && event.shiftKey && event.code === "KeyD") return { kind: "split", direction: "down" };
   if (mac && event.shiftKey) return null;
   // Copy and paste: macOS has them on the Edit menu, natively. Elsewhere the
   // pane owns ctrl+c and ctrl+v, so the shell's ctrl+shift pair does it.
@@ -143,6 +151,10 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
       return { kind: "new" };
     case "KeyU":
       return { kind: "attention" };
+    // Split the focused pane: Cmd+D, as Orca splits (its
+    // `terminal.splitRight`), Ctrl+Shift+D elsewhere.
+    case "KeyD":
+      return { kind: "split", direction: "right" };
     default:
       return null;
   }
@@ -262,8 +274,8 @@ export function visited(recent: readonly string[], key: string): string[] {
  * strip's first.
  */
 export function tabAfterClose(
-  before: readonly Tab[],
-  after: readonly Tab[],
+  before: readonly { key: string }[],
+  after: readonly { key: string }[],
   recent: readonly string[],
   closing: string | null,
 ): string | null {

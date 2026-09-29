@@ -303,3 +303,195 @@ test("collapse is remembered by project path, so two repos with one name stay ap
   assert.equal(first.open, false);
   assert.equal(second.open, true, "the other 'app' stays open");
 });
+
+// The filter field (O7). Two projects, three worktrees, one session each, so
+// what a query keeps is readable off the rows alone.
+function filterFrame(over: Partial<SessionsView_Serialize> = {}): SessionsView_Serialize {
+  return frame({
+    workspaces: [
+      {
+        name: "web",
+        path: "/web",
+        sessions: [session("login-1", "/web/wt-login"), session("signup-1", "/web/wt-signup")],
+        shell_session: null,
+      },
+      { name: "api", path: "/api", sessions: [session("billing-1", "/api/wt-billing")], shell_session: null },
+    ],
+    ...over,
+  });
+}
+
+function filterInput(): HTMLInputElement {
+  const input = document.querySelector<HTMLInputElement>('.sidebar input[aria-label="Filter worktrees"]');
+  assert.ok(input, "the sidebar draws a filter field");
+  return input;
+}
+
+/** Type `text` into the field the way a person does: its value, then `input`. */
+async function typeFilter(text: string): Promise<void> {
+  const input = filterInput();
+  input.focus();
+  input.value = text;
+  input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  await settle();
+}
+
+/** Press Escape in the field; the event, so a test can read what it did. */
+async function pressEscape(): Promise<KeyboardEvent> {
+  const event = new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  filterInput().dispatchEvent(event);
+  await settle();
+  return event as unknown as KeyboardEvent;
+}
+
+function drawnRows(): (string | null)[] {
+  return [...document.querySelectorAll(".session-row")].map((row) => row.getAttribute("data-session"));
+}
+
+function drawnProjects(): (string | null)[] {
+  return [...document.querySelectorAll("details.workspace")].map((group) => group.getAttribute("data-workspace"));
+}
+
+test("typing in the filter keeps only matching worktrees, ignoring case, and drops empty projects", async () => {
+  await open(filterFrame());
+  assert.deepEqual(drawnRows(), ["login-1", "signup-1", "billing-1"]);
+  await typeFilter("LOGIN");
+  assert.deepEqual(drawnRows(), ["login-1"]);
+  assert.deepEqual(drawnProjects(), ["web"], "a project with no match is not drawn");
+  assert.equal(document.querySelector(".workspace-count")?.textContent, "1", "the count is the rows still drawn");
+});
+
+test("a query naming a project keeps every worktree in it", async () => {
+  await open(filterFrame());
+  await typeFilter("api");
+  assert.deepEqual(drawnRows(), ["billing-1"]);
+});
+
+test("Escape in a filled field clears it and every row comes back", async () => {
+  await open(filterFrame());
+  await typeFilter("signup");
+  assert.deepEqual(drawnRows(), ["signup-1"]);
+  const escape = await pressEscape();
+  assert.equal(escape.defaultPrevented, true, "the field took the Escape it answered");
+  assert.equal(filterInput().value, "");
+  assert.deepEqual(drawnRows(), ["login-1", "signup-1", "billing-1"]);
+});
+
+test("Escape in an empty field is left alone for whoever else listens", async () => {
+  await open(filterFrame());
+  const escape = await pressEscape();
+  assert.equal(escape.defaultPrevented, false);
+});
+
+test("the clear button empties the field and keeps the keyboard in it", async () => {
+  await open(filterFrame());
+  await typeFilter("login");
+  const clear = document.querySelector<HTMLButtonElement>('.sidebar button[aria-label="Clear filter"]');
+  assert.ok(clear, "a filled field offers a clear button");
+  clear.click();
+  await settle();
+  assert.equal(filterInput().value, "");
+  assert.equal(document.activeElement, filterInput());
+  assert.deepEqual(drawnRows(), ["login-1", "signup-1", "billing-1"]);
+  assert.equal(document.querySelector('.sidebar button[aria-label="Clear filter"]'), null, "empty, no clear button");
+});
+
+test("a query nothing matches says so rather than drawing an empty list", async () => {
+  await open(filterFrame());
+  await typeFilter("zzz");
+  assert.deepEqual(drawnRows(), []);
+  assert.equal(document.querySelector(".sidebar .empty")?.textContent, "No worktrees match");
+});
+
+test("filtering out the selected row leaves the selection alone, and clearing brings it back selected", async () => {
+  const opened: string[] = [];
+  await open(filterFrame({ selected_session_id: "signup-1" }), (id) => opened.push(id));
+  await typeFilter("login");
+  assert.deepEqual(drawnRows(), ["login-1"]);
+  assert.deepEqual(opened, [], "hiding a row opens nothing in its place");
+  await pressEscape();
+  const selected = document.querySelector('.session-row[aria-current="true"]');
+  assert.equal(selected?.getAttribute("data-session"), "signup-1");
+});
+
+test("a new frame is filtered by the query already typed", async () => {
+  const { setHeld } = await open(filterFrame());
+  await typeFilter("login");
+  const next = filterFrame();
+  next.workspaces[1].sessions.push(session("login-2", "/api/wt-login"));
+  setHeld(next);
+  await settle();
+  assert.deepEqual(drawnRows(), ["login-1", "login-2"]);
+});
+
+test("the query is not kept across a relaunch", async () => {
+  await open(filterFrame());
+  await typeFilter("login");
+  cleanup?.();
+  cleanup = undefined;
+  document.body.innerHTML = "";
+  await open(filterFrame());
+  assert.equal(filterInput().value, "");
+  assert.deepEqual(drawnRows(), ["login-1", "signup-1", "billing-1"]);
+});
+
+test("the host moving the selection to a hidden row clears the filter, as Orca lifts filters on activation", async () => {
+  const { setHeld } = await open(filterFrame());
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "billing-1" }));
+  await settle();
+  assert.equal(filterInput().value, "");
+  assert.equal(document.querySelector('.session-row[aria-current="true"]')?.getAttribute("data-session"), "billing-1");
+});
+
+test("a new frame keeping the same hidden selection leaves the query alone", async () => {
+  const { setHeld } = await open(filterFrame({ selected_session_id: "signup-1" }));
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "signup-1" }));
+  await settle();
+  assert.equal(filterInput().value, "login");
+  assert.deepEqual(drawnRows(), ["login-1"]);
+});
+
+test("a selection moving to a row the query still shows leaves the query alone", async () => {
+  const { setHeld } = await open(filterFrame());
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "login-1" }));
+  await settle();
+  assert.equal(filterInput().value, "login");
+});
+
+test("a create into a project the query hides clears the filter so its pending card shows", async () => {
+  const { setPending } = await open(filterFrame());
+  await typeFilter("login");
+  setPending({ projectPath: "/api", name: "new-billing" });
+  await settle();
+  assert.equal(filterInput().value, "");
+  assert.equal(document.querySelector('details[data-workspace="api"] li[data-pending="true"]')?.textContent, "new-billing");
+});
+
+test("a create into a project the query shows leaves the query alone", async () => {
+  const { setPending } = await open(filterFrame());
+  await typeFilter("login");
+  setPending({ projectPath: "/web", name: "new-web" });
+  await settle();
+  assert.equal(filterInput().value, "login");
+});
+
+test("the field is a search landmark with a visible n / m count and a polite announcement", async () => {
+  await open(filterFrame());
+  assert.ok(document.querySelector('.sidebar [role="search"] input[aria-label="Filter worktrees"]'));
+  await typeFilter("login");
+  assert.equal(document.querySelector(".sidebar-filter-count")?.textContent, "1 / 3");
+  const status = document.querySelector('.sidebar [role="status"]');
+  assert.equal(status?.getAttribute("aria-live"), "polite");
+  assert.equal(status?.textContent, "", "announced after a pause, not on each keystroke");
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(status?.textContent, "1 of 3 worktrees match");
+  await typeFilter("zzz");
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(status?.textContent, "No worktrees match");
+  await pressEscape();
+  assert.equal(document.querySelector(".sidebar-filter-count"), null);
+  assert.equal(status?.textContent, "");
+});

@@ -6,6 +6,7 @@ import type { FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/Ap
 import { ackTurn, pruneAcks, readAcks, rowAckKey, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
+import { UsageSegment } from "./usage_segment.tsx";
 import {
   configRevision,
   shellAgentStatus,
@@ -27,7 +28,7 @@ import { phaseOf, questionFor, questionOver, type Refusal, sendInOrder } from ".
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
-import { agentStateCounts, boardColumns, countIn, sameColumns } from "./board.ts";
+import { agentStateCounts, boardColumns, countIn, nextNeedsYou, sameColumns, showIntents } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -38,9 +39,22 @@ import { emptyPaneView } from "./pane_empty.ts";
 import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
 import { cardForSession, statusForTarget } from "./status.ts";
-import { TerminalTab } from "./terminal_tab.tsx";
+import {
+  activateTab,
+  focusGroup,
+  groups,
+  initialLayout,
+  readStored,
+  splitGroup,
+  writeLayout,
+  type GroupId,
+  type Layout,
+} from "./layout.ts";
+import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
+import { Panes } from "./panes.tsx";
 import { Composer } from "./composer.tsx";
 import { Sidebar } from "./sidebar.tsx";
+import { runRowPick } from "./row_menu.ts";
 import { Titlebar } from "./titlebar.tsx";
 import { Statusbar } from "./statusbar.tsx";
 import { SettingsPage } from "./settings.tsx";
@@ -54,7 +68,6 @@ import {
   selectRowIntent,
   shownSessionOf,
   stepTab,
-  tabAfterClose,
   visited,
   modalBlocks,
   shellKeydown,
@@ -127,11 +140,44 @@ function Shell() {
   ];
   onCleanup(() => listeners.forEach((unlisten) => void unlisten.then((stop) => stop())));
 
-  // Terminal tabs: the strip is the Rust side's; which tab shows is ours.
+  // Terminal tabs: the strip is the Rust side's; where each tab sits, in
+  // which group of the split panes, and which tab each group shows is ours
+  // (`layout.ts`), kept in this window's storage across reloads.
   const [tabs, setTabs] = createSignal<Tab[]>([]);
-  const [active, setActive] = createSignal<string | null>(null);
-  // Tab keys in the order they were shown, most recent last: which tab to
-  // show when the shown one closes. Read only then, so not a signal.
+  const [layout, setLayout] = createSignal<Layout>(initialLayout([]));
+  // Where the window is in bringing the stored layout back. The host
+  // restores no tabs: after a relaunch its strip is empty, then gains a tab
+  // at a time as a person opens them. So the stored layout is read on the
+  // first strip with a tab, and rebuilt from on every strip (never written)
+  // until every stored tab is open again, a person reshapes the panes, or
+  // `RESTORE_MS` passes. Only then does the window follow the host and store
+  // what it shows; following earlier would drop each stored tab not open
+  // yet, and store that over the layout being restored.
+  let phase: "waiting" | Restore | "following" = "waiting";
+  // The tab last activated during a restore: kept shown across rebuilds.
+  let restoreShown: string | null = null;
+  /** The shown tab of the focused group: the terminal with the keyboard,
+   * the one the sidebar and the answer banner follow. */
+  const active = () => {
+    const current = layout();
+    return groups(current).find((group) => group.id === current.focused)?.active ?? null;
+  };
+  /** Every tab in the order the panes draw them: pane by pane in reading
+   * order, each strip left to right. What the tab chords count and step
+   * through, so Cmd+2 is the second tab a person sees. */
+  const inView = () => {
+    const byKey = new Map(tabs().map((tab) => [tab.key, tab]));
+    return groups(layout()).flatMap((group) => group.tabs.flatMap((key) => byKey.get(key) ?? []));
+  };
+  /** Take `next` as the layout, and store it once the window follows the
+   * host (`phase`); the same layout is a no-op. */
+  const commitLayout = (next: Layout) => {
+    if (next === layout()) return;
+    setLayout(next);
+    if (phase === "following") writeLayout(safeStorage(), next);
+  };
+  // Tab keys in the order they were shown, most recent last: which tab a
+  // group shows when its shown one closes. Read only then, so not a signal.
   let recent: string[] = [];
   // The board is the window's landing surface: what every agent is doing, and
   // what is waiting on a human. A terminal takes the work area while it is
@@ -158,11 +204,6 @@ function Shell() {
   // it back to the session list the sidebar is. The window keeps no copy.
   const [setup, setSetup] = createSignal<SetupView | null>(null);
   const focusers = new Map<string, () => void>();
-  const tabKeys = createMemo(
-    () => tabs().map((tab) => tab.key),
-    [],
-    { equals: (a, b) => a.length === b.length && a.every((key, i) => key === b[i]) },
-  );
   let sidebar: HTMLElement | undefined;
 
   /**
@@ -231,8 +272,11 @@ function Shell() {
    * take the keyboard from a text field (`terminalMayTakeFocus`).
    */
   const activate = (key: string | null, byHost: boolean, first: RendererIntent[] = []) => {
-    setActive(key);
     if (key !== null) {
+      // Shown in its own group, and that group focused: the host's
+      // `TabsView.focus` lands here as a person's click does.
+      commitLayout(activateTab(layout(), key));
+      if (typeof phase === "object") restoreShown = key;
       recent = visited(recent, key);
       // The session list follows the shown terminal, whoever showed it, so
       // the sidebar row and the answer banner are that session's.
@@ -275,20 +319,32 @@ function Shell() {
   const showTabs = (view: TabsView) => {
     setHostAnswers((n) => n + 1);
     setHostFocus(view.focus ?? "");
-    const before = tabs();
+    const keys = view.tabs.map((tab) => tab.key);
+    const shownBefore = active();
     setTabs(view.tabs);
-    recent = recent.filter((key) => view.tabs.some((tab) => tab.key === key));
+    recent = recent.filter((key) => keys.includes(key));
     for (const key of focusers.keys()) {
-      if (!view.tabs.some((tab) => tab.key === key)) focusers.delete(key);
+      if (!keys.includes(key)) focusers.delete(key);
+    }
+    // Followed (`followHost`), which returns the layout itself when nothing
+    // changed, so a strip that only restates the tabs costs nothing; or,
+    // while the stored layout comes back, rebuilt from it (`phase`).
+    if (phase === "following") commitLayout(followHost(layout(), keys, recent));
+    else if (keys.length > 0) {
+      const restore = phase === "waiting" ? beginRestore(readStored(safeStorage()), Date.now()) : phase;
+      phase = restoreDone(restore, keys, Date.now()) ? "following" : restore;
+      commitLayout(rebuild(restore, keys, restoreShown));
+      // Stored on the strip that ends the restore, even when the rebuild is
+      // the layout already shown and so wrote nothing.
+      if (phase === "following") writeLayout(safeStorage(), layout());
     }
     if (view.focus !== null) activate(view.focus, true);
-    else if (!view.tabs.some((tab) => tab.key === active())) {
-      // The shown tab closed or ended (its tmux session died, say): point at
-      // the one Orca would show next WITHOUT leaving the board. `activate`
-      // means a person chose a terminal; this is the strip tidying up after
-      // itself.
-      const next = tabAfterClose(before, view.tabs, recent, active());
-      setActive(next);
+    else if (active() !== shownBefore) {
+      // The shown tab closed or ended (its tmux session died, say), and its
+      // group shows the one Orca would show next, or closed into its
+      // neighbour: point there WITHOUT leaving the board. `activate` means a
+      // person chose a terminal; this is the strip tidying up after itself.
+      const next = active();
       if (next !== null) recent = visited(recent, next);
       if (next !== null && pane() === "terminal") {
         // The sidebar follows the terminal now shown, as `activate` has it
@@ -385,6 +441,54 @@ function Shell() {
   };
   const choose = (tab: Tab) =>
     activate(tab.key, false, tab.state === "detached" ? [openRowIntent(rowOf(tab.target))] : []);
+  /** Close `tab`: its terminal goes, and the host's next strip drops it
+   * from its group, closing the group if it was the last. */
+  const closeTab = (tab: Tab) => void invoke("terminal_close", { key: tab.key });
+  /** The Terminals entry: back to the panes, on the tab they show. */
+  const showTerminals = () => {
+    const tab = tabs().find((candidate) => candidate.key === active());
+    if (tab !== undefined) {
+      choose(tab);
+      return;
+    }
+    void invoke("answer_home");
+    closeTranscript();
+    setPane("terminal");
+  };
+  /**
+   * Take a layout the panes made (a split, a move, a resize). When it moved
+   * the keyboard, to another group or another tab, that tab is activated as
+   * a click on it would be, so the sidebar and the answer banner follow it.
+   */
+  const applyLayout = (next: Layout) => {
+    const before = layout();
+    const shownBefore = active();
+    // A person reshaping the panes ends a restore: what they made is kept.
+    phase = "following";
+    commitLayout(next);
+    const shown = active();
+    if (shown !== null && (next.focused !== before.focused || shown !== shownBefore)) activate(shown, false);
+  };
+  /** A press or the keyboard went into group `id`: it takes the focus, on
+   * the tab it shows. */
+  const focusPaneGroup = (id: GroupId) => {
+    const current = layout();
+    if (current.focused === id) return;
+    const shown = groups(current).find((group) => group.id === id)?.active ?? null;
+    if (shown !== null) activate(shown, false);
+    else commitLayout(focusGroup(current, id));
+  };
+  /** "Close split pane": every tab of the group closes, as Orca's does
+   * (`orca:src/renderer/src/components/tab-group/useTabGroupCloseScopeCommands.ts:24-34`).
+   * The terminals are the host's to end; its next strip, without them,
+   * collapses the group. */
+  const closePaneGroup = (id: GroupId) => {
+    const group = groups(layout()).find((candidate) => candidate.id === id);
+    for (const key of group?.tabs ?? []) {
+      const tab = tabs().find((candidate) => candidate.key === key);
+      if (tab !== undefined) closeTab(tab);
+    }
+  };
   /** Open the palette, or close it the way Esc does: the titlebar's search
    * button and the Cmd/Ctrl+Shift+K accelerator both send exactly this, so
    * there is one place that decides which way a press or a click goes. */
@@ -407,30 +511,75 @@ function Shell() {
     select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
   });
 
+  /** The Needs you card the last Cmd+U revealed, so the next press moves on. */
+  let jumped: string | null = null;
+  /**
+   * Cmd+U: reveal the next agent in the board's Needs you column. On the board
+   * its card takes focus and its row is selected, as a click on it does;
+   * anywhere else its tab is shown, or opened when it has none. Every send
+   * goes after `answer_home`, so from Settings or the Inbox nothing is
+   * refused. With nothing waiting it says so: Orca has no such chord, so
+   * there is no silence to match, and a chord that does nothing reads as dead.
+   */
+  const jumpToAttention = () => {
+    const card = nextNeedsYou(columns(), jumped);
+    if (card === null) {
+      toast("Nobody needs you");
+      return;
+    }
+    jumped = card.key;
+    // No row: an ACP agent (`nextNeedsYou` skips any other), shown by its transcript.
+    if (card.sessionId === null) {
+      void invoke("answer_home").then(() => openTranscript(card.key));
+      return;
+    }
+    if (showing("board")) {
+      void answer(showIntents(card.sessionId, card.hasOpenRequest));
+      [...document.querySelectorAll<HTMLElement>(".board-card")].find((node) => node.dataset.card === card.key)?.focus();
+      return;
+    }
+    const tab = tabs().find((one) => one.target.kind === "session" && one.target.id === card.sessionId);
+    if (tab !== undefined) choose(tab);
+    else void answer([openRowIntent({ session: card.sessionId })]);
+  };
+
   const onAccelerator = (shell: Accelerator) => {
     // A modal owns the keyboard: no chord may switch or close a tab, or focus
     // a terminal, behind the open composer.
     if (modalBlocks(shell, composer.open())) return;
     switch (shell.kind) {
       case "tab": {
-        const tab = tabs()[shell.index];
+        const tab = inView()[shell.index];
         if (tab) choose(tab);
         return;
       }
       case "prev":
       case "next": {
-        const key = stepTab(tabs(), active(), shell.kind === "next" ? 1 : -1);
+        const key = stepTab(inView(), active(), shell.kind === "next" ? 1 : -1);
         const tab = tabs().find((candidate) => candidate.key === key);
         if (tab) choose(tab);
         return;
       }
       case "close": {
-        const key = active();
-        if (key !== null) void invoke("terminal_close", { key });
+        const tab = tabs().find((candidate) => candidate.key === active());
+        if (tab) closeTab(tab);
         return;
       }
-      // ponytail: the attention jump is D2, the host switcher R1.
+      case "split": {
+        // Orca splits the pane in view; behind a page there is none.
+        if (!showing("terminal")) return;
+        const current = layout();
+        const next = splitGroup(current, current.focused, shell.direction);
+        // A pane of one tab has nothing to split out: open the session to
+        // put beside it first, then split it.
+        if (next === current) toast("Open another tab in this pane to split it");
+        else applyLayout(next);
+        return;
+      }
       case "attention":
+        jumpToAttention();
+        return;
+      // ponytail: the host switcher is R1.
       case "hosts":
         return;
       // Answered by the terminal that has focus; outside one there is no
@@ -462,6 +611,14 @@ function Shell() {
   onCleanup(() => window.removeEventListener("keydown", onKey));
 
   const openSession = (id: string) => openRow({ session: id });
+  /** The select-only intent for the shown terminal's row, or none when no
+   * terminal is shown: what a sidebar row menu sends after it moves the
+   * selection, so the answer banner stays that terminal's. */
+  const shownRowIntents = (): RendererIntent[] => {
+    const key = active();
+    const back = showing("terminal") && key !== null ? selectIntentFor(tabs(), key) : null;
+    return back === null ? [] : [back];
+  };
 
   onMount(async () => {
     setSidecar(await invoke<SidecarState>("sidecar_state"));
@@ -655,6 +812,16 @@ function Shell() {
             acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
+            onRowPick={(pick) =>
+              // Through `answer`, home first: the sidebar is drawn over
+              // Settings and the Inbox, whose screens refuse a row.
+              runRowPick(pick, {
+                open: (id) => void answer([openRowIntent({ session: id })]),
+                run: (intents) => void answer(intents),
+                copy: (text) => void invoke("clipboard_write", { text }),
+                reselect: shownRowIntents,
+              })
+            }
             ref={(element) => (sidebar = element)}
           />
           <section class="workarea">
@@ -711,6 +878,17 @@ function Shell() {
                   Stats
                 </button>
               </span>
+              {/* The terminal panes, whose tabs are in each pane's own strip. */}
+              <span class="tab terminals-tab" classList={{ active: showing("terminal") }}>
+                <button
+                  type="button"
+                  class="tab-title"
+                  aria-current={showing("terminal") ? "page" : undefined}
+                  onClick={showTerminals}
+                >
+                  Terminals
+                </button>
+              </span>
               {/* The ACP card's own place in the strip, where the session's
                   terminal tab would be if it had a pane. */}
               <Show when={transcriptKey()}>
@@ -733,18 +911,6 @@ function Shell() {
                   </span>
                 )}
               </Show>
-              <For each={tabs()}>
-                {(tab) => (
-                  <TerminalTab
-                    tab={tab}
-                    title={title(tab)}
-                    active={showing("terminal") && tab.key === active()}
-                    status={tabStatus(tab)}
-                    onChoose={() => choose(tab)}
-                    onClose={() => void invoke("terminal_close", { key: tab.key })}
-                  />
-                )}
-              </For>
             </nav>
             {/* One banner per open request, latched for a short grace across
                 frames that carry none (#1266): `AnswerSlot`. */}
@@ -820,26 +986,39 @@ function Shell() {
             <Show when={showing("terminal") && tabs().length === 0}>
               <EmptyPane view={emptyPaneView(sessions())} onOpen={openSession} />
             </Show>
-            {/* Keyed by tab key, not by the tab object each event replaces: a
-                terminal stays mounted, and keeps its buffer, while its tab is listed. */}
-            <For each={tabKeys()}>
-              {(key) => (
-                <Show when={tabs().find((tab) => tab.key === key)}>
-                  {(tab) => (
-                    <TerminalView
-                      tab={tab()}
-                      title={title(tab())}
-                      active={showing("terminal") && key === active()}
-                      mac={MAC}
-                      onAccelerator={onAccelerator}
-                      onLeave={() => sidebar?.focus()}
-                      focusRef={(focus) => focusers.set(key, focus)}
-                      theme={theme.painted()}
-                    />
-                  )}
-                </Show>
-              )}
-            </For>
+            {/* The split panes. Each terminal is keyed by tab key, not by the
+                tab object each event replaces: it stays mounted, and keeps its
+                buffer, while its tab is listed, whichever group it moves to. */}
+            <Show when={tabs().length > 0}>
+              <Panes
+                layout={layout()}
+                tabs={tabs()}
+                shown={showing("terminal")}
+                title={title}
+                status={tabStatus}
+                onChoose={choose}
+                onClose={closeTab}
+                onLayout={applyLayout}
+                onFocusGroup={focusPaneGroup}
+                onCloseGroup={closePaneGroup}
+                terminal={(key, visible) => (
+                  <Show when={tabs().find((tab) => tab.key === key)}>
+                    {(tab) => (
+                      <TerminalView
+                        tab={tab()}
+                        title={title(tab())}
+                        active={visible()}
+                        mac={MAC}
+                        onAccelerator={onAccelerator}
+                        onLeave={() => sidebar?.focus()}
+                        focusRef={(focus) => focusers.set(key, focus)}
+                        theme={theme.painted()}
+                      />
+                    )}
+                  </Show>
+                )}
+              />
+            </Show>
           </section>
         </div>
         <Statusbar
@@ -849,7 +1028,16 @@ function Shell() {
           idle={countIn(columns(), "idle")}
           // A development build shows frames the store refused (#1132).
           framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
-        />
+        >
+          <UsageSegment
+            usage={usage()}
+            stale={usageStale()}
+            onOpen={() => {
+              closeTranscript();
+              setPane("stats");
+            }}
+          />
+        </Statusbar>
         <Show when={palette()}>
           <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
         </Show>

@@ -19,6 +19,7 @@ import {
   COLUMNS,
   countIn,
   elsewhereCount,
+  nextNeedsYou,
   showIntents,
 } from "./board.ts";
 
@@ -411,4 +412,39 @@ test("an idle agent whose row already rings Ask is counted once, in one of need-
   (sessions.workspaces[0].sessions[0] as { attention: unknown[] }).attention = [{ kind: "Ask", options: [], route: "Daemon" }];
   const columns = boardColumns(status(card("claude:p-1", { state: "idle" })), fleet, sessions, NO_ACKS);
   assert.equal(countIn(columns, "needs") + countIn(columns, "idle"), 1);
+});
+
+test("the attention jump walks the Needs you column top to bottom, then wraps", () => {
+  // The column's own order, the one the board draws: an open request first,
+  // then by title. The jump reads that list and never counts one of its own.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"], ["u-2", "web", "p-2"], ["u-3", "cli", "p-3"]);
+  const columns = boardColumns(
+    status(
+      card("claude:p-2", { state: "waiting" }),
+      card("claude:p-1", { state: "waiting" }),
+      card("claude:p-3", { state: "working" }),
+    ),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  assert.equal(nextNeedsYou(columns, null)?.key, "claude:p-1", "nothing jumped to yet: the top card");
+  assert.equal(nextNeedsYou(columns, "claude:p-1")?.key, "claude:p-2");
+  assert.equal(nextNeedsYou(columns, "claude:p-2")?.key, "claude:p-1", "past the last card, back to the top");
+  assert.equal(nextNeedsYou(columns, "claude:p-3")?.key, "claude:p-1", "a card that left Needs starts it over");
+});
+
+test("the attention jump skips a card no click can open, and finds nothing when nothing needs you", () => {
+  // `codex:gone` has no session row and no transcript: the board draws it
+  // disabled, so the jump has nowhere to take the person.
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const waiting = boardColumns(
+    status(card("claude:p-1", { state: "waiting" }), card("codex:gone", { state: "waiting" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  assert.equal(nextNeedsYou(waiting, "claude:p-1")?.key, "claude:p-1");
+  const quiet = boardColumns(status(card("claude:p-1", { state: "working" })), fleet, sessions, NO_ACKS);
+  assert.equal(nextNeedsYou(quiet, null), null);
 });

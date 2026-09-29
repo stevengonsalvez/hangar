@@ -12,7 +12,7 @@
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
 use ainb_hangar_proto::spawn::{
-    REPO_NOT_REGISTERED, SpawnAgent, WorktreeCreateParams, WorktreeCreateResult,
+    REPO_NOT_REGISTERED, SPAWN_STARTED, SpawnAgent, WorktreeCreateParams, WorktreeCreateResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,7 +105,7 @@ pub fn mint_op_id() -> OpId {
 pub fn refusal_text(error: &DaemonError) -> String {
     match error {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
-            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0. Update it, or start it without that setting."
+            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0 or with [hangar] spawn = false in ~/.agents-in-a-box/config/config.toml (or with that file unreadable). Update it, or restart it without that setting."
                 .into()
         }
         DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => {
@@ -114,6 +114,11 @@ pub fn refusal_text(error: &DaemonError) -> String {
         }
         DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
             format!("The daemon refused the request: {message}")
+        }
+        // `ainb run` ran: it is still going, or it failed after starting.
+        // Either way this is not a create that never happened.
+        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => {
+            format!("The create started: {message}")
         }
         DaemonError::Rpc { message, .. } => format!("Creating the worktree failed: {message}"),
         DaemonError::Timeout(_) => {
@@ -199,6 +204,7 @@ mod tests {
         // older than this app, or was started with the opt-out.
         let dark = refusal_text(&dark);
         assert!(dark.contains("AINB_HANGAR_SPAWN=0"), "{dark}");
+        assert!(dark.contains("[hangar] spawn = false"), "{dark}");
         assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
         let bad = DaemonError::Rpc {
             code: INVALID_PARAMS,
@@ -219,11 +225,20 @@ mod tests {
             message: "repo_path is not under a registered workspace folder".into(),
         };
         assert!(refusal_text(&worded).starts_with("The daemon refused the request"));
-        let failed = DaemonError::Rpc {
-            code: -32603,
-            message: "`ainb run` failed: branch exists".into(),
+        let started = DaemonError::Rpc {
+            code: SPAWN_STARTED,
+            message: "`ainb run` is still running after 120s: the worktree may still be \
+                      creating; check the sidebar"
+                .into(),
         };
-        assert!(refusal_text(&failed).starts_with("Creating the worktree failed"));
+        let started = refusal_text(&started);
+        assert!(started.starts_with("The create started: "), "{started}");
+        assert!(!started.contains("failed"), "{started}");
+        let unstarted = DaemonError::Rpc {
+            code: -32603,
+            message: "could not run ainb: No such file or directory".into(),
+        };
+        assert!(refusal_text(&unstarted).starts_with("Creating the worktree failed"));
         let slow = DaemonError::Timeout(std::time::Duration::from_secs(150));
         assert!(refusal_text(&slow).contains("may still be creating; check the sidebar"));
     }

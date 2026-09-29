@@ -157,6 +157,56 @@ body {
   font-style: italic;
 }
 
+/* The usage segment (Orca's provider segment): one borderless button over a
+   chip per provider, opening the stats tab. Quiet like the rest of the bar;
+   only the stale and failed marks take the amber. */
+.statusbar-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  padding: 0 4px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.statusbar-usage:hover {
+  background: var(--highlight);
+}
+
+.statusbar-usage-chip,
+.statusbar-usage-more {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.statusbar-usage-provider,
+.statusbar-usage-none,
+.statusbar-usage-pending {
+  color: var(--muted-foreground);
+}
+
+.statusbar-usage-warn {
+  color: var(--gold);
+}
+
+/* A provider name can run to 120 characters on the wire: cut it, never the
+   figure beside it. */
+.statusbar-usage-provider {
+  display: inline-block;
+  max-width: 12ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+
 .banner {
   display: flex;
   align-items: center;
@@ -263,6 +313,71 @@ body {
 .sidebar .empty {
   margin-inline: 12px;
   color: var(--muted-foreground);
+}
+
+/* The filter field under the sidebar's head (`sidebar_filter.tsx`): the
+   clear button sits inside the field's right edge, so the field keeps room
+   for it rather than letting typed text run under it. */
+.sidebar-filter {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin: 4px 12px 6px;
+}
+
+.sidebar-filter-input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 24px 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-meta);
+}
+
+.sidebar-filter-input::placeholder {
+  color: var(--muted-foreground);
+}
+
+/* While filtering, the `n / m` count sits left of the clear button, so the
+   field keeps room for both. */
+.sidebar-filter.filtering .sidebar-filter-input {
+  padding-inline-end: 72px;
+}
+
+.sidebar-filter-count {
+  position: absolute;
+  inset-inline-end: 26px;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+.sidebar-filter-clear {
+  position: absolute;
+  inset-inline-end: 2px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  line-height: 1.6;
+  cursor: pointer;
+}
+
+.sidebar-filter-clear:hover {
+  color: var(--text);
+}
+
+.sidebar-filter-input:focus-visible,
+.sidebar-filter-clear:focus-visible {
+  border-color: var(--ring);
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
 }
 
 /* A project group: a native disclosure, so collapsing one needs no keyboard
@@ -706,6 +821,217 @@ body {
   cursor: pointer;
 }
 
+/* A pane's find bar (Cmd+F), laid out as Orca's `TerminalSearch`: pinned to
+   the pane's top right, 340px wide, over the terminal. */
+.terminal-search {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  /* Above every layer xterm stacks in the pane (its scrollbar is 11). */
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  width: 340px;
+  max-width: calc(100% - 16px);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--popover) 95%, transparent);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.25);
+}
+
+.terminal-search-query {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+  outline: none;
+}
+
+.terminal-search-query::placeholder {
+  color: var(--muted-foreground);
+}
+
+.terminal-search button {
+  flex-shrink: 0;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.terminal-search button:hover,
+.terminal-search button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.terminal-search-count {
+  flex-shrink: 0;
+  padding: 0 4px;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.terminal-search-divider {
+  flex-shrink: 0;
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--border);
+}
+
+/* The split panes: each group a box placed by `layout.ts`'s geometry, its
+   own tab strip on top; each terminal a box of its own over its group's
+   body, so a tab moving between groups is only a new position. */
+.panes {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--terminal-bg);
+}
+
+.pane-group {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The strip's border inside its height, so the terminal placed right under
+   it (`var(--h-tabs)` down) never covers the focused pane's mark. */
+.pane-strip {
+  box-sizing: border-box;
+}
+
+/* Of several panes, the focused one's strip carries the ring's colour on its
+   bottom edge, as Orca marks its focused group; the others dim a little. */
+.panes:not([data-groups="1"]) .pane-group[data-focused] .pane-strip {
+  border-bottom-color: var(--ring);
+}
+
+.panes:not([data-groups="1"]) .pane-group:not([data-focused]) .pane-strip {
+  opacity: 0.8;
+}
+
+.pane-actions {
+  margin-left: auto;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.pane-slot {
+  position: absolute;
+}
+
+.pane-slot > .terminal {
+  position: absolute;
+  inset: 0;
+}
+
+/* A seam's handle: a band wide enough to grab, drawn as a hairline. */
+.pane-divider {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+
+.pane-divider[data-axis="row"] {
+  width: 6px;
+  margin-left: -3px;
+  cursor: col-resize;
+}
+
+.pane-divider[data-axis="column"] {
+  height: 6px;
+  margin-top: -3px;
+  cursor: row-resize;
+}
+
+.pane-divider::after {
+  content: "";
+  position: absolute;
+  background: var(--border);
+}
+
+.pane-divider[data-axis="row"]::after {
+  inset: 0 2px 0 3px;
+}
+
+.pane-divider[data-axis="column"]::after {
+  inset: 3px 0 2px 0;
+}
+
+.pane-divider:hover::after,
+.pane-divider[data-dragging]::after {
+  background: var(--ring);
+}
+
+/* Where a dragged tab would land. */
+.pane-drop {
+  position: absolute;
+  z-index: 3;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--ring) 16%, transparent);
+  outline: 1px solid var(--ring);
+  outline-offset: -1px;
+}
+
+.pane-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--popover);
+  box-shadow: var(--float-shadow);
+}
+
+.pane-menu-heading {
+  padding: 4px 8px;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+}
+
+.pane-menu button {
+  padding: 4px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-menu button:hover,
+.pane-menu button:focus-visible {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  outline: none;
+}
+
 .toasts {
   position: fixed;
   right: 16px;
@@ -806,6 +1132,45 @@ body {
 .palette .empty {
   color: var(--muted-foreground);
   padding: 10px 14px;
+}
+
+/* A sidebar row's context menu (`row_menu.tsx`): Orca's small dropdown at the
+   pointer, on the elevated menu tokens. Fixed, so a scrolled sidebar still
+   puts it where the right-click was. */
+.row-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 13rem;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+}
+
+.row-menu-item {
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+  text-align: left;
+  cursor: pointer;
+}
+
+.row-menu-item:hover:not([aria-disabled="true"]),
+.row-menu-item:focus-visible {
+  background: var(--highlight);
+  outline: none;
+}
+
+.row-menu-item[aria-disabled="true"] {
+  color: var(--muted-foreground);
+  cursor: default;
 }
 
 /* The new-worktree composer (Mod+N): a floating surface like the palette's,
@@ -2187,3 +2552,49 @@ body {
   display: contents;
 }
 
+
+/* A pane's right-click menu, as Orca's `TerminalContextMenu`: opened at the
+   pointer, on the elevated surface the tokens keep for menus. */
+.terminal-menu {
+  position: fixed;
+  /* Over xterm's layers and the find bar (12). */
+  z-index: 13;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  min-width: 240px;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: 8px;
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  backdrop-filter: blur(20px);
+  color: var(--text);
+}
+
+.terminal-menu button {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: var(--text-row);
+  text-align: left;
+  cursor: pointer;
+}
+
+.terminal-menu button:focus {
+  background: var(--accent);
+  outline: none;
+}
+
+.terminal-menu kbd {
+  margin-left: auto;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}

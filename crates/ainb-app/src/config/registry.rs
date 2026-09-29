@@ -2718,6 +2718,17 @@ mod tests {
         );
     }
 
+    /// `[hangar] spawn` is the daemon's boot-read spawn opt-out: no settings
+    /// surface may write it, so it must never become a registered key.
+    #[test]
+    fn the_daemon_spawn_opt_out_is_not_a_settable_key() {
+        let mut root = toml::Value::Table(toml::map::Map::new());
+        for value in ["true", "false"] {
+            assert!(set_validated(&mut root, "hangar.spawn", value).is_err());
+        }
+        assert!(root.as_table().is_some_and(toml::map::Map::is_empty));
+    }
+
     #[test]
     fn set_validated_writes_through_a_nested_path() {
         let mut root = toml::Value::Table(toml::map::Map::new());
