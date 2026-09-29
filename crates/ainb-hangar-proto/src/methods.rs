@@ -1843,8 +1843,9 @@ pub const WORKTREE_AGENT_ADD: &str = "worktree/agent_add";
 /// repository or a worktree ainb created.
 ///
 /// Dark, like [`WORKTREE_CREATE`]: `METHOD_NOT_FOUND` unless
-/// `AINB_HANGAR_SPAWN` is set at boot, and not in the mutation registry
-/// until its flip PR.
+/// `AINB_HANGAR_SPAWN` is set at boot. In the mutation registry already, so
+/// a retried op id replays the first create instead of opening a second
+/// shell.
 ///
 /// Params: [`crate::spawn::ShellCreateParams`].
 /// Result: [`crate::spawn::ShellCreateResult`].
@@ -1864,8 +1865,8 @@ pub const SHELL_LIST: &str = "shell/list";
 /// name. Any other name is refused before tmux runs.
 ///
 /// Dark, like [`SHELL_CREATE`]: `METHOD_NOT_FOUND` unless
-/// `AINB_HANGAR_SPAWN` is set at boot, and not in the mutation registry
-/// until its flip PR.
+/// `AINB_HANGAR_SPAWN` is set at boot. In the mutation registry, like
+/// [`SHELL_CREATE`].
 ///
 /// Params: [`crate::spawn::ShellCloseParams`].
 /// Result: [`crate::spawn::ShellCloseResult`].
