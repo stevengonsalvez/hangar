@@ -706,6 +706,80 @@ body {
   cursor: pointer;
 }
 
+/* A pane's find bar (Cmd+F), laid out as Orca's `TerminalSearch`: pinned to
+   the pane's top right, 340px wide, over the terminal. */
+.terminal-search {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  /* Above every layer xterm stacks in the pane (its scrollbar is 11). */
+  z-index: 12;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  box-sizing: border-box;
+  width: 340px;
+  max-width: calc(100% - 16px);
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--popover) 95%, transparent);
+  color: var(--text);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 0.25);
+}
+
+.terminal-search-query {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-row);
+  outline: none;
+}
+
+.terminal-search-query::placeholder {
+  color: var(--muted-foreground);
+}
+
+.terminal-search button {
+  flex-shrink: 0;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  cursor: pointer;
+}
+
+.terminal-search button:hover,
+.terminal-search button[aria-pressed="true"] {
+  background: var(--accent);
+  color: var(--text);
+}
+
+.terminal-search-count {
+  flex-shrink: 0;
+  padding: 0 4px;
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.terminal-search-divider {
+  flex-shrink: 0;
+  width: 1px;
+  height: 16px;
+  margin: 0 2px;
+  background: var(--border);
+}
+
 .toasts {
   position: fixed;
   right: 16px;
