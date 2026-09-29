@@ -68,9 +68,10 @@ export function Composer(props: Props) {
 
   // Read per open (this is mounted only while open), so a folder registered
   // since the last open is offered. It lands after the first paint: a blank
-  // project is filled then, a listed pick is left alone, and a pick the new
-  // rows no longer carry moves to the first row (or clears), so what is sent
-  // is always what the select shows.
+  // project is filled then, and a listed pick is left alone. A pick the new
+  // rows no longer carry is cleared, never moved to another row: Create is
+  // then refused ("Choose a project.") rather than sent to a repository the
+  // person never chose.
   const [registered, { mutate: setRegistered, refetch: refetchRegistered }] = createResource(loadRegisteredProjects, {
     initialValue: [],
   });
@@ -84,8 +85,8 @@ export function Composer(props: Props) {
     const rows = projects();
     const pick = untrack(fields).projectPath;
     if (rows.some((project) => project.path === pick)) return;
-    const first = rows[0]?.path ?? "";
-    if (first !== pick) set("projectPath", first);
+    const next = pick === "" ? (rows[0]?.path ?? "") : "";
+    if (next !== pick) set("projectPath", next);
   });
   const preview = createMemo(() => branchPreview(fields().name));
 
@@ -203,6 +204,13 @@ export function Composer(props: Props) {
             {/* `selected` per option, not only the select's value: a refetched
                 list replaces the options, and a replaced option would
                 otherwise drop the choice back to the first row. */}
+            {/* Without it a select with no pick shows its first row, which
+                is not what Create would send. */}
+            <Show when={fields().projectPath === "" && projects().length > 0}>
+              <option value="" selected disabled>
+                Choose a project
+              </option>
+            </Show>
             <For each={projects()}>
               {(project) => (
                 <option value={project.path} selected={project.path === fields().projectPath}>
