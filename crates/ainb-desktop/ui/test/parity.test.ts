@@ -19,7 +19,13 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { renderToString } from "solid-js/web";
 import type { ConfigView_Serialize, HangarView_Serialize } from "../../../ainb-app/bindings/AppState";
-import { editRefusal, SECRET_REASON } from "../src/settings.ts";
+import {
+  DENIED_REASON,
+  editRefusal,
+  NOT_DRAWN_REASON,
+  SECRET_REASON,
+  TUI_THEME_REASON,
+} from "../src/settings.ts";
 import { SettingsPage } from "../src/settings.tsx";
 
 const PARITY_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../../ainb-app/tests/parity");
@@ -116,9 +122,21 @@ test("the page's edit policy is the reducer's, row for row", () => {
     .filter((line) => line !== "")
     .map((line) => line.split(" ") as [string, string]);
   assert.ok(verdicts.length > 100, "the fixture lists the registry");
-  const wrong = verdicts.filter(([verdict, key]) => {
-    const refusal = editRefusal(key, verdict === "secret");
-    return verdict === "allow" ? refusal !== null : verdict === "secret" ? refusal !== SECRET_REASON : refusal === null;
-  });
+  const expected: Record<string, string | null> = {
+    allow: null,
+    deny: DENIED_REASON,
+    secret: SECRET_REASON,
+    theme: TUI_THEME_REASON,
+  };
+  const wrong = verdicts.filter(([verdict, key]) => editRefusal(key, verdict === "secret") !== expected[verdict]);
   assert.deepEqual(wrong, [], "rows where the page and the reducer disagree");
+});
+
+test("every refusal the page draws is the reducer's own sentence", () => {
+  // The page keeps a copy of each reason to draw a row inert without a round
+  // trip; `renderer_edit.rs` is where they are written.
+  const reducer = readFileSync(join(PARITY_DIR, "../../src/config/renderer_edit.rs"), "utf8");
+  for (const reason of [DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON]) {
+    assert.ok(reducer.includes(JSON.stringify(reason)), `renderer_edit.rs does not say: ${reason}`);
+  }
 });

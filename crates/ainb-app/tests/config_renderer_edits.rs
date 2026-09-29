@@ -21,7 +21,8 @@ use ainb_app::app::pointer;
 use ainb_app::app::screens::ids as screen_ids;
 use ainb_app::config::registry::{self, RowKind};
 use ainb_app::config::renderer_edit::{
-    self, ALLOWED, DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_REASON,
+    self, ALLOWED, DENIED, DENIED_REASON, NOT_DRAWN_REASON, SECRET_REASON, TUI_THEME_KEY,
+    TUI_THEME_REASON,
 };
 use ainb_app::config::settings_model::{
     ConfigCategory, ConfigRowEdit, ConfigSetting, ConfigValue, SecretValue,
@@ -159,8 +160,17 @@ fn every_registry_row_is_classified_exactly_once() {
         allowed_secret.is_empty(),
         "a secret row is allowed: {allowed_secret:?}"
     );
+    assert!(
+        rows.contains(TUI_THEME_KEY),
+        "{TUI_THEME_KEY} is a registry row"
+    );
+    assert!(
+        !denied.contains(TUI_THEME_KEY) && !allowed.contains(TUI_THEME_KEY),
+        "{TUI_THEME_KEY} is on a list"
+    );
     let unclassified: Vec<_> = rows
         .iter()
+        .filter(|key| **key != TUI_THEME_KEY)
         .filter(|key| !denied.contains(*key) && !allowed.contains(*key) && !secrets.contains(*key))
         .collect();
     assert!(
@@ -171,6 +181,22 @@ fn every_registry_row_is_classified_exactly_once() {
         assert!(
             !pattern.ends_with('.'),
             "a prefix on the allow list: {pattern}"
+        );
+    }
+}
+
+/// A deny-list entry's `why` is for whoever reads the list; a renderer hears
+/// [`DENIED_REASON`] for every one (a secret, [`SECRET_REASON`]). No entry
+/// carries a sentence that reads like a refusal the person never sees.
+#[test]
+fn every_denied_row_is_refused_with_the_denied_reason() {
+    for (pattern, why) in DENIED {
+        let secret = registry::row(pattern).is_some_and(|row| matches!(row.kind, RowKind::Secret));
+        let expected = if secret { SECRET_REASON } else { DENIED_REASON };
+        assert_eq!(
+            renderer_edit::refusal(&concrete(pattern)),
+            Some(expected),
+            "{pattern}: {why}"
         );
     }
 }
@@ -211,7 +237,14 @@ fn every_executable_valued_row_in_the_schema_is_denied() {
 #[test]
 fn every_denied_row_is_refused_from_a_renderer_by_name_and_by_key_sequence() {
     let keymap = Keymap::defaults();
-    for (pattern, why) in DENIED {
+    // The TUI's theme is refused the same two ways, with its own sentence
+    // naming where the desktop's theme lives.
+    let refused = DENIED.iter().map(|(pattern, why)| (*pattern, *why, DENIED_REASON)).chain([(
+        TUI_THEME_KEY,
+        "the desktop's theme has one owner",
+        TUI_THEME_REASON,
+    )]);
+    for (pattern, why, reason) in refused {
         // A secret row on the deny list is refused as a secret first; the
         // secret test below covers it.
         if registry::row(pattern).is_some_and(|row| matches!(row.kind, RowKind::Secret)) {
@@ -219,13 +252,6 @@ fn every_denied_row_is_refused_from_a_renderer_by_name_and_by_key_sequence() {
         }
         let key = concrete(pattern);
         let mut state = text_row(&key);
-        // Refused like every denied row, but with its own sentence: the TUI's
-        // theme names where the desktop's lives instead.
-        let reason = if *pattern == "ui_preferences.theme" {
-            TUI_THEME_REASON
-        } else {
-            DENIED_REASON
-        };
 
         // By name: the command's action is judged before the reducer runs it,
         // and the reducer drops the payload even so, with a notice.
@@ -412,7 +438,7 @@ fn the_verdicts_match_the_committed_fixture() {
         committed, verdicts,
         "renderer_editable_rows.txt is stale: regenerate it and update settings.ts"
     );
-    for verdict in ["allow ", "deny ", "secret "] {
+    for verdict in ["allow ", "deny ", "secret ", "theme "] {
         assert!(
             verdicts.lines().any(|line| line.starts_with(verdict)),
             "{verdict}"

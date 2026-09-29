@@ -4,9 +4,11 @@
 //! two exact lists of registry keys and refused otherwise: [`DENIED`], the
 //! rows whose value reaches a program the host runs, a socket it binds or
 //! connects to, a mount, an approval gate, or the bridge's identity; and
-//! [`ALLOWED`], the rows the desktop's settings page edits. Deny by default: a
-//! row on neither list is refused, and `tests/config_renderer_edits.rs` walks
-//! the whole config schema so a new row fails until it is classified here.
+//! [`ALLOWED`], the rows the desktop's settings page edits. One row is on
+//! neither, refused for ownership rather than trust: [`TUI_THEME_KEY`]. Deny
+//! by default: a row on neither list is refused, and
+//! `tests/config_renderer_edits.rs` walks the whole config schema so a new
+//! row fails until it is classified here.
 //! There are no prefixes; each entry names one row, with `*` for a map
 //! segment only. Hidden registry entries (no row on the screen) are on
 //! neither list: an edit of one finds no row and is refused as unclassified.
@@ -29,16 +31,10 @@
 
 use super::registry;
 
-/// Rows a renderer may never set, each with why.
-///
-/// One entry is here for ownership, not trust: `ui_preferences.theme` is the
-/// terminal UI's own colour theme, and the desktop's theme has one owner, its
-/// Settings > Appearance switch. See [`TUI_THEME_REASON`].
+/// Rows a renderer may never set, each with why. The why is for whoever
+/// reads this list; a renderer's edit of any of them is refused with
+/// [`DENIED_REASON`].
 pub const DENIED: &[(&str, &str)] = &[
-    (
-        "ui_preferences.theme",
-        "the terminal UI's own theme; the desktop's is Settings > Appearance",
-    ),
     ("presets.file", "a file the host reads presets from"),
     (
         "general.skill_install_real_homes",
@@ -367,9 +363,15 @@ pub const SECRET_REASON: &str =
 /// `Text` intents stop at the same count.
 pub const MAX_TEXT_CHARS: usize = 2_000;
 
-/// Why a renderer may not set `ui_preferences.theme`: the settings page's
-/// own copy (`TUI_THEME_REASON` in `ainb-desktop/ui/src/settings.ts`) says the
-/// same, so the person sees where the desktop's theme lives.
+/// The terminal UI's own colour theme. A renderer may not set it, for
+/// ownership rather than trust: the desktop's theme has one owner, its
+/// Settings > Appearance switch, so the row is on neither list and is refused
+/// with [`TUI_THEME_REASON`].
+pub const TUI_THEME_KEY: &str = "ui_preferences.theme";
+
+/// Why a renderer may not set [`TUI_THEME_KEY`]: the settings page's own copy
+/// (`TUI_THEME_REASON` in `ainb-desktop/ui/src/settings.ts`) says the same, so
+/// the person sees where the desktop's theme lives.
 pub const TUI_THEME_REASON: &str =
     "this is the terminal UI's theme; the desktop's is Settings > Appearance above";
 
@@ -385,7 +387,7 @@ pub fn refusal(key: &str) -> Option<&'static str> {
     if registry::row(key).is_some_and(|row| matches!(row.kind, registry::RowKind::Secret)) {
         return Some(SECRET_REASON);
     }
-    if normalised == "ui_preferences.theme" {
+    if normalised == TUI_THEME_KEY {
         return Some(TUI_THEME_REASON);
     }
     if DENIED.iter().any(|(pattern, _)| *pattern == normalised) {
@@ -442,8 +444,9 @@ fn is_format(c: char) -> bool {
 }
 
 /// Every registry row with the verdict a renderer's edit of it gets, one line
-/// each: `allow <key>`, `deny <key>` or `secret <key>`. Committed as a fixture
-/// so the page's own copy of the policy is diffed against this one.
+/// each: `allow <key>`, `deny <key>`, `secret <key>` or, for
+/// [`TUI_THEME_KEY`], `theme <key>`. Committed as a fixture so the page's own
+/// copy of the policy is diffed against this one, reason by reason.
 #[must_use]
 pub fn verdicts() -> String {
     let mut lines: Vec<String> = registry::rows()
@@ -451,6 +454,7 @@ pub fn verdicts() -> String {
             let verdict = match refusal(row.key) {
                 None => "allow",
                 Some(SECRET_REASON) => "secret",
+                Some(TUI_THEME_REASON) => "theme",
                 Some(_) => "deny",
             };
             format!("{verdict} {}", row.key)
@@ -480,7 +484,7 @@ mod tests {
     #[test]
     fn there_are_no_prefixes_so_a_sibling_row_is_not_allowed_by_its_neighbour() {
         assert_eq!(refusal("ui_preferences.show_git_status"), None);
-        assert_eq!(refusal("ui_preferences.theme"), Some(TUI_THEME_REASON));
+        assert_eq!(refusal(TUI_THEME_KEY), Some(TUI_THEME_REASON));
         assert_eq!(
             refusal("ui_preferences.preferred_editor"),
             Some(DENIED_REASON)

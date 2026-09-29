@@ -225,9 +225,11 @@ export const MAX_TEXT_CHARS = 2000;
 export const DENIED_REASON = "its value reaches something the host runs, binds or trusts, so the window may not set it";
 export const NOT_DRAWN_REASON = "the window's settings page does not edit it";
 export const SECRET_REASON = "a secret is set from the terminal, not the window; the page shows only whether it is set";
-/** `ui_preferences.theme` is the TUI's own colour theme (dark or light only).
- * The desktop's theme has one owner, Settings > Appearance above, so a pick
- * here never repaints every TUI, and the two are never at odds. */
+/** The TUI's own colour theme (dark or light only). Refused for ownership,
+ * not trust: the desktop's theme has one owner, Settings > Appearance above,
+ * so a pick here never repaints every TUI, and the two are never at odds. On
+ * neither list; the fixture's `theme` verdict names it. */
+export const TUI_THEME_KEY = "ui_preferences.theme";
 export const TUI_THEME_REASON = "this is the terminal UI's theme; the desktop's is Settings > Appearance above";
 
 /** Whether the concrete key `key` meets `pattern`, `*` standing for one map segment. */
@@ -246,7 +248,7 @@ function matchesPattern(pattern: string, key: string): boolean {
  */
 export function editRefusal(key: string, secret = false): string | null {
   if (secret) return SECRET_REASON;
-  if (key === "ui_preferences.theme") return TUI_THEME_REASON;
+  if (key === TUI_THEME_KEY) return TUI_THEME_REASON;
   if (DENIED_ROWS.some((pattern) => matchesPattern(pattern, key))) return DENIED_REASON;
   if (ALLOWED_ROWS.some((pattern) => matchesPattern(pattern, key))) return null;
   return NOT_DRAWN_REASON;
