@@ -236,12 +236,12 @@ function Shell() {
       // The session list follows the shown terminal, whoever showed it, so
       // the sidebar row and the answer banner are that session's.
       const select = selectIntentFor(tabs(), key);
-      // Off the settings page first, as Orca leaves any page for the terminal
-      // before it activates a worktree: there the reducer is on its Config
-      // screen, whose gate refuses a session-list row. One ordered run, so
-      // `first` and the row go only once the reducer is back on the list.
-      const leave = settings() ? CLOSE_SETTINGS : [];
-      void run([...leave, ...first, ...(select === null ? [] : [select])]);
+      // Back to the session list first, as Orca leaves any page for the
+      // terminal before it activates a worktree: on Settings or the Inbox the
+      // reducer is on a screen whose gate refuses a session-list row. The host
+      // decides by the reducer's own screen (#121), which a frame can trail,
+      // and `first` and the row go only once it is back on the list.
+      void invoke("answer_home").then(() => run([...first, ...(select === null ? [] : [select])]));
       setPane("terminal");
       closeTranscript();
       focusTab(key, byHost);
