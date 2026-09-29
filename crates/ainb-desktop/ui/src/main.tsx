@@ -6,6 +6,7 @@ import type { FrameBatch_Serialize, HostId } from "../../../ainb-app/bindings/Ap
 import { ackTurn, pruneAcks, readAcks, rowAckKey, writeAcks, type AckMap, type AckStorage } from "./acks.ts";
 import { createFrameStore } from "./store.ts";
 import { Stats } from "./stats.tsx";
+import { UsageSegment } from "./usage_segment.tsx";
 import {
   configRevision,
   shellAgentStatus,
@@ -835,7 +836,16 @@ function Shell() {
           idle={countIn(columns(), "idle")}
           // A development build shows frames the store refused (#1132).
           framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
-        />
+        >
+          <UsageSegment
+            usage={usage()}
+            stale={usageStale()}
+            onOpen={() => {
+              closeTranscript();
+              setPane("stats");
+            }}
+          />
+        </Statusbar>
         <Show when={palette()}>
           <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
         </Show>
