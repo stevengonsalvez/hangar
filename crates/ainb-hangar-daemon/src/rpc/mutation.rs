@@ -35,7 +35,10 @@
 //! verb this daemon does not serve (turned off at boot, or an unadvertised
 //! capability): nothing ran, and the same op id must execute once the verb
 //! is served. `REPO_NOT_REGISTERED` is a spawn verb refused before it ran
-//! anything: the same op id must execute once the project is added.
+//! anything: the same op id must execute once the project is added. A spawn
+//! verb that did start `ainb run` and got no session back answers
+//! `SPAWN_STARTED`, which is recorded: the run may still be making it, or
+//! has run its own rollback.
 
 use ainb_hangar_proto::mutation::{
     ACK_KEY, MutatingMethod, MutationAck, MutationStatus, MutationTier, OpId,
@@ -333,6 +336,20 @@ fn store_error(error: &sqlx::Error) -> RpcError {
 /// handler may raise them only from its checks, never after it has started
 /// work. The spawn verbs refuse an unregistered repository while resolving
 /// the path, before `ainb run` or tmux runs.
+///
+/// `INTERNAL_ERROR` frees the op id on the same promise: it is raised only
+/// before the handler has any effect. On `worktree/create` and
+/// `worktree/agent_add` that holds by construction: once `ainb run` is
+/// started, every outcome short of a session (the run outlived its bound, its
+/// wait was lost, it failed, its output was not a session) is
+/// [`SPAWN_STARTED`](ainb_hangar_proto::spawn::SPAWN_STARTED), which is
+/// recorded, so a retry replays the answer instead of running `ainb run` a
+/// second time. `INTERNAL_ERROR` there means nothing was started: no home
+/// directory, a worktree check that could not finish, no place for the run's
+/// output, or an `ainb` that could not be spawned. (Serializing the session a
+/// run returned is the one step after an effect that answers through
+/// `INTERNAL_ERROR`, and it cannot fail: the result is a plain struct of
+/// strings.)
 const fn frees_the_op_id(code: i32) -> bool {
     code == super::STORE_UNAVAILABLE
         || code == super::INTERNAL_ERROR
@@ -872,7 +889,13 @@ mod tests {
         assert!(frees_the_op_id(
             ainb_hangar_proto::spawn::REPO_NOT_REGISTERED
         ));
-        for code in [-32602, -32000, -32008, -32009, -32011] {
+        for code in [
+            -32602,
+            -32000,
+            -32008,
+            -32009,
+            ainb_hangar_proto::spawn::SPAWN_STARTED,
+        ] {
             assert!(
                 !frees_the_op_id(code),
                 "{code} must be recorded, not abandoned"
