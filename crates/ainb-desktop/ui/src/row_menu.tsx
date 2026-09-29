@@ -9,8 +9,10 @@ interface Props {
   label: string;
   items: RowMenuItem[];
   onPick(action: RowMenuAction): void;
-  /** Esc, Tab, or a press outside: close without choosing. */
-  onClose(): void;
+  /** Close without choosing. `restore` is true for Esc and Tab, which give
+   * the keyboard back to the row; false when it has already gone elsewhere
+   * (a press outside, another control, the window losing focus). */
+  onClose(restore: boolean): void;
 }
 
 /**
@@ -37,10 +39,21 @@ export function RowMenu(props: Props) {
     focusAt(stepItem(props.items, -1, 1));
     // Capture, so a press that something else stops still closes the menu.
     const outside = (event: Event) => {
-      if (!menu.contains(event.target as Node)) props.onClose();
+      if (!menu.contains(event.target as Node)) props.onClose(false);
     };
+    // A menu left drawn at a point that no longer matches its row, or over a
+    // window nobody is looking at, is closed, as a native one is.
+    const away = () => props.onClose(false);
     document.addEventListener("pointerdown", outside, true);
-    onCleanup(() => document.removeEventListener("pointerdown", outside, true));
+    document.addEventListener("scroll", away, true);
+    window.addEventListener("blur", away);
+    window.addEventListener("resize", away);
+    onCleanup(() => {
+      document.removeEventListener("pointerdown", outside, true);
+      document.removeEventListener("scroll", away, true);
+      window.removeEventListener("blur", away);
+      window.removeEventListener("resize", away);
+    });
   });
 
   const onKeyDown = (event: KeyboardEvent) => {
@@ -57,7 +70,7 @@ export function RowMenu(props: Props) {
         break;
       case "Escape":
       case "Tab":
-        props.onClose();
+        props.onClose(true);
         break;
       default:
         return;
@@ -74,6 +87,12 @@ export function RowMenu(props: Props) {
       aria-label={props.label}
       style={{ left: `${props.x}px`, top: `${props.y}px` }}
       onKeyDown={onKeyDown}
+      // The keyboard went to another control (the palette, the composer): the
+      // menu closes and leaves it there.
+      onFocusOut={(event) => {
+        const next = event.relatedTarget as Node | null;
+        if (next !== null && !menu.contains(next)) props.onClose(false);
+      }}
       // A right-click on the open menu is not a second menu over it.
       onContextMenu={(event) => event.preventDefault()}
     >
@@ -85,7 +104,9 @@ export function RowMenu(props: Props) {
             role="menuitem"
             class="row-menu-item"
             tabIndex={-1}
-            disabled={item.disabled}
+            // Not `disabled`: that would hide the item and its reason from a
+            // screen reader. The arrows skip it and a click runs nothing.
+            aria-disabled={item.disabled ? "true" : undefined}
             title={item.reason}
             onClick={() => {
               if (!item.disabled) props.onPick(item.action);
