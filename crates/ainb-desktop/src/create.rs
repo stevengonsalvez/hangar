@@ -18,6 +18,8 @@ use ainb_hangar_proto::spawn::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::shell_tab::MAY_STILL_OPEN;
+
 /// The JSON-RPC code for a method the daemon does not serve.
 const METHOD_NOT_FOUND: i32 = -32601;
 /// The JSON-RPC code for params the daemon refused.
@@ -93,32 +95,104 @@ pub fn params(args: CreateWorktreeArgs, op_id: OpId) -> WorktreeCreateParams {
     }
 }
 
-/// Which spawn request a sentence or an op id is for: the window's two ways
-/// of starting an agent, which share one reading of the daemon's codes.
+/// Which daemon request a sentence or an op id is for: the window's spawn
+/// verbs (a new worktree, a new agent, a new terminal) and a terminal's close,
+/// which share one reading of the daemon's codes, so each code has one
+/// sentence here and nowhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnVerb {
     /// `worktree/create`: a new worktree with an agent in it.
     CreateWorktree,
     /// `worktree/agent_add`: one more agent in a worktree that exists.
     AddAgent,
+    /// `shell/create`: a plain terminal in a worktree.
+    OpenTerminal,
+    /// `shell/close`: end a terminal the daemon opened.
+    CloseTerminal,
+}
+
+impl SpawnVerb {
+    /// What was being done, to lead a failure: "Opening the terminal failed".
+    const fn doing(self) -> &'static str {
+        match self {
+            Self::CreateWorktree => "Creating the worktree",
+            Self::AddAgent => "Adding the agent",
+            Self::OpenTerminal => "Opening the terminal",
+            Self::CloseTerminal => "Closing the terminal",
+        }
+    }
+
+    /// What a daemon without the verb cannot do.
+    const fn missing(self) -> &'static str {
+        match self {
+            Self::CreateWorktree => "create worktrees",
+            Self::AddAgent => "add agents to a worktree",
+            Self::OpenTerminal | Self::CloseTerminal => "run shells",
+        }
+    }
+
+    /// The repository an unregistered refusal is about: a create names its
+    /// source, the others the worktree they act in.
+    const fn repository(self) -> &'static str {
+        match self {
+            Self::CreateWorktree => "this repository is",
+            _ => "this worktree's repository is",
+        }
+    }
+
+    /// What a request that may already have happened says, with the
+    /// daemon's `detail`: a second press could start a second one. `None`
+    /// for a close, which starts nothing.
+    fn may_have_started(self, detail: &str) -> Option<String> {
+        match self {
+            Self::CreateWorktree => Some(format!(
+                "The create started but did not finish: {detail}. Check the sidebar before creating again."
+            )),
+            Self::AddAgent => Some(format!(
+                "The agent was started but has not reported back yet: {detail}. Check the sidebar before adding another."
+            )),
+            Self::OpenTerminal => Some(format!("{MAY_STILL_OPEN} ({detail})")),
+            Self::CloseTerminal => None,
+        }
+    }
+
+    /// What a request the daemon did not answer in time says. `None` for a
+    /// close: nothing can have started, so it simply failed.
+    fn unanswered(self) -> Option<String> {
+        match self {
+            Self::CreateWorktree => Some(
+                "The daemon did not answer in time: the worktree may still be creating; check the sidebar."
+                    .into(),
+            ),
+            Self::AddAgent => Some(
+                "The daemon did not answer in time: the agent may still be starting; check the sidebar."
+                    .into(),
+            ),
+            Self::OpenTerminal => Some(format!("{MAY_STILL_OPEN} (the daemon did not answer in time)")),
+            Self::CloseTerminal => None,
+        }
+    }
 }
 
 /// A fresh op id for one request. Every request mints its own: nothing in the
 /// window retries a press, so two presses (Create twice, an agent picked
-/// twice) are two ops the daemon keeps apart, never one it would fold.
+/// twice, New terminal twice) are two ops the daemon keeps apart, never one
+/// it would fold.
 #[must_use]
 pub fn mint_op_id(verb: SpawnVerb) -> OpId {
     let prefix = match verb {
         SpawnVerb::CreateWorktree => "desktop-create",
         SpawnVerb::AddAgent => "desktop-agent-add",
+        SpawnVerb::OpenTerminal | SpawnVerb::CloseTerminal => "desktop-shell",
     };
     OpId::parse(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
         .expect("a uuid op id is always well formed")
 }
 
-/// A spawn verb's daemon error as the sentence the window shows. Chosen by
-/// the error's code, never its words; the daemon's detail is shown where it
-/// is the answer (a refused field, a failure, a run that started).
+/// A daemon error as the sentence the window shows for `verb`: the one place
+/// a code becomes words. Chosen by the error's code, never its words; the
+/// daemon's detail is shown where it is the answer (a refused field, a
+/// failure, a run that started, an unregistered repository).
 ///
 /// The spawn opt-out is named in the file the daemon reads it from, by the
 /// daemon's own rule: `$AINB_HANGAR_HOME` when set, else `~/.agents-in-a-box`.
@@ -135,65 +209,30 @@ pub fn spawn_refusal_text(error: &DaemonError, verb: SpawnVerb) -> String {
 /// sentence is testable without touching the environment.
 #[must_use]
 pub fn refusal_sentence(error: &DaemonError, verb: SpawnVerb, spawn_config: &Path) -> String {
-    let create = verb == SpawnVerb::CreateWorktree;
+    let doing = verb.doing();
     match error {
         DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => format!(
-            "This daemon does not {}: it is older than this app, or was started with AINB_HANGAR_SPAWN=0 or with [hangar] spawn = false in {} (or with that file unreadable). Update it, or restart it without that setting.",
-            if create {
-                "create worktrees"
-            } else {
-                "add agents to a worktree"
-            },
+            "{doing} failed: this daemon does not {}. It is older than this app, or was started with AINB_HANGAR_SPAWN=0 or with [hangar] spawn = false in {} (or with that file unreadable). Update it, or restart it without that setting.",
+            verb.missing(),
             spawn_config.display()
         ),
-        DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => format!(
-            "{} not in a registered project folder: use Add project to pick its folder, then {} again.",
-            if create {
-                "This repository is"
-            } else {
-                "This worktree's repository is"
-            },
-            if create { "create" } else { "add the agent" }
+        DaemonError::Rpc { code, message } if *code == REPO_NOT_REGISTERED => format!(
+            "{doing} failed: {} not in a registered project folder. Use Add project to pick its folder, then try again. ({message})",
+            verb.repository()
         ),
-        DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => format!(
-            "The daemon refused {}: {message}",
-            if create {
-                "the request"
-            } else {
-                "the new agent"
-            }
-        ),
-        // `ainb run` ran: it is still going, or it failed after starting.
-        // Either way this is not a spawn that never happened, and a second
-        // press could start a second one.
-        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => {
-            if create {
-                format!(
-                    "The create started but did not finish: {message}. Check the sidebar before creating again."
-                )
-            } else {
-                format!(
-                    "The agent was started but has not reported back yet: {message}. Check the sidebar before adding another."
-                )
-            }
+        DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
+            format!("{doing} failed: the daemon refused it: {message}")
         }
-        DaemonError::Rpc { message, .. } => format!(
-            "{} failed: {message}",
-            if create {
-                "Creating the worktree"
-            } else {
-                "Adding the agent"
-            }
-        ),
-        DaemonError::Timeout(_) => format!(
-            "The daemon did not answer in time: {}; check the sidebar.",
-            if create {
-                "the worktree may still be creating"
-            } else {
-                "the agent may still be starting"
-            }
-        ),
-        other => format!("The daemon is not reachable: {other}"),
+        // `ainb run` or tmux ran: it is still going, or it failed after
+        // starting. Either way this is not a request that never happened.
+        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => verb
+            .may_have_started(message)
+            .unwrap_or_else(|| format!("{doing} failed: {message}")),
+        DaemonError::Rpc { message, .. } => format!("{doing} failed: {message}"),
+        DaemonError::Timeout(_) => verb
+            .unanswered()
+            .unwrap_or_else(|| format!("{doing} failed: the daemon did not answer in time.")),
+        other => format!("{doing} failed: the daemon is not reachable: {other}"),
     }
 }
 
@@ -264,7 +303,7 @@ mod tests {
 
     #[test]
     fn refusals_read_as_sentences() {
-        use SpawnVerb::{AddAgent, CreateWorktree};
+        use SpawnVerb::{AddAgent, CloseTerminal, CreateWorktree, OpenTerminal};
         let text = |code: i32, message: &str, verb| {
             refusal_sentence(
                 &DaemonError::Rpc {
@@ -275,12 +314,11 @@ mod tests {
                 Path::new("/srv/hangar-home/config/config.toml"),
             )
         };
-        for verb in [CreateWorktree, AddAgent] {
+        for verb in [CreateWorktree, AddAgent, OpenTerminal, CloseTerminal] {
             // The verbs are on by default: a daemon that does not serve one
-            // is older than this app, or was started with the opt-out.
+            // is older than this app, or was started with an opt-out.
             let dark = text(METHOD_NOT_FOUND, "unknown method", verb);
             assert!(dark.contains("AINB_HANGAR_SPAWN=0"), "{dark}");
-            assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
             assert!(dark.contains("[hangar] spawn = false"), "{dark}");
             // The file the daemon reads, not a fixed `~/.agents-in-a-box`.
             assert!(
@@ -288,43 +326,44 @@ mod tests {
                 "{dark}"
             );
             assert!(!dark.contains(".agents-in-a-box"), "{dark}");
+            assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
             let unregistered = text(REPO_NOT_REGISTERED, "not under a registered folder", verb);
-            assert!(unregistered.contains("use Add project"), "{unregistered}");
+            assert!(unregistered.contains("Add project"), "{unregistered}");
+            assert!(
+                unregistered.contains("(not under a registered folder)"),
+                "{unregistered}"
+            );
             // By code, not by sentence: the same words under INVALID_PARAMS
             // are just a refusal, with the daemon's detail.
-            let worded = text(INVALID_PARAMS, "not under a registered folder", verb);
-            assert!(worded.starts_with("The daemon refused"), "{worded}");
+            let worded = text(INVALID_PARAMS, "not in a registered project folder", verb);
+            assert!(!worded.contains("Add project"), "{worded}");
             assert!(
-                worded.ends_with(": not under a registered folder"),
+                worded.ends_with("the daemon refused it: not in a registered project folder"),
                 "{worded}"
             );
-            // Started, not failed: a second press could start a second one.
+            assert!(
+                text(-32603, "tmux could not start", verb)
+                    .ends_with("failed: tmux could not start")
+            );
+        }
+        // Started, not failed: a second press could start a second one.
+        for verb in [CreateWorktree, AddAgent, OpenTerminal] {
             let started = text(
                 SPAWN_STARTED,
                 "`ainb run` is still running after 120s",
                 verb,
             );
-            assert!(started.contains("started"), "{started}");
             assert!(
                 started.contains("`ainb run` is still running after 120s"),
                 "{started}"
             );
-            assert!(started.contains("Check the sidebar before"), "{started}");
             assert!(!started.contains("failed"), "{started}");
             let slow = spawn_refusal_text(
                 &DaemonError::Timeout(std::time::Duration::from_secs(150)),
                 verb,
             );
-            assert!(slow.contains("check the sidebar"), "{slow}");
+            assert!(!slow.contains("failed"), "{slow}");
         }
-        assert!(
-            text(INVALID_PARAMS, "bad base", CreateWorktree)
-                .starts_with("The daemon refused the request: ")
-        );
-        assert!(
-            text(INVALID_PARAMS, "not a tree", AddAgent)
-                .starts_with("The daemon refused the new agent: ")
-        );
         assert!(
             text(SPAWN_STARTED, "m", CreateWorktree)
                 .starts_with("The create started but did not finish: m")
@@ -333,12 +372,30 @@ mod tests {
             text(SPAWN_STARTED, "m", AddAgent)
                 .starts_with("The agent was started but has not reported back yet: m")
         );
+        assert!(text(SPAWN_STARTED, "m", OpenTerminal).starts_with(MAY_STILL_OPEN));
         assert!(
-            text(-32603, "could not run ainb", CreateWorktree)
+            text(SPAWN_STARTED, "m", CreateWorktree)
+                .contains("Check the sidebar before creating again")
+        );
+        assert!(
+            text(SPAWN_STARTED, "m", AddAgent).contains("Check the sidebar before adding another")
+        );
+        // A close starts nothing: a late answer or a started code is a failure.
+        let slow = DaemonError::Timeout(std::time::Duration::from_secs(30));
+        assert!(
+            spawn_refusal_text(&slow, CloseTerminal).starts_with("Closing the terminal failed")
+        );
+        assert!(text(SPAWN_STARTED, "m", CloseTerminal).starts_with("Closing the terminal failed"));
+        assert!(
+            spawn_refusal_text(&slow, CreateWorktree)
+                .contains("may still be creating; check the sidebar")
+        );
+        assert!(
+            text(INVALID_PARAMS, "bad base", CreateWorktree)
                 .starts_with("Creating the worktree failed")
         );
         assert!(
-            text(-32603, "could not run ainb", AddAgent).starts_with("Adding the agent failed")
+            text(INVALID_PARAMS, "not a tree", AddAgent).starts_with("Adding the agent failed")
         );
     }
 
@@ -348,6 +405,8 @@ mod tests {
         let add = mint_op_id(SpawnVerb::AddAgent);
         assert!(create.as_str().starts_with("desktop-create-"), "{create:?}");
         assert!(add.as_str().starts_with("desktop-agent-add-"), "{add:?}");
+        let shell = mint_op_id(SpawnVerb::OpenTerminal);
+        assert!(shell.as_str().starts_with("desktop-shell-"), "{shell:?}");
         assert_ne!(add, mint_op_id(SpawnVerb::AddAgent));
     }
 }
