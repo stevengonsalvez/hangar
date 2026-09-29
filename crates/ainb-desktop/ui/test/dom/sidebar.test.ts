@@ -358,6 +358,7 @@ test("typing in the filter keeps only matching worktrees, ignoring case, and dro
   await typeFilter("LOGIN");
   assert.deepEqual(drawnRows(), ["login-1"]);
   assert.deepEqual(drawnProjects(), ["web"], "a project with no match is not drawn");
+  assert.equal(document.querySelector(".workspace-count")?.textContent, "1", "the count is the rows still drawn");
 });
 
 test("a query naming a project keeps every worktree in it", async () => {
@@ -432,4 +433,65 @@ test("the query is not kept across a relaunch", async () => {
   await open(filterFrame());
   assert.equal(filterInput().value, "");
   assert.deepEqual(drawnRows(), ["login-1", "signup-1", "billing-1"]);
+});
+
+test("the host moving the selection to a hidden row clears the filter, as Orca lifts filters on activation", async () => {
+  const { setHeld } = await open(filterFrame());
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "billing-1" }));
+  await settle();
+  assert.equal(filterInput().value, "");
+  assert.equal(document.querySelector('.session-row[aria-current="true"]')?.getAttribute("data-session"), "billing-1");
+});
+
+test("a new frame keeping the same hidden selection leaves the query alone", async () => {
+  const { setHeld } = await open(filterFrame({ selected_session_id: "signup-1" }));
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "signup-1" }));
+  await settle();
+  assert.equal(filterInput().value, "login");
+  assert.deepEqual(drawnRows(), ["login-1"]);
+});
+
+test("a selection moving to a row the query still shows leaves the query alone", async () => {
+  const { setHeld } = await open(filterFrame());
+  await typeFilter("login");
+  setHeld(filterFrame({ selected_session_id: "login-1" }));
+  await settle();
+  assert.equal(filterInput().value, "login");
+});
+
+test("a create into a project the query hides clears the filter so its pending card shows", async () => {
+  const { setPending } = await open(filterFrame());
+  await typeFilter("login");
+  setPending({ projectPath: "/api", name: "new-billing" });
+  await settle();
+  assert.equal(filterInput().value, "");
+  assert.equal(document.querySelector('details[data-workspace="api"] li[data-pending="true"]')?.textContent, "new-billing");
+});
+
+test("a create into a project the query shows leaves the query alone", async () => {
+  const { setPending } = await open(filterFrame());
+  await typeFilter("login");
+  setPending({ projectPath: "/web", name: "new-web" });
+  await settle();
+  assert.equal(filterInput().value, "login");
+});
+
+test("the field is a search landmark with a visible n / m count and a polite announcement", async () => {
+  await open(filterFrame());
+  assert.ok(document.querySelector('.sidebar [role="search"] input[aria-label="Filter worktrees"]'));
+  await typeFilter("login");
+  assert.equal(document.querySelector(".sidebar-filter-count")?.textContent, "1 / 3");
+  const status = document.querySelector('.sidebar [role="status"]');
+  assert.equal(status?.getAttribute("aria-live"), "polite");
+  assert.equal(status?.textContent, "", "announced after a pause, not on each keystroke");
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(status?.textContent, "1 of 3 worktrees match");
+  await typeFilter("zzz");
+  await new Promise((resolve) => setTimeout(resolve, 450));
+  assert.equal(status?.textContent, "No worktrees match");
+  await pressEscape();
+  assert.equal(document.querySelector(".sidebar-filter-count"), null);
+  assert.equal(status?.textContent, "");
 });
