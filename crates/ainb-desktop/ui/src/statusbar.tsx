@@ -6,11 +6,9 @@ import { daemonDotState } from "./statusbar.ts";
 interface Props {
   host: HostId | undefined;
   sidecar: SidecarState;
-  /** ASK + APPROVE + WAIT + ERR: every row that blocks a turn on a human,
-   * summed by the caller from `ROOT_SELECTORS` (`main.tsx`), which already
-   * owns which kinds count. */
+  /** The board's Needs column (`countIn`): every agent blocked on a human. */
   needsYou: number;
-  /** `ROOT_SELECTORS.idleCount`. */
+  /** The board's Idle column (`countIn`). */
   idle: number;
   /** Frames the store refused (#1132): a development build only. */
   framesIgnored?: number;

@@ -5,7 +5,7 @@
 
 import type { AttentionKind, HostId } from "../../../ainb-app/bindings/AppState";
 import { elsewhereCount } from "./board.ts";
-import { idleCount, ringCount } from "./sessions.ts";
+import { ringCount } from "./sessions.ts";
 import { unreadCount } from "./inbox.ts";
 import type { FrameStore } from "./store.ts";
 
@@ -22,7 +22,6 @@ export const ROOT_SELECTORS = {
   approveCount: ringSelector("Approve"),
   waitCount: ringSelector("Wait"),
   errCount: ringSelector("Err"),
-  idleCount: (store, host) => (host === undefined ? 0 : idleCount(store.section(host, "sessions"))),
   sessionsStale: (store, host) => host !== undefined && store.state.stale[host]?.sessions === true,
   /** The git view was withheld for being over the frame ceiling, so the review
    * tab is drawing a diff the host has already moved past. */

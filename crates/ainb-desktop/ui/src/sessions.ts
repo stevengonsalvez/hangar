@@ -150,17 +150,3 @@ export function ringCount(view: SessionsView_Serialize | undefined, kind: Attent
   return allSessions(view).filter((session) => ringFor(session) === kind).length;
 }
 
-/**
- * How many rows are idle, the footer's last count. A row ringing a
- * [`NEED_YOU`] kind is waiting on a person, whatever its lifecycle says: an
- * agent blocked on a question sits at an idle prompt, so its status reads
- * `Idle` too. Counting it here as well as in "need you" showed one waiting
- * session as "1 need you 1 idle"; such a row lands in exactly one of the two
- * counts. A row that only rings `Done` is idle, and counts here.
- */
-export function idleCount(view: SessionsView_Serialize | undefined): number {
-  return allSessions(view).filter((session) => {
-    const ring = ringFor(session);
-    return session.status === "Idle" && (ring === null || !NEED_YOU.includes(ring));
-  }).length;
-}

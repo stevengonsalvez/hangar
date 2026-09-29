@@ -18,8 +18,8 @@ import {
   shellUsage,
   SUBSCRIBED,
 } from "./subscription.ts";
-import { allSessions, label, NEED_YOU, ringFor } from "./sessions.ts";
-import { ringSelector, ROOT_SELECTORS } from "./selectors.ts";
+import { allSessions, label, ringFor } from "./sessions.ts";
+import { ROOT_SELECTORS } from "./selectors.ts";
 import { AcpCard } from "./acp.tsx";
 import { transcriptIntent, transcriptView } from "./acp.ts";
 import { AnswerSlot } from "./answer.tsx";
@@ -27,7 +27,7 @@ import { phaseOf, questionFor, questionOver, type Refusal, sendInOrder } from ".
 import { newNotices, noticeKey } from "./notices.ts";
 import { terminal as updateDone, updateLine, type UpdatePhase } from "./update.ts";
 import { Board } from "./board.tsx";
-import { agentStateCounts } from "./board.ts";
+import { agentStateCounts, boardColumns, countIn, sameColumns } from "./board.ts";
 import { CLOSE_INBOX, OPEN_INBOX, inboxCounts } from "./inbox.ts";
 import { Inbox } from "./inbox.tsx";
 import { SURFACES } from "./surfaces.ts";
@@ -74,11 +74,6 @@ import { startTheme } from "./theme/theme.ts";
 
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
-
-/** The selectors summed into the status bar's one "N need you" count: one
- * per `NEED_YOU` kind, the same list `idleCount` leaves out, so a row is in
- * one total or the other and never both. */
-const ATTENTION_SELECTORS = NEED_YOU.map(ringSelector);
 
 /** How long a toast stays up. */
 const TOAST_MS = 5000;
@@ -505,9 +500,12 @@ function Shell() {
   /** ASK + APPROVE + WAIT + ERR: the status bar's one "N need you" amber
    * count. Each selector is its own memo first, so a drain that only moves
    * one of the four still wakes just that one before the sum recomputes. */
-  const attentionCounts = ATTENTION_SELECTORS.map((select) => createMemo(() => select(store, host())));
-  const needsYou = createMemo(() => attentionCounts.reduce((sum, count) => sum + count(), 0));
-  const idle = createMemo(() => ROOT_SELECTORS.idleCount(store, host()));
+  // The board's columns, projected ONCE and read by the board and by the
+  // status bar's two counts, so the footer moves on the frame the board does
+  // and a session is in exactly one of "need you" and "idle".
+  const columns = createMemo(() => boardColumns(agentStatus(), fleet(), sessions(), acks()), undefined, {
+    equals: sameColumns,
+  });
   const sessionsStale = createMemo(() => ROOT_SELECTORS.sessionsStale(store, host()));
   const gitViewStale = createMemo(() => ROOT_SELECTORS.gitViewStale(store, host()));
   const loading = createMemo(() => ROOT_SELECTORS.workspacesLoading(store, host()));
@@ -786,7 +784,7 @@ function Shell() {
                 fleet={fleet()}
                 sessions={sessions()}
                 elsewhere={elsewhere()}
-                acks={acks()}
+                columns={columns()}
                 onAck={ackSession}
                 onChoose={dispatch}
                 onOpenTranscript={openTranscript}
@@ -820,8 +818,8 @@ function Shell() {
         <Statusbar
           host={host()}
           sidecar={sidecar()}
-          needsYou={needsYou()}
-          idle={idle()}
+          needsYou={countIn(columns(), "needs")}
+          idle={countIn(columns(), "idle")}
           // A development build shows frames the store refused (#1132).
           framesIgnored={import.meta.env.DEV ? store.framesIgnored() : undefined}
         />

@@ -1,9 +1,7 @@
 import { createMemo, For, Show } from "solid-js";
 import type { AgentStatusView, FleetView_Serialize, SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
-import type { AckMap } from "./acks.ts";
 import {
   attentionRows,
-  boardColumns,
   boardHealth,
   COLUMN_TITLES,
   daemonReachable,
@@ -25,26 +23,15 @@ interface Props {
   sessions: SessionsView_Serialize | undefined;
   /** Open rows no session in this window can show: a root selector's memo. */
   elsewhere: number;
-  /** This viewer's Done acks (`acks.ts`), owned by `main.tsx` because the
-   * sidebar and the tab strip read the very same map: three surfaces
-   * disagreeing about which turn was opened is the bug a shared owner
-   * prevents. */
-  acks: AckMap;
+  /** The columns, projected once by the window (`boardColumns`) and shared
+   * with the status bar's counts, so the board and the footer are one list. */
+  columns: BoardColumn[];
   /** A row was chosen: dispatch its intent. */
   onChoose(intent: RendererIntent): void;
   /** An ACP card was chosen: open its transcript where a terminal would be. */
   onOpenTranscript(sessionKey: string): void;
   /** A Done card was opened: ack its current turn. */
   onAck(sessionKey: string, turnMarker: number): void;
-}
-
-/**
- * Whether two projections draw the same board. A drain that touches Sessions,
- * Fleet or agent_status recomputes the columns; without this every card button
- * would be rebuilt, and a keyboard user's focus dropped, on every one.
- */
-function sameColumns(a: BoardColumn[], b: BoardColumn[]): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
 }
 
 /**
@@ -56,11 +43,7 @@ function sameColumns(a: BoardColumn[], b: BoardColumn[]): boolean {
  * is the `ask` pane when something is open on that agent.
  */
 export function Board(props: Props) {
-  const columns = createMemo(
-    () => boardColumns(props.agentStatus, props.fleet, props.sessions, props.acks),
-    undefined,
-    { equals: sameColumns },
-  );
+  const columns = () => props.columns;
   const health = createMemo(() => boardHealth(props.agentStatus));
   const waiting = createMemo(() => attentionRows(props.fleet, props.sessions));
   // Drawn by key, not by object identity (#1267). Every frame that reaches
