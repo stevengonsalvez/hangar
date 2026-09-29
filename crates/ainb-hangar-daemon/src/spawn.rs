@@ -59,6 +59,11 @@ pub fn enabled() -> bool {
 pub enum SpawnError {
     /// The request was refused before anything ran.
     Invalid(String),
+    /// The repository is in no registered folder and is not an added
+    /// project: refused before anything ran, with its own variant so the RPC
+    /// layer answers [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] by
+    /// type, whatever the message says.
+    Unregistered(String),
     /// `ainb run` ran and failed, or could not be run at all.
     Failed(String),
 }
@@ -181,10 +186,10 @@ pub fn registered_roots(home: &Path) -> Vec<PathBuf> {
     roots
 }
 
-/// The refusal for a repository in no registered folder and not an added
-/// project. `worktree/create` answers it with
-/// [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] rather than
-/// `INVALID_PARAMS`, so a client can offer the fix by code, not by sentence.
+/// The message of [`SpawnError::Unregistered`], the refusal for a repository
+/// in no registered folder and not an added project. The variant, not this
+/// text, is what `worktree/create` answers
+/// [`ainb_hangar_proto::spawn::REPO_NOT_REGISTERED`] for.
 pub const UNREGISTERED: &str = "repo_path is not under a registered workspace folder: add its \
                                 folder to workspace_defaults.workspace_scan_paths";
 
@@ -243,7 +248,7 @@ fn resolve_repo(repo_path: &str, home: &Path) -> Result<PathBuf, SpawnError> {
     if !roots.iter().any(|root| canonical.starts_with(root))
         && !registered_projects(home).contains(&canonical)
     {
-        return Err(SpawnError::Invalid(UNREGISTERED.into()));
+        return Err(SpawnError::Unregistered(UNREGISTERED.into()));
     }
     let top = std::process::Command::new("git")
         .arg("-C")
@@ -379,7 +384,7 @@ fn resolve_worktree(
     let source = linked_worktree_source(&canonical)
         .map_err(|why| SpawnError::Invalid(format!("worktree_path {why}")))?;
     resolve_repo(&source.to_string_lossy(), home).map_err(|error| match error {
-        SpawnError::Invalid(why) => SpawnError::Invalid(format!(
+        SpawnError::Invalid(why) | SpawnError::Unregistered(why) => SpawnError::Invalid(format!(
             "the worktree's source repository is refused: {why}"
         )),
         failed @ SpawnError::Failed(_) => failed,
@@ -484,13 +489,15 @@ fn resolve_shell_dir(
     }
     let repo_why = match resolve_repo(worktree_path, home) {
         Ok(dir) => return Ok(dir),
-        Err(SpawnError::Invalid(why)) => why,
+        Err(SpawnError::Invalid(why) | SpawnError::Unregistered(why)) => why,
         Err(failed) => return Err(failed),
     };
     resolve_worktree(worktree_path, home, managed).map_err(|error| match error {
-        SpawnError::Invalid(tree_why) => SpawnError::Invalid(format!(
-            "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
-        )),
+        SpawnError::Invalid(tree_why) | SpawnError::Unregistered(tree_why) => {
+            SpawnError::Invalid(format!(
+                "worktree_path is neither a registered repository ({repo_why}) nor a worktree ainb created ({tree_why})"
+            ))
+        }
         failed @ SpawnError::Failed(_) => failed,
     })
 }
@@ -1179,7 +1186,7 @@ mod tests {
         git(outside.path(), &["init", "-q"]);
         assert!(matches!(
             resolve_repo(&outside.path().display().to_string(), home.path()),
-            Err(SpawnError::Invalid(m)) if m.contains("registered")
+            Err(SpawnError::Unregistered(_))
         ));
 
         let sub = repo.join("src");
@@ -1212,7 +1219,7 @@ mod tests {
         assert_eq!(resolved, std::fs::canonicalize(&project).unwrap());
         assert!(matches!(
             resolve_repo(&nested.display().to_string(), home.path()),
-            Err(SpawnError::Invalid(m)) if m.contains("registered")
+            Err(SpawnError::Unregistered(_))
         ));
     }
 
