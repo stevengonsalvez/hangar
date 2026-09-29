@@ -5,7 +5,7 @@
 // life, whatever the layout does around it, and a pane whose shown tab
 // closes goes back to the tab it showed before.
 
-import { fromMenu, host, measure, panes, pointer, strip, tab, tabEl, tick, until, visible } from "./tab_host.ts";
+import { fromMenu, host, measure, panes, pointer, stored, strip, tab, tabEl, tick, until, visible } from "./tab_host.ts";
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -26,7 +26,7 @@ const SAVED = JSON.stringify({
   },
 });
 
-test("a relaunch whose host lists no tab yet restores the stored panes from the first strip that has one", async () => {
+test("a relaunch restores the stored panes as their tabs reopen one by one", async () => {
   localStorage.setItem("ainb.layout", SAVED);
   host.tabs = [];
   const root = document.createElement("div");
@@ -37,10 +37,19 @@ test("a relaunch whose host lists no tab yet restores the stored panes from the 
   await tick();
   assert.equal(localStorage.getItem("ainb.layout"), SAVED, "an empty strip leaves the stored layout alone");
 
+  // The host restores no tabs: a reopens first, alone.
+  host.tabs = [tab("a")];
+  strip();
+  await until(() => panes().length === 1, "a in a pane");
+  assert.deepEqual(panes(), ["g1:a*a!"]);
+  assert.equal(localStorage.getItem("ainb.layout"), SAVED, "b and c are still to come: nothing is stored over them");
+
   host.tabs = ["a", "b", "c"].map(tab);
   strip();
   await until(() => document.querySelectorAll(".pane-group").length === 2, "the stored panes");
   assert.deepEqual(panes(), ["g1:a,c*a", "g2:b*b!"]);
+  assert.equal(stored().focused, "g2", "every stored tab open again: the window stores what it shows");
+  assert.deepEqual(stored().root.children.map((child: { tabs: string[] }) => child.tabs), [["tmux_a", "tmux_c"], ["tmux_b"]]);
 });
 
 test("a terminal is one node for its tab's life: through a split, a move, a drag and host frames", async () => {
@@ -72,9 +81,14 @@ test("a terminal is one node for its tab's life: through a split, a move, a drag
   assert.deepEqual(panes(), ["g1:a*a", "g4:c*c!", "g2:b*b"]);
   same("a drag");
 
+  // Host frames carry fresh tab objects, as the real IPC does (`tab_host.ts`):
+  // a view keyed by tab object would remount here.
   strip("tmux_c");
   await tick();
-  same("a host frame that focuses it");
+  same("a host frame of fresh tab objects that focuses it");
+  strip();
+  await tick();
+  same("a host frame of fresh tab objects that changes nothing");
   host.tabs = [...host.tabs, tab("d")];
   strip();
   await until(() => tabEl("d") !== null, "d in a strip");
