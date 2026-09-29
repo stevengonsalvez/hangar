@@ -413,12 +413,15 @@ function Shell() {
    * its card takes focus and its row is selected, as a click on it does;
    * anywhere else its tab is shown, or opened when it has none. Every send
    * goes after `answer_home`, so from Settings or the Inbox nothing is
-   * refused. Nothing waiting: nothing happens, as Orca's reveal
-   * (`reveal-dashboard-agent.ts`) returns silently when it cannot activate.
+   * refused. With nothing waiting it says so: Orca has no such chord, so
+   * there is no silence to match, and a chord that does nothing reads as dead.
    */
   const jumpToAttention = () => {
     const card = nextNeedsYou(columns(), jumped);
-    if (card === null) return;
+    if (card === null) {
+      toast("Nobody needs you");
+      return;
+    }
     jumped = card.key;
     // No row: an ACP agent (`nextNeedsYou` skips any other), shown by its transcript.
     if (card.sessionId === null) {
