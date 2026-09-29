@@ -72,6 +72,9 @@ let nextCallback = 1;
       case "subscribe":
         return HOST;
       case "terminal_visible":
+        // Taken a moment later, as across the real IPC: a read that does not
+        // wait for the set is answered against the one before it.
+        await new Promise((resolve) => setTimeout(resolve, 50));
         host.inView = [...(args.keys as string[])];
         host.named = true;
         return true;
@@ -145,12 +148,13 @@ export const selected = () =>
     .filter(([id]) => id === "session_list.select_row")
     .map(([, args]) => args.target.session);
 
-/** Right-click `name`'s tab and choose the menu entry `selector` names. */
-export async function fromMenu(name: string, selector: string): Promise<void> {
+/** Right-click `name`'s tab and choose the menu entry `selector` names,
+ * then let the window settle, unless `settle` is false. */
+export async function fromMenu(name: string, selector: string, settle = true): Promise<void> {
   tabEl(name).dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 10, clientY: 10 }));
   await until(() => document.querySelector(`.pane-menu ${selector}`) !== null, `the menu entry ${selector}`);
   document.querySelector<HTMLElement>(`.pane-menu ${selector}`)!.click();
-  await tick();
+  if (settle) await tick();
 }
 
 /** The panes laid out 1000 x 600 at the window's corner, as a real page
