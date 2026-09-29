@@ -293,8 +293,12 @@ function Shell() {
         // The sidebar follows the terminal now shown, as `activate` has it
         // follow every other: left on the closed tab's session, the answer
         // banner's scope (`questionOver`) would hide this one's question.
-        const select = selectIntentFor(view.tabs, next);
-        if (select !== null) dispatch(select);
+        // Not under Settings or the Inbox: no terminal is shown there, and
+        // the reducer, on that page, refuses a session-list row.
+        if (!settings() && !inboxOpen()) {
+          const select = selectIntentFor(view.tabs, next);
+          if (select !== null) dispatch(select);
+        }
         focusTab(next, true);
       }
     }
