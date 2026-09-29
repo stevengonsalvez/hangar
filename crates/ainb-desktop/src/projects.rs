@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use ainb_app::config::WorkspaceDefaults;
 use ainb_app::git::WorkspaceScanner;
-use ainb_hangar_daemon::spawn::{PROJECTS_FILE, registered_projects, registered_roots};
+use ainb_hangar_daemon::spawn::{
+    PROJECTS_FILE, expand_home, registered_projects, registered_roots,
+};
 use serde::Serialize;
 
 /// One repository the composer may create into.
@@ -39,8 +41,8 @@ impl RegisteredProject {
     }
 }
 
-/// The repositories under `home`'s registered roots plus each added project,
-/// by name, at most `defaults.max_repositories` of them. Roots are scanned the
+/// The repositories under `home`'s registered roots, by name, at most
+/// `defaults.max_repositories` of them, then every added project. Roots are scanned the
 /// way the TUI's repository picker scans (depth and excludes from
 /// `defaults`), but never through its cache, which is keyed on the TUI's own
 /// wider set of folders. A scanned repository whose canonical path leaves
@@ -63,22 +65,40 @@ pub fn list(home: &Path, defaults: &WorkspaceDefaults) -> Vec<RegisteredProject>
             .collect()
     };
     let mut projects: Vec<RegisteredProject> = Vec::new();
-    for canonical in scanned.into_iter().chain(registered_projects(home)) {
-        let project = RegisteredProject::at(&canonical);
-        if !projects.iter().any(|known| known.path == project.path) {
-            projects.push(project);
-        }
+    for canonical in scanned {
+        push_new(&mut projects, RegisteredProject::at(&canonical));
     }
-    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    sort_by_name(&mut projects);
     if projects.len() > defaults.max_repositories {
         tracing::info!(
             found = projects.len(),
             shown = defaults.max_repositories,
-            "project list cut at workspace_defaults.max_repositories"
+            "scanned projects cut at workspace_defaults.max_repositories"
         );
         projects.truncate(defaults.max_repositories);
     }
+    // Added projects after the scan and never cut: each is one a person
+    // picked, and a pick the list dropped would leave the Project select
+    // showing another repository than the one a create sends.
+    let mut added: Vec<RegisteredProject> = registered_projects(home)
+        .iter()
+        .map(|path| RegisteredProject::at(path))
+        .collect();
+    sort_by_name(&mut added);
+    for project in added {
+        push_new(&mut projects, project);
+    }
     projects
+}
+
+fn push_new(projects: &mut Vec<RegisteredProject>, project: RegisteredProject) {
+    if !projects.iter().any(|known| known.path == project.path) {
+        projects.push(project);
+    }
+}
+
+fn sort_by_name(projects: &mut [RegisteredProject]) {
+    projects.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
 }
 
 /// Register `folder`, a repository a person picked in the native folder
@@ -86,8 +106,10 @@ pub fn list(home: &Path, defaults: &WorkspaceDefaults) -> Vec<RegisteredProject>
 /// `projects` in the daemon's [`PROJECTS_FILE`]. The daemon matches that entry
 /// exactly, never as a root, so no repository nested inside it is admitted.
 /// Only a repository's own top folder is accepted, never the home folder or
-/// one above it. A repository the daemon already accepts (inside a registered
-/// root, or added before) is returned as it is, with nothing written.
+/// one above it. Every pick is recorded, even one inside a registered root:
+/// the scan that lists root repositories stops at `scan_max_depth` and
+/// `exclude_paths`, and a pick it cannot see would be accepted but never
+/// listed. A pick already in the file is not added twice.
 ///
 /// # Errors
 /// The sentence the composer shows: no home, not a folder, not a repository's
@@ -112,12 +134,8 @@ pub fn register(home: &Path, folder: &Path) -> Result<RegisteredProject, String>
         ));
     }
     let project = RegisteredProject::at(&canonical);
-    let accepted = registered_roots(&home).iter().any(|root| canonical.starts_with(root))
-        || registered_projects(&home).contains(&canonical);
-    if !accepted {
-        append_project(&home, &project.path)
-            .map_err(|error| format!("Could not register {shown}: {error:#}"))?;
-    }
+    append_project(&home, &canonical)
+        .map_err(|error| format!("Could not register {shown}: {error:#}"))?;
     Ok(project)
 }
 
@@ -144,10 +162,11 @@ const PROJECTS_HEADER: &str = "# Repositories added with Add project in the ainb
 # The daemon creates worktrees from exactly these folders (never from a\n\
 # repository nested inside one). Remove a line to unregister it.\n";
 
-/// Append `path` to the projects file under a lock, read inside the lock so
-/// two adds cannot lose one. A file that exists but does not parse is
-/// refused, never replaced.
-fn append_project(home: &Path, path: &str) -> anyhow::Result<()> {
+/// Append `canonical` to the projects file unless an entry already names
+/// it, deciding under the lock from what is read inside it, so two adds can
+/// neither lose one nor record one twice. A file that exists but does not
+/// parse is refused, never replaced.
+fn append_project(home: &Path, canonical: &Path) -> anyhow::Result<()> {
     use ainb_app::config::{lock, read_existing, write_atomic};
 
     let file = home.join(".agents-in-a-box").join("config").join(PROJECTS_FILE);
@@ -168,7 +187,15 @@ fn append_project(home: &Path, path: &str) -> anyhow::Result<()> {
         .and_then(toml::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    projects.push(toml::Value::String(path.to_string()));
+    let listed = projects
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .filter_map(|entry| std::fs::canonicalize(expand_home(home, entry)).ok())
+        .any(|entry| entry == canonical);
+    if listed {
+        return Ok(());
+    }
+    projects.push(toml::Value::String(canonical.display().to_string()));
     table.insert("projects".into(), toml::Value::Array(projects));
     write_atomic(
         &file,
@@ -322,11 +349,14 @@ mod tests {
         );
     }
 
+    /// A pick inside a root is recorded too: the scan that lists root
+    /// repositories stops at `scan_max_depth`, so a deep one would otherwise
+    /// be accepted and never listed.
     #[test]
-    fn a_repository_inside_a_registered_root_writes_nothing() {
+    fn a_deep_repository_inside_a_root_is_recorded_and_listed() {
         let home = tempfile::tempdir().unwrap();
-        let repo = home.path().join("code/app");
-        git_repo(&repo);
+        let deep = home.path().join("code/a/b/c/d/deep");
+        git_repo(&deep);
         write_config(
             home.path(),
             "onboarding.toml",
@@ -335,8 +365,53 @@ mod tests {
                 home.path().join("code").display()
             ),
         );
-        register(home.path(), &repo).expect("accepted as it is");
-        assert!(!projects_file(home.path()).exists());
+        assert!(
+            list(home.path(), &WorkspaceDefaults::default()).is_empty(),
+            "past the scan depth"
+        );
+
+        let project = register(home.path(), &deep).expect("registered");
+        assert_eq!(list(home.path(), &WorkspaceDefaults::default()), [project]);
+        let canonical = std::fs::canonicalize(&deep).unwrap();
+        assert_eq!(registered_projects(home.path()), [canonical]);
+    }
+
+    #[test]
+    fn added_projects_are_never_cut_by_max_repositories() {
+        let home = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            git_repo(&home.path().join("code").join(name));
+        }
+        let added = home.path().join("elsewhere/aa");
+        git_repo(&added);
+        write_config(
+            home.path(),
+            "config.toml",
+            "[workspace_defaults]\nworkspace_scan_paths = [\"~/code\"]\n",
+        );
+        register(home.path(), &added).expect("registered");
+        let defaults = WorkspaceDefaults {
+            max_repositories: 1,
+            ..WorkspaceDefaults::default()
+        };
+        let names: Vec<String> =
+            list(home.path(), &defaults).into_iter().map(|project| project.name).collect();
+        assert_eq!(
+            names,
+            ["a", "aa"],
+            "the scan is cut, the added project is not"
+        );
+    }
+
+    #[test]
+    fn a_project_added_twice_is_recorded_once() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("app");
+        git_repo(&repo);
+        register(home.path(), &repo).expect("registered");
+        // Spelled differently, same repository.
+        register(home.path(), &home.path().join("app/")).expect("again");
+        assert_eq!(registered_projects(home.path()).len(), 1);
     }
 
     #[test]
