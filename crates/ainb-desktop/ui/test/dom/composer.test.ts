@@ -153,6 +153,8 @@ test("with no project at all, the composer says how to register a folder", async
   const container = await open({ workspaces: [], selected_session_id: null } as unknown as SessionsView_Serialize);
   const hint = container.querySelector(".composer-empty-projects");
   assert.ok(hint, "an empty state, not only 'Choose a project.'");
+  assert.match(hint.textContent ?? "", /Add your repositories' folder to workspace_defaults\.workspace_scan_paths/);
+  assert.match(hint.textContent ?? "", /replaces the whole list/, "the command's effect is said, not left to surprise");
   assert.equal(
     hint.querySelector("code")?.textContent,
     `ainb config set workspace_defaults.workspace_scan_paths '["~/code"]'`,
