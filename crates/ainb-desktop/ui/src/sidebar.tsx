@@ -8,9 +8,9 @@ import type {
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
-import { opensRowMenu, rowMenuItems, type RowPick } from "./row_menu.ts";
+import { opensRowMenu, rowMenuItems, sessionIn, type RowPick } from "./row_menu.ts";
 import { RowMenu } from "./row_menu.tsx";
-import { allSessions, isSelected, label } from "./sessions.ts";
+import { isSelected, label } from "./sessions.ts";
 import { SidebarFilter } from "./sidebar_filter.tsx";
 import { filterProjectGroups, hidesProject, hidesSession } from "./sidebar_filter.ts";
 import {
@@ -175,7 +175,7 @@ export function Sidebar(props: Props) {
   // it, so the keyboard goes back to the sidebar itself.
   createEffect(() => {
     const at = menu();
-    if (at && !allSessions(props.sessions).some((session) => session.id === at.session.id)) {
+    if (at && !sessionIn(props.sessions, at.session.id)) {
       setMenu(null);
       at.sidebar?.focus();
     }
@@ -267,7 +267,7 @@ export function Sidebar(props: Props) {
               closeMenu(true);
               // The session as the latest frame has it, not as it was when
               // the menu opened.
-              const session = allSessions(props.sessions).find((one) => one.id === at.session.id) ?? at.session;
+              const session = sessionIn(props.sessions, at.session.id) ?? at.session;
               props.onRowPick?.({ action, session, name: at.name });
             }}
           />
