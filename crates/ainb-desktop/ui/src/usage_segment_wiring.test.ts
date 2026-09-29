@@ -24,15 +24,36 @@ test("the stats tab and the status bar segment draw that same read", () => {
   assert.match(MAIN, /<UsageSegment\s+usage=\{usage\(\)\}\s+stale=\{usageStale\(\)\}/);
 });
 
-test("a click on the segment does what the Stats tab's own click does", () => {
-  const segment = MAIN.slice(MAIN.indexOf("<UsageSegment"), MAIN.indexOf("/>", MAIN.indexOf("<UsageSegment")));
-  assert.match(segment, /onOpen=\{\(\) => \{\s*closeTranscript\(\);\s*setPane\("stats"\);\s*\}\}/);
+/** The body of the first `<attr>={() => { ... }}` handler after `from`, whitespace folded. */
+function handler(from: string, attr: string): string {
+  const start = MAIN.indexOf(from);
+  assert.ok(start >= 0, `main.tsx still has ${from}`);
+  const open = MAIN.indexOf(`${attr}={() => {`, start);
+  const close = MAIN.indexOf("}}", open);
+  assert.ok(open > start && close > open, `${from} still has an ${attr} handler`);
+  return MAIN.slice(open + `${attr}={() => {`.length, close).replace(/\s+/g, " ").trim();
+}
+
+test("a click on the segment does exactly what the Stats tab's own click does", () => {
+  const tab = handler('class="tab stats-tab"', "onClick");
+  assert.equal(tab, 'closeTranscript(); setPane("stats");', "the Stats tab's click");
+  assert.equal(handler("<UsageSegment", "onOpen"), tab);
 });
 
-test("the segment's modules cannot subscribe, read the store or poll", () => {
+// Anything that could subscribe, read the store or poll comes in by import;
+// the segment may import only its projection, Solid and the wire types.
+const ALLOWED = new Set(["solid-js", "./stats.ts", "./usage_segment.ts", "../../../ainb-app/bindings/AppState"]);
+
+test("the segment's modules import nothing that could subscribe, read the store or poll", () => {
   for (const file of ["./usage_segment.ts", "./usage_segment.tsx"]) {
     const text = source(file);
-    for (const banned of ["@tauri-apps", "invoke", "listen(", "./store", "./subscription", "setInterval", "setTimeout"]) {
+    const imports = [...text.matchAll(/^import[^;]*?from "([^"]+)";/gms)].map(([, from]) => from);
+    assert.ok(imports.length > 0, `${file}: the import scan found its imports`);
+    for (const from of imports) {
+      assert.ok(ALLOWED.has(from), `${file} imports ${from}: it must draw the window's read`);
+    }
+    assert.doesNotMatch(text, /\bimport\(/, `${file} must not import dynamically`);
+    for (const banned of ["createResource", "fetch(", "setInterval", "setTimeout", "requestAnimationFrame", "__TAURI"]) {
       assert.ok(!text.includes(banned), `${file} must not use ${banned}: it draws the window's read`);
     }
   }
