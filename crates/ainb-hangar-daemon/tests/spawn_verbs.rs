@@ -604,7 +604,8 @@ async fn an_agent_add_runs_ainb_run_in_the_existing_worktree() {
 /// An agent joins only a tree ainb made from a registered repository: the
 /// repository's own checkout, and a managed-looking tree cut from a
 /// repository outside every registered folder, are refused before `ainb`
-/// runs.
+/// runs. The unregistered source answers `REPO_NOT_REGISTERED`, as
+/// `worktree/create` does, so a client offers Add project by code.
 #[tokio::test]
 async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -653,10 +654,14 @@ async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree(
     let planted = std::fs::canonicalize(planted).unwrap().display().to_string();
     switch_on(&fake_ainb(tools.path(), true));
 
-    for (path, why) in [
-        (registered.repo(), "directly in"),
-        (planted, "main checkout"),
-        (stray, "registered"),
+    for (path, why, code) in [
+        (registered.repo(), "directly in", -32602),
+        (planted, "main checkout", -32602),
+        (
+            stray,
+            "registered",
+            ainb_hangar_proto::spawn::REPO_NOT_REGISTERED,
+        ),
     ] {
         let response = call_method(
             m::WORKTREE_AGENT_ADD,
@@ -665,7 +670,7 @@ async fn an_agent_add_refuses_a_main_checkout_or_an_unregistered_repos_worktree(
         .await;
         assert_eq!(
             response["error"]["code"].as_i64(),
-            Some(-32602),
+            Some(i64::from(code)),
             "{path}: {response}"
         );
         assert!(
