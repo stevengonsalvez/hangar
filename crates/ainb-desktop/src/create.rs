@@ -194,7 +194,11 @@ mod tests {
             code: METHOD_NOT_FOUND,
             message: "unknown method: worktree/create".into(),
         };
-        assert!(refusal_text(&dark).contains("AINB_HANGAR_SPAWN=1"));
+        // The verbs are on by default: a daemon that does not serve one is
+        // older than this app, or was started with the opt-out.
+        let dark = refusal_text(&dark);
+        assert!(dark.contains("AINB_HANGAR_SPAWN=0"), "{dark}");
+        assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
         let bad = DaemonError::Rpc {
             code: INVALID_PARAMS,
             message: "base is not a valid git ref name".into(),
