@@ -309,9 +309,10 @@ async fn a_repo_outside_every_registered_folder_is_refused() {
     }))
     .await;
 
+    // Its own code, so a client offers the fix without reading the sentence.
     assert_eq!(
         response["error"]["code"].as_i64(),
-        Some(-32602),
+        Some(i64::from(ainb_hangar_proto::spawn::REPO_NOT_REGISTERED)),
         "{response}"
     );
     assert!(!tools.path().join("argv.txt").exists(), "nothing ran");
