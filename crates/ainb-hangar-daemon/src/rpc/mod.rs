@@ -5938,6 +5938,7 @@ mod fleet_launch_tests {
         assert_eq!(
             args,
             [
+                "-u",
                 "new-session",
                 "-d",
                 "-s",
