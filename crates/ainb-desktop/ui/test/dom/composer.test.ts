@@ -153,7 +153,7 @@ test("with no project at all, the composer says how to register a folder", async
   const container = await open({ workspaces: [], selected_session_id: null } as unknown as SessionsView_Serialize);
   const hint = container.querySelector(".composer-empty-projects");
   assert.ok(hint, "an empty state, not only 'Choose a project.'");
-  assert.match(hint.textContent ?? "", /Add your repositories' folder to workspace_defaults\.workspace_scan_paths/);
+  assert.match(hint.textContent ?? "", /add your repositories' folder to workspace_defaults\.workspace_scan_paths/i);
   assert.match(hint.textContent ?? "", /replaces the whole list/, "the command's effect is said, not left to surprise");
   assert.equal(
     hint.querySelector("code")?.textContent,
@@ -167,6 +167,11 @@ test("the empty state's Add folder opens the same picker and lands on the new pr
   const container = await open({ workspaces: [], selected_session_id: null } as unknown as SessionsView_Serialize);
   hostReplies.set("project_add", { name: "first", path: "/code/first" });
   hostReplies.set("projects_list", [{ name: "first", path: "/code/first" }]);
+  assert.equal(
+    container.querySelectorAll(".composer-add-project, .composer-add-folder").length,
+    1,
+    "one add button in the empty state",
+  );
   container.querySelector<HTMLButtonElement>(".composer-empty-projects .composer-add-folder")!.click();
   await settle();
 
