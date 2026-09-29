@@ -101,33 +101,33 @@ test("a needs-you card carries the need kind its wait_kind names", () => {
 });
 
 test("an idle card whose turn just finished reads done until this viewer acks it", () => {
-  const { sessions, fleet } = world();
-  const agentStatus = status(card("a:1", { state: "idle", turn_complete: true, evidence_observed_at: 7 }));
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const agentStatus = status(card("claude:p-1", { state: "idle", turn_complete: true, evidence_observed_at: 7 }));
   const before = boardColumns(agentStatus, fleet, sessions, NO_ACKS);
   assert.deepEqual(
     before.map((column) => [column.state, column.cards.map((c) => c.key)]),
     [
       ["needs", []],
       ["working", []],
-      ["done", ["a:1"]],
+      ["done", ["claude:p-1"]],
       ["idle", []],
     ],
   );
 
-  const acked: AckMap = ackTurn(NO_ACKS, "a:1", 7);
+  const acked: AckMap = ackTurn(NO_ACKS, "claude:p-1", 7);
   const after = boardColumns(agentStatus, fleet, sessions, acked);
   const by = Object.fromEntries(after.map((column) => [column.state, column.cards.map((c) => c.key)]));
   assert.deepEqual(by.done, [], "acked at this turn: the Done card is gone");
-  assert.deepEqual(by.idle, ["a:1"], "and the card reads idle instead");
+  assert.deepEqual(by.idle, ["claude:p-1"], "and the card reads idle instead");
 });
 
 test("a later turn's Done shows again after an earlier turn was acked", () => {
-  const { sessions, fleet } = world();
-  const acked = ackTurn(NO_ACKS, "a:1", 7);
-  const laterTurn = status(card("a:1", { state: "idle", turn_complete: true, evidence_observed_at: 8 }));
+  const { sessions, fleet } = world(["u-1", "api", "p-1"]);
+  const acked = ackTurn(NO_ACKS, "claude:p-1", 7);
+  const laterTurn = status(card("claude:p-1", { state: "idle", turn_complete: true, evidence_observed_at: 8 }));
   const columns = boardColumns(laterTurn, fleet, sessions, acked);
   const by = Object.fromEntries(columns.map((column) => [column.state, column.cards.map((c) => c.key)]));
-  assert.deepEqual(by.done, ["a:1"], "turn 8 was never acked, only turn 7 was");
+  assert.deepEqual(by.done, ["claude:p-1"], "turn 8 was never acked, only turn 7 was");
 });
 
 test("an exited agent is kept in Done until opened, then Idle, never a fifth column", () => {
@@ -146,6 +146,21 @@ test("an exited agent nobody can open goes straight to Idle, never stuck in Done
   assert.deepEqual(idle.cards.map((c) => c.key), ["claude:p-orphan"]);
   assert.equal(idle.cards[0].sessionId, null);
 });
+
+test("a finished turn nobody can open goes straight to Idle, and an ACP one stays in Done", () => {
+  const { sessions, fleet } = world(); // no row for either card
+  const finished = { state: "idle", turn_complete: true } as const;
+  const columns = boardColumns(
+    status(card("claude:p-lost", finished), card("acp:t-1", { ...finished, provider: "acp" })),
+    fleet,
+    sessions,
+    NO_ACKS,
+  );
+  const by = Object.fromEntries(columns.map((column) => [column.state, column.cards.map((c) => c.key)]));
+  assert.deepEqual(by.idle, ["claude:p-lost"], "no row, no transcript: nothing could ack it out of Done");
+  assert.deepEqual(by.done, ["acp:t-1"], "its transcript opens it, so it waits in Done to be read");
+});
+
 test("an unverifiable card falls in with idle, marked unverifiable rather than drawn as plainly idle", () => {
   const { sessions, fleet } = world();
   const columns = boardColumns(status(card("a:1", { state: "unverifiable" })), fleet, sessions, NO_ACKS);
