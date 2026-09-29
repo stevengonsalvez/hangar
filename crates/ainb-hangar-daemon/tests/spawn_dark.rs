@@ -1,7 +1,7 @@
 //! `worktree/create`, `worktree/agent_add` and the `shell/*` verbs ship dark: with
 //! `AINB_HANGAR_SPAWN` unset at boot the daemon answers `METHOD_NOT_FOUND`,
-//! exactly as a v1.29.0 daemon does, and none is in the mutation registry
-//! yet.
+//! exactly as a v1.29.0 daemon does. The worktree verbs are not in the
+//! mutation registry yet; `shell/create` and `shell/close` are.
 //!
 //! Its own test binary: the switch is read once per process, so the enabled
 //! path lives in `spawn_verbs.rs`, a separate process that sets it.
@@ -112,15 +112,13 @@ fn worktree_agent_add_is_not_in_the_mutation_registry_while_dark() {
     ));
 }
 
+/// The shell verbs are in the ledger while dark: a retried op id replays
+/// the first create rather than opening a second shell. Listing is a read.
 #[test]
-fn shell_create_is_not_in_the_mutation_registry_while_dark() {
-    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
-}
-
-#[test]
-fn shell_list_and_close_are_not_in_the_mutation_registry_while_dark() {
+fn shell_create_and_close_are_in_the_mutation_registry_while_dark() {
+    assert!(ainb_hangar_proto::mutation::is_mutating(m::SHELL_CREATE));
+    assert!(ainb_hangar_proto::mutation::is_mutating(m::SHELL_CLOSE));
     assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_LIST));
-    assert!(!ainb_hangar_proto::mutation::is_mutating(m::SHELL_CLOSE));
 }
 
 #[test]
