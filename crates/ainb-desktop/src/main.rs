@@ -18,7 +18,8 @@ use std::time::Duration;
 use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
-use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
+use ainb_desktop::agent_add::AddAgentArgs;
+use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree, SpawnVerb, spawn_refusal_text};
 use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
@@ -306,13 +307,11 @@ fn terminal_close(window: tauri::State<'_, Window>, key: String) {
 }
 
 /// The daemon client this window asks, or the sentence saying why not.
-fn daemon_client(
-    verb: ainb_desktop::shell_tab::Verb,
-) -> Result<ainb_hangar_client::DaemonClient, String> {
+fn daemon_client(verb: SpawnVerb) -> Result<ainb_hangar_client::DaemonClient, String> {
     ainb_app::fleet::bridge::daemon::surface_client(
         ainb_hangar_proto::connections::SurfaceKind::Desktop,
     )
-    .map_err(|error| ainb_desktop::shell_tab::refusal_text(verb, &error))
+    .map_err(|error| spawn_refusal_text(&error, verb))
 }
 
 /// The folder `target` names, resolved from the host's own session list or
@@ -339,11 +338,11 @@ async fn shell_open(
     window: tauri::State<'_, Window>,
     target: ainb_desktop::worktree_target::WorktreeTarget,
 ) -> Result<String, String> {
-    use ainb_desktop::shell_tab::{self, Verb};
+    use ainb_desktop::shell_tab;
     let terminals =
         window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
     let dir = resolve_worktree(&window, &target)?;
-    match shell_tab::open_tab(&daemon_client(Verb::Open)?, terminals, &dir).await {
+    match shell_tab::open_tab(&daemon_client(SpawnVerb::OpenTerminal)?, terminals, &dir).await {
         Ok(key) => {
             tracing::info!(tmux = %key, "window opened a shell");
             Ok(key)
@@ -362,9 +361,9 @@ async fn shell_open(
 /// tab is refused: this ends only shells the daemon opened.
 #[tauri::command]
 async fn shell_close(window: tauri::State<'_, Window>, key: String) -> Result<(), String> {
-    use ainb_desktop::shell_tab::{self, Verb};
+    use ainb_desktop::shell_tab;
     let terminals = window.terminals.as_ref().ok_or("No terminal tabs are open.")?;
-    shell_tab::close_tab(terminals, &daemon_client(Verb::Close)?, &key)
+    shell_tab::close_tab(terminals, &daemon_client(SpawnVerb::CloseTerminal)?, &key)
         .await
         .map(|_| ())
 }
@@ -390,7 +389,7 @@ async fn restore_shells(handle: tauri::AppHandle) {
     let Some(terminals) = window.terminals.as_ref() else {
         return;
     };
-    let client = match daemon_client(ainb_desktop::shell_tab::Verb::Open) {
+    let client = match daemon_client(SpawnVerb::OpenTerminal) {
         Ok(client) => client,
         Err(error) => {
             tracing::warn!(%error, "shells not restored");
@@ -422,11 +421,41 @@ async fn worktree_create(
     let client = ainb_app::fleet::bridge::daemon::surface_client(
         ainb_hangar_proto::connections::SurfaceKind::Desktop,
     )
-    .map_err(|error| ainb_desktop::create::refusal_text(&error))?;
+    .map_err(|error| spawn_refusal_text(&error, SpawnVerb::CreateWorktree))?;
     let created = ainb_desktop::create::request(&client, args).await?;
     tracing::info!(session = %created.session_id, "window created a worktree session");
-    // The session exists either way; a tab that cannot open is said out loud
-    // rather than leaving the person with a closed composer and nothing new.
+    open_created_tab(&app, &window, &created);
+    Ok(created)
+}
+
+/// Add one more agent to the worktree `args.target` names, then open its tab.
+///
+/// The page sends ids and an agent, never a path: the worktree is read from
+/// the host's own session list or shell tab ([`resolve_worktree`]), and the
+/// daemon does the work (`worktree/agent_add`). A refusal comes back as the
+/// sentence the window shows.
+#[tauri::command]
+async fn worktree_agent_add(
+    app: tauri::AppHandle,
+    window: tauri::State<'_, Window>,
+    args: AddAgentArgs,
+) -> Result<CreatedWorktree, String> {
+    let worktree = resolve_worktree(&window, &args.target)?;
+    let client = ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| spawn_refusal_text(&error, SpawnVerb::AddAgent))?;
+    let created = ainb_desktop::agent_add::request(&client, worktree, args.agent).await?;
+    tracing::info!(session = %created.session_id, "window added an agent to a worktree");
+    open_created_tab(&app, &window, &created);
+    Ok(created)
+}
+
+/// Open the tab of a session the daemon just made, which the host focuses.
+///
+/// The session exists either way; a tab that cannot open is said out loud
+/// rather than leaving the person with nothing new on screen.
+fn open_created_tab(app: &tauri::AppHandle, window: &Window, created: &CreatedWorktree) {
     let attach_problem = match (
         &window.terminals,
         uuid::Uuid::parse_str(&created.session_id),
@@ -454,12 +483,11 @@ async fn worktree_create(
             "Created {} but could not open its tab: {problem}",
             created.branch
         ));
-        tracing::warn!(%message, "worktree created without a tab");
+        tracing::warn!(%message, "session created without a tab");
         if let Err(error) = app.emit("toast", &message) {
             tracing::warn!(%error, "toast not delivered to the webview");
         }
     }
-    Ok(created)
 }
 
 /// What deleting a session would remove, for the delete dialog to say before
@@ -1317,6 +1345,7 @@ fn main() {
             shell_close,
             shell_reattach,
             worktree_create,
+            worktree_agent_add,
             session_delete_preview,
             session_delete,
             session_rename,

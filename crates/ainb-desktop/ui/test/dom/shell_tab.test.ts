@@ -1,6 +1,6 @@
 // "New terminal" in the whole window (`main.tsx`), mounted over the fake host:
-// the strip's + and Mod+T ask the host for a shell in the shown tab's
-// worktree, the host's tab lands in the strip, and closing a shell's tab,
+// the pane strip's + menu and Mod+T ask the host for a shell in the shown
+// tab's worktree, the host's tab lands in the strip, and closing a shell's tab,
 // by its x or by Mod+W, ends the shell (`shell_close`) where any other tab
 // only detaches (`terminal_close`). A refusal shows the host's sentence.
 //
@@ -68,7 +68,13 @@ internals.invoke = async (command, args = {}) => {
   return null;
 };
 
-const plus = () => document.querySelector<HTMLButtonElement>(".tab-new-terminal");
+const plus = () => document.querySelector<HTMLButtonElement>(".pane-strip .tab-new");
+/** Open the pane's + menu and pick New terminal, as a person does. */
+async function newTerminal(): Promise<void> {
+  plus()!.click();
+  await until(() => document.querySelector(".tab-create-menu") !== null, "the + menu");
+  document.querySelector<HTMLButtonElement>('.tab-create-menu [data-item="terminal"]')!.click();
+}
 const lastCall = (command: string) => [...calls].reverse().find((call) => call.command === command);
 const shellTabs = () =>
   [...document.querySelectorAll<HTMLElement>(".tab[data-state]")].filter((tab) =>
@@ -78,15 +84,13 @@ const toasts = () => [...document.querySelectorAll(".toast")].map((toast) => toa
 /** Mod+T and Mod+W as this window reads them off macOS: Ctrl+Shift. */
 const chord = (code: string, key: string) => press({ code, key, ctrlKey: true, shiftKey: true });
 
-test("the + is off with nothing to open in, and opens a shell in the shown tab's worktree", async () => {
+test("the pane strip's + opens a shell in the shown tab's worktree", async () => {
   await mountWindow();
-  // The board, and no row selected: no worktree is in view.
-  assert.ok(plus(), "the window mounts the New terminal +");
-  assert.equal(plus()!.disabled, true);
+  assert.ok(plus(), "the pane strip mounts the + menu");
+  assert.equal(document.querySelector("nav.tabs:not(.pane-strip) .tab-new"), null, "none beside Board and Review");
 
   await showTab("u-1");
-  assert.equal(plus()!.disabled, false);
-  plus()!.click();
+  await newTerminal();
   await until(() => shellTabs().length === 1, "the shell's tab in the strip");
   // Only ids cross: the host resolves the folder.
   assert.deepEqual(lastCall("shell_open")?.args, { target: { kind: "session", id: "u-1" } });
@@ -126,7 +130,7 @@ test("closing a shell's tab ends the shell, by its x and by Mod+W; a session tab
 test("a refusal shows the host's sentence as it came", async () => {
   await showTab("u-1");
   refuse.set("shell_open", MAY_STILL_OPEN_TEXT);
-  plus()!.click();
+  await newTerminal();
   await until(() => toasts().some((text) => text.includes("may still open")), "the refusal toast");
   assert.ok(toasts().includes(MAY_STILL_OPEN_TEXT), toasts().join(" | "));
   assert.equal(host.tabs.filter((tab) => tab.key.startsWith("ainb-dsh-")).length, 0, "no tab for a refused open");

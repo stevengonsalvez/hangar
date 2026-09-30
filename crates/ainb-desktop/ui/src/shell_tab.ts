@@ -15,7 +15,8 @@ import type { WorktreeTarget } from "./worktree_target.ts";
 export const NO_SESSION = "Select a session or a terminal tab first: a new terminal opens in its worktree.";
 
 export interface ShellTabDeps {
-  /** The worktree a new terminal opens in (`worktreeTarget`). */
+  /** The worktree Mod+T opens a terminal in: the focused pane's
+   * (`worktreeTarget`). A pane's "+" names its own. */
   target(): WorktreeTarget | null;
   toast(message: string): void;
 }
@@ -26,9 +27,9 @@ export interface ShellTabDeps {
  * detail), and is shown as it came.
  */
 export function createShellTabs(deps: ShellTabDeps) {
-  /** A new shell in the target's worktree; the host opens its tab. */
-  const open = async (): Promise<void> => {
-    const target = deps.target();
+  /** A new shell in `target`'s worktree (a pane's "+"), else the focused
+   * pane's (Mod+T); the host opens its tab. */
+  const open = async (target: WorktreeTarget | null = deps.target()): Promise<void> => {
     if (target === null) {
       deps.toast(NO_SESSION);
       return;
