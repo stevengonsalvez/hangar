@@ -202,9 +202,7 @@ fn a_name_only_counts_as_taken_within_its_project() {
 /// What the terminal does when a person names a session there while the
 /// window is open: the label store on disk gains a label.
 fn terminal_labels(tmux: &str, label: &str) {
-    let mut store = SessionLabelStore::load();
-    store.set(tmux.to_string(), Some(label.to_string()));
-    store.save().expect("the terminal's write");
+    SessionLabelStore::set_label(tmux, Some(label.to_string())).expect("the terminal's write");
 }
 
 #[test]
@@ -227,4 +225,44 @@ fn a_label_the_terminal_wrote_since_launch_is_kept_and_counts_as_taken() {
         "the window's write kept the terminal's label"
     );
     assert_eq!(relaunched_label(&f.other_tmux).as_deref(), Some("Billing"));
+}
+
+/// The label file in the scratch home, replaced by `bytes` until the guard
+/// drops, so a failed assertion cannot leave a damaged file for the next test.
+struct DamagedLabelFile(std::path::PathBuf);
+
+impl DamagedLabelFile {
+    fn write(bytes: &[u8]) -> Self {
+        let path = support::isolated_home().join(".agents-in-a-box").join("session-labels.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for DamagedLabelFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[test]
+fn a_label_file_that_does_not_parse_is_the_fields_refusal_and_is_left_as_it_is() {
+    let _one = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let f = fixture();
+    let damaged: &[u8] = b"{\"tmux-a\": \"Keep me\", ";
+    let file = DamagedLabelFile::write(damaged);
+
+    let refusal = f.shell.rename_session(f.api, "Fix login").expect_err("refused");
+    assert!(refusal.contains("was not saved"), "{refusal}");
+    assert!(
+        !refusal.contains("Keep me"),
+        "the field repeats no label: {refusal}"
+    );
+    assert_eq!(
+        std::fs::read(&file.0).unwrap(),
+        damaged,
+        "the file was rewritten"
+    );
+    assert_eq!(f.frames.lock().unwrap().len(), 0, "nothing was framed");
 }
