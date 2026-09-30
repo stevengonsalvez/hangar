@@ -972,6 +972,22 @@ pub async fn load_session_store_async() -> std::io::Result<SessionStore> {
     session_source().await.load().await
 }
 
+/// [`load_session_store_async`], except that a `sessions.json` that cannot be
+/// read or parsed is an error, not an empty store
+/// ([`SessionStore::load_checked`]): for a caller that acts on what the store
+/// does NOT hold, where an unreadable file must not read as "no such row".
+///
+/// # Errors
+///
+/// As [`load_session_store_async`], and a file that does not read or parse.
+pub async fn load_session_store_checked_async() -> std::io::Result<SessionStore> {
+    SessionStore::ensure_lock_not_held()?;
+    match session_source().await {
+        SessionSource::File | SessionSource::Degraded(_) => SessionStore::load_checked(),
+        daemon @ SessionSource::Daemon(_) => daemon.load().await,
+    }
+}
+
 /// [`load_session_store_async`] from sync code.
 ///
 /// # Errors
