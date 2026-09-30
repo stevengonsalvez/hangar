@@ -264,4 +264,98 @@ mod tests {
             "{log}"
         );
     }
+
+    /// Serializes the tests below: they mutate the process-wide `HOME` and
+    /// `AINB_HANGAR_HOME`, which every other test in this binary that calls
+    /// `load()` (none today, but `dirs::home_dir()` is process-global) would
+    /// otherwise race.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with `HOME` and `AINB_HANGAR_HOME` set to `home` and
+    /// `hangar_home` (`None` removes the variable), then restores whatever was
+    /// there before, even if `body` panics.
+    fn with_home_and_hangar_home<R>(
+        home: Option<&std::path::Path>,
+        hangar_home: Option<&str>,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior_home = std::env::var_os("HOME");
+        let prior_hangar = std::env::var_os("AINB_HANGAR_HOME");
+
+        match home {
+            Some(path) => std::env::set_var("HOME", path),
+            None => std::env::remove_var("HOME"),
+        }
+        match hangar_home {
+            Some(path) => std::env::set_var("AINB_HANGAR_HOME", path),
+            None => std::env::remove_var("AINB_HANGAR_HOME"),
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+
+        match prior_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prior_hangar {
+            Some(v) => std::env::set_var("AINB_HANGAR_HOME", v),
+            None => std::env::remove_var("AINB_HANGAR_HOME"),
+        }
+
+        result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    /// `load()` reads `[notifyd]` from `$AINB_HANGAR_HOME`, never from
+    /// `$HOME`. Two distinct homes, each with its OWN config carrying a
+    /// distinct value ("7" under the hangar home the reader must use, "9"
+    /// under `$HOME` it must not), so a reader that used `$HOME` would read a
+    /// wrong value instead of silently passing.
+    #[test]
+    fn load_reads_the_hangar_home_not_home() {
+        let hangar_home = TempDir::new().unwrap();
+        let hangar_path = ainb_hangar_core::paths::config_path_in(hangar_home.path());
+        std::fs::create_dir_all(hangar_path.parent().unwrap()).unwrap();
+        std::fs::write(&hangar_path, "[notifyd]\nos_debounce_secs = 7\n").unwrap();
+        let wrong_home = TempDir::new().unwrap();
+        let wrong_path =
+            wrong_home.path().join(".agents-in-a-box").join("config").join("config.toml");
+        std::fs::create_dir_all(wrong_path.parent().unwrap()).unwrap();
+        std::fs::write(&wrong_path, "[notifyd]\nos_debounce_secs = 9\n").unwrap();
+
+        let debounce = with_home_and_hangar_home(
+            Some(wrong_home.path()),
+            Some(hangar_home.path().to_str().unwrap()),
+            || load().os_debounce_secs,
+        );
+        assert_eq!(debounce, 7, "must read $AINB_HANGAR_HOME, not $HOME");
+    }
+
+    /// With `$AINB_HANGAR_HOME` unset, `load()` falls back to
+    /// `$HOME/.agents-in-a-box`.
+    #[test]
+    fn load_falls_back_to_home_when_hangar_home_is_unset() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".agents-in-a-box").join("config").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[notifyd]\nos_debounce_secs = 11\n").unwrap();
+
+        let debounce =
+            with_home_and_hangar_home(Some(home.path()), None, || load().os_debounce_secs);
+        assert_eq!(debounce, 11);
+    }
+
+    /// An empty `$AINB_HANGAR_HOME` is not "set": `load()` must fall back to
+    /// `$HOME/.agents-in-a-box`, the same as when the variable is absent.
+    #[test]
+    fn load_treats_an_empty_hangar_home_as_unset() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join(".agents-in-a-box").join("config").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[notifyd]\nos_debounce_secs = 13\n").unwrap();
+
+        let debounce =
+            with_home_and_hangar_home(Some(home.path()), Some(""), || load().os_debounce_secs);
+        assert_eq!(debounce, 13, "an empty override must fall through to $HOME");
+    }
 }
