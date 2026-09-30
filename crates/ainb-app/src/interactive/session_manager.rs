@@ -1022,30 +1022,44 @@ pub enum WorktreeRollback<'a> {
     SessionLinkOnly(&'a WorktreeManager),
 }
 
+/// Whether tmux's `stderr` for a failed `-t =<name>` command says that
+/// session is not running: no such session, no server, no socket. Anything
+/// else (a socket it may not open, a server that did not answer) says
+/// nothing about the session.
+fn tmux_says_gone(stderr: &str) -> bool {
+    ["can't find session", "no server running", "No such file"]
+        .iter()
+        .any(|gone| stderr.contains(gone))
+}
+
 /// End the tmux session named exactly `name` and check that it has ended.
 ///
-/// A failed `kill-session` is fine when the session is not running (already
-/// exited, or no server at all); a session still running afterwards is an
-/// error, so a removal never deletes the folder of an agent still in it.
+/// A failed `kill-session` is fine when tmux then says the session is not
+/// running ([`tmux_says_gone`]: already exited, or no server at all); a
+/// session still running, or a tmux that cannot say, is an error, so a
+/// removal never deletes the folder of an agent that may still be in it.
 ///
 /// # Errors
 /// [`InteractiveSessionError::Io`] when tmux cannot be run, and
-/// [`InteractiveSessionError::Tmux`] when the session is still running.
+/// [`InteractiveSessionError::Tmux`] when the session is still running or
+/// tmux could not say whether it is.
 async fn end_tmux_session(name: &str) -> Result<(), InteractiveSessionError> {
     // `=name` is exact: a bare `-t` resolves a prefix, so ending "feat-auth"
     // would end a live "feat-auth-2".
     let target = format!("={name}");
     let killed = Command::new("tmux").args(["kill-session", "-t", &target]).output().await?;
-    let running = Command::new("tmux")
-        .args(["has-session", "-t", &target])
-        .output()
-        .await?
-        .status
-        .success();
-    if running {
+    let probe = Command::new("tmux").args(["has-session", "-t", &target]).output().await?;
+    if probe.status.success() {
         return Err(InteractiveSessionError::Tmux(format!(
             "tmux session {name} is still running after kill-session ({})",
             String::from_utf8_lossy(&killed.stderr).trim()
+        )));
+    }
+    let why = String::from_utf8_lossy(&probe.stderr);
+    if !tmux_says_gone(&why) {
+        return Err(InteractiveSessionError::Tmux(format!(
+            "tmux could not say whether session {name} is still running: {}",
+            why.trim()
         )));
     }
     if killed.status.success() {
@@ -1281,6 +1295,27 @@ impl Drop for HeldLockMark {
 }
 
 impl SessionStore {
+    /// [`Self::load`], except that a `sessions.json` that exists and cannot be
+    /// read or parsed is an error rather than an empty store: for a caller
+    /// that acts on what the store does NOT hold.
+    ///
+    /// # Errors
+    /// The file could not be read, or does not parse.
+    pub fn load_checked() -> std::io::Result<Self> {
+        let path = Self::storage_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e),
+        };
+        serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} does not parse: {e}", path.display()),
+            )
+        })
+    }
+
     /// Load session store from disk
     pub fn load() -> Self {
         let path = Self::storage_path();
@@ -2666,22 +2701,33 @@ impl InteractiveSessionManager {
         // `worktree/create`, so every session the desktop makes) names its
         // session `tmux_{workspace}-{id}` instead. Killing the guess missed the
         // agent and could hit another session sharing the tree. The derived
-        // names stay as the fallback for a row that no longer exists.
+        // names stay as the fallback for a row that no longer exists, and only
+        // for a tree no other session works in (`derived_tmux_name`). A store
+        // that cannot be read is not "no row": it stops the removal.
         let tmux_session_name: Option<String> = if let Some(ref session) = session_opt {
             info!(
                 "Using tmux session name from memory: {}",
                 session.tmux_session_name
             );
             Some(session.tmux_session_name.clone())
-        } else if let Some(name) = Self::stored_tmux_name(session_id).await {
-            info!("Resolved tmux name from sessions.json: {}", name);
-            Some(name)
         } else {
-            info!(
-                "No sessions.json entry for {}, deriving its tmux name from the worktree",
-                session_id
-            );
-            self.derived_tmux_name(session_id)
+            let store =
+                crate::cli::util::load_session_store_checked_async().await.map_err(|e| {
+                    InteractiveSessionError::InvalidState(format!(
+                        "the session store could not be read, so this session's tmux \
+                         session is unknown; nothing was removed: {e}"
+                    ))
+                })?;
+            if let Some(name) = Self::stored_tmux_name(&store, session_id) {
+                info!("Resolved tmux name from sessions.json: {}", name);
+                Some(name)
+            } else {
+                info!(
+                    "No sessions.json entry for {}, deriving its tmux name from the worktree",
+                    session_id
+                );
+                self.derived_tmux_name(&store, session_id)?
+            }
         };
 
         // A session still running here keeps an agent working in a folder
@@ -2785,13 +2831,10 @@ impl InteractiveSessionManager {
         Ok(())
     }
 
-    /// The tmux name `session_id`'s row in sessions.json was saved with, or
-    /// `None` when there is no row or the store cannot be read.
-    async fn stored_tmux_name(session_id: Uuid) -> Option<String> {
-        crate::cli::util::load_session_store_async()
-            .await
-            .map_err(|e| warn!("session store unavailable: {e}"))
-            .ok()?
+    /// The tmux name `session_id`'s row in `store` was saved with, or `None`
+    /// when it has no row.
+    fn stored_tmux_name(store: &SessionStore, session_id: Uuid) -> Option<String> {
+        store
             .sessions()
             .values()
             .find(|m| m.session_id == session_id)
@@ -2802,7 +2845,16 @@ impl InteractiveSessionManager {
     /// runs under: the current, then the pre-#1122 uncapped, then the legacy
     /// form, whichever is running, else the legacy one. `None` when the
     /// worktree cannot be read.
-    fn derived_tmux_name(&self, session_id: Uuid) -> Option<String> {
+    ///
+    /// # Errors
+    /// [`InteractiveSessionError::InvalidState`] when another session works
+    /// in the tree ([`tree_in_use_by_another`] against `store`): a name
+    /// derived from the tree could be that session's, so none is guessed.
+    fn derived_tmux_name(
+        &self,
+        store: &SessionStore,
+        session_id: Uuid,
+    ) -> Result<Option<String>, InteractiveSessionError> {
         let worktree = match self.worktree_manager.get_worktree_info(session_id) {
             Ok(worktree) => worktree,
             Err(e) => {
@@ -2810,9 +2862,21 @@ impl InteractiveSessionManager {
                     "No worktree to derive a tmux name from for {}: {}",
                     session_id, e
                 );
-                return None;
+                return Ok(None);
             }
         };
+        if tree_in_use_by_another(
+            &self.worktree_manager,
+            store,
+            &worktree.path,
+            Some(session_id),
+        ) {
+            return Err(InteractiveSessionError::InvalidState(format!(
+                "session {session_id} has no row and another session works in {}, so a tmux \
+                 name derived from the tree could be that session's; nothing was removed",
+                worktree.path.display()
+            )));
+        }
         let worktree_folder = Self::extract_worktree_folder(&worktree.path);
         let tmux_name = Self::generate_tmux_name(&worktree_folder, &worktree.branch_name);
         let uncapped_name =
@@ -2826,13 +2890,13 @@ impl InteractiveSessionManager {
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
-        Some(if exists(&tmux_name) {
+        Ok(Some(if exists(&tmux_name) {
             tmux_name
         } else if uncapped_name != tmux_name && exists(&uncapped_name) {
             uncapped_name
         } else {
             Self::generate_tmux_name_legacy(&worktree.branch_name)
-        })
+        }))
     }
 
     /// Check if a session is still alive (tmux session exists)
@@ -6562,5 +6626,145 @@ mod shared_worktree_tests {
         );
         let store = SessionStore::load();
         assert!(store.sessions().is_empty(), "{:?}", store.sessions().keys());
+    }
+
+    /// A private tmux server for `fx`: the socket a bare `tmux` reaches under
+    /// the TMUX_TMPDIR set here, which is what the code under test runs, and
+    /// the directory that holds it (kept alive by the caller).
+    fn private_tmux(fx: &mut SharedTree) -> (tempfile::TempDir, PathBuf) {
+        // Under /tmp: macOS caps unix socket paths at 104 bytes.
+        let tmux_tmp = tempfile::Builder::new()
+            .prefix("ainb-drv-")
+            .tempdir_in("/tmp")
+            .expect("tmux dir");
+        fx.home.set("TMUX_TMPDIR", tmux_tmp.path());
+        fx.home.unset("TMUX");
+        fx.home.set("SHELL", "/bin/sh");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let uid = std::fs::metadata(tmux_tmp.path()).expect("tmux dir meta").uid();
+        let socket_dir = tmux_tmp.path().join(format!("tmux-{uid}"));
+        std::fs::create_dir_all(&socket_dir).expect("socket dir");
+        std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("socket dir mode");
+        let socket = socket_dir.join("default");
+        (tmux_tmp, socket)
+    }
+
+    fn tmux_on(socket: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(socket)
+            .args(args)
+            .output()
+            .expect("tmux")
+    }
+
+    /// Ends one session by exact name on the test's socket, whatever happened.
+    struct EndExact(PathBuf, String);
+    impl Drop for EndExact {
+        fn drop(&mut self) {
+            eprintln!("ending tmux session {} on {}", self.1, self.0.display());
+            let _ = tmux_on(&self.0, &["kill-session", "-t", &format!("={}", self.1)]);
+        }
+    }
+
+    fn tmux_missing() -> bool {
+        let missing = !std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(
+            !missing || std::env::var_os("CI").is_none(),
+            "tmux is missing under CI"
+        );
+        missing
+    }
+
+    /// The name a TUI session in the first session's tree runs under: what
+    /// the removal would derive for a session with no row.
+    fn derived_name(fx: &SharedTree) -> String {
+        let folder = InteractiveSessionManager::extract_worktree_folder(&fx.minted);
+        InteractiveSessionManager::generate_tmux_name(&folder, "feat")
+    }
+
+    /// A session store that does not parse is not an empty one: the removal
+    /// must not read it as "no row", derive a name from the shared tree, and
+    /// end the other session running under it.
+    #[tokio::test]
+    async fn an_unreadable_store_stops_the_removal_before_any_tmux_kill() {
+        if !git_available() || tmux_missing() {
+            return;
+        }
+        let mut fx = shared_tree();
+        let (_tmux_dir, socket) = private_tmux(&mut fx);
+        let sibling = derived_name(&fx);
+        let _end = EndExact(socket.clone(), sibling.clone());
+        let started = tmux_on(
+            &socket,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                &sibling,
+                "-c",
+                &fx.resolved.display().to_string(),
+            ],
+        );
+        assert!(started.status.success(), "{started:?}");
+        std::fs::write(SessionStore::storage_path(), "{ not json").expect("damage the store");
+
+        let mut manager = InteractiveSessionManager::new().expect("manager");
+        let refused = manager.remove_session(fx.first).await;
+
+        assert!(refused.is_err(), "an unreadable store removed the session");
+        let alive = tmux_on(&socket, &["has-session", "-t", &format!("={sibling}")]);
+        assert!(alive.status.success(), "the other session's tmux was ended");
+        assert!(fx.resolved.is_dir(), "the shared tree was removed");
+    }
+
+    /// A session with no row in a tree another session works in: a name
+    /// derived from the tree could be the other session's, so none is killed.
+    #[tokio::test]
+    async fn no_name_is_derived_in_a_tree_another_session_works_in() {
+        if !git_available() || tmux_missing() {
+            return;
+        }
+        let mut fx = shared_tree();
+        let (_tmux_dir, socket) = private_tmux(&mut fx);
+        let sibling = derived_name(&fx);
+        let _end = EndExact(socket.clone(), sibling.clone());
+        let started = tmux_on(
+            &socket,
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                &sibling,
+                "-c",
+                &fx.resolved.display().to_string(),
+            ],
+        );
+        assert!(started.status.success(), "{started:?}");
+        // Only the second session has a row, and it runs under the derived name.
+        let mut store = SessionStore::default();
+        store.upsert(row(fx.second, &sibling, &fx.resolved));
+        store.save().expect("seed store");
+
+        let mut manager = InteractiveSessionManager::new().expect("manager");
+        let refused = manager.remove_session(fx.first).await;
+
+        assert!(
+            refused.is_err(),
+            "the first session was removed by a guessed name"
+        );
+        let alive = tmux_on(&socket, &["has-session", "-t", &format!("={sibling}")]);
+        assert!(
+            alive.status.success(),
+            "the second session's tmux was ended"
+        );
+        assert!(
+            fx.resolved.is_dir(),
+            "the second session's tree was removed"
+        );
     }
 }
