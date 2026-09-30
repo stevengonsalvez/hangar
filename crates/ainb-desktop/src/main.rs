@@ -114,9 +114,9 @@ fn show_notice(handle: &tauri::AppHandle, notice: &Notice) {
     use tauri_plugin_notification::NotificationExt;
     let shown = handle.notification().builder().title(&notice.title).body(&notice.body).show();
     match shown {
-        Ok(()) => tracing::info!(session = %notice.session_key, "OS notification handed to the OS"),
+        Ok(()) => tracing::info!(session = ?notice.session_key, "OS notification handed to the OS"),
         Err(error) => {
-            tracing::warn!(%error, session = %notice.session_key, "OS notification not sent");
+            tracing::warn!(%error, session = ?notice.session_key, "OS notification not sent");
         }
     }
 }
