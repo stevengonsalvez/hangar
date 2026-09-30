@@ -27,12 +27,10 @@ use ainb_app::Intent;
 use ainb_app::app::state::AppState;
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
-use ainb_hangar_proto::spawn::{
-    SPAWN_STARTED, ShellCloseParams, ShellCreateParams, ShellCreateResult,
-};
+use ainb_hangar_proto::spawn::{ShellCloseParams, ShellCreateParams, ShellCreateResult};
 use uuid::Uuid;
 
-use crate::create::{SpawnVerb, mint_op_id, spawn_refusal_text};
+use crate::create::{SpawnVerb, may_have_started, mint_op_id, spawn_refusal_text};
 use crate::terminal::{TabTarget, Terminals};
 
 /// The worktree folder of the listed session `session_id`, from the host's
@@ -72,20 +70,9 @@ pub fn close_params(tmux_session_name: &str, op_id: OpId) -> ShellCloseParams {
 }
 
 /// How long after an open that may still make its shell the host looks for
-/// it once more: past tmux's own 10s answer budget in the daemon.
+/// it once more: past the daemon's own answer budget for tmux
+/// (`ainb_hangar_daemon::spawn::SHELL_TMUX_TIMEOUT`).
 pub const LATE_RESTORE: Duration = Duration::from_secs(12);
-
-/// Whether a failed `shell/create` may still have made its shell: the
-/// daemon did not answer in time, or said tmux started but did not finish.
-/// Any other refusal made nothing.
-#[must_use]
-pub fn may_still_open(error: &DaemonError) -> bool {
-    match error {
-        DaemonError::Timeout(_) => true,
-        DaemonError::Rpc { code, .. } => *code == SPAWN_STARTED,
-        _ => false,
-    }
-}
 
 async fn create(
     client: &DaemonClient,
@@ -132,9 +119,6 @@ pub struct OpenTabError {
     pub message: String,
     /// The reducer's report of a failed attach, for the host to dispatch.
     pub report: Option<Intent>,
-    /// The shell may still appear ([`may_still_open`]): the host looks for
-    /// it again after [`LATE_RESTORE`].
-    pub may_still_open: bool,
 }
 
 /// Open a shell in `worktree_path` and attach it as a tab; answer the tab's
@@ -143,18 +127,31 @@ pub struct OpenTabError {
 /// A shell whose tab cannot attach is closed again before this returns: the
 /// window shows no tab for it, so nothing else would ever end it.
 ///
+/// A refusal that may still make its shell ([`may_have_started`]) hands
+/// `late` [`LATE_RESTORE`]: the host schedules its one late look
+/// ([`restore_after`]) with it, so the shell gets its tab unasked. `late`
+/// is not called on any other outcome.
+///
 /// # Errors
 /// The daemon's refusal, or the failed attach with its report.
 pub async fn open_tab(
     client: &DaemonClient,
     terminals: &Terminals,
     worktree_path: &str,
+    late: impl FnOnce(Duration),
 ) -> Result<String, OpenTabError> {
-    let shell = create(client, worktree_path).await.map_err(|error| OpenTabError {
-        message: spawn_refusal_text(&error, SpawnVerb::OpenTerminal),
-        report: None,
-        may_still_open: may_still_open(&error),
-    })?;
+    let shell = match create(client, worktree_path).await {
+        Ok(shell) => shell,
+        Err(error) => {
+            if may_have_started(&error) {
+                late(LATE_RESTORE);
+            }
+            return Err(OpenTabError {
+                message: spawn_refusal_text(&error, SpawnVerb::OpenTerminal),
+                report: None,
+            });
+        }
+    };
     let name = shell.tmux_session_name.clone();
     let Some(report) = terminals.open(target(&shell)) else {
         return Ok(name);
@@ -170,7 +167,6 @@ pub async fn open_tab(
     Err(OpenTabError {
         message,
         report: Some(report),
-        may_still_open: false,
     })
 }
 
@@ -265,7 +261,7 @@ mod tests {
     use super::*;
     use crate::create::MAY_STILL_OPEN;
     use ainb_app::config::AppConfig;
-    use ainb_hangar_proto::spawn::REPO_NOT_REGISTERED;
+    use ainb_hangar_proto::spawn::{REPO_NOT_REGISTERED, SPAWN_STARTED};
 
     /// The JSON-RPC code for a method the daemon does not serve.
     const METHOD_NOT_FOUND: i32 = -32601;
@@ -363,28 +359,5 @@ mod tests {
         // A close that timed out opened nothing.
         let text = spawn_refusal_text(&slow, SpawnVerb::CloseTerminal);
         assert!(text.starts_with("Closing the terminal failed"), "{text}");
-    }
-
-    #[test]
-    fn only_a_timeout_or_a_started_run_may_still_open() {
-        assert!(may_still_open(&DaemonError::Timeout(
-            std::time::Duration::from_secs(30)
-        )));
-        assert!(may_still_open(&DaemonError::Rpc {
-            code: SPAWN_STARTED,
-            message: "tmux did not answer within 10s".into(),
-        }));
-        for code in [
-            METHOD_NOT_FOUND,
-            INVALID_PARAMS,
-            REPO_NOT_REGISTERED,
-            -32603,
-        ] {
-            let refused = DaemonError::Rpc {
-                code,
-                message: "no".into(),
-            };
-            assert!(!may_still_open(&refused), "{code} made nothing");
-        }
     }
 }
