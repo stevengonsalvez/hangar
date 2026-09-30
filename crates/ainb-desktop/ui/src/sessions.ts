@@ -84,13 +84,13 @@ export function ringFor(session: Session_Serialize): AttentionKind | null {
 export const LABEL_CHARS = 80;
 
 /**
- * A name as the sidebar may draw it: control and format characters removed
- * (a bidi override or an escape in a branch name cannot restyle the row) and
- * cut to `LABEL_CHARS` characters.
+ * Text as the window may draw it: control and format characters removed (a
+ * bidi override or an escape in a branch name cannot restyle the row) and
+ * cut to `max` characters, a sidebar label's `LABEL_CHARS` unless given.
  */
-export function label(text: string): string {
+export function label(text: string, max: number = LABEL_CHARS): string {
   return Array.from(text.replace(/[\p{Cc}\p{Cf}]/gu, ""))
-    .slice(0, LABEL_CHARS)
+    .slice(0, max)
     .join("");
 }
 
