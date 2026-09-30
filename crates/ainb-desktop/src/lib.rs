@@ -27,6 +27,9 @@
 //!   and ends it with the tab.
 //! - [`sidecar`] finds or starts the bundled hangar daemon and holds this
 //!   surface's presence against it.
+//! - [`notify`] decides which session moves raise an OS notification: into
+//!   Needs or Done, once per move, unless off or already on screen;
+//!   [`notify_delivery`] shows them on the OS and hears their click.
 //! - [`theme`] keeps the host's copy of the theme a person picked, so the
 //!   window opens in it before the page has painted.
 //!
@@ -44,6 +47,8 @@ pub mod delete;
 pub mod executor;
 pub mod host;
 pub mod intent;
+pub mod notify;
+pub mod notify_delivery;
 pub mod projects;
 pub mod rename;
 pub mod setup;

@@ -24,6 +24,8 @@ use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
+use ainb_desktop::notify::{self, Gate, Notifier};
+use ainb_desktop::notify_delivery::{self, OsDelivery};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
@@ -79,6 +81,59 @@ struct Window {
     /// The theme a person picked (`theme_set`), shared with the window's
     /// OS-theme repaint.
     theme: Arc<ThemePick>,
+}
+
+/// What holds an OS notification back, as the page and the window last said
+/// (`notify::decide`). Managed before the main window exists, so the window's
+/// first focus event has somewhere to land.
+struct Notifications {
+    /// The host's copy of the Settings toggle (`notifications_set`).
+    file: PathBuf,
+    enabled: AtomicBool,
+    /// The card key of the session the work area shows (`notify_focus`).
+    shown: Mutex<Option<String>>,
+    window_focused: AtomicBool,
+}
+
+impl Notifications {
+    fn gate(&self) -> Gate {
+        Gate {
+            enabled: self.enabled.load(Ordering::Relaxed),
+            focused_session: self
+                .shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            window_focused: self.window_focused.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What the page hears when a person clicks a session's notification: the
+/// card key it names, for the page to select that session's row.
+#[derive(Clone, serde::Serialize)]
+struct NotifyOpen {
+    session_key: String,
+}
+
+/// A click on a notification: the window is brought forward, and the page
+/// told which session to select (`notify:open`). A summary names none, so its
+/// click only brings the window forward. Runs on the notice's own thread.
+fn open_from_notice(handle: &tauri::AppHandle, session: Option<String>) {
+    if let Some(window) = handle.get_webview_window("main") {
+        // Best effort: a window that is not minimized or hidden refuses nothing
+        // that matters, and `set_focus` below is the one that must land.
+        let _ = window.unminimize();
+        let _ = window.show();
+        if let Err(error) = window.set_focus() {
+            tracing::warn!(%error, "the window did not take focus for a notification click");
+        }
+    }
+    if let Some(session_key) = session {
+        if let Err(error) = handle.emit("notify:open", NotifyOpen { session_key }) {
+            tracing::warn!(%error, "notification click not delivered to the webview");
+        }
+    }
 }
 
 /// Drain the host's queued session-store writes before this process ends
@@ -948,6 +1003,24 @@ fn theme_set(
     paint_window_theme(&webview, preference);
 }
 
+/// The page's notifications toggle, told on every change and once at start:
+/// kept for the next launch, and obeyed from the next tick.
+#[tauri::command]
+fn notifications_set(notifications: tauri::State<'_, Notifications>, enabled: bool) {
+    notifications.enabled.store(enabled, Ordering::Relaxed);
+    if let Err(error) = notify::store(&notifications.file, enabled) {
+        tracing::warn!(%error, "notifications toggle not kept for the next launch");
+    }
+}
+
+/// The card key of the session the work area shows (its terminal, or its ACP
+/// transcript), `None` for none, told whenever it changes: that session is not
+/// announced while the window has focus.
+#[tauri::command]
+fn notify_focus(notifications: tauri::State<'_, Notifications>, session: Option<String>) {
+    *notifications.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = session;
+}
+
 /// Create the main window already in the stored pick's theme: its appearance
 /// forced before the webview exists, and its background the page's, set
 /// before it is first shown. `tauri.conf.json` declares the window with
@@ -1142,10 +1215,32 @@ fn main() {
             let hangar_home = ainb_hangar_core::hangar_home()
                 .ok_or("the hangar home cannot be resolved: set AINB_HANGAR_HOME")?;
             init_logging(&hangar_home);
+            let notifications_file = hangar_home.join(notify::NOTIFICATIONS_FILE);
+            app.manage(Notifications {
+                enabled: AtomicBool::new(notify::load(&notifications_file)),
+                file: notifications_file,
+                shown: Mutex::new(None),
+                window_focused: AtomicBool::new(false),
+            });
+            // macOS posts a notification as an app it knows: this bundle, or
+            // Terminal from a dev build, which has none (the rule
+            // tauri-plugin-notification used).
+            #[cfg(target_os = "macos")]
+            if let Err(error) = notify_rust::set_application(if tauri::is_dev() {
+                "com.apple.Terminal"
+            } else {
+                app.config().identifier.as_str()
+            }) {
+                tracing::warn!(?error, "notifications will post as the default application");
+            }
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme = Arc::new(ThemePick::load(hangar_home.join(theme::THEME_FILE)));
-            open_main_window(app.handle(), Arc::clone(&theme))?;
+            let main_window = open_main_window(app.handle(), Arc::clone(&theme))?;
+            // Focus events keep it current from here (`on_window_event`).
+            app.state::<Notifications>()
+                .window_focused
+                .store(main_window.is_focused().unwrap_or(false), Ordering::Relaxed);
             // The desktop loads the user config itself and hands it to the
             // host, which reads nothing from disk for it.
             let config = AppConfig::load().unwrap_or_else(|error| {
@@ -1313,12 +1408,35 @@ fn main() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let mut interval = tokio::time::interval(tick);
+                // Section 20's version the notifier last read, and the phase
+                // it last saw of every session.
+                let mut seen = 0;
+                let mut notifier = Notifier::default();
+                let os = OsDelivery::default();
+                let open: notify_delivery::Open = {
+                    let handle = handle.clone();
+                    Arc::new(move |session| open_from_notice(&handle, session))
+                };
                 loop {
                     interval.tick().await;
-                    handle.state::<Window>().shell.tick();
+                    let window = handle.state::<Window>();
+                    window.shell.tick();
+                    if let Some(sessions) = window.shell.agent_sessions_since(&mut seen) {
+                        let gate = handle.state::<Notifications>().gate();
+                        let now = ainb_app::fleet::daemons::heartbeat::now_ms();
+                        let notices = notifier.observe(sessions, &gate, now);
+                        notify_delivery::announce(&os, notices, &open);
+                    }
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                if let Some(notifications) = window.try_state::<Notifications>() {
+                    notifications.window_focused.store(*focused, Ordering::Relaxed);
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             subscribe,
@@ -1354,7 +1472,9 @@ fn main() {
             update_check,
             update_apply,
             update_settings,
-            theme_set
+            theme_set,
+            notifications_set,
+            notify_focus
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| {
