@@ -1022,6 +1022,40 @@ pub enum WorktreeRollback<'a> {
     SessionLinkOnly(&'a WorktreeManager),
 }
 
+/// End the tmux session named exactly `name` and check that it has ended.
+///
+/// A failed `kill-session` is fine when the session is not running (already
+/// exited, or no server at all); a session still running afterwards is an
+/// error, so a removal never deletes the folder of an agent still in it.
+///
+/// # Errors
+/// [`InteractiveSessionError::Io`] when tmux cannot be run, and
+/// [`InteractiveSessionError::Tmux`] when the session is still running.
+async fn end_tmux_session(name: &str) -> Result<(), InteractiveSessionError> {
+    // `=name` is exact: a bare `-t` resolves a prefix, so ending "feat-auth"
+    // would end a live "feat-auth-2".
+    let target = format!("={name}");
+    let killed = Command::new("tmux").args(["kill-session", "-t", &target]).output().await?;
+    let running = Command::new("tmux")
+        .args(["has-session", "-t", &target])
+        .output()
+        .await?
+        .status
+        .success();
+    if running {
+        return Err(InteractiveSessionError::Tmux(format!(
+            "tmux session {name} is still running after kill-session ({})",
+            String::from_utf8_lossy(&killed.stderr).trim()
+        )));
+    }
+    if killed.status.success() {
+        info!("Killed tmux session: {name}");
+    } else {
+        info!("tmux session {name} was not running");
+    }
+    Ok(())
+}
+
 /// Roll back resources created before a fresh Interactive session is registered.
 pub async fn rollback_failed_interactive_launch(
     session_id: Uuid,
@@ -2623,113 +2657,38 @@ impl InteractiveSessionManager {
         let session_opt = self.active_sessions.remove(&session_id);
         info!("Session in active_sessions: {}", session_opt.is_some());
 
-        // Step 1: Resolve the tmux session name, then kill it.
+        // Step 1: Resolve the tmux session name, then end it.
         //
-        // Resolution order: in-memory session → worktree-derived name → the
-        // persisted sessions.json entry. The store fallback is what makes
-        // orphaned records deletable: an entry whose worktree/symlink is already
-        // gone (e.g. a shared worktree removed by a sibling session, or a record
-        // imported without a `by-session/<uuid>` symlink) still carries its
-        // `tmux_session_name`, so we can kill the tmux session and — crucially —
-        // always fall through to the store cleanup in Step 3 instead of bailing.
+        // Resolution order: in-memory session, then the persisted row, then a
+        // name derived from the worktree. The row holds the name the session
+        // was started under; a derived `tmux_{folder}_{branch}` is only a guess
+        // from the folder and today's HEAD, and `ainb run` (the daemon's
+        // `worktree/create`, so every session the desktop makes) names its
+        // session `tmux_{workspace}-{id}` instead. Killing the guess missed the
+        // agent and could hit another session sharing the tree. The derived
+        // names stay as the fallback for a row that no longer exists.
         let tmux_session_name: Option<String> = if let Some(ref session) = session_opt {
             info!(
                 "Using tmux session name from memory: {}",
                 session.tmux_session_name
             );
             Some(session.tmux_session_name.clone())
+        } else if let Some(name) = Self::stored_tmux_name(session_id).await {
+            info!("Resolved tmux name from sessions.json: {}", name);
+            Some(name)
         } else {
-            // Try to get worktree info and derive tmux session name
-            info!("Session not in memory, discovering from worktree");
-            match self.worktree_manager.get_worktree_info(session_id) {
-                Ok(worktree) => {
-                    info!("Found worktree with branch: {}", worktree.branch_name);
-                    let worktree_folder = Self::extract_worktree_folder(&worktree.path);
-                    let tmux_name =
-                        Self::generate_tmux_name(&worktree_folder, &worktree.branch_name);
-                    let uncapped_name =
-                        Self::generate_tmux_name_uncapped(&worktree_folder, &worktree.branch_name);
-                    let legacy_name = Self::generate_tmux_name_legacy(&worktree.branch_name);
-                    // Check if new format session exists, then the uncapped form a
-                    // session minted before #1122 may still run under, otherwise
-                    // try legacy.
-                    // `=name` is exact: a bare `-t` prefix-matches, so a live
-                    // "feat-auth-2" would answer for "feat-auth" and we would
-                    // then kill the exact "feat-auth", which matches nothing,
-                    // leaving the real session running with its worktree gone.
-                    let exists = |name: &str| {
-                        std::process::Command::new("tmux")
-                            .args(["has-session", "-t", &format!("={name}")])
-                            .output()
-                            .map(|o| o.status.success())
-                            .unwrap_or(false)
-                    };
-                    let final_name = if exists(&tmux_name) {
-                        info!("Found tmux session with new format: {}", tmux_name);
-                        tmux_name
-                    } else if uncapped_name != tmux_name && exists(&uncapped_name) {
-                        info!(
-                            "Found tmux session under its uncapped name: {}",
-                            uncapped_name
-                        );
-                        uncapped_name
-                    } else {
-                        info!("Trying legacy tmux session name: {}", legacy_name);
-                        legacy_name
-                    };
-                    Some(final_name)
-                }
-                Err(e) => {
-                    // Couldn't resolve from the worktree (it's gone / never had a
-                    // symlink). Fall back to the persisted store so we can still
-                    // kill tmux and purge the record. Do NOT bail — bailing here is
-                    // exactly what left orphaned entries stuck in the UI.
-                    warn!(
-                        "Could not derive tmux name from worktree for session {} ({}); \
-                         falling back to sessions.json",
-                        session_id, e
-                    );
-                    let store_name = crate::cli::util::load_session_store_async()
-                        .await
-                        .map_err(|e| warn!("session store unavailable: {e}"))
-                        .ok()
-                        .and_then(|store| {
-                            store
-                                .sessions()
-                                .values()
-                                .find(|m| m.session_id == session_id)
-                                .map(|m| m.tmux_session_name.clone())
-                        });
-                    if let Some(ref n) = store_name {
-                        info!("Resolved tmux name from sessions.json: {}", n);
-                    } else {
-                        info!(
-                            "No sessions.json entry for {} either — proceeding to cleanup by id",
-                            session_id
-                        );
-                    }
-                    store_name
-                }
-            }
+            info!(
+                "No sessions.json entry for {}, deriving its tmux name from the worktree",
+                session_id
+            );
+            self.derived_tmux_name(session_id)
         };
 
+        // A session still running here keeps an agent working in a folder
+        // the steps below delete, so it stops the removal instead of being
+        // logged and passed over.
         if let Some(ref name) = tmux_session_name {
-            info!("Attempting to kill tmux session: {}", name);
-            // `=name` forces an exact target: bare `-t name` resolves exact, then
-            // prefix, then fnmatch, so deleting "feat-auth" would kill a live
-            // "feat-auth-2".
-            let output = Command::new("tmux")
-                .args(["kill-session", "-t", &format!("={name}")])
-                .output()
-                .await?;
-
-            if output.status.success() {
-                info!("Successfully killed tmux session: {}", name);
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("Failed to kill tmux session '{}': {}", name, stderr);
-                // Continue anyway - session might already be dead
-            }
+            end_tmux_session(name).await?;
         } else {
             info!(
                 "No tmux session name to kill for {} — skipping tmux step",
@@ -2824,6 +2783,56 @@ impl InteractiveSessionManager {
             session_id
         );
         Ok(())
+    }
+
+    /// The tmux name `session_id`'s row in sessions.json was saved with, or
+    /// `None` when there is no row or the store cannot be read.
+    async fn stored_tmux_name(session_id: Uuid) -> Option<String> {
+        crate::cli::util::load_session_store_async()
+            .await
+            .map_err(|e| warn!("session store unavailable: {e}"))
+            .ok()?
+            .sessions()
+            .values()
+            .find(|m| m.session_id == session_id)
+            .map(|m| m.tmux_session_name.clone())
+    }
+
+    /// The tmux name a session made by the TUI in `session_id`'s worktree
+    /// runs under: the current, then the pre-#1122 uncapped, then the legacy
+    /// form, whichever is running, else the legacy one. `None` when the
+    /// worktree cannot be read.
+    fn derived_tmux_name(&self, session_id: Uuid) -> Option<String> {
+        let worktree = match self.worktree_manager.get_worktree_info(session_id) {
+            Ok(worktree) => worktree,
+            Err(e) => {
+                info!(
+                    "No worktree to derive a tmux name from for {}: {}",
+                    session_id, e
+                );
+                return None;
+            }
+        };
+        let worktree_folder = Self::extract_worktree_folder(&worktree.path);
+        let tmux_name = Self::generate_tmux_name(&worktree_folder, &worktree.branch_name);
+        let uncapped_name =
+            Self::generate_tmux_name_uncapped(&worktree_folder, &worktree.branch_name);
+        // `=name` is exact: a bare `-t` prefix-matches, so a live
+        // "feat-auth-2" would answer for "feat-auth".
+        let exists = |name: &str| {
+            std::process::Command::new("tmux")
+                .args(["has-session", "-t", &format!("={name}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        Some(if exists(&tmux_name) {
+            tmux_name
+        } else if uncapped_name != tmux_name && exists(&uncapped_name) {
+            uncapped_name
+        } else {
+            Self::generate_tmux_name_legacy(&worktree.branch_name)
+        })
     }
 
     /// Check if a session is still alive (tmux session exists)
