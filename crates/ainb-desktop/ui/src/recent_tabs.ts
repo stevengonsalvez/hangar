@@ -7,6 +7,21 @@
 //   a tab a person closes ──▶ closed stack (10, newest first)
 //     Cmd+Shift+T ──▶ newest entry that can come back, where it was
 //
+// What differs from Orca, and why:
+//   - One closed stack for the window, not one per worktree: Orca's strip is
+//     a worktree's, this window's strip holds every worktree's tabs.
+//   - The switcher's list is fixed when it opens; Orca rebuilds it on each
+//     press. A tab that closes while Ctrl is held stays listed, and choosing
+//     it shows nothing.
+//   - Whether a closed tab can come back is checked before asking the host
+//     (`reopenOf`): a session tab only while its session is listed, a shell
+//     only while some listed session or open shell names its worktree. A bare
+//     tmux tab is not checked: the frame lists no tmux sessions, so a dead one
+//     is the host's to refuse, with a toast. A listed session's tmux session
+//     is not checked either; reattaching it is the host's.
+//   - Before the first sessions frame nothing is known to be gone, so reopen
+//     neither reopens nor drops anything (`popReopenable`).
+//
 // Pure, like `layout.ts`: `recent_tabs.test.ts` checks each rule without a window.
 
 import type { SessionsView_Serialize } from "../../../ainb-app/bindings/AppState";
@@ -113,12 +128,15 @@ export function reopenOf(closed: ClosedTab, open: readonly Tab[], sessions: Sess
  * The newest entry of `stack` that can come back and how, and the stack
  * without it. Entries above it that cannot come back are dropped, as Orca
  * drops a drained entry and tries the next (`recently-closed-tabs.ts:169-201`).
+ * With no sessions frame yet (`sessions` undefined) nothing is known to be
+ * gone: nothing comes back and the stack is kept whole.
  */
 export function popReopenable(
   stack: readonly ClosedTab[],
   open: readonly Tab[],
   sessions: SessionsView_Serialize | undefined,
 ): { found: { closed: ClosedTab; reopen: Reopen } | null; rest: ClosedTab[] } {
+  if (sessions === undefined) return { found: null, rest: [...stack] };
   for (let at = 0; at < stack.length; at += 1) {
     const reopen = reopenOf(stack[at], open, sessions);
     if (reopen !== null) return { found: { closed: stack[at], reopen }, rest: stack.slice(at + 1) };
