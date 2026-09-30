@@ -129,7 +129,7 @@ async function tryCommand(id) {
 /** Open the palette, or leave it open: the chord toggles it. */
 async function openPalette() {
   if (await $(".palette-query").isExisting()) return;
-  await browser.keys([...MOD, "k"]);
+  await browser.keys([...MOD, "j"]);
   await $(".palette-query").waitForExist({ timeout: 30_000 });
 }
 

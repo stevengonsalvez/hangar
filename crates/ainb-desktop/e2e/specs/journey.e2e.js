@@ -103,7 +103,7 @@ describe("the desktop shell", () => {
     await click(".session-row");
     const wasSelected = await selected();
 
-    await browser.keys([...MOD, "k"]);
+    await browser.keys([...MOD, "j"]);
     await setPaletteQuery("Select next session");
     await browser.waitUntil(async () => (await $$(".palette-row")).length > 0, {
       timeout: 15_000,
@@ -124,7 +124,7 @@ describe("the desktop shell", () => {
     const other = sessions.find((session) => session.id !== first.id);
     assert.ok(other, "the world seeded a second session");
     const tabsNow = (await $$(".tab")).length;
-    await browser.keys([...MOD, "k"]);
+    await browser.keys([...MOD, "j"]);
     await setPaletteQuery(other.branch);
     await browser.waitUntil(
       async () =>
