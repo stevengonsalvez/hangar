@@ -135,15 +135,18 @@ test("reopen takes the newest entry that can come back, dropping those above it 
 test("a reopened tab goes back to its pane and place once the layout holds it", () => {
   // g1: b, c, x | g2: a. `a` came back into the focused g2; it was g1's first.
   const layout = splitGroup(initialLayout(["a", "b", "c", "x"]), "g1", "right");
-  const moved = placeReopened(layout, new Map([["a", closed(session("a"), "g1", 0)]]));
-  assert.deepEqual(moved.placed, ["a"]);
+  const on = (key: string, closedTab: ClosedTab, until = 100) => new Map([[key, { closed: closedTab, until }]]);
+  const moved = placeReopened(layout, on("a", closed(session("a"), "g1", 0)), 0);
+  assert.deepEqual(moved.done, ["a"]);
   assert.deepEqual(
     groups(moved.layout).map((group) => [group.id, group.tabs]),
     [["g1", ["a", "b", "c", "x"]]],
     "back at g1's front; g2, emptied, closed",
   );
-  const waiting = placeReopened(layout, new Map([["y", closed(session("y"))]]));
-  assert.deepEqual(waiting, { layout, placed: [] }, "a key not back yet waits");
-  const paneGone = placeReopened(layout, new Map([["c", closed(session("c"), "g9", 0)]]));
-  assert.deepEqual(paneGone, { layout, placed: ["c"] }, "a pane closed since leaves the tab where it landed");
+  assert.deepEqual(placeReopened(layout, on("y", closed(session("y"))), 99), { layout, done: [] }, "a key not back yet waits");
+  assert.deepEqual(placeReopened(layout, on("y", closed(session("y"))), 100), { layout, done: ["y"] }, "until its time is up");
+  // Listed only after its time: some other open brought it, so it stays.
+  assert.deepEqual(placeReopened(layout, on("a", closed(session("a"), "g1", 0)), 100), { layout, done: ["a"] });
+  const paneGone = placeReopened(layout, on("c", closed(session("c"), "g9", 0)), 0);
+  assert.deepEqual(paneGone, { layout, done: ["c"] }, "a pane closed since leaves the tab where it landed");
 });
