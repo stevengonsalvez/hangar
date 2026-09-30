@@ -4,10 +4,11 @@
 //! entries that failed to decode. Never a value from the file, and never the
 //! raw source line a parse error sits on.
 //!
-//! Lives here because every reader of that file depends on this crate: the
-//! daemon, and the notifyd and session-reader plugins, which must not depend on
-//! the daemon. One implementation, so no reader can drift back to logging the
-//! errors verbatim.
+//! Lives here because the daemon and the notifyd and session-reader plugins
+//! all depend on this crate and must not depend on each other: they read the
+//! file through this module, one implementation, rather than each logging
+//! its own parse and decode errors verbatim. The burndown plugin's reader
+//! does not yet go through it (#274).
 //!
 //! Why not verbatim: toml's `Display` for a parse error quotes the offending
 //! source line, and serde's message for a wrong-typed value quotes the value.
