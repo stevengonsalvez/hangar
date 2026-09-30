@@ -4,8 +4,9 @@ import { asBadge, badgeTitle, PR_BADGE_REFRESH_MS, stateLabel, type PrBadge } fr
 /**
  * A worktree card's PR badge: the PR's state and number, and a CI dot while
  * it has checks. Asks the host for `sessionId`'s badge on mount, whenever the
- * card's session or branch changes, and every `PR_BADGE_REFRESH_MS`; draws
- * nothing until an answer is a badge, and nothing again after a miss.
+ * card's session or branch changes, and every `PR_BADGE_REFRESH_MS` while the
+ * window is visible; draws nothing until an answer is a badge, and nothing
+ * again after a miss.
  *
  * A click opens the PR through `onOpenUrl` (the host's `open_url`, whose
  * rule the URL passes) and goes no further: the card around the badge never
@@ -32,7 +33,8 @@ export function PrBadgeButton(props: {
           () => live && setBadge(null),
         );
       void ask();
-      const timer = setInterval(ask, PR_BADGE_REFRESH_MS);
+      // A hidden window has nobody to show a fresher badge to.
+      const timer = setInterval(() => document.hidden || void ask(), PR_BADGE_REFRESH_MS);
       // Under Node (the DOM tests mount the whole window and never unmount
       // it) a live timer would hold the test process open; a browser's timer
       // id has no `unref`.
