@@ -10,6 +10,8 @@
 //! - [`clipboard`] holds the size rule a copy and a paste share.
 //! - [`delete`] deletes a session from the window, and first says what
 //!   that removes: the folder, or only the session when another shares it.
+//! - [`rename`] renames a sidebar row: the session's display name, never
+//!   its branch or its folder.
 //! - [`projects`] lists the repositories the composer may create into,
 //!   sessions or not.
 //! - [`setup`] is the desktop-native path for the onboarding writes the
@@ -37,6 +39,7 @@ pub mod executor;
 pub mod host;
 pub mod intent;
 pub mod projects;
+pub mod rename;
 pub mod setup;
 pub mod shell;
 pub mod sidecar;
