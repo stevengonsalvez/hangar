@@ -121,9 +121,10 @@ struct RawPr {
     status_check_rollup: Option<Vec<RawCheck>>,
 }
 
-/// One rollup entry: a check run carries `status` and `conclusion`, a commit
-/// status context carries `state`.
+/// One rollup entry: a check run carries `name`, `status` and `conclusion`,
+/// a commit status context carries `context` and `state`.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawCheck {
     #[serde(default)]
     status: Option<String>,
@@ -131,6 +132,25 @@ struct RawCheck {
     conclusion: Option<String>,
     #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    workflow_name: Option<String>,
+    #[serde(default)]
+    started_at: Option<String>,
+}
+
+impl RawCheck {
+    /// Which check this is a run of: a re-run carries the same workflow and
+    /// name as the run it replaces.
+    fn identity(&self) -> (&str, &str) {
+        (
+            self.workflow_name.as_deref().unwrap_or_default(),
+            self.name.as_deref().or(self.context.as_deref()).unwrap_or_default(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -169,10 +189,33 @@ fn outcome(check: &RawCheck) -> Outcome {
     }
 }
 
-/// The rollup as one dot: any failure is a fail, else anything unfinished is
-/// pending, else any pass is a pass; empty or all neutral is none.
+/// The latest run of each check: a failed run that was re-run green is
+/// history, not the PR's state (`gh pr checks` drops it the same way). The
+/// timestamps are RFC 3339 in UTC, so they order as text; an unnamed entry is
+/// always its own check.
+fn latest_runs(checks: &[RawCheck]) -> Vec<&RawCheck> {
+    let mut latest: HashMap<(&str, &str), &RawCheck> = HashMap::new();
+    let mut unnamed = Vec::new();
+    for check in checks {
+        let identity = check.identity();
+        if identity.1.is_empty() {
+            unnamed.push(check);
+            continue;
+        }
+        let newer = latest.get(&identity).is_none_or(|kept| check.started_at > kept.started_at);
+        if newer {
+            latest.insert(identity, check);
+        }
+    }
+    unnamed.extend(latest.into_values());
+    unnamed
+}
+
+/// The rollup as one dot, over each check's latest run: any failure is a
+/// fail, else anything unfinished is pending, else any pass is a pass; empty
+/// or all neutral is none.
 fn rollup(checks: &[RawCheck]) -> PrChecks {
-    let outcomes: Vec<Outcome> = checks.iter().map(outcome).collect();
+    let outcomes: Vec<Outcome> = latest_runs(checks).into_iter().map(outcome).collect();
     if outcomes.contains(&Outcome::Failed) {
         PrChecks::Fail
     } else if outcomes.contains(&Outcome::Pending) {
