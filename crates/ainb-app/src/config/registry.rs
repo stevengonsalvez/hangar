@@ -2729,6 +2729,20 @@ mod tests {
         assert!(root.as_table().is_some_and(toml::map::Map::is_empty));
     }
 
+    /// The daemon reads `[hangar]` as holding `spawn` alone and takes any
+    /// other key there as a typo of the opt-out, keeping the spawn verbs off.
+    /// A registered `hangar.*` key would be one a settings surface could
+    /// write, and writing it would switch spawn off.
+    #[test]
+    fn no_registered_key_lives_under_the_daemon_hangar_section() {
+        let under: Vec<&str> = CONFIG_REGISTRY
+            .iter()
+            .map(Entry::key)
+            .filter(|key| *key == "hangar" || key.starts_with("hangar."))
+            .collect();
+        assert!(under.is_empty(), "{under:?}");
+    }
+
     #[test]
     fn set_validated_writes_through_a_nested_path() {
         let mut root = toml::Value::Table(toml::map::Map::new());

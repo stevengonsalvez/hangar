@@ -595,23 +595,26 @@ const CODEX_APP_SERVER_DEFAULT: &str = "desktop";
 /// `ainb-core`: the TUI crate already depends on this one, so reaching back
 /// would be a cycle.
 fn codex_app_server_from_config() -> ConfigSetting {
-    let Ok(home) = hangar_dir() else {
-        return ConfigSetting::Absent;
-    };
-    let path = home.join("config").join("config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    hangar_dir().map_or(ConfigSetting::Absent, |home| {
+        codex_app_server_in(&crate::spawn::config_path_in(&home))
+    })
+}
+
+/// [`codex_app_server_from_config`] for the config file at `path`, so each
+/// file state is testable without touching `$AINB_HANGAR_HOME`.
+fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
+    let parsed = match hangar_config(path) {
+        Ok(Some(parsed)) => parsed,
+        // Any read that finds nothing, a link to nowhere too, is "not set".
+        Ok(None) => return ConfigSetting::Absent,
+        Err(HangarConfigError::Read(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return ConfigSetting::Absent;
         }
-        Err(error) => {
+        Err(HangarConfigError::Read(error)) => {
             tracing::warn!(path = %path.display(), %error, "cannot read hangar config");
             return ConfigSetting::Unreadable;
         }
-    };
-    let parsed: toml::Value = match text.parse() {
-        Ok(parsed) => parsed,
-        Err(error) => {
+        Err(HangarConfigError::Parse(error)) => {
             tracing::warn!(path = %path.display(), %error, "hangar config is not valid TOML");
             return ConfigSetting::Unreadable;
         }
@@ -634,6 +637,59 @@ fn codex_app_server_from_config() -> ConfigSetting {
     }
 }
 
+/// Read and parse the hangar home's config file at `path` (see
+/// [`spawn::config_path_in`]): the one reader behind every key the daemon
+/// takes from it, `[hangar] spawn` and `[codex] app_server`. One read per
+/// call; each caller keeps its own answer for each outcome.
+///
+/// `Ok(None)` is nothing at `path` at all. A link to nowhere is not that: it
+/// is a [`HangarConfigError::Read`] of kind `NotFound`, so a caller for which
+/// the file may hold an opt-out can refuse to read it as "missing".
+///
+/// # Errors
+///
+/// [`HangarConfigError`] when the file cannot be read or is not valid TOML.
+pub fn hangar_config(path: &std::path::Path) -> Result<Option<toml::Table>, HangarConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(HangarConfigError::Read(error)),
+    };
+    text.parse()
+        .map(Some)
+        .map_err(|error| HangarConfigError::Parse(toml_error_at(&error, &text)))
+}
+
+/// `error` as its message and a 1-based line and column in `text`, on one
+/// line (a multi-line message is joined with `; `).
+///
+/// Never toml's own `Display`: it quotes the offending source line, and a
+/// token on that line would land in the daemon log.
+fn toml_error_at(error: &toml::de::Error, text: &str) -> String {
+    let message = error.message().trim_end().replace('\n', "; ");
+    let Some(span) = error.span() else {
+        return message;
+    };
+    let before = &text.as_bytes()[..span.start.min(text.len())];
+    let line_start = before.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
+    let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
+    let column = String::from_utf8_lossy(&before[line_start..]).chars().count() + 1;
+    format!("{message} at line {line}, column {column}")
+}
+
+/// Why [`hangar_config`] has no table to give.
+#[derive(Debug)]
+pub enum HangarConfigError {
+    /// The file is there (or a link to it is) but could not be read.
+    Read(std::io::Error),
+    /// The file is not valid TOML: a description of where and why.
+    Parse(String),
+}
+
 /// What the hangar config had to say about `[codex] app_server`.
 ///
 /// `Unreadable` is deliberately NOT folded into `Absent`. A syntax error
@@ -641,6 +697,7 @@ fn codex_app_server_from_config() -> ConfigSetting {
 /// silently apply the `desktop` default, moving a user who had explicitly
 /// chosen `own` onto a shared app-server with Codex Desktop. Isolation must
 /// never be lost to an unrelated typo.
+#[derive(Debug, PartialEq, Eq)]
 enum ConfigSetting {
     Set(String),
     Absent,
@@ -1761,6 +1818,127 @@ mod tests {
             "absent section"
         );
         assert_eq!(read("[codex]\nother = 1\n"), None, "absent key");
+    }
+
+    /// What each state of the config file means for `[codex] app_server`.
+    ///
+    /// A missing file, and any read that finds nothing (a link to nowhere
+    /// too), is "not set"; anything present but unusable keeps Ainb's own
+    /// server, never the shared default.
+    #[test]
+    fn codex_app_server_follows_each_config_file_state() {
+        use super::ConfigSetting::{Absent, Set, Unreadable};
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        assert_eq!(super::codex_app_server_in(&path), Absent, "no file");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (text, want) in [
+            ("[codex]\napp_server = \"own\"\n", Set("own".into())),
+            ("[fleet]\nterminal = \"warp\"\n", Absent),
+            ("[codex]\napp_server = \"\"\n", Unreadable),
+            ("[codex]\napp_server = 1\n", Unreadable),
+            ("[codex\napp_server = \"own\"\n", Unreadable),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(super::codex_app_server_in(&path), want, "{text:?}");
+        }
+
+        let linked = home.path().join("linked.toml");
+        std::os::unix::fs::symlink(home.path().join("not-there.toml"), &linked).unwrap();
+        assert_eq!(
+            super::codex_app_server_in(&linked),
+            Absent,
+            "a link to nowhere"
+        );
+        let directory = home.path().join("directory.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            super::codex_app_server_in(&directory),
+            Unreadable,
+            "a directory"
+        );
+    }
+
+    /// What the daemon log actually gets from a config with a token on a
+    /// malformed line, through both readers of the file: where, never what.
+    #[test]
+    fn neither_config_reader_logs_the_line_of_a_parse_error() {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[codex]\napp_server = \"own\"\ntoken = \"sk-SECRET-123\n",
+        )
+        .unwrap();
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!crate::spawn::served_by_config(&path), "spawn kept off");
+            assert_eq!(
+                super::codex_app_server_in(&path),
+                super::ConfigSetting::Unreadable,
+                "codex keeps its own server"
+            );
+        });
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(!log.contains("sk-SECRET"), "{log}");
+        assert_eq!(
+            log.matches("at line 3, column 23").count(),
+            2,
+            "one located warning per reader: {log}"
+        );
+    }
+
+    /// A parse error names where it is and never what the line holds: the
+    /// description goes to the daemon log, and the bad line may carry a token.
+    #[test]
+    fn a_config_parse_error_does_not_quote_the_offending_line() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[codex]\napp_server = \"own\"\ntoken = \"sk-secret-123\n",
+        )
+        .unwrap();
+        let Err(super::HangarConfigError::Parse(description)) = super::hangar_config(&path) else {
+            panic!("an unterminated string is a parse error");
+        };
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert_eq!(description, "invalid basic string at line 3, column 23");
+
+        // A multi-line message (what was wrong, then what was expected) is
+        // one log line.
+        std::fs::write(&path, "token = sk-secret-123\n").unwrap();
+        let Err(super::HangarConfigError::Parse(description)) = super::hangar_config(&path) else {
+            panic!("an unquoted string is a parse error");
+        };
+        assert!(!description.contains('\n'), "{description:?}");
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert!(description.contains("; expected "), "{description}");
+        assert!(
+            description.ends_with(" at line 1, column 9"),
+            "{description}"
+        );
     }
 
     /// The resolver's value semantics.

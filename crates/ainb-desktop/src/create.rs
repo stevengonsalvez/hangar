@@ -9,6 +9,8 @@
 //!           ◀── CreatedWorktree ──┘ then attaches the new tmux session as a tab
 //! ```
 
+use std::path::{Path, PathBuf};
+
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
 use ainb_hangar_proto::spawn::{
@@ -101,13 +103,27 @@ pub fn mint_op_id() -> OpId {
 }
 
 /// A daemon error as the sentence the composer shows.
+///
+/// The spawn opt-out is named in the file the daemon reads it from, by the
+/// daemon's own rule: `$AINB_HANGAR_HOME` when set, else `~/.agents-in-a-box`.
 #[must_use]
 pub fn refusal_text(error: &DaemonError) -> String {
+    let spawn_config = ainb_hangar_daemon::hangar_dir().map_or_else(
+        |_| PathBuf::from("$AINB_HANGAR_HOME/config/config.toml"),
+        |home| ainb_hangar_daemon::spawn::config_path_in(&home),
+    );
+    refusal_text_in(error, &spawn_config)
+}
+
+/// [`refusal_text`] with the daemon's config file given, so the sentence is
+/// testable without touching the environment.
+#[must_use]
+pub fn refusal_text_in(error: &DaemonError, spawn_config: &Path) -> String {
     match error {
-        DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => {
-            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0 or with [hangar] spawn = false in ~/.agents-in-a-box/config/config.toml (or with that file unreadable). Update it, or restart it without that setting."
-                .into()
-        }
+        DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => format!(
+            "This daemon does not create worktrees: it is older than this app, or was started with AINB_HANGAR_SPAWN=0 or with [hangar] spawn = false in {} (or with that file unreadable). Update it, or restart it without that setting.",
+            spawn_config.display()
+        ),
         DaemonError::Rpc { code, .. } if *code == REPO_NOT_REGISTERED => {
             "This repository is not in a registered project folder: use Add project to pick its folder, then create again."
                 .into()
@@ -202,10 +218,16 @@ mod tests {
         };
         // The verbs are on by default: a daemon that does not serve one is
         // older than this app, or was started with the opt-out.
-        let dark = refusal_text(&dark);
+        let dark = refusal_text_in(&dark, Path::new("/srv/hangar-home/config/config.toml"));
         assert!(dark.contains("AINB_HANGAR_SPAWN=0"), "{dark}");
         assert!(dark.contains("[hangar] spawn = false"), "{dark}");
         assert!(!dark.contains("AINB_HANGAR_SPAWN=1"), "{dark}");
+        // The file the daemon reads, not a fixed `~/.agents-in-a-box`.
+        assert!(
+            dark.contains("in /srv/hangar-home/config/config.toml "),
+            "{dark}"
+        );
+        assert!(!dark.contains(".agents-in-a-box"), "{dark}");
         let bad = DaemonError::Rpc {
             code: INVALID_PARAMS,
             message: "base is not a valid git ref name".into(),
