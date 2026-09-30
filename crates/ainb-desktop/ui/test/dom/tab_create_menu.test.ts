@@ -117,6 +117,7 @@ test("one + holds New terminal, a separator, then the daemon's agents, as Orca's
   menu()!.dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await settle();
   assert.equal(menu(), null, "Escape closes it");
+  assert.ok(document.activeElement === plus(container), "and hands the keyboard back to the +");
   assert.equal(hostCalls.size, 0, "and sends nothing");
 });
 
