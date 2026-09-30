@@ -53,7 +53,10 @@ export function PrBadgeButton(props: {
           data-checks={shown().checks}
           title={badgeTitle(shown())}
           aria-label={badgeTitle(shown())}
-          onClick={(event) => {
+          // A native listener, not Solid's delegated `onClick`: a delegated
+          // handler runs at the document, after the card and every other
+          // ancestor has already heard the click.
+          on:click={(event: MouseEvent) => {
             event.preventDefault();
             event.stopPropagation();
             props.onOpenUrl(shown().url);

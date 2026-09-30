@@ -59,6 +59,10 @@ test("clicking the badge opens the PR through open_url and does not open or sele
   await until(() => hasBadge("u-1"), "u-1's PR badge");
   const sent = host.sent.length;
   const selected = host.selected;
+  // Nothing around the badge acts on a click today, so what proves the click
+  // stops there is that the card never hears it.
+  let cardHeard = 0;
+  cardOf("u-1")!.addEventListener("click", () => (cardHeard += 1));
   const clicked = new window.MouseEvent("click", { bubbles: true, cancelable: true });
   badgeOf("u-1")!.dispatchEvent(clicked);
   await drain();
@@ -67,6 +71,7 @@ test("clicking the badge opens the PR through open_url and does not open or sele
   assert.equal(host.selected, selected, "the selection did not move");
   assert.equal(document.querySelector(".session-row[aria-current]") !== null, false, "no row is drawn selected");
   assert.equal(document.activeElement?.closest(".session-row") != null, false, "no row took the keyboard");
+  assert.equal(cardHeard, 0, "the click stopped at the badge");
 });
 
 test("a card whose refresh misses or fails drops the badge it drew", async () => {
