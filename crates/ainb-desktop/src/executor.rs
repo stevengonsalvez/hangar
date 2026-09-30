@@ -205,7 +205,7 @@ impl Executor for DesktopExecutor {
                 store @ (ainb_app::app::Persist::AppConfig { .. }
                 | ainb_app::app::Persist::ConfigExternalKeys(_)
                 | ainb_app::app::Persist::Favorites(_)
-                | ainb_app::app::Persist::SessionLabels(_)
+                | ainb_app::app::Persist::SessionLabel { .. }
                 | ainb_app::app::Persist::Onboarding(_)
                 | ainb_app::app::Persist::OnboardingGitDirectories(_)),
             ) => match ainb_app::config::persist::write(&store) {
