@@ -13,7 +13,7 @@ function session(id: string, over: Partial<Session_Serialize> = {}): Session_Ser
 }
 
 function card(key: string, over: Partial<WorktreeCard> = {}): WorktreeCard {
-  return { key, sessionId: key, title: key, branch: `ainb/${key}`, gitChanges: null, model: null, sessions: [session(key)], ...over };
+  return { key, title: key, primaryId: key, branch: `ainb/${key}`, gitChanges: null, model: null, sessions: [session(key)], ...over };
 }
 
 function group(name: string, cards: WorktreeCard[]): ProjectGroup {

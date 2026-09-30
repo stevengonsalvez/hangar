@@ -2,6 +2,7 @@ import { createEffect, createMemo, createSignal, For, on, Show } from "solid-js"
 import type {
   AgentCardFrame,
   FleetView_Serialize,
+  SessionLabelStore,
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
@@ -11,6 +12,7 @@ import { keyedList, sameKeys } from "./keyed.ts";
 import { PrBadgeButton } from "./pr_badge.tsx";
 import { opensRowMenu, rowMenuItems, sessionIn, type RowPick } from "./row_menu.ts";
 import { RowMenu } from "./row_menu.tsx";
+import { RenameField } from "./rename_field.tsx";
 import { isSelected, label } from "./sessions.ts";
 import { SidebarFilter } from "./sidebar_filter.tsx";
 import { filterProjectGroups, hidesProject, hidesSession } from "./sidebar_filter.ts";
@@ -53,6 +55,12 @@ interface Props {
   /** An item was chosen in a row's context menu (`row_menu.ts`). Without
    * it a right-click on a row is left to the webview. */
   onRowPick?(pick: RowPick): void;
+  /** The host's label store (the `session_labels` section): each card's
+   * title, by its primary session's tmux name (`sidebar_model.ts`). */
+  labels?: SessionLabelStore;
+  /** Ask the host to rename `sessionId` to `name`, as typed. Resolves `null`
+   * when it did, else the host's reason. Without it no title is editable. */
+  onRename?(sessionId: string, name: string): Promise<string | null>;
   /** The host's `pr_badge` for a card's session. Without it, or without
    * `onOpenUrl`, no card draws a PR badge. */
   prBadge?(sessionId: string): Promise<unknown>;
@@ -68,6 +76,8 @@ interface MenuAt {
   session: Session_Serialize;
   /** The worktree's name as its card shows it: what Copy Worktree Name copies. */
   name: string;
+  /** The card's key: the card whose title Rename edits. */
+  card: string;
   x: number;
   y: number;
   row: HTMLElement;
@@ -106,7 +116,7 @@ export function Sidebar(props: Props) {
   // objects would remount every row whenever any one changed, and a focused
   // row would drop the keyboard to <body>. Keys are equal frame to frame, so
   // the lists patch, and each row reads its current data through its key.
-  const allGroups = createMemo(() => projectGroups(props.sessions));
+  const allGroups = createMemo(() => projectGroups(props.sessions, props.labels));
   // The filter's text: a signal, never storage, so a relaunch opens the whole
   // list, as Orca's own search drops its query when its surface closes. It
   // only hides rows: the selection is the host's and stays where it was.
@@ -187,6 +197,16 @@ export function Sidebar(props: Props) {
     }
   });
 
+  // The card whose title is a rename field, by its worktree key (the card's
+  // own `key`, not the keyed list's); one at a time, as Orca has one editor
+  // open. A card that leaves what is drawn (gone, or hidden by the filter)
+  // takes its field with it, rather than reopening it later with the keyboard.
+  const [renaming, setRenaming] = createSignal<string | null>(null);
+  createEffect(() => {
+    const key = renaming();
+    if (key !== null && !kept().some((group) => group.cards.some((card) => card.key === key))) setRenaming(null);
+  });
+
   return (
     <aside class="sidebar" aria-label="Sessions" tabIndex={-1} ref={props.ref}>
       <div class="sidebar-head">
@@ -246,6 +266,12 @@ export function Sidebar(props: Props) {
                                 acks={props.acks}
                                 onOpen={props.onOpen}
                                 onMenu={props.onRowPick ? openMenu : undefined}
+                                renaming={renaming() === card().key}
+                                onRename={props.onRename}
+                                onRenameStart={() => setRenaming(card().key)}
+                                // Only its own field: a commit that lands after
+                                // another card's field opened leaves that one.
+                                onRenameDone={() => setRenaming((key) => (key === card().key ? null : key))}
                                 prBadge={props.prBadge}
                                 onOpenUrl={props.onOpenUrl}
                               />
@@ -273,6 +299,7 @@ export function Sidebar(props: Props) {
             onClose={closeMenu}
             onPick={(action) => {
               closeMenu(true);
+              if (action === "rename") return setRenaming(at.card);
               // The session as the latest frame has it, not as it was when
               // the menu opened.
               const session = sessionIn(props.sessions, at.session.id) ?? at.session;
@@ -295,15 +322,29 @@ function Card(props: {
   acks?: AckMap;
   onOpen(sessionId: string): void;
   onMenu?(at: MenuAt): void;
+  /** This card's title is the rename field. */
+  renaming: boolean;
+  onRename?(sessionId: string, name: string): Promise<string | null>;
+  onRenameStart(): void;
+  onRenameDone(): void;
   prBadge?(sessionId: string): Promise<unknown>;
   onOpenUrl?(url: string): void;
 }) {
+  let item!: HTMLLIElement;
   const rows = createMemo(() => keyedList(props.card.sessions, (session) => session.id));
   const rowKeys = createMemo(() => rows().keys, [], { equals: sameKeys });
   const menuFor = (row: HTMLElement, x: number, y: number) => {
     const session = props.card.sessions.find((candidate) => candidate.id === row.dataset.session);
     if (!props.onMenu || !session) return false;
-    props.onMenu({ session, name: props.card.title, x, y, row, sidebar: row.closest<HTMLElement>(".sidebar") });
+    props.onMenu({
+      session,
+      name: props.card.title,
+      card: props.card.key,
+      x,
+      y,
+      row,
+      sidebar: row.closest<HTMLElement>(".sidebar"),
+    });
     return true;
   };
   /** A right-click anywhere on the card, as on Orca's: on a row it acts on
@@ -323,9 +364,36 @@ function Card(props: {
     const rect = row.getBoundingClientRect();
     if (menuFor(row, rect.left, rect.bottom)) event.preventDefault();
   };
+  /** The field is done. From Enter or Esc the keyboard goes back to the row
+   * the title names, so it stays in the sidebar rather than on the body. */
+  const renameDone = (restore: boolean) => {
+    const id = props.card.primaryId;
+    props.onRenameDone();
+    if (restore) [...item.querySelectorAll<HTMLElement>(".session-row")].find((row) => row.dataset.session === id)?.focus();
+  };
   return (
-    <li class="worktree-card" onContextMenu={onContextMenu}>
-      <div class="worktree-card-title">{label(props.card.title)}</div>
+    <li class="worktree-card" ref={item} onContextMenu={onContextMenu}>
+      <Show
+        when={props.renaming && props.onRename}
+        fallback={
+          <div class="worktree-card-title" onDblClick={() => props.onRename && props.onRenameStart()}>
+            {label(props.card.title)}
+          </div>
+        }
+      >
+        {(rename) => {
+          // Taken once: the field can still be answering after this branch
+          // is gone, and a read of `rename` then is a stale read.
+          const submit = rename();
+          return (
+            <RenameField
+              current={props.card.title}
+              onSubmit={(name) => submit(props.card.primaryId, name)}
+              onDone={renameDone}
+            />
+          );
+        }}
+      </Show>
       <div class="worktree-card-meta">
         <span class="branch">{label(props.card.branch)}</span>
         <Show when={props.card.gitChanges}>
@@ -337,7 +405,7 @@ function Card(props: {
         <Show when={props.prBadge && props.onOpenUrl ? { fetch: props.prBadge, open: props.onOpenUrl } : null}>
           {(host) => (
             <PrBadgeButton
-              sessionId={props.card.sessionId}
+              sessionId={props.card.primaryId}
               branch={props.card.branch}
               fetch={host().fetch}
               onOpenUrl={host().open}

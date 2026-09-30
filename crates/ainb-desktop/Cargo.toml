@@ -26,7 +26,7 @@ required-features = ["app"]
 
 [features]
 default = []
-app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-notification", "dep:tauri-plugin-opener", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
+app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-opener", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
 # The window serves `ui/dist` over its own protocol instead of the dev server
 # at `build.devUrl`. A plain `cargo build` keeps the dev server, which is what
 # `tauri dev` and the frontend's hot reload want; every build that has to run
@@ -59,6 +59,11 @@ ainb-hangar-daemon = { path = "../ainb-hangar-daemon" }
 anyhow = "1"
 arboard = "3.6"
 nix = { version = "0.29", features = ["fs", "process", "signal"] }
+# The OS notification a session's move into Needs or Done raises, sent by the
+# host (`notify_delivery.rs`). Straight to the platform rather than through
+# tauri-plugin-notification, which drops the handle a click arrives on. Needs
+# no Tauri, so the headless tests drive it too.
+notify-rust = "4.18"
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -80,11 +85,6 @@ tauri = { version = "~2.11.5", optional = true }
 # dialog the OS draws, which the webview's script cannot click. Rust side only;
 # the webview never calls the plugin, so it needs no capability.
 tauri-plugin-dialog = { version = "2.7", optional = true }
-# The OS notification a session's move into Needs or Done raises
-# (`notify.rs`), sent by the host only. Its page shim still asks
-# `is_permission_granted` on every load, so the capability allows that one
-# read and not `notify`. `~2.4`: 2.5 wants tauri 2.12, past this crate's pin.
-tauri-plugin-notification = { version = "~2.4", optional = true }
 # Opens a terminal link in the default browser (`open_url`), after
 # `links::web_url` has passed it. Called as a library, never registered as a
 # plugin, so the webview has none of its commands and needs no capability.
@@ -110,3 +110,8 @@ tokio = { version = "1.36", features = ["full", "test-util"] }
 # The updater tests sign a manifest with a throwaway key.
 base64 = "0.22"
 ed25519-dalek = "2.1"
+
+# The notification click test serves a fake notification daemon on a private
+# session bus (`tests/notify_click_dbus.rs`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

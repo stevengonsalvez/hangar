@@ -74,6 +74,13 @@ impl<S: FrameSink> Shell<S> {
         host.answer_home(executor);
     }
 
+    /// The worktree folder of the listed session `session_id`; see
+    /// [`crate::shell_tab::session_worktree`].
+    #[must_use]
+    pub fn session_worktree(&self, session_id: uuid::Uuid) -> Option<String> {
+        crate::shell_tab::session_worktree(self.core().host.state(), session_id)
+    }
+
     /// The reducer's current screen id, for a test to read.
     #[must_use]
     pub fn current_screen(&self) -> String {
@@ -141,6 +148,25 @@ impl<S: FrameSink> Shell<S> {
     /// Must be called inside a tokio runtime.
     pub fn reload_workspaces(&self) {
         self.core().host.start_workspace_load();
+    }
+
+    /// Rename a row's display name ([`DesktopHost::rename_session`]) and run
+    /// the label store write before returning, so a relaunch finds the name.
+    /// A write that fails is the reducer's own notice, as any store write is.
+    ///
+    /// # Errors
+    /// Why the name was refused; nothing was written then.
+    pub fn rename_session(&self, session: uuid::Uuid, name: &str) -> Result<(), String> {
+        let mut core = self.core();
+        let Core { host, executor } = &mut *core;
+        let mut reports = Vec::new();
+        for effect in host.rename_session(session, name)? {
+            reports.extend(executor.execute(effect));
+        }
+        for report in reports {
+            host.run(report, executor);
+        }
+        Ok(())
     }
 
     /// Every command the palette may offer; see [`DesktopHost::palette`].

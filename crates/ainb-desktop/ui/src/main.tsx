@@ -15,6 +15,7 @@ import {
   shellGitView,
   shellHangar,
   shellInbox,
+  shellLabels,
   shellSessions,
   shellUsage,
   SUBSCRIBED,
@@ -39,7 +40,7 @@ import { Palette } from "./palette.tsx";
 import { emptyPaneView } from "./pane_empty.ts";
 import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
-import { cardForSession, statusForTarget } from "./status.ts";
+import { cardForSession, sessionForCard, statusForTarget } from "./status.ts";
 import {
   activateTab,
   focusGroup,
@@ -53,6 +54,9 @@ import {
 } from "./layout.ts";
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
+import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
+import { NewTerminalButton } from "./shell_tab.tsx";
+import { shownTargetOf, worktreeTarget } from "./worktree_target.ts";
 import { Composer } from "./composer.tsx";
 import { createDeleteFlow } from "./delete_dialog.ts";
 import { DeleteDialog } from "./delete_dialog.tsx";
@@ -92,6 +96,19 @@ import { startNotifications } from "./notifications.ts";
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
+/** The most characters a toast draws: the host's own cut
+ * (`intent::MAX_TOAST_CHARS`). A sidebar label's 80 would drop a refusal's
+ * detail, the part that says what to do. */
+const TOAST_CHARS = 300;
+
+/** `text` as a toast draws it: control and format characters removed, as a
+ * label's are, and cut to `TOAST_CHARS`. */
+function toastLine(text: string): string {
+  return Array.from(text.replace(/[\p{Cc}\p{Cf}]/gu, ""))
+    .slice(0, TOAST_CHARS)
+    .join("");
+}
+
 /** How long a toast stays up. */
 const TOAST_MS = 5000;
 
@@ -128,6 +145,9 @@ function Shell() {
     listen<SidecarState>("sidecar", (event) => setSidecar(event.payload)),
     listen<TabsView>("terminal_tabs", (event) => showTabs(event.payload)),
     listen<string>("toast", (event) => toast(event.payload)),
+    // A click on a session's OS notification; the host already brought the
+    // window forward (`notify_delivery.rs`).
+    listen<{ session_key: string }>("notify:open", (event) => openFromNotice(event.payload.session_key)),
     listen<UpdatePhase>("update", (event) => {
       setUpdatePhase(event.payload);
       if (updateDone(event.payload)) setTimeout(() => setUpdatePhase(null), TOAST_MS);
@@ -436,6 +456,18 @@ function Shell() {
     await invoke("answer_home");
     return run(intents);
   };
+  /**
+   * The session a clicked OS notification names, by its card key: its row is
+   * selected, as a click on its board card selects it, after `answer_home` so
+   * no page refuses it. An ACP agent has no row; its transcript opens.
+   */
+  const openFromNotice = (sessionKey: string) => {
+    const card = agentStatus()?.view?.cards.find((one) => one.session_key === sessionKey);
+    if (card === undefined) return;
+    const row = sessionForCard(card, allSessions(sessions()), fleet()?.fleet_metadata);
+    if (row !== undefined) void answer([selectRowIntent({ session: row.id })]);
+    else if (card.provider === "acp") void invoke("answer_home").then(() => openTranscript(sessionKey));
+  };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
     void invoke<boolean>("setup_write", { write }).then((ran) => {
@@ -451,11 +483,16 @@ function Shell() {
     if (key !== null) focusers.get(key)?.();
     else sidebar?.focus();
   };
-  const choose = (tab: Tab) =>
-    activate(tab.key, false, tab.state === "detached" ? [openRowIntent(rowOf(tab.target))] : []);
+  const choose = (tab: Tab) => {
+    // A shell has no row to re-attach through: the host re-attaches it.
+    const viaRow = tab.state === "detached" && tab.target.kind !== "shell";
+    if (tab.state === "detached" && !viaRow) reattach(tab);
+    activate(tab.key, false, viaRow ? [openRowIntent(rowOf(tab.target))] : []);
+  };
   /** Close `tab`: its terminal goes, and the host's next strip drops it
-   * from its group, closing the group if it was the last. */
-  const closeTab = (tab: Tab) => void invoke("terminal_close", { key: tab.key });
+   * from its group, closing the group if it was the last. A shell's tab
+   * also ends its shell (`shell_tab.ts`). */
+  const closeTab = (tab: Tab) => shellTabs.close(tab);
   /** The Terminals entry: back to the panes, on the tab they show. */
   const showTerminals = () => {
     const tab = tabs().find((candidate) => candidate.key === active());
@@ -613,6 +650,9 @@ function Shell() {
         else applyLayout(next);
         return;
       }
+      case "terminal":
+        void shellTabs.open();
+        return;
       case "attention":
         jumpToAttention();
         return;
@@ -655,9 +695,14 @@ function Shell() {
   let toastId = 0;
   const toast = (text: string) => {
     const id = ++toastId;
-    setToasts((shown) => [...shown, { id, text: label(text) }]);
+    setToasts((shown) => [...shown, { id, text: toastLine(text) }]);
     setTimeout(() => setToasts((shown) => shown.filter((entry) => entry.id !== id)), TOAST_MS);
   };
+
+  // "New terminal" and every tab close: a shell's tab ends its shell.
+  const plusTarget = () =>
+    worktreeTarget(shownTargetOf(showing("terminal"), tabs(), active()), sessions()?.selected_session_id ?? null);
+  const shellTabs = createShellTabs({ target: plusTarget, toast });
 
   // The accelerators work outside a terminal too; a terminal marks the ones
   // it handled, so they do not run twice.
@@ -754,11 +799,12 @@ function Shell() {
    * or its terminal's, `null` for none: the host raises no OS notification
    * for that session while this window has focus (`notify.rs`). */
   const focusedCard = createMemo(() => {
+    // Settings and the Inbox cover the work area, a transcript card too.
     if (settings() || inboxOpen()) return null;
     const transcript = transcriptKey();
     if (transcript !== null) return transcript;
     const key = active();
-    return showing("terminal") && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
+    return pane() === "terminal" && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
   });
   createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session }).catch(() => {})));
 
@@ -800,6 +846,7 @@ function Shell() {
   /** A tab's title: its session's name when the sidebar knows it. */
   const title = (tab: Tab) => {
     const target = tab.target;
+    if (target.kind === "shell") return label(shellTitle(target));
     const session = target.kind === "session" ? allSessions(sessions()).find((row) => row.id === target.id) : undefined;
     return label(session?.name ?? target.tmux);
   };
@@ -868,6 +915,15 @@ function Shell() {
             acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
+            labels={shellLabels(store, host())?.session_label_store}
+            // The host checks and keeps the name; no reducer row runs, so
+            // nothing walks home first, as the Delete confirmation does not.
+            onRename={(id, name) =>
+              invoke("session_rename", { id, name }).then(
+                () => null,
+                (why: unknown) => String(why),
+              )
+            }
             // A miss is `null` from the host; a command that failed (the
             // window's state not managed yet) draws no badge either.
             prBadge={(sessionId) => invoke<unknown>("pr_badge", { sessionId }).catch(() => null)}
@@ -975,6 +1031,11 @@ function Shell() {
                   </span>
                 )}
               </Show>
+              <NewTerminalButton
+                ready={plusTarget() !== null}
+                mac={MAC}
+                onOpen={() => void shellTabs.open()}
+              />
             </nav>
             {/* One banner per open request, latched for a short grace across
                 frames that carry none (#1266): `AnswerSlot`. */}

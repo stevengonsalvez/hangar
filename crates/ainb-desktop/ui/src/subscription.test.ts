@@ -15,6 +15,7 @@ import {
   shellGitView,
   shellHangar,
   shellInbox,
+  shellLabels,
   shellSessions,
   shellUsage,
   SUBSCRIBED,
@@ -64,12 +65,14 @@ test("the shell chrome reads only subscribed sections, and the list names no unr
     shellGitView(store, "local");
     shellUsage(store, "local");
     shellInbox(store, "local");
+    shellLabels(store, "local");
     dispose();
   });
 
   assert.ok(read.has("sessions"), "the recorder saw the chrome's reads");
   assert.ok(read.has("usage"), "the stats tab reads section 21");
   assert.ok(read.has("inbox"), "the inbox page reads section 16");
+  assert.ok(read.has("session_labels"), "the sidebar reads its card titles' labels");
   const subscribed = new Set<string>(SUBSCRIBED);
   for (const name of read) {
     assert.ok(subscribed.has(name), `the chrome reads "${name}", which is not subscribed`);

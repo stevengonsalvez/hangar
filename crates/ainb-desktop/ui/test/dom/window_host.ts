@@ -35,6 +35,15 @@ export const host = {
   sent: [] as Sent[],
   /** Sessions whose open the host refuses, as its gate refuses a row. */
   refuseOpen: new Set<string>(),
+  /** The label store, by tmux session name: the `session_labels` section. */
+  labels: {} as Record<string, string>,
+  /** Every `session_rename` the window sent, with its arguments as sent. */
+  renames: [] as Array<Record<string, unknown>>,
+  /** The host's answer to a rename: `null` keeps the name (and frames the
+   * label, as the real host does), a string is its refusal. */
+  renameReply: (() => null) as (name: string) => string | null,
+  /** Held until it resolves before the host answers a rename: a slow host. */
+  renameGate: Promise.resolve() as Promise<void>,
   frames: undefined as undefined | { onmessage: Callback },
   events: new Map<string, Callback[]>(),
   /** The host's `pr_badge` answer per session: a session not here is a miss
@@ -60,6 +69,7 @@ function sessionsBody() {
     status: "Running",
     branch_name: `ainb/${id}`,
     workspace_path: path,
+    tmux_session_name: `tmux_${id}`,
     attention: [],
   });
   return {
@@ -70,6 +80,27 @@ function sessionsBody() {
     selected_session_id: host.selected,
     shell_selected: false,
   };
+}
+
+const labelsBody = () => ({
+  session_label_store: { ...host.labels },
+  session_label_rename_mode: false,
+  session_label_rename_buffer: "",
+  session_label_rename_target: null,
+  session_context_menu: null,
+});
+
+/** The host's `session_rename`: its reply, and on success the label framed,
+ * after the reply, as the window's frame drain lands it after the command's
+ * answer. */
+async function rename(args: Record<string, unknown>): Promise<null> {
+  host.renames.push(args);
+  await host.renameGate;
+  const refusal = host.renameReply(args.name as string);
+  if (refusal !== null) throw refusal;
+  host.labels[`tmux_${args.id as string}`] = (args.name as string).trim();
+  setTimeout(() => host.frames?.onmessage({ frames: [frame("session_labels", labelsBody())] }), 0);
+  return null;
 }
 
 /** Put the reducer on `screen` and frame it, as the host does after a move. */
@@ -135,10 +166,17 @@ let nextCallback = 1;
         return { tabs: host.tabs, focus: null };
       case "subscribe":
         host.frames = args.frames as { onmessage: Callback };
-        host.frames.onmessage({ frames: [frame("shell", shellBody()), frame("sessions", sessionsBody())] });
+        host.frames.onmessage({
+          frames: [frame("shell", shellBody()), frame("sessions", sessionsBody()), frame("session_labels", labelsBody())],
+        });
         return HOST;
       case "dispatch":
         return dispatch(args.intent as Intent);
+      case "session_rename":
+        return rename(args);
+      // What a composer, wrongly opened by a key typed into a field, asks for.
+      case "projects_list":
+        return [];
       case "pr_badge": {
         const session = args.sessionId as string;
         host.prAsked.push(session);

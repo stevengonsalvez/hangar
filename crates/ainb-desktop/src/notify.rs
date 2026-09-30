@@ -29,6 +29,8 @@
 //!   window loses focus or the setting comes back on.
 //! - One session fires at most once per [`COOLDOWN_MS`], Orca's burst
 //!   cooldown, so a phase that flaps is one banner and not a stream.
+//! - [`BURST`] or more moves in one read (a wake from sleep, a reconnect) are
+//!   one summary banner, "N sessions need you", not a stack of them.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -43,6 +45,9 @@ pub const NOTIFICATIONS_FILE: &str = "desktop-notifications";
 /// The shortest gap between two notifications for one session: Orca's
 /// `NOTIFICATION_COOLDOWN_MS`.
 pub const COOLDOWN_MS: i64 = 5_000;
+
+/// How many notices from one read become one summary notice.
+pub const BURST: usize = 3;
 
 /// What a session is doing, as far as notifications care.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,10 +145,22 @@ pub struct Gate {
     pub window_focused: bool,
 }
 
+/// What a notification announces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    Needs,
+    Done,
+    /// Several sessions moved in one read ([`BURST`]).
+    Summary,
+}
+
 /// One notification to show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    pub session_key: String,
+    pub kind: NoticeKind,
+    /// The session a click opens; `None` for a summary, whose click only
+    /// brings the window forward.
+    pub session_key: Option<String>,
     pub title: String,
     pub body: String,
 }
@@ -193,15 +210,58 @@ pub fn decide(previous: Option<&Phase>, next: &Session, gate: &Gate) -> Option<N
     if gate.window_focused && gate.focused_session.as_deref() == Some(next.key.as_str()) {
         return None;
     }
-    let body = match movement {
-        Move::Needs(kind) => format!("Needs you: {}", needs_what(kind)),
-        Move::Done => "Done: finished its turn".to_string(),
+    let (kind, body) = match movement {
+        Move::Needs(wait) => (
+            NoticeKind::Needs,
+            format!("Needs you: {}", needs_what(wait)),
+        ),
+        Move::Done => (NoticeKind::Done, "Done: finished its turn".to_string()),
     };
     Some(Notice {
-        session_key: next.key.clone(),
+        kind,
+        session_key: Some(next.key.clone()),
         title: next.label.clone(),
         body,
     })
+}
+
+/// `notices` as they are shown: as they are, below [`BURST`]; one summary
+/// naming how many need you and how many are done, and who, at or above it.
+#[must_use]
+pub fn coalesce(notices: Vec<Notice>) -> Vec<Notice> {
+    if notices.len() < BURST {
+        return notices;
+    }
+    let needs = notices.iter().filter(|notice| notice.kind == NoticeKind::Needs).count();
+    let done = notices.len() - needs;
+    let title = match (needs, done) {
+        (_, 0) => format!("{needs} sessions need you"),
+        (0, _) => format!("{done} sessions are done"),
+        _ => format!(
+            "{needs} {} you, {done} done",
+            if needs == 1 {
+                "session needs"
+            } else {
+                "sessions need"
+            }
+        ),
+    };
+    const NAMED: usize = 3;
+    let mut body = notices
+        .iter()
+        .take(NAMED)
+        .map(|notice| notice.title.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    if notices.len() > NAMED {
+        body.push_str(&format!(" and {} more", notices.len() - NAMED));
+    }
+    vec![Notice {
+        kind: NoticeKind::Summary,
+        session_key: None,
+        title,
+        body,
+    }]
 }
 
 fn needs_what(kind: Option<WaitKind>) -> &'static str {
@@ -228,8 +288,9 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    /// Fold one read of every session at `now_ms` and return what to show.
-    /// A session the read leaves out is forgotten: back later, it is a first
+    /// Fold one read of every session at `now_ms` and return what to show,
+    /// a burst as one summary ([`coalesce`]). Each session in a summary
+    /// still starts its own cooldown. A session the read leaves out is forgotten: back later, it is a first
     /// read again.
     pub fn observe(
         &mut self,
@@ -256,7 +317,7 @@ impl Notifier {
         }
         self.phases = phases;
         self.fired_at.retain(|_, at| cooling(*at, now_ms));
-        notices
+        coalesce(notices)
     }
 }
 
@@ -319,7 +380,8 @@ mod tests {
             &on(),
         )
         .expect("Working to Needs fires");
-        assert_eq!(notice.session_key, KEY);
+        assert_eq!(notice.kind, NoticeKind::Needs);
+        assert_eq!(notice.session_key.as_deref(), Some(KEY));
         assert_eq!(notice.title, "hangar");
         assert_eq!(notice.body, "Needs you: it asked a question");
         for previous in [DONE, FREE, Phase::Exited, Phase::Unknown] {
@@ -571,6 +633,77 @@ mod tests {
             1,
             "the wall clock went back a minute"
         );
+    }
+
+    fn named(key: &str, phase: Phase) -> Session {
+        Session {
+            key: key.to_string(),
+            label: key.to_string(),
+            phase,
+        }
+    }
+
+    #[test]
+    fn ten_sessions_moving_in_one_read_are_one_summary() {
+        let mut notifier = Notifier::default();
+        let keys: Vec<String> = (0..10).map(|n| format!("s{n}")).collect();
+        let read =
+            |phase: &Phase| keys.iter().map(|key| named(key, phase.clone())).collect::<Vec<_>>();
+        assert!(notifier.observe(read(&Phase::Working), &on(), 0).is_empty());
+        let notices = notifier.observe(read(&needs(WaitKind::Ask, "q1")), &on(), 10_000);
+        assert_eq!(notices.len(), 1, "one banner for the burst: {notices:?}");
+        let summary = &notices[0];
+        assert_eq!(summary.kind, NoticeKind::Summary);
+        assert_eq!(
+            summary.session_key, None,
+            "a click only brings the window forward"
+        );
+        assert_eq!(summary.title, "10 sessions need you");
+        assert_eq!(summary.body, "s0, s1, s2 and 7 more");
+
+        // Each session in the summary started its own cooldown.
+        notifier.observe(read(&Phase::Working), &on(), 11_000);
+        assert!(
+            notifier.observe(read(&DONE), &on(), 12_000).is_empty(),
+            "inside every session's cooldown"
+        );
+    }
+
+    #[test]
+    fn two_moves_in_one_read_stay_two_notices() {
+        let mut notifier = Notifier::default();
+        let read = |a: Phase, b: Phase| vec![named("a", a), named("b", b)];
+        notifier.observe(read(Phase::Working, Phase::Working), &on(), 0);
+        let notices = notifier.observe(read(needs(WaitKind::Ask, "q1"), DONE), &on(), 10_000);
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].session_key.as_deref(), Some("a"));
+        assert_eq!(notices[0].kind, NoticeKind::Needs);
+        assert_eq!(notices[1].session_key.as_deref(), Some("b"));
+        assert_eq!(notices[1].kind, NoticeKind::Done);
+    }
+
+    #[test]
+    fn a_mixed_burst_says_how_many_need_you_and_how_many_are_done() {
+        let notice = |kind, title: &str| Notice {
+            kind,
+            session_key: Some(title.to_string()),
+            title: title.to_string(),
+            body: String::new(),
+        };
+        let summary = coalesce(vec![
+            notice(NoticeKind::Needs, "api"),
+            notice(NoticeKind::Done, "web"),
+            notice(NoticeKind::Done, "cli"),
+        ]);
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].title, "1 session needs you, 2 done");
+        assert_eq!(summary[0].body, "api, web, cli");
+        let done = coalesce(vec![
+            notice(NoticeKind::Done, "a"),
+            notice(NoticeKind::Done, "b"),
+            notice(NoticeKind::Done, "c"),
+        ]);
+        assert_eq!(done[0].title, "3 sessions are done");
     }
 
     #[test]

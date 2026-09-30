@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window: core IPC for the shell's own commands and events, dragging the window by its own titlebar (the native one is overlaid on macOS), and the read-only permission check the notification plugin's page shim makes on every load. The host sends every notification; the page is not granted to send one.",
+  "description": "The main window: core IPC for the shell's own commands and events, and dragging the window by its own titlebar (the native one is overlaid on macOS).",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-start-dragging", "notification:allow-is-permission-granted"]
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
 }

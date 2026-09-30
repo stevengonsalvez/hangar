@@ -482,6 +482,37 @@ body {
   flex-shrink: 0;
 }
 
+/* The title as its rename field: the title's own font and weight, so the
+   card does not jump when it opens (Orca's text presentation,
+   `WorktreeTitleInlineRename.tsx:131-134`), and room under it for the host's
+   reason when a name is refused. */
+.worktree-card-title.renaming {
+  overflow: visible;
+  white-space: normal;
+}
+
+.rename-input {
+  width: 100%;
+  min-width: 0;
+  padding: 0 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.rename-input[aria-invalid="true"] {
+  border-color: var(--destructive);
+}
+
+.rename-refusal {
+  margin: 2px 0 0;
+  color: var(--destructive);
+  font-size: var(--text-meta);
+  font-weight: 400;
+}
+
 /* A card's PR badge (`pr_badge.tsx`): the PR's state and number, and a CI
    dot, at the end of the meta line. A button, so the keyboard reaches it,
    drawn as a quiet pill so it reads as the card's status, not a control.
@@ -846,6 +877,20 @@ body {
   .tab-close {
     opacity: 1;
   }
+}
+
+/* "New terminal": the strip's own +, after its last tab, as Orca's is. */
+.tab-new-terminal {
+  padding: 2px 10px;
+  color: var(--muted-foreground);
+}
+
+.tab-new-terminal:hover:not(:disabled) {
+  color: var(--foreground);
+}
+
+.tab-new-terminal:disabled {
+  opacity: 0.4;
 }
 
 .terminal {

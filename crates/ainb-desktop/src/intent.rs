@@ -193,7 +193,7 @@ pub fn typed_text(text: &str) -> String {
 }
 
 /// Whether `c` is in Unicode's `Cf` (format) category.
-fn is_format(c: char) -> bool {
+pub(crate) fn is_format(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
