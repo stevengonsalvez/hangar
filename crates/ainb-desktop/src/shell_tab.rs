@@ -15,12 +15,21 @@
 //! As in Orca, closing a terminal tab ends its shell, and a relaunch
 //! reattaches the shells still running: the daemon, not the window, owns
 //! them, so they outlive the window as tmux does.
+//!
+//! An open the daemon did not finish answering may still make its shell
+//! (a timeout, or `SPAWN_STARTED`): the host looks once more
+//! [`LATE_RESTORE`] later and attaches it then, so a late shell still gets
+//! its tab without another press.
+
+use std::time::Duration;
 
 use ainb_app::Intent;
 use ainb_app::app::state::AppState;
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
-use ainb_hangar_proto::spawn::{ShellCloseParams, ShellCreateParams, ShellCreateResult};
+use ainb_hangar_proto::spawn::{
+    SPAWN_STARTED, ShellCloseParams, ShellCreateParams, ShellCreateResult,
+};
 use uuid::Uuid;
 
 use crate::create::{SpawnVerb, mint_op_id, spawn_refusal_text};
@@ -62,16 +71,40 @@ pub fn close_params(tmux_session_name: &str, op_id: OpId) -> ShellCloseParams {
     }
 }
 
-/// Ask the daemon for a shell in `worktree_path`.
-///
-/// # Errors
-/// The sentence for the window ([`spawn_refusal_text`]).
-pub async fn open(client: &DaemonClient, worktree_path: &str) -> Result<ShellCreateResult, String> {
+/// How long after an open that may still make its shell the host looks for
+/// it once more: past tmux's own 10s answer budget in the daemon.
+pub const LATE_RESTORE: Duration = Duration::from_secs(12);
+
+/// Whether a failed `shell/create` may still have made its shell: the
+/// daemon did not answer in time, or said tmux started but did not finish.
+/// Any other refusal made nothing.
+#[must_use]
+pub fn may_still_open(error: &DaemonError) -> bool {
+    match error {
+        DaemonError::Timeout(_) => true,
+        DaemonError::Rpc { code, .. } => *code == SPAWN_STARTED,
+        _ => false,
+    }
+}
+
+async fn create(
+    client: &DaemonClient,
+    worktree_path: &str,
+) -> Result<ShellCreateResult, DaemonError> {
     client
         .shell_create(&create_params(
             worktree_path,
             mint_op_id(SpawnVerb::OpenTerminal),
         ))
+        .await
+}
+
+/// Ask the daemon for a shell in `worktree_path`.
+///
+/// # Errors
+/// The sentence for the window ([`spawn_refusal_text`]).
+pub async fn open(client: &DaemonClient, worktree_path: &str) -> Result<ShellCreateResult, String> {
+    create(client, worktree_path)
         .await
         .map_err(|error| spawn_refusal_text(&error, SpawnVerb::OpenTerminal))
 }
@@ -99,6 +132,9 @@ pub struct OpenTabError {
     pub message: String,
     /// The reducer's report of a failed attach, for the host to dispatch.
     pub report: Option<Intent>,
+    /// The shell may still appear ([`may_still_open`]): the host looks for
+    /// it again after [`LATE_RESTORE`].
+    pub may_still_open: bool,
 }
 
 /// Open a shell in `worktree_path` and attach it as a tab; answer the tab's
@@ -114,9 +150,10 @@ pub async fn open_tab(
     terminals: &Terminals,
     worktree_path: &str,
 ) -> Result<String, OpenTabError> {
-    let shell = open(client, worktree_path).await.map_err(|message| OpenTabError {
-        message,
+    let shell = create(client, worktree_path).await.map_err(|error| OpenTabError {
+        message: spawn_refusal_text(&error, SpawnVerb::OpenTerminal),
         report: None,
+        may_still_open: may_still_open(&error),
     })?;
     let name = shell.tmux_session_name.clone();
     let Some(report) = terminals.open(target(&shell)) else {
@@ -133,6 +170,7 @@ pub async fn open_tab(
     Err(OpenTabError {
         message,
         report: Some(report),
+        may_still_open: false,
     })
 }
 
@@ -185,9 +223,11 @@ pub fn reattach(terminals: &Terminals, key: &str) -> Option<Intent> {
     }
 }
 
-/// Open a tab, unfocused, for every shell the daemon still runs: the
-/// relaunch half of Orca's model. Returns how many were listed and the
-/// failure reports of those that could not attach.
+/// Open a tab, unfocused, for every shell the daemon still runs that has
+/// none: the relaunch half of Orca's model, and the late look after an open
+/// that may still make its shell. A shell that already has a tab is left as
+/// it is, so a tab the person detached stays detached. Returns how many were
+/// listed and the failure reports of those that could not attach.
 ///
 /// # Errors
 /// The daemon could not list its shells.
@@ -199,9 +239,25 @@ pub async fn restore(
     let reports = listed
         .shells
         .iter()
+        .filter(|shell| terminals.target(&shell.tmux_session_name).is_none())
         .filter_map(|shell| terminals.open_unfocused(target(shell)))
         .collect();
     Ok((listed.shells.len(), reports))
+}
+
+/// [`restore`], once, after `delay`: the host's single late look for a
+/// shell an open may still make. Not a loop: a shell later than this is
+/// found by the next launch.
+///
+/// # Errors
+/// The daemon could not list its shells.
+pub async fn restore_after(
+    delay: Duration,
+    client: &DaemonClient,
+    terminals: &Terminals,
+) -> Result<(usize, Vec<Intent>), DaemonError> {
+    tokio::time::sleep(delay).await;
+    restore(client, terminals).await
 }
 
 #[cfg(test)]
@@ -209,7 +265,7 @@ mod tests {
     use super::*;
     use crate::create::MAY_STILL_OPEN;
     use ainb_app::config::AppConfig;
-    use ainb_hangar_proto::spawn::{REPO_NOT_REGISTERED, SPAWN_STARTED};
+    use ainb_hangar_proto::spawn::REPO_NOT_REGISTERED;
 
     /// The JSON-RPC code for a method the daemon does not serve.
     const METHOD_NOT_FOUND: i32 = -32601;
@@ -307,5 +363,28 @@ mod tests {
         // A close that timed out opened nothing.
         let text = spawn_refusal_text(&slow, SpawnVerb::CloseTerminal);
         assert!(text.starts_with("Closing the terminal failed"), "{text}");
+    }
+
+    #[test]
+    fn only_a_timeout_or_a_started_run_may_still_open() {
+        assert!(may_still_open(&DaemonError::Timeout(
+            std::time::Duration::from_secs(30)
+        )));
+        assert!(may_still_open(&DaemonError::Rpc {
+            code: SPAWN_STARTED,
+            message: "tmux did not answer within 10s".into(),
+        }));
+        for code in [
+            METHOD_NOT_FOUND,
+            INVALID_PARAMS,
+            REPO_NOT_REGISTERED,
+            -32603,
+        ] {
+            let refused = DaemonError::Rpc {
+                code,
+                message: "no".into(),
+            };
+            assert!(!may_still_open(&refused), "{code} made nothing");
+        }
     }
 }
