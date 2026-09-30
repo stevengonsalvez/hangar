@@ -1028,6 +1028,82 @@ echo '{"state":"OPEN","isDraft":false,"number":9,"url":"https://github.com/o/r/p
         assert_eq!(calls(), 3, "spawning resumed once the pause passed");
     }
 
+    /// A rate limit discovered by one of several keys asked at once must not
+    /// let every other one still queued for a permit spawn its own `gh` too:
+    /// an ask that gets its permit only after the pause is already set finds
+    /// that out in `cached` (`Miss::Paused`) and never calls `fetch`. A key
+    /// that already had a badge keeps it through and after the burst, never
+    /// blanked by the pause it did not itself hit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rate_limit_hit_by_many_keys_at_once_spawns_gh_no_more_than_the_in_flight_bound() {
+        let (dir, gh) = fake_gh(
+            r#"for last; do :; done
+echo called >> "$(dirname "$0")/calls"
+if [ "$last" = "warm" ]; then
+  echo '{"state":"OPEN","isDraft":false,"number":9,"url":"https://github.com/o/r/pull/9","statusCheckRollup":[]}'
+else
+  echo 'API rate limit exceeded for user ID 123.' >&2
+  exit 1
+fi"#,
+        );
+        // Warm the freshly written script past a possible `ETXTBSY`.
+        let _ = run(&gh, here(), "warm").await;
+        let calls_file = dir.path().join("calls");
+        std::fs::write(&calls_file, "").unwrap();
+        let calls = || std::fs::read_to_string(&calls_file).unwrap().lines().count();
+
+        let badges = Arc::new(PrBadges::with_rate_limit_pause(
+            Some(gh),
+            Duration::from_secs(60),
+        ));
+        // "warm" has a real badge, cached, before anything is paused.
+        let warm = badges.badge(here(), "warm").await;
+        assert_eq!(warm.as_ref().map(|badge| badge.number), Some(9));
+        // Only the burst below should count from here.
+        std::fs::write(&calls_file, "").unwrap();
+
+        const KEYS: usize = 12;
+        let mut asks = Vec::new();
+        for index in 0..KEYS {
+            let badges = Arc::clone(&badges);
+            asks.push(tokio::spawn(async move {
+                badges.badge(here(), &format!("k{index}")).await
+            }));
+        }
+        // Asked again in the middle of the burst: it must not blink just
+        // because every one of its neighbours is hitting the limit.
+        let warm_during = tokio::spawn({
+            let badges = Arc::clone(&badges);
+            async move { badges.badge(here(), "warm").await }
+        });
+
+        for (index, ask) in asks.into_iter().enumerate() {
+            assert_eq!(
+                ask.await.unwrap(),
+                None,
+                "k{index}: no prior badge, so nothing to keep, paused or not"
+            );
+        }
+        assert_eq!(
+            warm_during.await.unwrap().as_ref().map(|badge| badge.number),
+            Some(9),
+            "warm keeps its badge through the limiting call"
+        );
+        assert!(
+            calls() <= MAX_IN_FLIGHT,
+            "at most {MAX_IN_FLIGHT} gh processes for the whole burst of {KEYS} keys, got {}",
+            calls()
+        );
+
+        let warm_after = badges.badge(here(), "warm").await;
+        assert_eq!(
+            warm_after.as_ref().map(|badge| badge.number),
+            Some(9),
+            "warm still has not blinked after the limiting call"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_answer_and_a_miss_are_both_cached_until_the_ttl() {
         let badges = PrBadges::new(None);
