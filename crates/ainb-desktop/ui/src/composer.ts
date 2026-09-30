@@ -310,13 +310,18 @@ export interface PendingWorktree {
 }
 
 /** What the create flow needs from the window it runs in. */
-export interface ComposerFlowDeps {
+export interface ComposerFlowDeps extends FollowDeps {
   /** The host call. Absent: the real `worktree_create` command. */
   create?(args: CreateWorktreeArgs): Promise<CreatedWorktree>;
   /** A failure that lands after the view closed, so it is not lost. */
   toast(message: string): void;
   /** Where the keyboard goes when the view closes. */
   restoreFocus(): void;
+}
+
+/** What following a created session needs from the window: its session list,
+ * a select-only row pick, and a clock. */
+export interface FollowDeps {
   /** The session list as the window last drew it. */
   sessions(): SessionsView_Serialize | undefined;
   /** Select `sessionId`'s row in the session list, without attaching it: the
@@ -359,33 +364,14 @@ export interface ComposerFlow {
  * view, and a failure the view is no longer open to show becomes a toast.
  *
  * A success also selects the new session, as Orca activates and reveals a
- * worktree it just created: the host opens the new tab, and this moves the
- * session list's selection (the sidebar row and the answer banner's scope)
- * onto it too. The daemon lists the session on its own schedule, so the
- * selection waits until the list carries the row, for at most `FOLLOW_MS`,
- * and gives up the moment the list's selection moves off the row it had
- * when the create finished: a pick from the sidebar, a tab, the board or the
- * palette all move that one selection, so any of them wins over a late row.
+ * worktree it just created (`createFollow`).
  */
 export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
   const create = deps.create ?? ((args: CreateWorktreeArgs) => invoke<CreatedWorktree>("worktree_create", { args }));
   const [open, setOpen] = createSignal(false);
   const [state, setState] = createSignal<CreateState>({ kind: "idle" });
   const [pending, setPending] = createSignal<PendingWorktree | null>(null);
-  const now = deps.now ?? Date.now;
-  // The created session waiting for its row, selected once, when it lands.
-  const [following, setFollowing] = createSignal<Following | null>(null);
-  createEffect(() => {
-    const wait = following();
-    if (wait === null) return;
-    const view = deps.sessions();
-    const selected = view?.selected_session_id ?? null;
-    if (selected === wait.id) return setFollowing(null);
-    if (selected !== wait.selectedAtCreate || now() - wait.since > FOLLOW_MS) return setFollowing(null);
-    if (!listed(view, wait.id)) return;
-    setFollowing(null);
-    deps.select(wait.id);
-  });
+  const follow = createFollow(deps);
 
   const closeComposer = () => {
     if (!open()) return;
@@ -413,11 +399,7 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
         (result) => {
           setPending(null);
           setState({ kind: "done", result });
-          setFollowing({
-            id: result.session_id,
-            since: now(),
-            selectedAtCreate: deps.sessions()?.selected_session_id ?? null,
-          });
+          follow(result.session_id);
           closeComposer();
         },
         (error: unknown) => {
@@ -429,6 +411,37 @@ export function createComposerFlow(deps: ComposerFlowDeps): ComposerFlow {
       );
     },
   };
+}
+
+/**
+ * The select-the-new-session rule every create in the window shares (a new
+ * worktree, a new agent in one): `follow(id)` moves the session list's
+ * selection onto `id` once the list carries its row, as Orca activates what
+ * it just made. The host already opened and focused the tab; this makes the
+ * sidebar row and the answer banner's scope agree with it. The daemon lists
+ * the session on its own schedule, so the selection waits for the row for at
+ * most `FOLLOW_MS`, and gives up the moment the list's selection moves off
+ * the row it had when `follow` was called: a pick from the sidebar, a tab,
+ * the board or the palette all move that one selection, so any of them wins
+ * over a late row. A second `follow` replaces the first.
+ */
+export function createFollow(deps: FollowDeps): (sessionId: string) => void {
+  const now = deps.now ?? Date.now;
+  // The created session waiting for its row, selected once, when it lands.
+  const [following, setFollowing] = createSignal<Following | null>(null);
+  createEffect(() => {
+    const wait = following();
+    if (wait === null) return;
+    const view = deps.sessions();
+    const selected = view?.selected_session_id ?? null;
+    if (selected === wait.id) return setFollowing(null);
+    if (selected !== wait.selectedAtCreate || now() - wait.since > FOLLOW_MS) return setFollowing(null);
+    if (!listed(view, wait.id)) return;
+    setFollowing(null);
+    deps.select(wait.id);
+  });
+  return (sessionId) =>
+    setFollowing({ id: sessionId, since: now(), selectedAtCreate: deps.sessions()?.selected_session_id ?? null });
 }
 
 /** Whether the session list carries a row for `sessionId`. */
