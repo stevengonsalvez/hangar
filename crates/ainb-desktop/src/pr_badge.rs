@@ -256,12 +256,15 @@ pub fn parse(stdout: &[u8]) -> Result<PrBadge, Miss> {
     })
 }
 
-/// A branch name `gh` is handed: non-empty, bounded, never read as a flag, and
+/// A branch name `gh` is handed: non-empty, bounded, never read as a flag or
+/// as a PR number (`gh pr view 42` and `#42` name PR 42, not a branch), and
 /// free of the whitespace and control characters git refuses in one.
 fn plausible_branch(branch: &str) -> bool {
+    let number = branch.trim_start_matches('#');
     !branch.is_empty()
         && branch.len() <= 255
         && !branch.starts_with('-')
+        && !(!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
         && !branch.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
@@ -305,6 +308,8 @@ pub async fn lookup(gh: &Path, worktree: &Path, branch: &str) -> Result<PrBadge,
         // `--` ends the flags: the branch is only ever a positional.
         .args(["pr", "view", "--json", FIELDS, "--", branch])
         .current_dir(worktree)
+        // Would name another repository than the worktree's own remotes.
+        .env_remove("GH_REPO")
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1")
         .env("NO_COLOR", "1")
