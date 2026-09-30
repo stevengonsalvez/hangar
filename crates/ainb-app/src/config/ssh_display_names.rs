@@ -61,7 +61,8 @@ impl SessionLabelStore {
             return Self::default();
         };
         Self::load_in(&dir).unwrap_or_else(|error| {
-            tracing::warn!(%error, "session labels not loaded");
+            // The kind only: a parse error can quote a label out of the file.
+            tracing::warn!(kind = ?error.kind(), "session labels not loaded");
             Self::default()
         })
     }
@@ -71,7 +72,14 @@ impl SessionLabelStore {
         if !dir.is_dir() {
             return Ok(Self::default());
         }
-        let _lock = crate::config::lock::lock_for(&dir.join(FILE))?;
+        // A home this process may read but not write still shows its labels:
+        // a write replaces the file whole by rename, so a read without the
+        // lock never sees half of one.
+        let _lock = match crate::config::lock::lock_for(&dir.join(FILE)) {
+            Ok(lock) => Some(lock),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+            Err(error) => return Err(error),
+        };
         Self::read(dir)
     }
 
@@ -103,24 +111,32 @@ impl SessionLabelStore {
         Ok(store)
     }
 
-    /// The store in `dir`: the current file, else the legacy one, else empty.
-    /// The caller holds the lock.
+    /// The store in `dir`: the current file, else the legacy one. The caller
+    /// holds the lock.
     fn read(dir: &Path) -> io::Result<Self> {
-        for name in [FILE, LEGACY_FILE] {
-            match fs::read_to_string(dir.join(name)) {
-                Ok(content) => {
-                    return serde_json::from_str(&content).map_err(|error| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("{name} does not parse ({error}), so it was left as it is"),
-                        )
-                    });
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        match fs::read_to_string(dir.join(FILE)) {
+            Ok(content) => serde_json::from_str(&content).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{FILE} does not parse ({error}), so it was left as it is"),
+                )
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::read_legacy(dir)),
+            Err(error) => Err(error),
         }
-        Ok(Self::default())
+    }
+
+    /// The legacy file's labels, where the store starts until the current
+    /// file exists. No write touches the legacy file, so one that cannot be
+    /// read is only logged and the store starts empty.
+    fn read_legacy(dir: &Path) -> Self {
+        let Ok(content) = fs::read_to_string(dir.join(LEGACY_FILE)) else {
+            return Self::default();
+        };
+        serde_json::from_str(&content).unwrap_or_else(|error: serde_json::Error| {
+            tracing::warn!(category = ?error.classify(), "{LEGACY_FILE} not loaded");
+            Self::default()
+        })
     }
 
     /// Get display name for a tmux session
