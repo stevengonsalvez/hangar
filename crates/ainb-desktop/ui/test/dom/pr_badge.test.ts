@@ -41,7 +41,7 @@ test("a card with an open PR and failing CI draws the badge and a fail dot", asy
   assert.equal(badge.querySelector(".pr-state")?.textContent, "Open");
   assert.equal(badge.querySelector(".pr-number")?.textContent, "#42");
   assert.equal(badge.querySelector(".ci-dot")?.getAttribute("data-checks"), "fail");
-  assert.equal(badge.getAttribute("aria-label"), "PR #42 open, checks failing");
+  assert.equal(badge.getAttribute("aria-label"), "Open #42, pull request, checks failing");
   assert.equal(badge.closest(".worktree-card-meta") !== null, true, "on the card's meta line");
   assert.equal(badge.closest(".session-row") !== null, false, "outside every row's button");
 });

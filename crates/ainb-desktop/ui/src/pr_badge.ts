@@ -39,10 +39,11 @@ export function asBadge(answer: unknown): PrBadge | null {
 /** The badge's state word: Open, Draft, Merged or Closed. */
 export const stateLabel = (badge: PrBadge): string => STATES[badge.state];
 
-/** What the badge reads aloud and shows on hover: `PR #12 open, checks
- * failing`, without the checks when there are none. */
+/** What the badge reads aloud and shows on hover: its own visible text
+ * first, then what it is, then the checks when it has any (`Open #12, pull
+ * request, checks failing`). */
 export function badgeTitle(badge: PrBadge): string {
   const checks = CHECKS[badge.checks];
-  const title = `PR #${badge.number} ${stateLabel(badge).toLowerCase()}`;
+  const title = `${stateLabel(badge)} #${badge.number}, pull request`;
   return checks === null ? title : `${title}, ${checks}`;
 }
