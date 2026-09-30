@@ -62,7 +62,10 @@ pub struct OsDelivery {
 
 impl Default for OsDelivery {
     fn default() -> Self {
-        Self { waiting: Arc::new(AtomicUsize::new(0)), wait_timeout: WAIT_TIMEOUT }
+        Self {
+            waiting: Arc::new(AtomicUsize::new(0)),
+            wait_timeout: WAIT_TIMEOUT,
+        }
     }
 }
 
@@ -79,7 +82,10 @@ impl OsDelivery {
     #[cfg(any(test, feature = "test-seams"))]
     #[must_use]
     pub fn with_wait_timeout(timeout: Duration) -> Self {
-        Self { wait_timeout: timeout, ..Self::default() }
+        Self {
+            wait_timeout: timeout,
+            ..Self::default()
+        }
     }
 }
 
@@ -208,7 +214,10 @@ fn send(notice: &Notice, waiting: &AtomicUsize, clicked: Click, wait_timeout: Du
             #[cfg(not(target_os = "macos"))]
             tracing::info!(session, "OS notification delivered");
             #[cfg(target_os = "macos")]
-            tracing::info!(session, "OS notification queued with the notification center");
+            tracing::info!(
+                session,
+                "OS notification queued with the notification center"
+            );
             handle
         }
         Err(error) => {
@@ -232,7 +241,10 @@ fn send(notice: &Notice, waiting: &AtomicUsize, clicked: Click, wait_timeout: Du
     match waited {
         Ok(()) => {
             #[cfg(target_os = "macos")]
-            tracing::info!(session, "OS notification delivered: the notification center confirmed the send");
+            tracing::info!(
+                session,
+                "OS notification delivered: the notification center confirmed the send"
+            );
             tracing::debug!(session, "OS notification clicked or closed");
         }
         Err(error) => tracing::warn!(session, %error, "OS notification not delivered"),
@@ -305,21 +317,37 @@ mod tests {
         let waiting = AtomicUsize::new(0);
         {
             let (_guard, already_waiting) = WaiterGuard::claim(&waiting);
-            assert_eq!(already_waiting, 0, "the first claim sees nobody ahead of it");
-            assert_eq!(waiting.load(Ordering::SeqCst), 1, "the claim is counted while held");
+            assert_eq!(
+                already_waiting, 0,
+                "the first claim sees nobody ahead of it"
+            );
+            assert_eq!(
+                waiting.load(Ordering::SeqCst),
+                1,
+                "the claim is counted while held"
+            );
         }
-        assert_eq!(waiting.load(Ordering::SeqCst), 0, "dropping the guard frees its slot");
+        assert_eq!(
+            waiting.load(Ordering::SeqCst),
+            0,
+            "dropping the guard frees its slot"
+        );
     }
 
     #[test]
     fn a_claimed_waiter_guard_releases_its_slot_on_an_early_return() {
         let waiting = AtomicUsize::new(0);
+        // Mirrors the cap-hit branch in `send`: it returns early while a
+        // guard from `WaiterGuard::claim` is still in scope.
         fn claim_then_bail(waiting: &AtomicUsize) {
             let (_guard, _already_waiting) = WaiterGuard::claim(waiting);
-            return; // the cap-hit path in `send` returns while still holding a guard
         }
         claim_then_bail(&waiting);
-        assert_eq!(waiting.load(Ordering::SeqCst), 0, "an early return still drops the guard");
+        assert_eq!(
+            waiting.load(Ordering::SeqCst),
+            0,
+            "an early return still drops the guard"
+        );
     }
 
     #[test]
@@ -329,7 +357,10 @@ mod tests {
             let (_guard, _already_waiting) = WaiterGuard::claim(&waiting);
             panic!("simulated failure while a waiter is held");
         }));
-        assert!(result.is_err(), "the panic is expected to propagate out of catch_unwind");
+        assert!(
+            result.is_err(),
+            "the panic is expected to propagate out of catch_unwind"
+        );
         assert_eq!(
             waiting.load(Ordering::SeqCst),
             0,
@@ -352,7 +383,10 @@ mod tests {
             std::thread::sleep(Duration::from_secs(2));
             "too late"
         });
-        assert!(result.is_err(), "a worker slower than the bound must not be waited for");
+        assert!(
+            result.is_err(),
+            "a worker slower than the bound must not be waited for"
+        );
     }
 
     // The cap-hit path's `tracing::warn!` is exercised end to end, against a

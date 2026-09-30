@@ -50,7 +50,10 @@ impl<S: tracing::Subscriber> Layer<S> for CollectEvents {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut message = String::new();
         event.record(&mut AllFields(&mut message));
-        self.log.lock().unwrap().push(CapturedEvent { level: *event.metadata().level(), message });
+        self.log.lock().unwrap().push(CapturedEvent {
+            level: *event.metadata().level(),
+            message,
+        });
     }
 }
 
@@ -186,7 +189,9 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     let log: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::DEBUG)
-        .with(CollectEvents { log: Arc::clone(&log) });
+        .with(CollectEvents {
+            log: Arc::clone(&log),
+        });
     tracing::subscriber::set_global_default(subscriber)
         .expect("the only test in this binary sets the global subscriber once");
 
@@ -316,5 +321,9 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
         .iter()
         .find(|event| event.message.contains("click wait timed out"))
         .unwrap_or_else(|| panic!("no timeout line among {captured:?}"));
-    assert_eq!(timed_out.level, tracing::Level::WARN, "a timed-out wait is a warning");
+    assert_eq!(
+        timed_out.level,
+        tracing::Level::WARN,
+        "a timed-out wait is a warning"
+    );
 }
