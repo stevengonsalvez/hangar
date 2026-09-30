@@ -136,11 +136,16 @@ test("Ctrl+Shift+D splits the focused pane right, Alt+Shift+D down, as Orca's ke
   press({ ctrlKey: true, shiftKey: true });
   await tick();
   assert.deepEqual(panes(), ["g1:a*a", "g4:d*d!", "g2:b,c*c"]);
-  // A pane of one tab has nothing to split out: nothing changes, and it says so.
+  // A pane of one tab asks for a shell in its worktree to split out
+  // (`split_one_tab.test.ts`); this host opens none, so nothing changes.
+  host.calls = [];
   press({ altKey: true, shiftKey: true });
   await tick();
   assert.deepEqual(panes(), ["g1:a*a", "g4:d*d!", "g2:b,c*c"]);
-  assert.ok([...document.querySelectorAll(".toast")].some((toast) => toast.textContent?.includes("to split it")));
+  assert.deepEqual(
+    host.calls.filter((call) => call.command === "shell_open").map((call) => call.args),
+    [{ target: { kind: "session", id: "u-d" } }],
+  );
   // Down, from a pane of two.
   tabEl("b").querySelector<HTMLElement>(".tab-title")!.click();
   await until(() => panes().includes("g2:b,c*b!"), "b chosen");
