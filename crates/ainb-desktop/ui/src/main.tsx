@@ -769,11 +769,12 @@ function Shell() {
    * or its terminal's, `null` for none: the host raises no OS notification
    * for that session while this window has focus (`notify.rs`). */
   const focusedCard = createMemo(() => {
+    // Settings and the Inbox cover the work area, a transcript card too.
     if (settings() || inboxOpen()) return null;
     const transcript = transcriptKey();
     if (transcript !== null) return transcript;
     const key = active();
-    return showing("terminal") && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
+    return pane() === "terminal" && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
   });
   createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session }).catch(() => {})));
 
