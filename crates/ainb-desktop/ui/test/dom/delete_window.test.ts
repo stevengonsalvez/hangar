@@ -21,6 +21,9 @@ const host = {
   frames: undefined as undefined | { onmessage: Callback },
   events: new Map<string, Callback[]>(),
   preview: { tree: "removed", changes: 0 } as { tree: string; changes: number | null },
+  /** When set, the next preview waits for `answer` instead of `preview`. */
+  hold: false,
+  answer: undefined as undefined | ((preview: { tree: string; changes: number | null }) => void),
 };
 
 function frames() {
@@ -85,6 +88,10 @@ let nextCallback = 1;
       case "session_delete_preview":
       case "session_delete":
         host.calls.push([command, args]);
+        if (command === "session_delete_preview" && host.hold) {
+          host.hold = false;
+          return new Promise((resolve) => (host.answer = resolve));
+        }
         return command === "session_delete_preview" ? host.preview : null;
       default:
         return null;
@@ -127,8 +134,9 @@ function focusIs(expected: Element | null | undefined, message: string) {
   assert.ok(active === expected, `${message}: focus is on ${active?.outerHTML.slice(0, 80) ?? "nothing"}`);
 }
 
-/** Right-click `id`'s row and choose Delete, as a person does. */
-async function openDelete(id: string): Promise<void> {
+/** Right-click `id`'s row and choose Delete, as a person does, and wait
+ * for the dialog; for its answer too unless `pending`. */
+async function openDelete(id: string, pending = false): Promise<void> {
   await until(() => row(id) !== null, "the sidebar row");
   row(id)!.focus();
   row(id)!.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true }) as unknown as Event);
@@ -136,7 +144,8 @@ async function openDelete(id: string): Promise<void> {
   const item = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((el) => el.textContent === "Delete");
   assert.ok(item, "the menu offers Delete");
   item.click();
-  await until(() => button("Delete Workspace")?.disabled === false, "the dialog, ready");
+  if (pending) await until(() => dialog() !== null, "the dialog, still counting");
+  else await until(() => button("Delete Workspace")?.disabled === false, "the dialog, ready");
 }
 
 test("Delete in the real window: inert behind, no Mod+N, Esc closes, focus back on the row", async () => {
@@ -190,4 +199,37 @@ test("Delete in the real window: the confirm sends the host's delete once, with 
     ["session_delete", { sessionId: "u-1", expected: "removed", expectedChanges: 0, force: false }],
   ]);
   assert.equal(shell().hasAttribute("inert"), false);
+});
+
+test("Delete in the real window: a press while the count is out deletes nothing; a dirty count asks for Force Delete", async () => {
+  host.calls = [];
+  host.hold = true;
+  await openDelete("u-2", true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  focusIs(button("Cancel"), "Cancel holds the keyboard while the host counts");
+  // The confirm, where a reflexive press lands if the keyboard is anywhere
+  // but Cancel: it must not start a delete before the count is known.
+  button("Delete")!.click();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(
+    host.calls.map(([command]) => command),
+    ["session_delete_preview"],
+    "nothing deleted while counting",
+  );
+  assert.ok(dialog(), "the dialog is still open");
+
+  host.answer!({ tree: "removed", changes: 3 });
+  await until(() => button("Force Delete") !== undefined, "the dirty count");
+  assert.deepEqual(
+    [...document.querySelectorAll<HTMLButtonElement>(".delete-dialog button")].map((el) => el.textContent),
+    ["Cancel", "Force Delete"],
+  );
+  focusIs(button("Cancel"), "the keyboard stays on Cancel for Force Delete");
+  button("Cancel")!.click();
+  await until(() => dialog() === null, "Cancel to close the dialog");
+  assert.deepEqual(
+    host.calls.map(([command]) => command),
+    ["session_delete_preview"],
+    "and still nothing deleted",
+  );
 });
