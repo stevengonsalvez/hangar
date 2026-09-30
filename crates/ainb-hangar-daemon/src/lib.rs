@@ -639,8 +639,8 @@ fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
 
 /// Read and parse the hangar home's config file at `path` (see
 /// [`spawn::config_path_in`]): the one reader behind every key the daemon
-/// takes from it, `[hangar] spawn` and `[codex] app_server`. One read per
-/// call; each caller keeps its own answer for each outcome.
+/// takes from that file. One read per call; each caller keeps its own answer
+/// for each outcome.
 ///
 /// `Ok(None)` is nothing at `path` at all. A link to nowhere is not that: it
 /// is a [`HangarConfigError::Read`] of kind `NotFound`, so a caller for which
