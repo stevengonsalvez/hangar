@@ -1,7 +1,8 @@
 //! A shell the daemon was still making when it answered gets its tab later,
 //! without another press: `shell/create` answers `SPAWN_STARTED` (tmux did
-//! not answer in time), the shell appears afterwards, and the host's one late
-//! look (`shell_tab::restore_after`) attaches it.
+//! not answer in time), `open_tab` schedules the host's one late look
+//! (`shell_tab::restore_after`) through the spawner it is handed, the shell
+//! appears afterwards, and the look attaches it.
 //!
 //! The daemon is a fake on a scratch unix socket; the shell is a real tmux
 //! session on a private server (`tmux -S` under this test's own directory),
@@ -13,7 +14,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ainb_desktop::shell_tab::{self, MAY_STILL_OPEN};
+use ainb_desktop::create::MAY_STILL_OPEN;
+use ainb_desktop::shell_tab::{self, LATE_RESTORE};
 use ainb_desktop::terminal::{TabEvents, TabState, TabTarget, TabsView, Terminals, Tmux};
 use ainb_hangar_client::DaemonClient;
 use ainb_hangar_proto::spawn::{REPO_NOT_REGISTERED, SPAWN_STARTED};
@@ -176,11 +178,29 @@ async fn a_shell_that_appears_after_a_started_answer_gets_its_tab_unasked() {
         reports,
     );
 
-    // The press: the daemon says tmux started but did not finish.
-    let failed = shell_tab::open_tab(&client, &terminals, DIR)
+    // The press: the daemon says tmux started but did not finish, so
+    // `open_tab` asks for the late look. The test's spawner records the
+    // delay asked for and runs the look sooner, so the test is quick.
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let look = Arc::new(Mutex::new(None));
+    let late = {
+        let (asked, look) = (asked.clone(), look.clone());
+        let (client, terminals) = (client.clone(), terminals.clone());
+        move |delay| {
+            asked.lock().expect("asked").push(delay);
+            *look.lock().expect("look") = Some(tokio::spawn(async move {
+                shell_tab::restore_after(Duration::from_secs(3), &client, &terminals).await
+            }));
+        }
+    };
+    let failed = shell_tab::open_tab(&client, &terminals, DIR, late)
         .await
         .expect_err("the daemon did not finish the shell");
-    assert!(failed.may_still_open, "a started shell may still appear");
+    assert_eq!(
+        *asked.lock().expect("asked"),
+        [LATE_RESTORE],
+        "one late look, LATE_RESTORE from now"
+    );
     assert!(failed.report.is_none(), "nothing tried to attach");
     assert!(
         failed.message.starts_with(MAY_STILL_OPEN),
@@ -189,15 +209,8 @@ async fn a_shell_that_appears_after_a_started_answer_gets_its_tab_unasked() {
     );
     assert!(terminals.view().tabs.is_empty(), "no tab yet");
 
-    // The host's one late look, scheduled now; tmux finishes the shell
-    // while it waits.
-    let late = {
-        let client = client.clone();
-        let terminals = terminals.clone();
-        tokio::spawn(async move {
-            shell_tab::restore_after(Duration::from_secs(3), &client, &terminals).await
-        })
-    };
+    // tmux finishes the shell while the late look waits.
+    let late = look.lock().expect("look").take().expect("the late look was scheduled");
     let mut sessions = Sessions::new(&tmux_socket);
     sessions.make(SHELL);
     daemon.shells.lock().expect("shells").push(SHELL.into());
@@ -303,7 +316,31 @@ async fn a_refused_open_made_nothing_and_is_not_looked_for_again() {
         Quiet,
         reports,
     );
-    let failed = shell_tab::open_tab(&client, &terminals, DIR).await.expect_err("refused");
-    assert!(!failed.may_still_open, "{}", failed.message);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let late = {
+        let asked = asked.clone();
+        move |delay| asked.lock().expect("asked").push(delay)
+    };
+    let failed = shell_tab::open_tab(&client, &terminals, DIR, late).await.expect_err("refused");
+    assert!(
+        asked.lock().expect("asked").is_empty(),
+        "a refusal made nothing to look for: {}",
+        failed.message
+    );
     assert!(failed.message.contains("Add project"), "{}", failed.message);
+}
+
+#[test]
+fn the_late_look_comes_after_the_daemons_tmux_wait_not_long_after() {
+    use ainb_hangar_daemon::spawn::SHELL_TMUX_TIMEOUT;
+    // Sooner, and a shell tmux is still making when the daemon gives up is
+    // not there yet; much later, and the person has pressed again.
+    assert!(
+        LATE_RESTORE > SHELL_TMUX_TIMEOUT,
+        "{LATE_RESTORE:?} is not past the daemon's {SHELL_TMUX_TIMEOUT:?}"
+    );
+    assert!(
+        LATE_RESTORE < SHELL_TMUX_TIMEOUT * 2,
+        "{LATE_RESTORE:?} is far past the daemon's {SHELL_TMUX_TIMEOUT:?}"
+    );
 }
