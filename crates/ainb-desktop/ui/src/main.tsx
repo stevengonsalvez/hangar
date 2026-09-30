@@ -111,18 +111,13 @@ import { startNotifications } from "./notifications.ts";
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
-/** The most characters a toast draws: the host's own cut
- * (`intent::MAX_TOAST_CHARS`). A sidebar label's 80 would drop a refusal's
- * detail, the part that says what to do. */
+/** The most characters a toast draws. The same number as the host's
+ * `intent::MAX_TOAST_CHARS`, which a Rust test holds equal to this one, but
+ * the host cuts only the toasts it sends itself: a command's refusal (such as
+ * `shell_open`'s) reaches the page whole, so this is where it is cut. A
+ * sidebar label's 80 would drop a refusal's detail, the part that says what
+ * to do. */
 const TOAST_CHARS = 300;
-
-/** `text` as a toast draws it: control and format characters removed, as a
- * label's are, and cut to `TOAST_CHARS`. */
-function toastLine(text: string): string {
-  return Array.from(text.replace(/[\p{Cc}\p{Cf}]/gu, ""))
-    .slice(0, TOAST_CHARS)
-    .join("");
-}
 
 /** How long a toast stays up. */
 const TOAST_MS = 5000;
@@ -816,7 +811,7 @@ function Shell() {
   let toastId = 0;
   const toast = (text: string) => {
     const id = ++toastId;
-    setToasts((shown) => [...shown, { id, text: toastLine(text) }]);
+    setToasts((shown) => [...shown, { id, text: label(text, TOAST_CHARS) }]);
     setTimeout(() => setToasts((shown) => shown.filter((entry) => entry.id !== id)), TOAST_MS);
   };
 

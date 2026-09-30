@@ -6,12 +6,16 @@
 //
 // The fake host answers `shell_open` as the real one does: a new shell tab,
 // focused, in the folder the target names.
+//
+// The window mounts once per file, so each test starts from the same place
+// (`beforeEach`): no shell tabs, no recorded calls, no queued refusal. Any one
+// test runs alone (`--test-name-pattern`) as it runs in the file.
 
 import "./window.ts";
-import { drain, host, mountWindow, press, showTab, until } from "./window_host.ts";
+import { drain, host, mountWindow, press, showTab, tabOf, until } from "./window_host.ts";
 
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 
 /** The host's sentence for an open that may have made its shell
  * (`create::MAY_STILL_OPEN` and the daemon's detail). */
@@ -57,7 +61,7 @@ internals.invoke = async (command, args = {}) => {
   }
   if (command === "shell_open") {
     opened += 1;
-    const key = `ainb-dsh-0000000${opened}`;
+    const key = `ainb-dsh-${String(opened).padStart(8, "0")}`;
     const dir = folderOf(args.target as Target);
     host.tabs = [...host.tabs, { key, target: { kind: "shell", tmux: key, dir }, state: "attached" } as never];
     setTimeout(() => emitTabs(key), 0);
@@ -83,42 +87,69 @@ const shellTabs = () =>
 const toasts = () => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent ?? "");
 /** Mod+T and Mod+W as this window reads them off macOS: Ctrl+Shift. */
 const chord = (code: string, key: string) => press({ code, key, ctrlKey: true, shiftKey: true });
+const isShell = (key: string) => key.startsWith("ainb-dsh-");
+
+let mounted: Promise<void> | undefined;
+
+beforeEach(async () => {
+  mounted ??= mountWindow();
+  await mounted;
+  calls.length = 0;
+  refuse.clear();
+  // The strip the window mounted with: the shells an earlier test opened
+  // end, and a session tab it closed is back.
+  const start = [tabOf("u-1"), tabOf("u-2")];
+  if (host.tabs.map((tab) => tab.key).join() !== start.map((tab) => tab.key).join()) {
+    host.tabs = start;
+    emitTabs(null);
+  }
+  await until(() => document.querySelectorAll(".tab[data-state]").length === start.length, "the starting strip");
+});
+
+/** Open a shell from `sessionId`'s tab, shown, and answer its key. */
+async function openShellFrom(sessionId: string): Promise<string> {
+  await showTab(sessionId);
+  const before = shellTabs().length;
+  await newTerminal();
+  await until(() => shellTabs().length === before + 1, "the shell's tab in the strip");
+  const key = host.tabs[host.tabs.length - 1].key;
+  await until(() => document.querySelector(`.terminal[data-tab='${key}']:not([hidden])`) !== null, "the shell shown");
+  await drain();
+  return key;
+}
 
 test("the pane strip's + opens a shell in the shown tab's worktree", async () => {
-  await mountWindow();
   assert.ok(plus(), "the pane strip mounts the + menu");
   assert.equal(document.querySelector("nav.tabs:not(.pane-strip) .tab-new"), null, "none beside Board and Review");
 
-  await showTab("u-1");
-  await newTerminal();
-  await until(() => shellTabs().length === 1, "the shell's tab in the strip");
+  await openShellFrom("u-1");
   // Only ids cross: the host resolves the folder.
   assert.deepEqual(lastCall("shell_open")?.args, { target: { kind: "session", id: "u-1" } });
   assert.equal(shellTabs()[0].querySelector(".tab-title")?.textContent, "Terminal · one");
 });
 
 test("Mod+T on a shown shell tab opens another shell in the same folder", async () => {
-  await until(() => document.querySelector<HTMLElement>(".terminal[data-tab='ainb-dsh-00000001']:not([hidden])") !== null, "the shell shown");
-  await drain();
+  const first = await openShellFrom("u-1");
   chord("KeyT", "T");
   await until(() => shellTabs().length === 2, "a second shell tab");
-  assert.deepEqual(lastCall("shell_open")?.args, { target: { kind: "shell", key: "ainb-dsh-00000001" } });
+  assert.deepEqual(lastCall("shell_open")?.args, { target: { kind: "shell", key: first } });
   assert.equal(shellTabs()[1].querySelector(".tab-title")?.textContent, "Terminal · one");
 });
 
 test("closing a shell's tab ends the shell, by its x and by Mod+W; a session tab only detaches", async () => {
-  const first = shellTabs()[0];
-  first.querySelector<HTMLButtonElement>(".tab-close")!.click();
+  const first = await openShellFrom("u-1");
+  const second = await openShellFrom("u-1");
+  shellTabs()[0].querySelector<HTMLButtonElement>(".tab-close")!.click();
   await until(() => shellTabs().length === 1, "the first shell's tab to close");
-  assert.equal(lastCall("shell_close")?.args.key, "ainb-dsh-00000001");
+  assert.equal(lastCall("shell_close")?.args.key, first);
   assert.equal(lastCall("terminal_close"), undefined, "a shell's tab is not merely detached");
 
   shellTabs()[0].querySelector<HTMLElement>(".tab-title")!.click();
-  await until(() => document.querySelector(".terminal[data-tab='ainb-dsh-00000002']:not([hidden])") !== null, "the second shell shown");
+  await until(() => document.querySelector(`.terminal[data-tab='${second}']:not([hidden])`) !== null, "the second shell shown");
   await drain();
   chord("KeyW", "W");
   await until(() => shellTabs().length === 0, "Mod+W to close the second shell");
-  assert.equal(lastCall("shell_close")?.args.key, "ainb-dsh-00000002");
+  assert.equal(lastCall("shell_close")?.args.key, second);
   assert.equal(lastCall("terminal_close"), undefined);
 
   await showTab("u-2");
@@ -133,5 +164,19 @@ test("a refusal shows the host's sentence as it came", async () => {
   await newTerminal();
   await until(() => toasts().some((text) => text.includes("may still open")), "the refusal toast");
   assert.ok(toasts().includes(MAY_STILL_OPEN_TEXT), toasts().join(" | "));
-  assert.equal(host.tabs.filter((tab) => tab.key.startsWith("ainb-dsh-")).length, 0, "no tab for a refused open");
+  assert.equal(host.tabs.filter((tab) => isShell(tab.key)).length, 0, "no tab for a refused open");
+});
+
+test("a long refusal is cleaned and cut at a toast's cap, not a label's", async () => {
+  await showTab("u-1");
+  // The page cuts a refusal at TOAST_CHARS (300, held equal to
+  // intent::MAX_TOAST_CHARS); a bidi override or an escape in its detail
+  // must not restyle the toast.
+  const detail = "d".repeat(400);
+  refuse.set("shell_open", `\u202EOpening the terminal failed:\u001b ${detail}`);
+  await newTerminal();
+  await until(() => toasts().some((text) => text.startsWith("Opening the terminal failed")), "the refusal toast");
+  const shown = toasts().find((text) => text.startsWith("Opening the terminal failed"))!;
+  assert.equal(Array.from(shown).length, 300, "cut at the toast's cap");
+  assert.ok(shown.startsWith("Opening the terminal failed: ddd"), shown.slice(0, 40));
 });

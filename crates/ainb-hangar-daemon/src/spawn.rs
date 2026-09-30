@@ -602,7 +602,7 @@ const SHELL_NAME_TRIES: usize = 3;
 
 /// Upper bound on one `tmux new-session`. It returns as soon as the session
 /// exists; a tmux server that does not answer in this long is wedged.
-const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
+pub const SHELL_TMUX_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The tmux user option a shell carries the op id of the create that made
 /// it: a label for whoever reads the session, not a lookup. Retries are the

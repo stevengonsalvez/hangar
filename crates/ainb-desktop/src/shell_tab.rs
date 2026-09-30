@@ -15,6 +15,13 @@
 //! As in Orca, closing a terminal tab ends its shell, and a relaunch
 //! reattaches the shells still running: the daemon, not the window, owns
 //! them, so they outlive the window as tmux does.
+//!
+//! An open the daemon did not finish answering may still make its shell
+//! (a timeout, or `SPAWN_STARTED`): the host looks once more
+//! [`LATE_RESTORE`] later and attaches it then, so a late shell still gets
+//! its tab without another press.
+
+use std::time::Duration;
 
 use ainb_app::Intent;
 use ainb_app::app::state::AppState;
@@ -23,7 +30,7 @@ use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
 use ainb_hangar_proto::spawn::{ShellCloseParams, ShellCreateParams, ShellCreateResult};
 use uuid::Uuid;
 
-use crate::create::{SpawnVerb, mint_op_id, spawn_refusal_text};
+use crate::create::{SpawnVerb, may_have_started, mint_op_id, spawn_refusal_text};
 use crate::terminal::{TabTarget, Terminals};
 
 /// The worktree folder of the listed session `session_id`, from the host's
@@ -62,16 +69,29 @@ pub fn close_params(tmux_session_name: &str, op_id: OpId) -> ShellCloseParams {
     }
 }
 
-/// Ask the daemon for a shell in `worktree_path`.
-///
-/// # Errors
-/// The sentence for the window ([`spawn_refusal_text`]).
-pub async fn open(client: &DaemonClient, worktree_path: &str) -> Result<ShellCreateResult, String> {
+/// How long after an open that may still make its shell the host looks for
+/// it once more: past the daemon's own answer budget for tmux
+/// (`ainb_hangar_daemon::spawn::SHELL_TMUX_TIMEOUT`).
+pub const LATE_RESTORE: Duration = Duration::from_secs(12);
+
+async fn create(
+    client: &DaemonClient,
+    worktree_path: &str,
+) -> Result<ShellCreateResult, DaemonError> {
     client
         .shell_create(&create_params(
             worktree_path,
             mint_op_id(SpawnVerb::OpenTerminal),
         ))
+        .await
+}
+
+/// Ask the daemon for a shell in `worktree_path`.
+///
+/// # Errors
+/// The sentence for the window ([`spawn_refusal_text`]).
+pub async fn open(client: &DaemonClient, worktree_path: &str) -> Result<ShellCreateResult, String> {
+    create(client, worktree_path)
         .await
         .map_err(|error| spawn_refusal_text(&error, SpawnVerb::OpenTerminal))
 }
@@ -107,17 +127,31 @@ pub struct OpenTabError {
 /// A shell whose tab cannot attach is closed again before this returns: the
 /// window shows no tab for it, so nothing else would ever end it.
 ///
+/// A refusal that may still make its shell ([`may_have_started`]) hands
+/// `late` [`LATE_RESTORE`]: the host schedules its one late look
+/// ([`restore_after`]) with it, so the shell gets its tab unasked. `late`
+/// is not called on any other outcome.
+///
 /// # Errors
 /// The daemon's refusal, or the failed attach with its report.
 pub async fn open_tab(
     client: &DaemonClient,
     terminals: &Terminals,
     worktree_path: &str,
+    late: impl FnOnce(Duration),
 ) -> Result<String, OpenTabError> {
-    let shell = open(client, worktree_path).await.map_err(|message| OpenTabError {
-        message,
-        report: None,
-    })?;
+    let shell = match create(client, worktree_path).await {
+        Ok(shell) => shell,
+        Err(error) => {
+            if may_have_started(&error) {
+                late(LATE_RESTORE);
+            }
+            return Err(OpenTabError {
+                message: spawn_refusal_text(&error, SpawnVerb::OpenTerminal),
+                report: None,
+            });
+        }
+    };
     let name = shell.tmux_session_name.clone();
     let Some(report) = terminals.open(target(&shell)) else {
         return Ok(name);
@@ -185,9 +219,11 @@ pub fn reattach(terminals: &Terminals, key: &str) -> Option<Intent> {
     }
 }
 
-/// Open a tab, unfocused, for every shell the daemon still runs: the
-/// relaunch half of Orca's model. Returns how many were listed and the
-/// failure reports of those that could not attach.
+/// Open a tab, unfocused, for every shell the daemon still runs that has
+/// none: the relaunch half of Orca's model, and the late look after an open
+/// that may still make its shell. A shell that already has a tab is left as
+/// it is, so a tab the person detached stays detached. Returns how many were
+/// listed and the failure reports of those that could not attach.
 ///
 /// # Errors
 /// The daemon could not list its shells.
@@ -199,9 +235,25 @@ pub async fn restore(
     let reports = listed
         .shells
         .iter()
+        .filter(|shell| terminals.target(&shell.tmux_session_name).is_none())
         .filter_map(|shell| terminals.open_unfocused(target(shell)))
         .collect();
     Ok((listed.shells.len(), reports))
+}
+
+/// [`restore`], once, after `delay`: the host's single late look for a
+/// shell an open may still make. Not a loop: a shell later than this is
+/// found by the next launch.
+///
+/// # Errors
+/// The daemon could not list its shells.
+pub async fn restore_after(
+    delay: Duration,
+    client: &DaemonClient,
+    terminals: &Terminals,
+) -> Result<(usize, Vec<Intent>), DaemonError> {
+    tokio::time::sleep(delay).await;
+    restore(client, terminals).await
 }
 
 #[cfg(test)]

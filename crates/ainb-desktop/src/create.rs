@@ -138,10 +138,10 @@ impl SpawnVerb {
         }
     }
 
-    /// What a request that may already have happened says, with the
-    /// daemon's `detail`: a second press could start a second one. `None`
-    /// for a close, which starts nothing.
-    fn may_have_started(self, detail: &str) -> Option<String> {
+    /// What a request the daemon says started but did not finish says,
+    /// with the daemon's `detail`: a second press could start a second one.
+    /// `None` for a close, which starts nothing.
+    fn started(self, detail: &str) -> Option<String> {
         match self {
             Self::CreateWorktree => Some(format!(
                 "The create started but did not finish: {detail}. Check the sidebar before creating again."
@@ -191,6 +191,19 @@ pub fn mint_op_id(verb: SpawnVerb) -> OpId {
 /// be gone, so another press could make a second one.
 pub const MAY_STILL_OPEN: &str = "The terminal may still open; check before opening another.";
 
+/// Whether the request `error` answered may still have done its work: the
+/// daemon did not answer in time, or said `ainb run` or tmux started but did
+/// not finish. Any other refusal did nothing. The one test for it, behind
+/// both the sentence ([`refusal_sentence`]) and the shell tab's late look.
+#[must_use]
+pub fn may_have_started(error: &DaemonError) -> bool {
+    match error {
+        DaemonError::Timeout(_) => true,
+        DaemonError::Rpc { code, .. } => *code == SPAWN_STARTED,
+        _ => false,
+    }
+}
+
 /// A daemon error as the sentence the window shows for `verb`: the one place
 /// a code becomes words. Chosen by the error's code, never its words; the
 /// daemon's detail is shown where it is the answer (a refused field, a
@@ -227,9 +240,9 @@ pub fn refusal_sentence(error: &DaemonError, verb: SpawnVerb, spawn_config: &Pat
         }
         // `ainb run` or tmux ran: it is still going, or it failed after
         // starting. Either way this is not a request that never happened.
-        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED => verb
-            .may_have_started(message)
-            .unwrap_or_else(|| format!("{doing} failed: {message}")),
+        DaemonError::Rpc { message, .. } if may_have_started(error) => {
+            verb.started(message).unwrap_or_else(|| format!("{doing} failed: {message}"))
+        }
         DaemonError::Rpc { message, .. } => format!("{doing} failed: {message}"),
         DaemonError::Timeout(_) => verb
             .unanswered()
@@ -410,5 +423,28 @@ mod tests {
         let shell = mint_op_id(SpawnVerb::OpenTerminal);
         assert!(shell.as_str().starts_with("desktop-shell-"), "{shell:?}");
         assert_ne!(add, mint_op_id(SpawnVerb::AddAgent));
+    }
+
+    #[test]
+    fn only_a_timeout_or_a_started_run_may_have_started() {
+        assert!(may_have_started(&DaemonError::Timeout(
+            std::time::Duration::from_secs(30)
+        )));
+        assert!(may_have_started(&DaemonError::Rpc {
+            code: SPAWN_STARTED,
+            message: "tmux did not answer within 10s".into(),
+        }));
+        for code in [
+            METHOD_NOT_FOUND,
+            INVALID_PARAMS,
+            REPO_NOT_REGISTERED,
+            -32603,
+        ] {
+            let refused = DaemonError::Rpc {
+                code,
+                message: "no".into(),
+            };
+            assert!(!may_have_started(&refused), "{code} did nothing");
+        }
     }
 }

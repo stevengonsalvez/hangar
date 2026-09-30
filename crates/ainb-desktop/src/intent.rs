@@ -224,6 +224,20 @@ pub(crate) fn is_format(c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// The page cuts a toast the host did not cut (a command's refusal) at
+    /// its own `TOAST_CHARS`: the two caps are one number, so a toast is the
+    /// same length whichever side cut it.
+    #[test]
+    fn the_page_cuts_toasts_where_the_host_does() {
+        let page = include_str!("../ui/src/main.tsx");
+        let declared = page
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("const TOAST_CHARS = "))
+            .expect("main.tsx declares TOAST_CHARS");
+        let chars: usize = declared.trim_end_matches(';').parse().expect("a number");
+        assert_eq!(chars, MAX_TOAST_CHARS, "ui/src/main.tsx TOAST_CHARS");
+    }
+
     #[test]
     fn typed_text_loses_what_a_person_cannot_see() {
         let override_ = "\u{202E}";
