@@ -282,6 +282,85 @@ async fn a_tmux_session_that_will_not_end_refuses_the_delete() {
 }
 
 #[tokio::test]
+async fn a_session_whose_name_prefixes_another_leaves_the_other_running() {
+    // The row's own session has already exited; another, whose name starts
+    // with the row's, still runs. A prefix or pattern match would end it.
+    if !tmux_available() {
+        return;
+    }
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    let socket = private_socket();
+    let name = ainb_run_name(session);
+    let sibling = format!("{name}x");
+    let _end = EndOnDrop {
+        socket: socket.clone(),
+        name: sibling.clone(),
+    };
+    start(&socket, &sibling, base.parent().unwrap());
+    let mut agent = row(session, &tree);
+    agent.tmux_session_name = name.clone();
+    save(&[agent]);
+
+    delete(&session.to_string(), TreeFate::Removed, Some(0), false)
+        .await
+        .expect("deleted");
+
+    assert!(!listed(session), "the row is gone");
+    assert!(
+        running(&socket, &sibling),
+        "{sibling} was ended by deleting {name}"
+    );
+}
+
+/// Puts a socket's mode back when the test is done, before its sessions end.
+struct RestoreMode(PathBuf, u32);
+
+impl Drop for RestoreMode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+#[tokio::test]
+async fn a_tmux_that_cannot_say_whether_the_agent_runs_refuses_the_delete() {
+    // Only "no such session", "no server" or "no socket" mean the agent is
+    // gone. A socket tmux may not open says nothing about it: the folder
+    // and the row stay.
+    if !tmux_available() {
+        return;
+    }
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    let socket = private_socket();
+    let name = ainb_run_name(session);
+    let _end = EndOnDrop {
+        socket: socket.clone(),
+        name: name.clone(),
+    };
+    start(&socket, &name, &tree);
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o7777;
+    // Dropped first: the mode is back before the session is ended.
+    let _restore = RestoreMode(socket.clone(), mode);
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let mut agent = row(session, &tree);
+    agent.tmux_session_name = name.clone();
+    save(&[agent]);
+
+    let error = delete(&session.to_string(), TreeFate::Removed, Some(0), false)
+        .await
+        .expect_err("refused while tmux cannot answer");
+
+    assert!(error.contains("could not say"), "{error}");
+    assert!(tree.is_dir(), "the folder stays");
+    assert!(listed(session), "the row stays");
+}
+
+#[tokio::test]
 async fn a_file_written_after_the_preview_refuses_the_delete_and_survives() {
     // A live agent writes while the dialog is open: the tree was clean when
     // counted, the confirm is a plain Delete, and the new file must not go.
