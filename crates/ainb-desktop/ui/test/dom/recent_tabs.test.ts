@@ -26,6 +26,8 @@ const typed: string[] = [];
 /** Every `shell_open` target, in order. */
 const shellOpens: Target[] = [];
 let opened = 0;
+/** List a new shell's tab before answering its open, as a host may. */
+let listBeforeAnswer = false;
 const FOLDERS: Record<string, string> = { "u-1": "/a/one", "u-2": "/a/two", "u-3": "/b/one" };
 
 function emitTabs(focus: string | null): void {
@@ -46,7 +48,10 @@ internals.invoke = async (command, args = {}) => {
         ? FOLDERS[target.id]
         : (host.tabs.find((tab) => tab.key === target.key) as unknown as { target: { dir: string } }).target.dir;
     host.tabs = [...host.tabs, { key, target: { kind: "shell", tmux: key, dir }, state: "attached" } as never];
-    setTimeout(() => emitTabs(key), 0);
+    if (listBeforeAnswer) {
+      emitTabs(key);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } else setTimeout(() => emitTabs(key), 0);
     return key;
   }
   if (command === "terminal_close" || command === "shell_close") {
@@ -155,6 +160,7 @@ test("Esc closes the switcher with nothing changed, and Ctrl let go after it sho
   const esc = escape();
   assert.equal(switcher(), null, "Esc closed it");
   assert.equal(esc.defaultPrevented, true, "the Esc is the switcher's, not the terminal's");
+  assert.ok(!typed.join("").includes("\x1b"), "the terminal with the keyboard never saw the Esc");
   releaseCtrl();
   await drain();
   assert.equal(shown(), "u-1", "still the tab shown before");
@@ -168,6 +174,20 @@ test("the window losing focus closes the switcher with nothing changed", async (
   releaseCtrl();
   await drain();
   assert.equal(shown(), "u-1");
+});
+
+test("a palette opened while Ctrl is held keeps the tab shown when Ctrl is let go", async () => {
+  ctrlTab();
+  await until(() => switcher() !== null, "the switcher");
+  press({ code: "KeyJ", key: "J", ctrlKey: true, shiftKey: true });
+  await until(() => document.querySelector(".palette") !== null, "the palette");
+  releaseCtrl();
+  await drain();
+  assert.equal(switcher(), null);
+  assert.equal(shown(), "u-1", "no tab switched behind the palette");
+  press({ code: "KeyJ", key: "J", ctrlKey: true, shiftKey: true });
+  await until(() => document.querySelector(".palette") === null, "the palette closed");
+  await drain();
 });
 
 test("the switcher lists only the focused pane's tabs, and a pane of one opens none", async () => {
@@ -231,6 +251,24 @@ test("a closed shell comes back as a fresh shell in its worktree, in its old pla
   await until(() => shellOpens.length === 2, "a shell asked for");
   assert.deepEqual(shellOpens[1], { kind: "session", id: "u-2" }, "in the closed shell's folder, named by the session whose worktree it is");
   await until(() => panes().join() === "g1:u-2,u-3,ainb-dsh-2*ainb-dsh-2!,g2:u-1*u-1", `the new shell back in g1, not ${panes().join()}`);
+});
+
+test("a reopened shell whose tab is listed before the host answers still goes back to its pane", async () => {
+  // g1: u-2, u-3, ainb-dsh-2 (shown, focused) | g2: u-1. Close the shell,
+  // focus g2, and have the host list the new shell before it answers.
+  closeShown();
+  await until(() => panes()[0] === "g1:u-2,u-3*u-3!", "the shell closed");
+  document.querySelector<HTMLElement>('.tab[data-key="tmux_u-1"] .tab-title')!.click();
+  await until(() => shown() === "u-1", "u-1 shown in g2");
+  await drain();
+  listBeforeAnswer = true;
+  try {
+    reopen();
+    await until(() => panes().join() === "g1:u-2,u-3,ainb-dsh-3*ainb-dsh-3!,g2:u-1*u-1", `the shell back in g1, not ${panes().join()}`);
+  } finally {
+    listBeforeAnswer = false;
+  }
+  await until(() => document.activeElement?.closest<HTMLElement>(".terminal[data-tab]")?.dataset.tab === "ainb-dsh-3", "the shell to have the keyboard");
 });
 
 test("reopen skips a session gone from the list and brings back the one closed before it", async () => {
