@@ -70,7 +70,12 @@ export function TabCreateMenu(props: Props) {
       event.preventDefault();
       close();
       trigger?.focus();
-    } else if (event.key === "Tab") close();
+    } else if (event.key === "Tab") {
+      // The + takes the keyboard before the menu goes: closed first, the
+      // focused item leaves the page and the keyboard falls to the body.
+      trigger?.focus();
+      close();
+    }
     else if (event.key === "ArrowDown") go(at + 1);
     else if (event.key === "ArrowUp") go(at - 1);
     else if (event.key === "Home") go(0);
