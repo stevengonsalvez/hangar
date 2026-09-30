@@ -1859,10 +1859,8 @@ mod tests {
         );
     }
 
-    /// What the daemon log actually gets from a config with a token on a
-    /// malformed line, through both readers of the file: where, never what.
-    #[test]
-    fn neither_config_reader_logs_the_line_of_a_parse_error() {
+    /// Everything logged while `run` runs, as the daemon's fmt layer writes it.
+    fn captured_log(run: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Captured {
@@ -1875,6 +1873,21 @@ mod tests {
             }
         }
 
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// What the daemon log actually gets from a config with a token on a
+    /// malformed line, through every reader of the file: where, never what.
+    #[test]
+    fn no_config_reader_logs_the_line_of_a_parse_error() {
         let home = tempfile::tempdir().unwrap();
         let path = crate::spawn::config_path_in(home.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1884,26 +1897,22 @@ mod tests {
         )
         .unwrap();
 
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let log = captured_log(|| {
             assert!(!crate::spawn::served_by_config(&path), "spawn kept off");
             assert_eq!(
                 super::codex_app_server_in(&path),
                 super::ConfigSetting::Unreadable,
                 "codex keeps its own server"
             );
+            assert!(
+                crate::acp_pool::acp_adapters_in(&path).is_empty(),
+                "acp keeps the built-in adapters"
+            );
         });
-
-        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(!log.contains("sk-SECRET"), "{log}");
         assert_eq!(
             log.matches("at line 3, column 23").count(),
-            2,
+            3,
             "one located warning per reader: {log}"
         );
     }
