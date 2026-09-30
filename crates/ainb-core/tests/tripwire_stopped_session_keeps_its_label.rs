@@ -141,9 +141,8 @@ async fn a_stopped_session_still_paints_the_label_it_ran_under() {
     });
     store.save().expect("save sessions.json");
 
-    let mut labels = SessionLabelStore::default();
-    labels.set(tmux_name.clone(), Some(LABEL.to_string()));
-    labels.save().expect("save session-labels.json");
+    SessionLabelStore::set_label(&tmux_name, Some(LABEL.to_string()))
+        .expect("save session-labels.json");
 
     // ── Drive the real loader ────────────────────────────────────────────
     let mut state = AppState::new();
@@ -179,9 +178,7 @@ async fn a_stopped_session_still_paints_the_label_it_ran_under() {
     // Negative control. With the label removed from the store and nothing else
     // changed, the same render must lose it. Without this the assertion above
     // would also pass on a build that painted the label from anywhere else.
-    let mut cleared = SessionLabelStore::default();
-    cleared.set(tmux_name.clone(), None);
-    cleared.save().expect("clear session-labels.json");
+    SessionLabelStore::set_label(&tmux_name, None).expect("clear session-labels.json");
 
     let mut unlabelled = AppState::new();
     unlabelled.load_real_workspaces().await;

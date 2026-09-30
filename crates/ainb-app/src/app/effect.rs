@@ -122,12 +122,12 @@ pub enum Effect {
     /// store), which is the seam a host points at its own config root.
     ///
     /// A failed write leaves disk behind memory. Whole-store writes
-    /// (`Favorites`, `SessionLabels`, `Onboarding`) heal on the next change to
-    /// that store, which carries the whole store again. Keyed and field writes
-    /// (`AppConfig`, `ConfigExternalKeys`, `OnboardingGitDirectories`,
-    /// `SessionHeadroom`) carry only what changed, so a failed one is lost
-    /// until that setting changes again; the report says so and the host does
-    /// not retry.
+    /// (`Favorites`, `Onboarding`) heal on the next change to that store,
+    /// which carries the whole store again. Keyed and field writes
+    /// (`AppConfig`, `ConfigExternalKeys`, `SessionLabel`,
+    /// `OnboardingGitDirectories`, `SessionHeadroom`) carry only what changed,
+    /// so a failed one is lost until that setting changes again; the report
+    /// says so and the host does not retry.
     Persist(Persist),
 }
 
@@ -153,8 +153,13 @@ pub enum Persist {
     ConfigExternalKeys(Vec<(String, String)>),
     /// The repository favourites, whole.
     Favorites(Snapshot<crate::config::FavoritesStore>),
-    /// The durable session labels, whole.
-    SessionLabels(Snapshot<crate::config::SessionLabelStore>),
+    /// One durable session label, set on the label store as it is on disk
+    /// ([`crate::config::SessionLabelStore::set_label`]), so a label another
+    /// process wrote since this one loaded the store is kept. `None` clears it.
+    SessionLabel {
+        tmux_session: String,
+        label: Option<String>,
+    },
     /// The onboarding record, whole.
     Onboarding(Snapshot<crate::config::OnboardingConfig>),
     /// The onboarding record's git directories, set on the record on disk so
@@ -177,7 +182,7 @@ impl Persist {
         match self {
             Self::AppConfig { .. } | Self::ConfigExternalKeys(_) => "config",
             Self::Favorites(_) => "favorites",
-            Self::SessionLabels(_) => "session_labels",
+            Self::SessionLabel { .. } => "session_labels",
             Self::Onboarding(_) | Self::OnboardingGitDirectories(_) => "onboarding",
             Self::SessionHeadroom { .. } => "session_store",
         }
@@ -231,8 +236,17 @@ impl Persist {
                 store.clone_from(later);
                 true
             }
-            (Self::SessionLabels(store), Self::SessionLabels(later)) => {
-                store.clone_from(later);
+            (
+                Self::SessionLabel {
+                    tmux_session,
+                    label,
+                },
+                Self::SessionLabel {
+                    tmux_session: later_session,
+                    label: later,
+                },
+            ) if tmux_session == later_session => {
+                label.clone_from(later);
                 true
             }
             (Self::Onboarding(record), Self::Onboarding(later)) => {

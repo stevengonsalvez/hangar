@@ -332,15 +332,17 @@ impl<S: FrameSink> DesktopHost<S> {
         effects
     }
 
-    /// Give `session` the display name `raw` ([`crate::rename::rename`]),
-    /// frame it, and return the label store write it queued.
+    /// Give `session` the display name `raw` ([`crate::rename::rename`],
+    /// which writes the label store itself), frame it, and return whatever
+    /// effects the state queued.
     ///
     /// A write outside dispatch, as the tick's are: the reducer's own label
     /// rename is the terminal's popup, driven by the selection and typed keys,
     /// and the window edits the name in its own field and sends it whole.
     ///
     /// # Errors
-    /// Why the name was refused; nothing was written or framed then.
+    /// Why the name was refused or not saved; nothing was written or framed
+    /// then.
     pub fn rename_session(
         &mut self,
         session: uuid::Uuid,

@@ -4,7 +4,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
+
+const FILE: &str = "session-labels.json";
+const LEGACY_FILE: &str = "ssh_display_names.json";
 
 /// Normalize a durable session label before it reaches disk or the UI.
 ///
@@ -26,6 +30,11 @@ pub fn normalize_session_label(raw: &str) -> Result<Option<String>, String> {
 
 /// Store for durable session labels.
 /// Maps tmux session name to a human-provided label, independent from Git.
+///
+/// The file has several writers: the terminal's label popup, the desktop
+/// window's rename and `ainb label`, each in its own process. So there is no
+/// whole-store save: [`Self::set_label`] is the one write, and it changes one
+/// label on the file as it stands, under the lock [`Self::load`] reads under.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript-bindings", derive(specta::Type))]
 pub struct SessionLabelStore {
@@ -35,39 +44,116 @@ pub struct SessionLabelStore {
 }
 
 impl SessionLabelStore {
-    /// Get the storage file path
-    fn storage_path() -> Option<PathBuf> {
+    /// The directory the store lives in. The legacy file sits beside it, so a
+    /// relocated home never reads the real home's labels.
+    fn storage_dir() -> Option<PathBuf> {
         std::env::var_os("AINB_HOME")
             .map(PathBuf::from)
             .or_else(dirs::home_dir)
-            .map(|base| base.join(".agents-in-a-box").join("session-labels.json"))
+            .map(|base| base.join(".agents-in-a-box"))
     }
 
-    fn legacy_storage_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| home.join(".agents-in-a-box").join("ssh_display_names.json"))
-    }
-
-    /// Load from disk (returns empty store if file doesn't exist)
+    /// Load from disk, under the lock writers hold. No file is an empty store,
+    /// and so is a file that does not parse: a reader shows what it can, and
+    /// only a write, which would replace the file, refuses it.
     pub fn load() -> Self {
-        Self::storage_path()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .or_else(|| Self::legacy_storage_path().and_then(|path| fs::read_to_string(path).ok()))
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
+        let Some(dir) = Self::storage_dir() else {
+            return Self::default();
+        };
+        Self::load_in(&dir).unwrap_or_else(|error| {
+            // The kind only: a parse error can quote a label out of the file.
+            tracing::warn!(kind = ?error.kind(), "session labels not loaded");
+            Self::default()
+        })
     }
 
-    /// Save to disk
-    pub fn save(&self) -> Result<(), std::io::Error> {
-        if let Some(path) = Self::storage_path() {
-            // Ensure directory exists
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let content = serde_json::to_string_pretty(self)?;
-            let _lock = crate::config::lock::lock_for(&path)?;
-            crate::config::write_atomic(&path, &content)?;
+    fn load_in(dir: &Path) -> io::Result<Self> {
+        Self::load_in_locked_by(dir, crate::config::lock::lock_for)
+    }
+
+    /// [`Self::load_in`] with the lock taken by `lock`, so a test can refuse
+    /// it the way a filesystem this process cannot write does.
+    fn load_in_locked_by<L>(
+        dir: &Path,
+        lock: impl FnOnce(&Path) -> io::Result<L>,
+    ) -> io::Result<Self> {
+        // Nothing has ever been saved, and a read creates no directory.
+        if !dir.is_dir() {
+            return Ok(Self::default());
         }
-        Ok(())
+        // A home this process may read but not write, by permission or on a
+        // read-only filesystem, still shows its labels: a write replaces the
+        // file whole by rename, so a read without the lock never sees half of
+        // one.
+        let _lock = match lock(&dir.join(FILE)) {
+            Ok(lock) => Some(lock),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        Self::read(dir)
+    }
+
+    /// Set the label for `tmux_session_name` in the store on disk (`None`
+    /// clears it) and return the store as written.
+    ///
+    /// Reads the file, changes the one label and writes the file back, all
+    /// under its lock, so a label another writer set since this process
+    /// loaded the store is kept.
+    ///
+    /// # Errors
+    /// The file exists but does not parse, and is left byte for byte as it
+    /// was (`InvalidData`); or it cannot be read or written.
+    pub fn set_label(tmux_session_name: &str, label: Option<String>) -> io::Result<Self> {
+        let dir = Self::storage_dir().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no home directory to keep session labels in",
+            )
+        })?;
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(FILE);
+        let _lock = crate::config::lock::lock_for(&path)?;
+        let mut store = Self::read(&dir).map_err(|error| {
+            io::Error::new(error.kind(), format!("{error}; the label was not saved"))
+        })?;
+        store.set(tmux_session_name.to_string(), label);
+        crate::config::write_atomic(&path, &serde_json::to_string_pretty(&store)?)?;
+        Ok(store)
+    }
+
+    /// The store in `dir`: the current file, else the legacy one. The caller
+    /// holds the lock.
+    fn read(dir: &Path) -> io::Result<Self> {
+        match fs::read_to_string(dir.join(FILE)) {
+            Ok(content) => serde_json::from_str(&content).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{FILE} does not parse ({error}), so it was left as it is"),
+                )
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::read_legacy(dir)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The legacy file's labels, where the store starts until the current
+    /// file exists. No write touches the legacy file, so one that cannot be
+    /// read is only logged and the store starts empty.
+    fn read_legacy(dir: &Path) -> Self {
+        let Ok(content) = fs::read_to_string(dir.join(LEGACY_FILE)) else {
+            return Self::default();
+        };
+        serde_json::from_str(&content).unwrap_or_else(|error: serde_json::Error| {
+            tracing::warn!(category = ?error.classify(), "{LEGACY_FILE} not loaded");
+            Self::default()
+        })
     }
 
     /// Get display name for a tmux session
@@ -75,7 +161,8 @@ impl SessionLabelStore {
         self.names.get(tmux_session_name)
     }
 
-    /// Set display name (None removes it)
+    /// Set display name in this copy only (None removes it); the file is
+    /// written by [`Self::set_label`].
     pub fn set(&mut self, tmux_session_name: String, display_name: Option<String>) {
         match display_name {
             Some(name) => {
@@ -120,6 +207,36 @@ mod tests {
         // Clear the name
         store.set("ssh-test-22".to_string(), None);
         assert!(store.get("ssh-test-22").is_none());
+    }
+
+    /// A home this process cannot write: the lock file cannot be created, so
+    /// the lock is refused with `kind`, and the read goes on without it.
+    fn load_with_lock_refused(kind: io::ErrorKind) -> io::Result<SessionLabelStore> {
+        let dir = tempfile::tempdir().expect("temporary label dir");
+        fs::write(dir.path().join(FILE), r#"{"tmux-a": "Fix login"}"#).expect("label file");
+        SessionLabelStore::load_in_locked_by(dir.path(), |_| Err::<(), _>(io::Error::from(kind)))
+    }
+
+    #[test]
+    fn a_home_on_a_read_only_filesystem_still_shows_its_labels() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ReadOnlyFilesystem,
+        ] {
+            let store = load_with_lock_refused(kind)
+                .unwrap_or_else(|error| panic!("{kind:?} lock refusal failed the read: {error}"));
+            assert_eq!(
+                store.get("tmux-a").map(String::as_str),
+                Some("Fix login"),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_refused_for_another_reason_fails_the_read() {
+        let error = load_with_lock_refused(io::ErrorKind::Other).expect_err("the read fails");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]

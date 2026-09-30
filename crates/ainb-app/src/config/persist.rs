@@ -19,7 +19,12 @@ pub fn write(persist: &Persist) -> Result<(), String> {
             AppConfig::save_external_keys(edits).map_err(|error| error.to_string())
         }
         Persist::Favorites(store) => store.0.save().map_err(|error| error.to_string()),
-        Persist::SessionLabels(store) => store.0.save().map_err(|error| error.to_string()),
+        Persist::SessionLabel {
+            tmux_session,
+            label,
+        } => crate::config::SessionLabelStore::set_label(tmux_session, label.clone())
+            .map(drop)
+            .map_err(|error| error.to_string()),
         Persist::Onboarding(record) => record.0.save().map_err(|error| error.to_string()),
         Persist::OnboardingGitDirectories(directories) => {
             // A record that exists but does not load is left alone: writing a
