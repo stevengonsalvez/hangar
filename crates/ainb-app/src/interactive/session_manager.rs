@@ -3786,6 +3786,11 @@ mod tests {
     async fn capture_failed_launch_pane_reads_a_dead_pane() {
         use tokio::process::Command as TokioCommand;
 
+        // Held for the test: other tests point TMUX_TMPDIR, SHELL and HOME at
+        // their own private tmux under this lock, and a bare `tmux` here must
+        // not reach a server they are halfway through setting up.
+        let _home = crate::test_home::ScopedHome::new();
+
         if TokioCommand::new("tmux").arg("-V").output().await.is_err() {
             println!("SKIP: tmux unavailable, cannot exercise pane capture");
             return;
