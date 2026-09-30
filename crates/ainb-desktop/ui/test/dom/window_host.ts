@@ -37,6 +37,13 @@ export const host = {
   refuseOpen: new Set<string>(),
   frames: undefined as undefined | { onmessage: Callback },
   events: new Map<string, Callback[]>(),
+  /** The host's `pr_badge` answer per session: a session not here is a miss
+   * (`null`), and an `Error` fails the command, as an unmanaged state does. */
+  prBadges: new Map<string, unknown>(),
+  /** The sessions `pr_badge` was asked about, in order. */
+  prAsked: [] as string[],
+  /** Every URL `open_url` was handed. */
+  opened: [] as string[],
 };
 
 function frame(section: string, body: unknown) {
@@ -132,6 +139,16 @@ let nextCallback = 1;
         return HOST;
       case "dispatch":
         return dispatch(args.intent as Intent);
+      case "pr_badge": {
+        const session = args.sessionId as string;
+        host.prAsked.push(session);
+        const answer = host.prBadges.get(session);
+        if (answer instanceof Error) throw answer.message;
+        return answer ?? null;
+      }
+      case "open_url":
+        host.opened.push(args.url as string);
+        return null;
       case "answer_home":
         host.sent.push({ id: "answer_home" });
         if (host.screen !== "session_list") show("session_list");
