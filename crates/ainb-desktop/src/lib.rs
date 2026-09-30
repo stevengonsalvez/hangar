@@ -9,6 +9,7 @@
 //! - [`intent::RendererIntent`] is what the webview may send.
 //! - [`worktree_target`] is how the page names a worktree for the strip's
 //!   "+", and how the host resolves it.
+//! - [`agent_add`] adds an agent to a worktree the page names by ids.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
 //! - [`links`] is the rule a terminal link passes before the host opens it:
 //!   an `http` or `https` URL and nothing else.
@@ -39,6 +40,7 @@
 //! None of it needs a window: the Tauri binary (`app` feature) wires these to
 //! channels and commands, and the tests drive them headless.
 
+pub mod agent_add;
 /// TypeScript for the shapes the webview sends and receives (#1158).
 #[cfg(feature = "typescript-bindings")]
 pub mod bindings;

@@ -346,12 +346,12 @@ fn store_error(error: &sqlx::Error) -> RpcError {
 /// recorded, so a retry replays the answer instead of running `ainb run` a
 /// second time. `shell/create` answers the same once `tmux new-session` ran
 /// without making the shell for certain (no answer in time, or a failure
-/// the best-effort take-back may not have undone). `INTERNAL_ERROR` there means nothing was started: no home
-/// directory, a worktree check that could not finish, no place for the run's
-/// output, or an `ainb` that could not be spawned. (Serializing the session a
-/// run returned is the one step after an effect that answers through
-/// `INTERNAL_ERROR`, and it cannot fail: the result is a plain struct of
-/// strings.)
+/// the best-effort take-back may not have undone). `INTERNAL_ERROR` there
+/// means nothing was started: no home directory, a worktree check that could
+/// not finish, no place for the run's output, or an `ainb` that could not be
+/// spawned. (Serializing the session a run returned is the one step after an
+/// effect that answers through `INTERNAL_ERROR`, and it cannot fail: the
+/// result is a plain struct of strings.)
 const fn frees_the_op_id(code: i32) -> bool {
     code == super::STORE_UNAVAILABLE
         || code == super::INTERNAL_ERROR

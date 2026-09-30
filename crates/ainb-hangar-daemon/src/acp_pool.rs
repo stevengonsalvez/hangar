@@ -398,7 +398,7 @@ pub async fn adapter_permission_mode(provider: &str) -> String {
 /// must not silently unpin the permission mode, which is the setting that stops
 /// an adapter inheriting `bypassPermissions` from ambient state.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-struct AcpAdapterToml {
+pub(crate) struct AcpAdapterToml {
     #[serde(default)]
     command: Option<String>,
     #[serde(default)]
@@ -410,33 +410,50 @@ struct AcpAdapterToml {
     models: Vec<String>,
 }
 
-/// Read `[acp.adapters]` from `~/.agents-in-a-box/config/config.toml`.
+/// Read `[acp.adapters]` from the hangar home's `config/config.toml`.
 ///
-/// Empty on any failure (no file, no `$HOME`, bad TOML, malformed table), with
-/// a warning: the built-in adapters are always the floor.
-fn acp_adapters_from_config() -> std::collections::HashMap<String, AcpAdapterToml> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return HashMap::new();
-    };
-    let path = std::path::PathBuf::from(home)
-        .join(".agents-in-a-box")
-        .join("config")
-        .join("config.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    let root: toml::Value = match toml::from_str(&text) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(%error, "acp: config.toml does not parse; using the built-in adapters");
+/// Empty on any failure (no hangar home, no file, bad TOML, malformed
+/// table), with a warning: the built-in adapters are always the floor.
+fn acp_adapters_from_config() -> HashMap<String, AcpAdapterToml> {
+    crate::hangar_dir().map_or_else(
+        |_| HashMap::new(),
+        |home| acp_adapters_in(&crate::spawn::config_path_in(&home)),
+    )
+}
+
+/// [`acp_adapters_from_config`] for the config file at `path`, so each file
+/// state is testable without touching `$AINB_HANGAR_HOME`.
+pub(crate) fn acp_adapters_in(path: &std::path::Path) -> HashMap<String, AcpAdapterToml> {
+    let root = match crate::hangar_config(path) {
+        Ok(Some(root)) => root,
+        Ok(None) => return HashMap::new(),
+        Err(crate::HangarConfigError::Read(error)) => {
+            tracing::warn!(path = %path.display(), %error, "acp: cannot read hangar config; using the built-in adapters");
+            return HashMap::new();
+        }
+        Err(crate::HangarConfigError::Parse(error)) => {
+            tracing::warn!(path = %path.display(), %error, "acp: config.toml does not parse; using the built-in adapters");
             return HashMap::new();
         }
     };
-    let Some(table) = root.get("acp").and_then(|acp| acp.get("adapters")).cloned() else {
+    let Some(table) = root.get("acp").and_then(|acp| acp.get("adapters")) else {
         return HashMap::new();
     };
-    table.try_into().unwrap_or_else(|error| {
-        tracing::warn!(%error, "acp: [acp.adapters] is malformed; using the built-in adapters");
+    table.clone().try_into().unwrap_or_else(|_| {
+        // Never serde's message: it quotes the offending value, and an
+        // adapter's command may carry a token. Name the entries instead.
+        let malformed: Vec<&String> = table.as_table().map_or_else(Vec::new, |adapters| {
+            adapters
+                .iter()
+                .filter(|(_, adapter)| (*adapter).clone().try_into::<AcpAdapterToml>().is_err())
+                .map(|(name, _)| name)
+                .collect()
+        });
+        tracing::warn!(
+            path = %path.display(),
+            ?malformed,
+            "acp: [acp.adapters] is malformed; using the built-in adapters"
+        );
         HashMap::new()
     })
 }

@@ -879,18 +879,66 @@ body {
   }
 }
 
-/* "New terminal": the strip's own +, after its last tab, as Orca's is. */
-.tab-new-terminal {
+/* The strip's one "+" after its last tab, as Orca's is, and its "New tab"
+   menu: fixed, so the strip's own scrolling never clips it, on the floating
+   surface tokens. */
+.tab-new {
   padding: 2px 10px;
   color: var(--muted-foreground);
 }
 
-.tab-new-terminal:hover:not(:disabled) {
+.tab-new:hover:not(:disabled) {
   color: var(--foreground);
 }
 
-.tab-new-terminal:disabled {
+.tab-new:disabled {
+  cursor: default;
   opacity: 0.4;
+}
+
+.tab-create-menu {
+  position: fixed;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  backdrop-filter: blur(20px);
+}
+
+.tab-create-menu button {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  text-align: left;
+  font-size: var(--text-sub);
+}
+
+.tab-create-menu button:hover:not(:disabled),
+.tab-create-menu button:focus-visible {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+}
+
+.tab-create-menu button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.tab-create-menu kbd {
+  color: var(--muted-foreground);
+  font: inherit;
+}
+
+.tab-create-separator {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--float-border);
 }
 
 .terminal {
