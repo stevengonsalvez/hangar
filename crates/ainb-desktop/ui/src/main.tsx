@@ -46,13 +46,16 @@ import { cardForSession, statusForTarget } from "./status.ts";
 import {
   activateTab,
   focusGroup,
+  groupOf,
   groups,
   initialLayout,
+  MAX_GROUPS,
   readStored,
   splitGroup,
   writeLayout,
   type GroupId,
   type Layout,
+  type SplitDirection,
 } from "./layout.ts";
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
@@ -202,6 +205,19 @@ function Shell() {
   // The session the last worktree step opened, until its tab is shown: the
   // next step goes on from it, not again from the tab still on screen.
   let steppedTo: string | null = null;
+  // The shell Cmd+D opened on a pane of one tab, split out once the host's
+  // strip lists it: the host answers `shell_open` and sends that strip on
+  // its own schedule, in either order.
+  let splitWhenListed: { key: string; direction: SplitDirection } | null = null;
+  const splitListed = () => {
+    const pending = splitWhenListed;
+    if (pending === null) return;
+    const current = layout();
+    const from = groupOf(current, pending.key);
+    if (from === null) return;
+    splitWhenListed = null;
+    applyLayout(splitGroup(current, from, pending.direction, pending.key));
+  };
   // The board is the window's landing surface: what every agent is doing, and
   // what is waiting on a human. A terminal takes the work area while it is
   // chosen, and the board is one click back.
@@ -389,6 +405,7 @@ function Shell() {
         focusTab(next, true);
       }
     }
+    splitListed();
   };
   // A refused intent comes back with the row and the reason: say so, or a
   // key the window may not use (onboarding installs, a commit) looks dead.
@@ -636,10 +653,25 @@ function Shell() {
         if (!showing("terminal")) return;
         const current = layout();
         const next = splitGroup(current, current.focused, shell.direction);
-        // A pane of one tab has nothing to split out: open the session to
-        // put beside it first, then split it.
-        if (next === current) toast("Open another tab in this pane to split it");
-        else applyLayout(next);
+        if (next !== current) {
+          applyLayout(next);
+          return;
+        }
+        // A pane of one tab has nothing to split out, and a split never
+        // makes an empty pane (`splitGroup`). Orca splits it anyway, with a
+        // new terminal in the new pane: open a shell in this pane's
+        // worktree, then split its tab out once the host lists it.
+        const focused = groups(current).find((group) => group.id === current.focused);
+        if (focused?.tabs.length !== 1 || groups(current).length >= MAX_GROUPS) {
+          toast("Open another tab in this pane to split it");
+          return;
+        }
+        const direction = shell.direction;
+        void shellTabs.open().then((key) => {
+          if (key === null) return;
+          splitWhenListed = { key, direction };
+          splitListed();
+        });
         return;
       }
       case "terminal":
