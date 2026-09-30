@@ -402,9 +402,12 @@ fn resolve_worktree(
 /// Open a plain shell in the worktree `target` names, as a tab, and answer
 /// the tab's key. The folder is the host's, from its own session list or
 /// shell tabs, never the page's; the daemon opens the shell, and closes it
-/// again when its tab cannot attach (`shell_tab::open_tab`).
+/// again when its tab cannot attach (`shell_tab::open_tab`). An open that
+/// may still make its shell is looked for once more later
+/// (`shell_tab::LATE_RESTORE`), so a late shell gets its tab unasked.
 #[tauri::command]
 async fn shell_open(
+    app: tauri::AppHandle,
     window: tauri::State<'_, Window>,
     target: ainb_desktop::worktree_target::WorktreeTarget,
 ) -> Result<String, String> {
@@ -421,6 +424,9 @@ async fn shell_open(
             // The reducer shows a failed attach in its own words.
             if let Some(report) = failed.report {
                 window.shell.dispatch(report);
+            }
+            if failed.may_still_open {
+                tauri::async_runtime::spawn(restore_shells(app, shell_tab::LATE_RESTORE));
             }
             Err(failed.message)
         }
@@ -451,10 +457,11 @@ fn shell_reattach(window: tauri::State<'_, Window>, key: String) {
     }
 }
 
-/// Reattach, as tabs, the shells the daemon still runs from an earlier
-/// launch. Once per launch; a daemon without the verb, or none reachable,
-/// leaves the strip as it is.
-async fn restore_shells(handle: tauri::AppHandle) {
+/// Reattach, as tabs, after `delay`, the shells the daemon runs that have no
+/// tab: once per launch, and once after an open that may still make its
+/// shell. A daemon without the verb, or none reachable, leaves the strip as
+/// it is.
+async fn restore_shells(handle: tauri::AppHandle, delay: std::time::Duration) {
     let window = handle.state::<Window>();
     let Some(terminals) = window.terminals.as_ref() else {
         return;
@@ -466,7 +473,7 @@ async fn restore_shells(handle: tauri::AppHandle) {
             return;
         }
     };
-    match ainb_desktop::shell_tab::restore(&client, terminals).await {
+    match ainb_desktop::shell_tab::restore_after(delay, &client, terminals).await {
         Ok((listed, reports)) => {
             tracing::info!(listed, failed = reports.len(), "restored shell tabs");
             for report in reports {
@@ -1408,7 +1415,10 @@ fn main() {
                         }
                         if !shells_restored {
                             shells_restored = true;
-                            tauri::async_runtime::spawn(restore_shells(handle.clone()));
+                            tauri::async_runtime::spawn(restore_shells(
+                                handle.clone(),
+                                std::time::Duration::ZERO,
+                            ));
                         }
                     }
                     if let Err(error) = handle.emit("sidecar", view) {
