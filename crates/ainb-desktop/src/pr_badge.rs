@@ -8,10 +8,11 @@
 //!                              ◀── PrBadge, or nothing on any miss
 //! ```
 //!
-//! One `gh pr view --json … -- <branch>` per (worktree, branch) per [`TTL`]:
-//! it names the PR and carries its check rollup in one call, where Orca's
-//! lookup then asks for the checks separately. `gh` resolves the repository
-//! from the worktree's own remotes, so the host never guesses one.
+//! One `gh pr view --json … -- <branch>` per (worktree, branch) per [`TTL`]
+//! ([`SETTLED_TTL`] once merged or closed): it names the PR and carries its
+//! check rollup in one call, where Orca's lookup then asks for the checks
+//! separately. `gh` resolves the repository from the worktree's own remotes
+//! (`GH_REPO` is dropped), so the host never guesses one.
 //!
 //! Every way `gh` fails (not installed, not logged in, offline, no GitHub
 //! remote, no PR, a slow or garbled answer) is a [`Miss`]: logged at debug
@@ -33,6 +34,9 @@ use tokio::time::Instant;
 /// How long an answer, or a miss, stands before `gh` is asked again. At 20
 /// cards that is 600 `gh` calls an hour, an eighth of GitHub's GraphQL budget.
 pub const TTL: Duration = Duration::from_secs(120);
+/// How long a merged or closed PR stands: it rarely moves again, and a new PR
+/// on the same branch still shows within this.
+pub const SETTLED_TTL: Duration = Duration::from_secs(600);
 /// The most `gh` processes running at once, Orca's own `MAX_CONCURRENT`.
 pub const MAX_IN_FLIGHT: usize = 4;
 /// How long one `gh` call may take before it is killed and counted a miss.
@@ -368,8 +372,15 @@ pub fn find_gh() -> Option<PathBuf> {
 struct Slot(OnceCell<(Instant, Option<PrBadge>)>);
 
 impl Slot {
-    fn stale(&self, now: Instant, ttl: Duration) -> bool {
-        self.0.get().is_some_and(|(at, _)| now.duration_since(*at) >= ttl)
+    /// Answered, and older than its TTL: [`SETTLED_TTL`] for a merged or
+    /// closed PR, [`TTL`] for anything else, a miss included.
+    fn stale(&self, now: Instant) -> bool {
+        self.0.get().is_some_and(|(at, badge)| {
+            let settled = badge
+                .as_ref()
+                .is_some_and(|badge| matches!(badge.state, PrState::Merged | PrState::Closed));
+            now.duration_since(*at) >= if settled { SETTLED_TTL } else { TTL }
+        })
     }
 }
 
@@ -377,7 +388,6 @@ impl Slot {
 /// [`MAX_IN_FLIGHT`] `gh` calls running and one per key.
 pub struct PrBadges {
     gh: Option<PathBuf>,
-    ttl: Duration,
     slots: Mutex<HashMap<(PathBuf, String), Arc<Slot>>>,
     in_flight: Semaphore,
 }
@@ -386,14 +396,8 @@ impl PrBadges {
     /// Badges read through `gh` at `gh`, or never when it is `None`.
     #[must_use]
     pub fn new(gh: Option<PathBuf>) -> Self {
-        Self::with_ttl(gh, TTL)
-    }
-
-    #[must_use]
-    pub fn with_ttl(gh: Option<PathBuf>, ttl: Duration) -> Self {
         Self {
             gh,
-            ttl,
             slots: Mutex::new(HashMap::new()),
             in_flight: Semaphore::new(MAX_IN_FLIGHT),
         }
@@ -437,11 +441,11 @@ impl PrBadges {
     fn slot(&self, key: (PathBuf, String)) -> Arc<Slot> {
         let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
-        if let Some(slot) = slots.get(&key).filter(|slot| !slot.stale(now, self.ttl)) {
+        if let Some(slot) = slots.get(&key).filter(|slot| !slot.stale(now)) {
             return Arc::clone(slot);
         }
         if slots.len() >= MAX_ENTRIES {
-            slots.retain(|_, slot| !slot.stale(now, self.ttl));
+            slots.retain(|_, slot| !slot.stale(now));
         }
         let slot = Arc::new(Slot::default());
         slots.insert(key, Arc::clone(&slot));
