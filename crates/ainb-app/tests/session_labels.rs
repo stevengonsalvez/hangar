@@ -185,6 +185,37 @@ fn a_load_waits_for_a_writer_that_holds_the_lock() {
 }
 
 #[test]
+fn a_label_write_waits_for_a_writer_that_holds_the_lock_and_keeps_its_label() {
+    let home = ScopedHome::new();
+    let file = label_file(&home);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, r#"{"tmux-a": "Before"}"#).unwrap();
+
+    let writer = lock_for(&file).expect("the other writer's lock");
+    let (written_tx, written_rx) = mpsc::channel();
+    let renamer = std::thread::spawn(move || {
+        written_tx.send(desktop_renames("tmux-b", "New")).unwrap();
+    });
+    assert!(
+        written_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the label was written while another writer held the lock"
+    );
+    // The other writer's change lands before it lets go, so a write that read
+    // the file before taking the lock puts "Before" back.
+    std::fs::write(&file, r#"{"tmux-a": "After"}"#).unwrap();
+    drop(writer);
+
+    written_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the label write finishes")
+        .expect("the label write succeeds");
+    renamer.join().unwrap();
+    let on_disk = SessionLabelStore::load();
+    assert_eq!(on_disk.get("tmux-a").map(String::as_str), Some("After"));
+    assert_eq!(on_disk.get("tmux-b").map(String::as_str), Some("New"));
+}
+
+#[test]
 fn a_desktop_rename_racing_a_terminal_rename_loses_neither() {
     let _home = ScopedHome::new();
     const ROUNDS: usize = 200;
