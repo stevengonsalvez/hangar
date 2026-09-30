@@ -403,8 +403,9 @@ fn resolve_worktree(
 /// the tab's key. The folder is the host's, from its own session list or
 /// shell tabs, never the page's; the daemon opens the shell, and closes it
 /// again when its tab cannot attach (`shell_tab::open_tab`). An open that
-/// may still make its shell is looked for once more later
-/// (`shell_tab::LATE_RESTORE`), so a late shell gets its tab unasked.
+/// may still make its shell has `open_tab` schedule the one late look here
+/// (`restore_shells` after `shell_tab::LATE_RESTORE`), so a late shell gets
+/// its tab unasked.
 #[tauri::command]
 async fn shell_open(
     app: tauri::AppHandle,
@@ -415,7 +416,11 @@ async fn shell_open(
     let terminals =
         window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
     let dir = resolve_worktree(&window, &target)?;
-    match shell_tab::open_tab(&daemon_client(SpawnVerb::OpenTerminal)?, terminals, &dir).await {
+    let client = daemon_client(SpawnVerb::OpenTerminal)?;
+    let late = |delay| {
+        tauri::async_runtime::spawn(restore_shells(app, delay));
+    };
+    match shell_tab::open_tab(&client, terminals, &dir, late).await {
         Ok(key) => {
             tracing::info!(tmux = %key, "window opened a shell");
             Ok(key)
@@ -424,9 +429,6 @@ async fn shell_open(
             // The reducer shows a failed attach in its own words.
             if let Some(report) = failed.report {
                 window.shell.dispatch(report);
-            }
-            if failed.may_still_open {
-                tauri::async_runtime::spawn(restore_shells(app, shell_tab::LATE_RESTORE));
             }
             Err(failed.message)
         }
