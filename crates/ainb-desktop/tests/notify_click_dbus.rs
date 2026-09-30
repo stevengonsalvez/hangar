@@ -15,8 +15,44 @@ use std::time::{Duration, Instant};
 
 use ainb_desktop::notify::{Notice, NoticeKind};
 use ainb_desktop::notify_delivery::{Deliver, MAX_WAITERS, OsDelivery};
+use tracing::field::{Field, Visit};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context, SubscriberExt};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
+
+/// One captured tracing event: its level plus every field (`message`,
+/// `error`, ...) rendered and joined, so a substring search sees the whole
+/// line the way an operator reading logs would.
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    level: tracing::Level,
+    message: String,
+}
+
+struct AllFields<'a>(&'a mut String);
+
+impl Visit for AllFields<'_> {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+/// Captures every tracing event emitted while it is the default subscriber,
+/// so a test can assert on what `notify_delivery` actually logged, not just
+/// on the click/close side effects it produced.
+struct CollectEvents {
+    log: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for CollectEvents {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut message = String::new();
+        event.record(&mut AllFields(&mut message));
+        self.log.lock().unwrap().push(CapturedEvent { level: *event.metadata().level(), message });
+    }
+}
 
 const PATH: &str = "/org/freedesktop/Notifications";
 
@@ -144,6 +180,16 @@ fn notice(session: &str) -> Notice {
 
 #[test]
 fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
+    // `send()` logs from its own `os-notice` thread, not this test's thread,
+    // so the capture has to be the process-wide default: `set_default` is
+    // thread-local and would miss every event `notify_delivery` emits.
+    let log: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::DEBUG)
+        .with(CollectEvents { log: Arc::clone(&log) });
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("the only test in this binary sets the global subscriber once");
+
     let bus = Bus::start();
     // The only test in this binary, and before anything here dials a bus.
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus.address);
@@ -221,6 +267,23 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     until(|| os.waiting() == MAX_WAITERS, "the cap's waiters");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(os.waiting(), MAX_WAITERS, "never more than the cap");
+    {
+        let captured = log.lock().unwrap();
+        let cap_hit = captured
+            .iter()
+            .find(|event| event.message.contains("already wait"))
+            .unwrap_or_else(|| panic!("no cap-hit line among {captured:?}"));
+        assert_eq!(
+            cap_hit.level,
+            tracing::Level::WARN,
+            "a full waiter cap is a warning, not routine info: {captured:?}"
+        );
+        assert!(
+            cap_hit.message.contains(&MAX_WAITERS.to_string()),
+            "the warning names the count that was hit: {}",
+            cap_hit.message
+        );
+    }
     let ids: Vec<u32> = daemon.shown.lock().unwrap()[2..].iter().map(|shown| shown.id).collect();
     let deadline = Instant::now() + Duration::from_secs(10);
     while os.waiting() > 0 {
@@ -230,4 +293,28 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
         std::thread::sleep(Duration::from_millis(50));
         assert!(Instant::now() < deadline, "expired notices kept waiting");
     }
+
+    // Stuck: a notification server that never answers (a hung/crashed daemon,
+    // modelled by simply never emitting its close/click signal) must not
+    // block that notice's waiter slot forever. `with_wait_timeout` is the
+    // test seam for `WAIT_TIMEOUT`; production uses ten minutes, this proves
+    // the same bound with one it does not have to sit through.
+    let stuck = OsDelivery::with_wait_timeout(Duration::from_millis(200));
+    stuck.deliver(notice("claude:stuck"), Box::new(|| {}));
+    until(|| shown(3 + burst), "the stuck notice to be shown too");
+    until(|| stuck.waiting() == 1, "the stuck notice to start waiting");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stuck.waiting() > 0 {
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            Instant::now() < deadline,
+            "a server that never answers must not wait past its bound"
+        );
+    }
+    let captured = log.lock().unwrap();
+    let timed_out = captured
+        .iter()
+        .find(|event| event.message.contains("click wait timed out"))
+        .unwrap_or_else(|| panic!("no timeout line among {captured:?}"));
+    assert_eq!(timed_out.level, tracing::Level::WARN, "a timed-out wait is a warning");
 }
