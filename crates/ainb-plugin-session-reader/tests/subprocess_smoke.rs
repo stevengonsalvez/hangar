@@ -137,9 +137,14 @@ fn subprocess_init_publishes_snapshot_then_responds_ok() {
     // Empty HOME so ProviderRoots::defaults() points at non-existent
     // dirs. Parsers degrade to empty without erroring.
     let home = tempfile::tempdir().expect("tempdir HOME");
+    // A separate, empty hangar home: the plugin reads `[session_reader]` from
+    // `$AINB_HANGAR_HOME/config/config.toml`, and an inherited override would
+    // hand it the operator's real config.
+    let hangar_home = tempfile::tempdir().expect("tempdir AINB_HANGAR_HOME");
 
     let mut child = Command::new(binary_path())
         .env("HOME", home.path())
+        .env("AINB_HANGAR_HOME", hangar_home.path())
         // Mute the plugin's tracing output — keeps the assertion log clean.
         .env("RUST_LOG", "off")
         .stdin(Stdio::piped())

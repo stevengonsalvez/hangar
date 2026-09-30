@@ -790,6 +790,7 @@ dependencies = [
 name = "ainb-plugin-session-reader"
 version = "0.1.0"
 dependencies = [
+ "ainb-hangar-core",
  "ainb-model-rates",
  "ainb-plugin-protocol",
  "ainb-plugin-sdk-rust",
@@ -807,6 +808,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
