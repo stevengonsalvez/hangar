@@ -57,6 +57,8 @@ import {
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
 import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
+import { closedFrom, placeReopened, popReopenable, pushClosed, switcherOrder, type ClosedTab } from "./recent_tabs.ts";
+import { createSwitcher } from "./recent_tabs.tsx";
 import { shownTargetOf, worktreeTarget } from "./worktree_target.ts";
 import { Composer } from "./composer.tsx";
 import { createDeleteFlow } from "./delete_dialog.ts";
@@ -199,6 +201,11 @@ function Shell() {
   // Tab keys in the order they were shown, most recent last: which tab a
   // group shows when its shown one closes. Read only then, so not a signal.
   let recent: string[] = [];
+  // The tabs a person closed, newest first (`pushClosed`), and the ones on
+  // their way back, by the key they come back as, still to be put where
+  // they were (`placeReopened`).
+  let closedTabs: ClosedTab[] = [];
+  const placing = new Map<string, ClosedTab>();
   // The session the last worktree step opened, until its tab is shown: the
   // next step goes on from it, not again from the tab still on screen.
   let steppedTo: string | null = null;
@@ -356,8 +363,11 @@ function Shell() {
     // Followed (`followHost`), which returns the layout itself when nothing
     // changed, so a strip that only restates the tabs costs nothing; or,
     // while the stored layout comes back, rebuilt from it (`phase`).
-    if (phase === "following") commitLayout(followHost(layout(), keys, recent));
-    else if (keys.length > 0) {
+    if (phase === "following") {
+      const back = placeReopened(followHost(layout(), keys, recent), placing);
+      back.placed.forEach((key) => placing.delete(key));
+      commitLayout(back.layout);
+    } else if (keys.length > 0) {
       const restore = phase === "waiting" ? beginRestore(readStored(safeStorage()), Date.now()) : phase;
       phase = restoreDone(restore, keys, Date.now()) ? "following" : restore;
       commitLayout(rebuild(restore, keys, restoreShown));
@@ -481,7 +491,49 @@ function Shell() {
   /** Close `tab`: its terminal goes, and the host's next strip drops it
    * from its group, closing the group if it was the last. A shell's tab
    * also ends its shell (`shell_tab.ts`). */
-  const closeTab = (tab: Tab) => shellTabs.close(tab);
+  const closeTab = (tab: Tab) => {
+    closedTabs = pushClosed(closedTabs, closedFrom(layout(), tab));
+    shellTabs.close(tab);
+  };
+  /** Mod+Shift+T: the newest closed tab that can come back does, where it
+   * was (`popReopenable`); the host's tab strip brings it. */
+  const reopenClosed = () => {
+    const { found, rest } = popReopenable(closedTabs, tabs(), sessions());
+    closedTabs = rest;
+    if (found === null) return;
+    const { closed, reopen } = found;
+    if (reopen.kind === "row") {
+      placing.set(closed.key, closed);
+      void answer([openRowIntent(reopen.row)]).then((refusal) => {
+        if (refusal !== null) placing.delete(closed.key);
+      });
+      return;
+    }
+    void shellTabs.open(reopen.target).then((key) => {
+      if (key === null) return;
+      placing.set(key, closed);
+      // The strip with the new shell can land before this answer does.
+      const back = placeReopened(layout(), placing);
+      back.placed.forEach((one) => placing.delete(one));
+      commitLayout(back.layout);
+    });
+  };
+  /** Ctrl+Tab: the focused pane's tabs, most recently shown first. */
+  const switcher = createSwitcher({
+    candidates: () => {
+      const current = layout();
+      const group = groups(current).find((one) => one.id === current.focused);
+      return group === undefined ? null : { keys: switcherOrder(group.tabs, recent, group.active), shown: group.active };
+    },
+    label: (key) => {
+      const tab = tabs().find((candidate) => candidate.key === key);
+      return tab === undefined ? key : title(tab);
+    },
+    commit: (key) => {
+      const tab = tabs().find((candidate) => candidate.key === key);
+      if (tab !== undefined) choose(tab);
+    },
+  });
   /** The Terminals entry: back to the panes, on the tab they show. */
   const showTerminals = () => {
     const tab = tabs().find((candidate) => candidate.key === active());
@@ -644,6 +696,14 @@ function Shell() {
       }
       case "terminal":
         void shellTabs.open();
+        return;
+      // Orca's switcher runs over the terminal view only
+      // (`orca:src/renderer/src/components/tab-bar/RecentTabSwitcher.tsx:59-61`).
+      case "recent":
+        if (showing("terminal") && !palette()) switcher.step(shell.step);
+        return;
+      case "reopen":
+        reopenClosed();
         return;
       case "attention":
         jumpToAttention();
@@ -1150,6 +1210,7 @@ function Shell() {
         <Show when={palette()}>
           <Palette sessions={sessions()} onChoose={dispatch} onClose={closePalette} />
         </Show>
+        {switcher.view()}
       </div>
       <Show when={composer.open()}>
         <Composer
