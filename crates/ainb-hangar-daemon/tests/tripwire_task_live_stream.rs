@@ -288,7 +288,6 @@ async fn an_acp_run_streams_the_same_transcript_it_later_re_reads() {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_DAEMON_POLL_MS", "200"),
@@ -437,7 +436,6 @@ async fn a_cancelled_acp_run_streams_its_interruption() {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_DAEMON_POLL_MS", "200"),

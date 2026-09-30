@@ -135,7 +135,7 @@ async function focusTerminal(session) {
 
 /** Open the palette by its chord, type the query, and read back where it went. */
 async function typeIntoPalette(session) {
-  await browser.keys([...MOD, "k"]);
+  await browser.keys([...MOD, "j"]);
   await $(".palette-query").waitForExist({ timeout: 30_000 });
   await browser.keys(QUERY);
   // The pane hears a leaked keystroke a moment later than the window does.
@@ -164,7 +164,7 @@ async function ready(session) {
  */
 async function backToSessionList() {
   if (!(await $(".palette-query").isExisting())) {
-    await browser.keys([...MOD, "k"]);
+    await browser.keys([...MOD, "j"]);
     await $(".palette-query").waitForExist({ timeout: 30_000 });
   }
   await setPaletteQuery("git_view.back");
@@ -244,7 +244,7 @@ describe("the palette over a terminal", () => {
     await ready(session);
     await focusTerminal(session);
 
-    await browser.keys([...MOD, "k"]);
+    await browser.keys([...MOD, "j"]);
     await $(".palette-query").waitForExist({ timeout: 30_000 });
     await browser.keys([...MOD, "1"]);
     await browser.pause(300);

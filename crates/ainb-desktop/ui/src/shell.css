@@ -1125,6 +1125,52 @@ body {
   outline: none;
 }
 
+/* The Ctrl+Tab switcher: a list over the panes while Ctrl is held, taking no
+   pointer, as Orca's (`RecentTabSwitcher.tsx:153-190`). */
+.tab-switcher-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  pointer-events: none;
+}
+
+.tab-switcher {
+  display: flex;
+  flex-direction: column;
+  width: min(520px, calc(100vw - 48px));
+  max-height: min(360px, 60vh);
+  overflow: hidden;
+  padding-bottom: 4px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-md);
+  background: var(--popover);
+  box-shadow: var(--float-shadow);
+}
+
+.tab-switcher-heading {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--float-border);
+  color: var(--muted-foreground);
+  font-size: var(--text-meta);
+  font-weight: 600;
+}
+
+.tab-switcher-option {
+  padding: 6px 12px;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-switcher-option[aria-selected="true"] {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+}
+
 .toasts {
   position: fixed;
   right: 16px;

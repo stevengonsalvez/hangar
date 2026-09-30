@@ -33,6 +33,8 @@ export const host = {
   selected: null as string | null,
   tabs: [tabOf("u-1"), tabOf("u-2")] as TabShape[],
   sent: [] as Sent[],
+  /** What the terminals sent their panes (`terminal_input`), in order. */
+  typed: [] as string[],
   /** Sessions whose open the host refuses, as its gate refuses a row. */
   refuseOpen: new Set<string>(),
   /** The label store, by tmux session name: the `session_labels` section. */
@@ -167,6 +169,9 @@ let nextCallback = 1;
         return dispatch(args.intent as Intent);
       case "session_rename":
         return rename(args);
+      case "terminal_input":
+        host.typed.push(args.data as string);
+        return null;
       // What a composer, wrongly opened by a key typed into a field, asks for.
       case "projects_list":
         return [];
@@ -227,11 +232,38 @@ export async function until(ready: () => boolean, what: string): Promise<void> {
 /** Let anything a press sent come back, and any refusal toast. */
 export const drain = () => new Promise((resolve) => setTimeout(resolve, 100));
 
-export type Chord = { code: string; key: string; metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean };
+export type Chord = { code: string; key: string; metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean };
 
-/** Press `chord` where the keyboard is, as a person does. */
+/** Each key's `KeyboardEvent.keyCode`, which xterm decides by. */
+const KEY_CODES: Record<string, number> = {
+  ...Object.fromEntries("ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("").map((c) => [`Key${c}`, c.charCodeAt(0)])),
+  ...Object.fromEntries(Array.from({ length: 10 }, (_, n) => [`Digit${n}`, 48 + n])),
+  Tab: 9,
+  Enter: 13,
+  Escape: 27,
+  Space: 32,
+  Backspace: 8,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+  BracketLeft: 219,
+  BracketRight: 221,
+  Minus: 189,
+  Equal: 187,
+  F10: 121,
+};
+
+/**
+ * Press `chord` where the keyboard is, as a person does. Its `keyCode` is
+ * set from `code`: happy-dom leaves it 0, and a focused xterm sends nothing
+ * for a keyCode of 0, so a key that leaked into a terminal would go unseen.
+ */
 export function press(chord: Chord): KeyboardEvent {
   const event = new window.KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...chord });
+  const keyCode = KEY_CODES[chord.code];
+  assert.ok(keyCode !== undefined, `press() knows no keyCode for ${chord.code}: add it to KEY_CODES`);
+  Object.defineProperty(event, "keyCode", { value: keyCode });
   (document.activeElement ?? document.body).dispatchEvent(event);
   return event as unknown as KeyboardEvent;
 }

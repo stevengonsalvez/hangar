@@ -591,6 +591,11 @@ const CODEX_APP_SERVER_DEFAULT: &str = "desktop";
 
 /// Read `[codex] app_server` from the hangar home's config, if present.
 ///
+/// That is `config/config.toml` under `$AINB_HANGAR_HOME` when set and
+/// non-empty, else under `~/.agents-in-a-box` (see [`spawn::config_path_in`]),
+/// read through [`hangar_config`], so a warning about the file says where,
+/// never what.
+///
 /// The daemon deliberately parses the one key it needs rather than depending on
 /// `ainb-core`: the TUI crate already depends on this one, so reaching back
 /// would be a cycle.
@@ -642,6 +647,10 @@ fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
 /// takes from that file. One read per call; each caller keeps its own answer
 /// for each outcome.
 ///
+/// The parse goes through [`ainb_hangar_core::config_file::parse`], the same
+/// sanitiser the notifyd and session-reader plugins use, so a
+/// [`HangarConfigError::Parse`] is safe to log: it says where, never what.
+///
 /// `Ok(None)` is nothing at `path` at all. A link to nowhere is not that: it
 /// is a [`HangarConfigError::Read`] of kind `NotFound`, so a caller for which
 /// the file may hold an opt-out can refuse to read it as "missing".
@@ -659,26 +668,9 @@ pub fn hangar_config(path: &std::path::Path) -> Result<Option<toml::Table>, Hang
         }
         Err(error) => return Err(HangarConfigError::Read(error)),
     };
-    text.parse()
+    ainb_hangar_core::config_file::parse(&text)
         .map(Some)
-        .map_err(|error| HangarConfigError::Parse(toml_error_at(&error, &text)))
-}
-
-/// `error` as its message and a 1-based line and column in `text`, on one
-/// line (a multi-line message is joined with `; `).
-///
-/// Never toml's own `Display`: it quotes the offending source line, and a
-/// token on that line would land in the daemon log.
-fn toml_error_at(error: &toml::de::Error, text: &str) -> String {
-    let message = error.message().trim_end().replace('\n', "; ");
-    let Some(span) = error.span() else {
-        return message;
-    };
-    let before = &text.as_bytes()[..span.start.min(text.len())];
-    let line_start = before.iter().rposition(|byte| *byte == b'\n').map_or(0, |at| at + 1);
-    let line = before.iter().filter(|byte| **byte == b'\n').count() + 1;
-    let column = String::from_utf8_lossy(&before[line_start..]).chars().count() + 1;
-    format!("{message} at line {line}, column {column}")
+        .map_err(HangarConfigError::Parse)
 }
 
 /// Why [`hangar_config`] has no table to give.
@@ -686,7 +678,8 @@ fn toml_error_at(error: &toml::de::Error, text: &str) -> String {
 pub enum HangarConfigError {
     /// The file is there (or a link to it is) but could not be read.
     Read(std::io::Error),
-    /// The file is not valid TOML: a description of where and why.
+    /// The file is not valid TOML: a description of where and why that never
+    /// quotes the file.
     Parse(String),
 }
 
@@ -1940,6 +1933,33 @@ mod tests {
         assert!(!log.contains("sk-SECRET"), "{log}");
         assert!(log.contains("[acp.adapters] is malformed"), "{log}");
         assert!(log.contains("malformed=[\"leaky\"]"), "{log}");
+    }
+
+    /// An unknown `permission_mode` is named by its adapter, never quoted: it is
+    /// a value from the file, and the file may hold a token anywhere.
+    #[test]
+    fn an_unknown_acp_permission_mode_is_logged_by_adapter_not_value() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[acp.adapters.leaky]\npermission_mode = \"sk-SECRET-789\"\n",
+        )
+        .unwrap();
+
+        let log = captured_log(|| {
+            let config = crate::acp_pool::PoolConfig::with_config_adapters(
+                crate::acp_pool::acp_adapters_in(&path),
+            );
+            assert_eq!(
+                config.adapters["leaky"].permission_mode, "default",
+                "an unknown mode is pinned to the default"
+            );
+        });
+        assert!(!log.contains("sk-SECRET"), "{log}");
+        assert!(log.contains("unknown acp permission_mode"), "{log}");
+        assert!(log.contains("adapter=leaky"), "{log}");
     }
 
     /// A parse error names where it is and never what the line holds: the

@@ -27,9 +27,9 @@ export interface ShellTabDeps {
  * detail), and is shown as it came.
  */
 export function createShellTabs(deps: ShellTabDeps) {
-  /** A new shell in `target`'s worktree (a pane's "+"), else the focused
-   * pane's (Mod+T); the host opens its tab. Answers the new tab's key, or
-   * `null` when nothing opened (the toast says why). */
+  /** A new shell in `target`'s worktree (a pane's "+", a reopened shell's),
+   * else the focused pane's (Mod+T); the host opens its tab. The new tab's
+   * key, or `null` when none opened. */
   const open = async (target: WorktreeTarget | null = deps.target()): Promise<string | null> => {
     if (target === null) {
       deps.toast(NO_SESSION);

@@ -35,6 +35,9 @@ pub mod autopilot;
 pub mod channel;
 /// Wall-clock injection (`HangarClock` + `SystemClock` / `FixedClock`).
 pub mod clock;
+/// What a reader of the hangar home's `config/config.toml` may log about it:
+/// where a parse error is and which entries are malformed, never the text.
+pub mod config_file;
 /// The single source of truth for the daemon's user-configurable knobs — the
 /// typed descriptor registry both the TUI Settings pane and the
 /// `ainb hangar daemon config` CLI iterate (keys, kinds, defaults, validation).

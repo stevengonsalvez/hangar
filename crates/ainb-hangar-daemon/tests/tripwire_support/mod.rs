@@ -519,16 +519,33 @@ pub fn tmux_available() -> bool {
 ///
 /// Per the `tmux_protection` global rule this never uses a bulk/wildcard kill —
 /// only `tmux kill-session -t <exact-name>` for the session it created.
+///
+/// The daemon's `HOME` is a fresh EMPTY directory the session owns, never the
+/// test's hangar home and never the operator's home. The daemon and its
+/// plugins must find their state and `config/config.toml` under
+/// `$AINB_HANGAR_HOME`; a reader that wrongly roots at `$HOME` finds nothing
+/// there, so the tripwire fails fast instead of passing on a shared directory
+/// (or reading the operator's real config).
 pub struct DaemonSession {
     name: String,
+    /// The daemon's `HOME`. Dropped after [`Drop::drop`] kills the session.
+    _home: tempfile::TempDir,
 }
 
 impl DaemonSession {
     /// Spawn `bin` (with `env` overrides) inside a fresh, uniquely-named tmux
     /// session. The session name embeds the pid + a nanosecond timestamp so
     /// parallel test binaries never collide.
+    ///
+    /// `HOME` is the session's own empty directory (see [`DaemonSession`]), so
+    /// `env` must not set it; pass the hangar home as `AINB_HANGAR_HOME`.
     pub fn spawn(bin: &Path, _home: &Path, env: &[(&str, &str)]) -> Self {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        assert!(
+            env.iter().all(|(key, _)| *key != "HOME"),
+            "DaemonSession pins HOME to its own empty dir; pass AINB_HANGAR_HOME instead"
+        );
+        let home = tempfile::tempdir().expect("tempdir for the daemon's HOME");
         reap_orphaned_tripwire_daemons(bin);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -539,6 +556,7 @@ impl DaemonSession {
         // Build the shell command: export each env var, then exec the daemon.
         // The daemon is the genuine binary; tmux keeps it alive across the poll.
         let mut cmd = String::new();
+        let _ = write!(cmd, "export HOME='{}'; ", home.path().display());
         for (k, v) in env {
             let _ = write!(cmd, "export {k}='{v}'; ");
         }
@@ -555,7 +573,7 @@ impl DaemonSession {
             .expect("spawn tmux session");
         assert!(status.success(), "tmux new-session failed for {name}");
 
-        Self { name }
+        Self { name, _home: home }
     }
 
     /// The exact tmux session name (for `capture-pane` assertions).
@@ -788,7 +806,9 @@ pub fn fake_acp_adapter() -> PathBuf {
 /// `[acp.adapters]` table an operator edits.
 ///
 /// Written to `hangar_home`'s `config/config.toml`, so the caller must export
-/// `AINB_HANGAR_HOME` as `hangar_home` into the daemon's environment.
+/// `AINB_HANGAR_HOME` as `hangar_home` into the daemon's environment. Under a
+/// [`DaemonSession`] the daemon's `HOME` is elsewhere and empty, so a reader
+/// that looks under `$HOME` instead misses this file and the tripwire fails.
 pub fn write_acp_adapter_config(hangar_home: &Path, command: &Path, permission_mode: &str) {
     let path = ainb_hangar_daemon::spawn::config_path_in(hangar_home);
     std::fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");

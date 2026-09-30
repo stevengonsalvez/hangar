@@ -275,3 +275,53 @@ test("the settings page draws Appearance > Theme when it is given a setter", asy
     "Appearance is drawn below the settings rows",
   );
 });
+
+test("the settings page draws the Notifications toggle, on by default, and a click reaches onNotifications", async () => {
+  const told: boolean[] = [];
+  const [enabled, setEnabled] = createSignal<boolean | undefined>(undefined);
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  cleanup = render(
+    () =>
+      createComponent(SettingsPage, {
+        config: frames().config,
+        hangar: frames().hangar,
+        revision: 1,
+        sidecar: { kind: "connected", daemon: "local" } as never,
+        setup: null,
+        run: () => undefined,
+        onSetupWrite: () => undefined,
+        onRefreshSetup: () => undefined,
+        onClose: () => undefined,
+        get notifications() {
+          return enabled();
+        },
+        onNotifications: (next: boolean) => {
+          told.push(next);
+          setEnabled(next);
+        },
+      }),
+    container,
+  );
+  await settle();
+  const panel = container.querySelector('section[aria-label="Notifications"]');
+  assert.ok(panel, "a Notifications panel");
+  const toggle = panel.querySelector<HTMLInputElement>("input[data-notifications-toggle]");
+  assert.ok(toggle, "a checkbox");
+  assert.equal(toggle.type, "checkbox");
+  assert.equal(toggle.checked, true, "nothing told yet: on");
+
+  toggle.click();
+  await settle();
+  assert.deepEqual(told, [false]);
+  assert.equal(toggle.checked, false);
+  toggle.click();
+  await settle();
+  assert.deepEqual(told, [false, true]);
+  assert.equal(toggle.checked, true);
+});
+
+test("the settings page draws no Notifications panel without a setter", async () => {
+  const page = await open();
+  assert.equal(page.container.querySelector('section[aria-label="Notifications"]'), null);
+});

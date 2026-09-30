@@ -150,12 +150,12 @@ impl<S: FrameSink> Shell<S> {
         self.core().host.start_workspace_load();
     }
 
-    /// Rename a row's display name ([`DesktopHost::rename_session`]) and run
-    /// the label store write before returning, so a relaunch finds the name.
-    /// A write that fails is the reducer's own notice, as any store write is.
+    /// Rename a row's display name ([`DesktopHost::rename_session`]). The
+    /// label store write lands inside the rename, so a relaunch finds the
+    /// name, and a write the store refuses comes back as the refusal.
     ///
     /// # Errors
-    /// Why the name was refused; nothing was written then.
+    /// Why the name was refused or not saved; nothing was written then.
     pub fn rename_session(&self, session: uuid::Uuid, name: &str) -> Result<(), String> {
         let mut core = self.core();
         let Core { host, executor } = &mut *core;
@@ -189,6 +189,21 @@ impl<S: FrameSink> Shell<S> {
         let mut core = self.core();
         core.host.subscribe(subscription);
         core.host.host_id().clone()
+    }
+
+    /// Every session section 20 holds, for the notifier, when the section has
+    /// moved since the version in `seen` (which this updates); `None` when it
+    /// has not, or holds no read (a reconnect's reset), so a notifier keeps
+    /// what it last saw across the gap rather than forgetting every session.
+    pub fn agent_sessions_since(&self, seen: &mut u64) -> Option<Vec<crate::notify::Session>> {
+        let core = self.core();
+        let section = &core.host.state().agent_status;
+        if section.version() == *seen {
+            return None;
+        }
+        *seen = section.version();
+        let view = section.get().view.as_ref()?;
+        Some(view.cards().map(crate::notify::Session::of).collect())
     }
 
     /// The host every frame names.

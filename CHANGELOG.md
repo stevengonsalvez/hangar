@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **cli**: `ainb run --existing-worktree` no longer auto-imports MCP servers from the worktree's `.mcp.json` into the shared pool; it pools only servers already in ainb's config. The first agent in a tree may have written that file, possibly with its permission prompts skipped
 - **daemon**: `shell/list` and `shell/close` read a shell's `@ainb_owner` option from the session only, so a global `set -g @ainb_owner daemon` no longer marks every `ainb-dsh-` session as the daemon's
+- **notifyd**, **session-reader**: a `config.toml` that does not parse is logged by line and column, and a wrong-typed value in `[notifyd]` or `[session_reader]` by its key, never quoted, so a token on a bad line no longer reaches the plugin log. Both now read `$AINB_HANGAR_HOME/config/config.toml` when that is set, as the daemon does, instead of always `~/.agents-in-a-box/config/config.toml`
+- **daemon**: an unknown `permission_mode` under `[acp.adapters.<name>]` is logged by the adapter's name, not the value
 
 ## [1.28.5] - 2026-09-13
 ### Fixed
