@@ -68,16 +68,33 @@ impl SessionLabelStore {
     }
 
     fn load_in(dir: &Path) -> io::Result<Self> {
+        Self::load_in_locked_by(dir, crate::config::lock::lock_for)
+    }
+
+    /// [`Self::load_in`] with the lock taken by `lock`, so a test can refuse
+    /// it the way a filesystem this process cannot write does.
+    fn load_in_locked_by<L>(
+        dir: &Path,
+        lock: impl FnOnce(&Path) -> io::Result<L>,
+    ) -> io::Result<Self> {
         // Nothing has ever been saved, and a read creates no directory.
         if !dir.is_dir() {
             return Ok(Self::default());
         }
-        // A home this process may read but not write still shows its labels:
-        // a write replaces the file whole by rename, so a read without the
-        // lock never sees half of one.
-        let _lock = match crate::config::lock::lock_for(&dir.join(FILE)) {
+        // A home this process may read but not write, by permission or on a
+        // read-only filesystem, still shows its labels: a write replaces the
+        // file whole by rename, so a read without the lock never sees half of
+        // one.
+        let _lock = match lock(&dir.join(FILE)) {
             Ok(lock) => Some(lock),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => None,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                None
+            }
             Err(error) => return Err(error),
         };
         Self::read(dir)
@@ -190,6 +207,36 @@ mod tests {
         // Clear the name
         store.set("ssh-test-22".to_string(), None);
         assert!(store.get("ssh-test-22").is_none());
+    }
+
+    /// A home this process cannot write: the lock file cannot be created, so
+    /// the lock is refused with `kind`, and the read goes on without it.
+    fn load_with_lock_refused(kind: io::ErrorKind) -> io::Result<SessionLabelStore> {
+        let dir = tempfile::tempdir().expect("temporary label dir");
+        fs::write(dir.path().join(FILE), r#"{"tmux-a": "Fix login"}"#).expect("label file");
+        SessionLabelStore::load_in_locked_by(dir.path(), |_| Err::<(), _>(io::Error::from(kind)))
+    }
+
+    #[test]
+    fn a_home_on_a_read_only_filesystem_still_shows_its_labels() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ReadOnlyFilesystem,
+        ] {
+            let store = load_with_lock_refused(kind)
+                .unwrap_or_else(|error| panic!("{kind:?} lock refusal failed the read: {error}"));
+            assert_eq!(
+                store.get("tmux-a").map(String::as_str),
+                Some("Fix login"),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lock_refused_for_another_reason_fails_the_read() {
+        let error = load_with_lock_refused(io::ErrorKind::Other).expect_err("the read fails");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
     }
 
     #[test]
