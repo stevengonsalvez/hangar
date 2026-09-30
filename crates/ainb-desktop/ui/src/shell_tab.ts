@@ -28,16 +28,18 @@ export interface ShellTabDeps {
  */
 export function createShellTabs(deps: ShellTabDeps) {
   /** A new shell in `target`'s worktree (a pane's "+"), else the focused
-   * pane's (Mod+T); the host opens its tab. */
-  const open = async (target: WorktreeTarget | null = deps.target()): Promise<void> => {
+   * pane's (Mod+T); the host opens its tab. Answers the new tab's key, or
+   * `null` when nothing opened (the toast says why). */
+  const open = async (target: WorktreeTarget | null = deps.target()): Promise<string | null> => {
     if (target === null) {
       deps.toast(NO_SESSION);
-      return;
+      return null;
     }
     try {
-      await invoke<string>("shell_open", { target });
+      return await invoke<string>("shell_open", { target });
     } catch (error) {
       deps.toast(String(error));
+      return null;
     }
   };
   /** Close `tab`: a shell's tab ends its shell, any other only detaches. */
