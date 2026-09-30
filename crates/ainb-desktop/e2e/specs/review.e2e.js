@@ -78,7 +78,7 @@ describe("reviewing from the window", () => {
 
     // The reducer builds the review for the selected session, through the
     // palette rather than through anything this spec reaches into.
-    await browser.keys([...MOD, "k"]);
+    await browser.keys([...MOD, "j"]);
     const query = await $(".palette-query");
     await query.waitForExist({ timeout: 30_000 });
     // The palette draws the first PALETTE_ROWS of the list until a query
