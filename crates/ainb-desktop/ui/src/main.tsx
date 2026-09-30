@@ -108,9 +108,12 @@ import { startNotifications } from "./notifications.ts";
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
 
-/** The most characters a toast draws: the host's own cut
- * (`intent::MAX_TOAST_CHARS`). A sidebar label's 80 would drop a refusal's
- * detail, the part that says what to do. */
+/** The most characters a toast draws. The same number as the host's
+ * `intent::MAX_TOAST_CHARS`, which a Rust test holds equal to this one, but
+ * the host cuts only the toasts it sends itself: a command's refusal (such as
+ * `shell_open`'s) reaches the page whole, so this is where it is cut. A
+ * sidebar label's 80 would drop a refusal's detail, the part that says what
+ * to do. */
 const TOAST_CHARS = 300;
 
 /** How long a toast stays up. */
