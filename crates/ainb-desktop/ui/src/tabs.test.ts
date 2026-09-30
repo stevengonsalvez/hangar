@@ -109,7 +109,8 @@ test("a new terminal opens on Cmd+T on macOS and Ctrl+Shift+T elsewhere", () => 
   assert.deepEqual(accelerator(key("KeyT", { ctrl: true, shift: true }), false), { kind: "terminal" });
   // Plain Ctrl+T is the pane's (transpose in a shell): never taken.
   assert.equal(accelerator(key("KeyT", { ctrl: true }), false), null);
-  assert.equal(accelerator(key("KeyT", { meta: true, shift: true }), true), null);
+  // Cmd+Shift+T is reopen closed tab, as Orca's (`recent_tabs.ts`).
+  assert.deepEqual(accelerator(key("KeyT", { meta: true, shift: true }), true), { kind: "reopen" });
   assert.equal(accelerator(key("KeyT"), true), null);
 });
 
