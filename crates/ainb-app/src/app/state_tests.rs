@@ -6006,4 +6006,18 @@ mod quiet_ticks {
             },
         );
     }
+
+    #[test]
+    fn a_bulk_delete_with_failures_names_the_first_one() {
+        let text = crate::app::state::bulk_delete_warning(
+            1,
+            3,
+            2,
+            "tmux session tmux_repo-1 is still running after kill-session",
+        );
+        assert_eq!(
+            text,
+            "Deleted 1/3 sessions (2 failed): tmux session tmux_repo-1 is still running after kill-session"
+        );
+    }
 }
