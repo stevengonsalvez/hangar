@@ -26,7 +26,7 @@ required-features = ["app"]
 
 [features]
 default = []
-app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
+app = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-opener", "dep:ainb-hangar-core", "dep:tracing-subscriber"]
 # The window serves `ui/dist` over its own protocol instead of the dev server
 # at `build.devUrl`. A plain `cargo build` keeps the dev server, which is what
 # `tauri dev` and the frontend's hot reload want; every build that has to run
@@ -77,11 +77,19 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", optional = true, features = ["fmt"] }
 uuid = { version = "1.5", features = ["serde", "v4"] }
+# Parses the URL a terminal link click asks the host to open (`links.rs`).
+# Already in the build through tauri.
+url = "2"
 tauri = { version = "~2.11.5", optional = true }
 # The native confirmation in front of the onboarding writes (#1175): a message
 # dialog the OS draws, which the webview's script cannot click. Rust side only;
 # the webview never calls the plugin, so it needs no capability.
 tauri-plugin-dialog = { version = "2.7", optional = true }
+# Opens a terminal link in the default browser (`open_url`), after
+# `links::web_url` has passed it. Called as a library, never registered as a
+# plugin, so the webview has none of its commands and needs no capability.
+# `~2.5`: 2.6 wants tauri 2.12, past this crate's pin.
+tauri-plugin-opener = { version = "~2.5", optional = true }
 tauri-plugin-wdio-webdriver = { version = "1.4", optional = true }
 # Pinned to the same releases `ainb-app` renders its frame contract with, so
 # both files are produced by one version of specta.

@@ -203,6 +203,21 @@ fn renderer_applied(
     );
 }
 
+/// A terminal link the page was clicked on, opened in the default browser if
+/// `links::web_url` passes it: an `http` or `https` URL, handed over as the
+/// parser serializes it. Anything else is refused here, before the OS is
+/// asked. The opener plugin is called as a library and never registered, so
+/// the webview has none of its commands: this is its only way to open a URL.
+#[tauri::command]
+fn open_url(url: String) {
+    let opened =
+        ainb_desktop::links::open(&url, |url| tauri_plugin_opener::open_url(url, None::<&str>));
+    // The reason is logged, never the URL: a link can carry a token.
+    if let Err(reason) = opened {
+        tracing::warn!(%reason, "terminal link not opened");
+    }
+}
+
 /// The terminal's copy: put the selection on the platform clipboard.
 ///
 /// A webview cannot reach the clipboard under this CSP, and the pane's own
@@ -1450,6 +1465,7 @@ fn main() {
             renderer_applied,
             clipboard_read,
             clipboard_write,
+            open_url,
             terminal_tabs,
             answer_home,
             terminal_output,

@@ -11,6 +11,8 @@
 //!   "+", and how the host resolves it.
 //! - [`agent_add`] adds an agent to a worktree the page names by ids.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
+//! - [`links`] is the rule a terminal link passes before the host opens it:
+//!   an `http` or `https` URL and nothing else.
 //! - [`delete`] deletes a session from the window, and first says what
 //!   that removes: the folder, or only the session when another shares it.
 //! - [`rename`] renames a sidebar row: the session's display name, never
@@ -47,6 +49,7 @@ pub mod delete;
 pub mod executor;
 pub mod host;
 pub mod intent;
+pub mod links;
 pub mod notify;
 pub mod notify_delivery;
 pub mod projects;
