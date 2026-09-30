@@ -143,6 +143,25 @@ impl<S: FrameSink> Shell<S> {
         self.core().host.start_workspace_load();
     }
 
+    /// Rename a row's display name ([`DesktopHost::rename_session`]) and run
+    /// the label store write before returning, so a relaunch finds the name.
+    /// A write that fails is the reducer's own notice, as any store write is.
+    ///
+    /// # Errors
+    /// Why the name was refused; nothing was written then.
+    pub fn rename_session(&self, session: uuid::Uuid, name: &str) -> Result<(), String> {
+        let mut core = self.core();
+        let Core { host, executor } = &mut *core;
+        let mut reports = Vec::new();
+        for effect in host.rename_session(session, name)? {
+            reports.extend(executor.execute(effect));
+        }
+        for report in reports {
+            host.run(report, executor);
+        }
+        Ok(())
+    }
+
     /// Every command the palette may offer; see [`DesktopHost::palette`].
     #[must_use]
     pub fn palette(&self) -> Vec<crate::host::PaletteEntry> {

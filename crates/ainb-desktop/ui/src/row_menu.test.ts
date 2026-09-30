@@ -22,9 +22,9 @@ test("a local row with a worktree path offers every wired item", () => {
   const items = rowMenuItems(session());
   assert.deepEqual(
     items.map((item) => item.action),
-    ["open", "editor", "copy_path", "copy_name", "delete"],
+    ["open", "rename", "editor", "copy_path", "copy_name", "delete"],
   );
-  assert.deepEqual(enabled(items), ["open", "editor", "copy_path", "copy_name", "delete"]);
+  assert.deepEqual(enabled(items), ["open", "rename", "editor", "copy_path", "copy_name", "delete"]);
 });
 
 test("Delete comes last and is the one destructive item, as Orca's", () => {
@@ -45,7 +45,7 @@ test("a Boss row cannot be deleted from the window, and says why", () => {
 
 test("a row with no worktree path cannot open an editor or copy a path, and says why", () => {
   const items = rowMenuItems(session({ workspace_path: "" }));
-  assert.deepEqual(enabled(items), ["open", "copy_name", "delete"]);
+  assert.deepEqual(enabled(items), ["open", "rename", "copy_name", "delete"]);
   for (const item of items.filter((candidate) => candidate.disabled)) {
     assert.ok(item.reason && item.reason.length > 0, `${item.action} names why it is off`);
   }
@@ -53,7 +53,7 @@ test("a row with no worktree path cannot open an editor or copy a path, and says
 
 test("a remote row cannot open its path in a local editor, as Orca marks Open in local only", () => {
   const items = rowMenuItems(session({ ssh_target: { host: "box" } as Session_Serialize["ssh_target"] }));
-  assert.deepEqual(enabled(items), ["open", "copy_path", "copy_name"]);
+  assert.deepEqual(enabled(items), ["open", "rename", "copy_path", "copy_name"]);
   assert.match(items.find((item) => item.action === "editor")?.reason ?? "", /local/i);
   // The delete runs on this machine: a remote row's session is not here.
   assert.match(items.find((item) => item.action === "delete")?.reason ?? "", /local/i);
@@ -61,12 +61,12 @@ test("a remote row cannot open its path in a local editor, as Orca marks Open in
 
 test("the arrow keys walk the enabled items and wrap, skipping disabled ones", () => {
   const items = rowMenuItems(session({ workspace_path: "" }));
-  // open(0) editor(1, off) copy_path(2, off) copy_name(3) delete(4)
-  assert.equal(stepItem(items, 0, 1), 3);
-  assert.equal(stepItem(items, 4, 1), 0);
-  assert.equal(stepItem(items, 0, -1), 4);
+  // open(0) rename(1) editor(2, off) copy_path(3, off) copy_name(4) delete(5)
+  assert.equal(stepItem(items, 1, 1), 4);
+  assert.equal(stepItem(items, 5, 1), 0);
+  assert.equal(stepItem(items, 0, -1), 5);
   assert.equal(stepItem(items, -1, 1), 0, "from nothing, down lands on the first");
-  assert.equal(stepItem(items, -1, -1), 4, "from nothing, up lands on the last");
+  assert.equal(stepItem(items, -1, -1), 5, "from nothing, up lands on the last");
 });
 
 test("a menu with nothing enabled has nowhere to step", () => {
