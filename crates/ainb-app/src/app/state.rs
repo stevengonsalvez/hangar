@@ -1051,6 +1051,12 @@ fn probe_tree(path: &std::path::Path) -> Result<usize, ()> {
     })
 }
 
+/// What a bulk delete with failures says: how many went, and the first
+/// failure's own words, so the reason is on screen and not only in the log.
+fn bulk_delete_warning(deleted: usize, total: usize, failed: usize, first_error: &str) -> String {
+    format!("Deleted {deleted}/{total} sessions ({failed} failed): {first_error}")
+}
+
 /// Shown when a bulk key is pressed with nothing checked.
 pub(crate) const NOTHING_SELECTED_WARNING: &str =
     "No sessions selected. Use Space to select sessions first.";
@@ -10630,7 +10636,6 @@ impl AppState {
     /// Delete a Boss mode session
     async fn delete_boss_session(&mut self, session_id: Uuid) -> anyhow::Result<()> {
         use crate::docker::{ContainerManager, SessionLifecycleManager};
-        use crate::git::WorktreeManager;
 
         info!("Deleting Boss mode session: {}", session_id);
 
@@ -10677,24 +10682,40 @@ impl AppState {
             Err(e) => {
                 warn!("Session not found in lifecycle manager: {}", e);
                 info!("Attempting to remove orphaned worktree directly");
-
-                // Remove the worktree directly, unless another session still
-                // works in it.
-                let worktree_manager = WorktreeManager::new()?;
-                match crate::interactive::session_manager::remove_session_worktree_now(
-                    &worktree_manager,
-                    session_id,
-                )
-                .await
-                {
-                    Ok(removal) => info!("Orphaned worktree: {removal:?}"),
-                    Err(worktree_err) => warn!("Failed to remove worktree: {}", worktree_err),
-                }
+                Self::remove_orphaned_boss_tree(session_id).await?;
             }
         }
 
         info!("Successfully deleted Boss session: {}", session_id);
         Ok(())
+    }
+
+    /// Remove the worktree of a Boss session the lifecycle manager does not
+    /// hold, unless another session still works in it.
+    ///
+    /// # Errors
+    /// The tree was kept: refused (a store that cannot say who else is in the
+    /// tree, a damaged `sessions.json` included) or failed. Logged at warn and
+    /// returned, so the delete is audited as the failure it is.
+    async fn remove_orphaned_boss_tree(session_id: Uuid) -> anyhow::Result<()> {
+        let worktree_manager = crate::git::WorktreeManager::new()?;
+        match crate::interactive::session_manager::remove_session_worktree_now(
+            &worktree_manager,
+            session_id,
+        )
+        .await
+        {
+            Ok(removal) => {
+                info!("Orphaned worktree: {removal:?}");
+                Ok(())
+            }
+            Err(worktree_err) => {
+                warn!("Orphaned worktree kept for {session_id}: {worktree_err}");
+                Err(anyhow::anyhow!(
+                    "the worktree of Boss session {session_id} was kept: {worktree_err}"
+                ))
+            }
+        }
     }
 
     /// Reseed the `Hangar Daemon` settings rows from the `daemon_config` table.
@@ -10793,6 +10814,9 @@ impl AppState {
                 AsyncAction::DeleteSession(session_id) => {
                     if let Err(e) = self.delete_session(session_id).await {
                         error!("Failed to delete session {}: {}", session_id, e);
+                        // A refused delete (an agent still running, a store
+                        // that cannot be read) leaves the row: say why.
+                        self.add_error_notification(format!("Delete failed: {e}"));
                     }
                 }
                 AsyncAction::StopSession(session_id) => {
@@ -10844,10 +10868,12 @@ impl AppState {
                     let total = session_ids.len();
                     let mut deleted = 0;
                     let mut failed = 0;
+                    let mut first_error = None;
                     for id in session_ids {
                         if let Err(e) = self.delete_session_core(id).await {
                             error!("Failed to delete session {}: {}", id, e);
                             failed += 1;
+                            first_error.get_or_insert_with(|| e.to_string());
                             // Still there, so keep it checked: the row was
                             // unchecked optimistically on confirmation.
                             self.sessions.selected_sessions.insert(id);
@@ -10857,10 +10883,12 @@ impl AppState {
                     }
                     // Refresh once after all deletions
                     self.load_real_workspaces().await;
-                    if failed > 0 {
-                        self.add_warning_notification(format!(
-                            "Deleted {}/{} sessions ({} failed)",
-                            deleted, total, failed
+                    if let Some(first_error) = first_error {
+                        self.add_warning_notification(bulk_delete_warning(
+                            deleted,
+                            total,
+                            failed,
+                            &first_error,
                         ));
                     } else {
                         self.add_success_notification(format!("Deleted {} session(s)", deleted));
