@@ -15,6 +15,7 @@ import {
   shellGitView,
   shellHangar,
   shellInbox,
+  shellLabels,
   shellSessions,
   shellUsage,
   SUBSCRIBED,
@@ -856,6 +857,15 @@ function Shell() {
             acks={acks()}
             onOpen={openSession}
             onNew={composer.openComposer}
+            labels={shellLabels(store, host())?.session_label_store}
+            // The host checks and keeps the name; no reducer row runs, so
+            // nothing walks home first, as the Delete confirmation does not.
+            onRename={(id, name) =>
+              invoke("session_rename", { id, name }).then(
+                () => null,
+                (why: unknown) => String(why),
+              )
+            }
             onRowPick={(pick) =>
               // Through `answer`, home first: the sidebar is drawn over
               // Settings and the Inbox, whose screens refuse a row.
