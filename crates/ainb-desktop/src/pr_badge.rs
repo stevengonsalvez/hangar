@@ -18,6 +18,13 @@
 //! remote, no PR, a slow or garbled answer) is a [`Miss`]: logged at debug
 //! and drawn as no badge. A miss is cached like an answer, so a machine with
 //! no `gh` login does not respawn it on every refresh.
+//!
+//! A rate limit is not a per-key miss: it means every further `gh` call is
+//! likely to fail the same way, for every card, so one [`Miss::RateLimited`]
+//! pauses the whole [`PrBadges`] for [`RATE_LIMIT_PAUSE`], as Orca's own
+//! pr-refresh-rate-limit-gate does. While paused, a card keeps the last
+//! badge it actually got (never blanked by the pause itself), and a key that
+//! never had one shows nothing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +44,9 @@ pub const TTL: Duration = Duration::from_secs(120);
 /// How long a merged or closed PR stands: it rarely moves again, and a new PR
 /// on the same branch still shows within this.
 pub const SETTLED_TTL: Duration = Duration::from_secs(600);
+/// How long a `gh` rate limit pauses every further lookup, for every key, once
+/// hit: GitHub's secondary limits typically clear well within this.
+pub const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(15 * 60);
 /// The most `gh` processes running at once, Orca's own `MAX_CONCURRENT`.
 pub const MAX_IN_FLIGHT: usize = 4;
 /// How long one `gh` call may take before it is killed and counted a miss.
@@ -100,6 +110,8 @@ pub enum Miss {
     Spawn(std::io::ErrorKind),
     /// `gh` is not logged in.
     Unauthenticated,
+    /// GitHub's API rate limit: pauses every key, not just this one.
+    RateLimited,
     /// The branch has no pull request.
     NoPr,
     /// `gh` exited non-zero for another reason: offline, no GitHub remote.
@@ -281,7 +293,12 @@ fn reads_as_pr_number(arg: &str) -> bool {
 /// Why `gh` exited non-zero, from the head of its stderr.
 fn exit_miss(code: Option<i32>, stderr: &[u8]) -> Miss {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
-    if stderr.contains("gh auth login") || stderr.contains("not logged in") {
+    if stderr.contains("rate limit") {
+        // GitHub's primary limit ("API rate limit exceeded for ...") and its
+        // secondary one ("You have exceeded a secondary rate limit ...")
+        // both carry this phrase.
+        Miss::RateLimited
+    } else if stderr.contains("gh auth login") || stderr.contains("not logged in") {
         Miss::Unauthenticated
     } else if stderr.contains("no pull requests found") {
         Miss::NoPr
@@ -391,35 +408,83 @@ impl Slot {
 }
 
 /// Every card's badge, cached per (worktree, branch) for a TTL, with at most
-/// [`MAX_IN_FLIGHT`] `gh` calls running and one per key.
+/// [`MAX_IN_FLIGHT`] `gh` calls running and one per key; paused for every key
+/// at once by a rate limit.
 pub struct PrBadges {
     gh: Option<PathBuf>,
     slots: Mutex<HashMap<(PathBuf, String), Arc<Slot>>>,
     in_flight: Semaphore,
+    /// How long a rate limit pauses every key: [`RATE_LIMIT_PAUSE`], except
+    /// in a test, which shrinks it rather than spending fifteen real minutes
+    /// crossing it.
+    rate_limit_pause: Duration,
+    /// Set by a [`Miss::RateLimited`]; no key is asked again before this.
+    paused_until: Mutex<Option<Instant>>,
+    /// Every key's last actual badge, kept across a rate-limit pause (and
+    /// past its own TTL) so the pause dims nothing that was already shown.
+    /// Pruned alongside `slots` in [`Self::slot`], so it cannot outgrow it.
+    last_good: Mutex<HashMap<(PathBuf, String), PrBadge>>,
 }
 
 impl PrBadges {
     /// Badges read through `gh` at `gh`, or never when it is `None`.
     #[must_use]
     pub fn new(gh: Option<PathBuf>) -> Self {
+        Self::with_rate_limit_pause(gh, RATE_LIMIT_PAUSE)
+    }
+
+    /// As [`Self::new`], but a rate limit pauses for `pause` rather than
+    /// [`RATE_LIMIT_PAUSE`].
+    fn with_rate_limit_pause(gh: Option<PathBuf>, pause: Duration) -> Self {
         Self {
             gh,
             slots: Mutex::new(HashMap::new()),
             in_flight: Semaphore::new(MAX_IN_FLIGHT),
+            rate_limit_pause: pause,
+            paused_until: Mutex::new(None),
+            last_good: Mutex::new(HashMap::new()),
         }
     }
 
     /// The badge for `branch` in `worktree`, from the cache while it is
     /// fresh; `None` for any miss, which is logged at debug and cached too.
+    ///
+    /// While a rate limit pauses every key, this spawns no `gh` at all: it
+    /// answers with the last badge this key actually got, or nothing for a
+    /// key that never had one.
     pub async fn badge(&self, worktree: &Path, branch: &str) -> Option<PrBadge> {
         let key = (worktree.to_path_buf(), branch.to_string());
-        self.cached(key, || async {
-            let Some(gh) = self.gh.as_deref() else {
-                return Err(Miss::NoGh);
-            };
-            lookup(gh, worktree, branch).await
-        })
-        .await
+        if self.paused(Instant::now()) {
+            return self
+                .last_good
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&key)
+                .cloned();
+        }
+        let answer = self
+            .cached(key.clone(), || async {
+                let Some(gh) = self.gh.as_deref() else {
+                    return Err(Miss::NoGh);
+                };
+                lookup(gh, worktree, branch).await
+            })
+            .await;
+        if let Some(badge) = &answer {
+            self.last_good
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(key, badge.clone());
+        }
+        answer
+    }
+
+    /// Whether a rate limit still holds every key back.
+    fn paused(&self, now: Instant) -> bool {
+        self.paused_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| now < until)
     }
 
     async fn cached<F, Fut>(&self, key: (PathBuf, String), fetch: F) -> Option<PrBadge>
@@ -436,6 +501,11 @@ impl PrBadges {
                 let answer = fetch().await;
                 if let Err(miss) = &answer {
                     tracing::debug!(?miss, branch = %key.1, "no PR badge");
+                    if matches!(miss, Miss::RateLimited) {
+                        let mut until =
+                            self.paused_until.lock().unwrap_or_else(PoisonError::into_inner);
+                        *until = Some(Instant::now() + self.rate_limit_pause);
+                    }
                 }
                 (Instant::now(), answer.ok())
             })
@@ -452,6 +522,8 @@ impl PrBadges {
         }
         if slots.len() >= MAX_ENTRIES {
             slots.retain(|_, slot| !slot.stale(now));
+            let mut last_good = self.last_good.lock().unwrap_or_else(PoisonError::into_inner);
+            last_good.retain(|key, _| slots.contains_key(key));
         }
         let slot = Arc::new(Slot::default());
         slots.insert(key, Arc::clone(&slot));
@@ -790,6 +862,75 @@ mod tests {
 
     fn key(branch: &str) -> (PathBuf, String) {
         (PathBuf::from("/w"), branch.to_string())
+    }
+
+    /// A rate limit pauses every key, not just the one that hit it: while
+    /// paused, a card keeps the last badge it actually got, a key that never
+    /// had one shows nothing, and no `gh` process is spawned for any key
+    /// until the pause passes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rate_limit_pauses_every_key_and_keeps_the_last_good_badge() {
+        let (dir, gh) = fake_gh(
+            r#"for last; do :; done
+echo called >> "$(dirname "$0")/calls"
+if [ "$last" = "limited" ]; then
+  echo 'API rate limit exceeded for user ID 123.' >&2
+  exit 1
+fi
+echo '{"state":"OPEN","isDraft":false,"number":9,"url":"https://github.com/o/r/pull/9","statusCheckRollup":[]}'"#,
+        );
+        // Warm the freshly written script past a possible `ETXTBSY`, then
+        // start the call count at zero for what this test actually asks.
+        let _ = run(&gh, here(), "warmup").await;
+        let calls_file = dir.path().join("calls");
+        std::fs::write(&calls_file, "").unwrap();
+        let calls = || std::fs::read_to_string(&calls_file).unwrap().lines().count();
+
+        // A short pause: real time, not tokio's paused clock, since a real
+        // `gh` process is spawned here; a test shrinks the pause instead of
+        // spending fifteen real minutes crossing it.
+        let pause = Duration::from_millis(300);
+        let badges = PrBadges::with_rate_limit_pause(Some(gh), pause);
+
+        let good = badges.badge(here(), "good").await;
+        assert_eq!(
+            good.as_ref().map(|badge| badge.number),
+            Some(9),
+            "a real badge, kept as this key's last good one"
+        );
+        assert_eq!(calls(), 1);
+
+        assert_eq!(
+            badges.badge(here(), "limited").await,
+            None,
+            "no badge for a key that never had one"
+        );
+        assert_eq!(calls(), 2, "one call to discover the rate limit");
+
+        for _ in 0..3 {
+            assert_eq!(
+                badges.badge(here(), "good").await.as_ref().map(|badge| badge.number),
+                Some(9),
+                "the pause keeps the badge this key already had"
+            );
+            assert_eq!(badges.badge(here(), "limited").await, None);
+            assert_eq!(
+                badges.badge(here(), "other").await,
+                None,
+                "never asked before, so nothing to keep"
+            );
+        }
+        assert_eq!(calls(), 2, "no gh process spawned for any key while paused");
+
+        tokio::time::sleep(pause + Duration::from_millis(200)).await;
+        let resumed = badges.badge(here(), "other").await;
+        assert_eq!(
+            resumed.as_ref().map(|badge| badge.number),
+            Some(9),
+            "a key that showed nothing while paused gets a real badge now"
+        );
+        assert_eq!(calls(), 3, "spawning resumed once the pause passed");
     }
 
     #[tokio::test(start_paused = true)]
