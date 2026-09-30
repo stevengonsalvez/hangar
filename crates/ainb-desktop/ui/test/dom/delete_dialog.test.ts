@@ -76,14 +76,19 @@ afterEach(() => {
 type Asked = ["preview", string] | ["delete", string, Confirmed];
 
 /** Mount the sidebar and the delete dialog over one flow, as `main.tsx`
- * does. `preview` is the host's answer; the default flow's host commands are
- * used when `deps` is `"host"`. */
-async function mount(preview: DeletePreview | Error, deps: "fake" | "host" = "fake") {
+ * does. `preview` is the host's answer, or a function asked for each answer
+ * (to hold one back); the default flow's host commands are used when `deps`
+ * is `"host"`. */
+async function mount(
+  preview: DeletePreview | Error | ((id: string) => Promise<DeletePreview>),
+  deps: "fake" | "host" = "fake",
+) {
   const asked: Asked[] = [];
   const toasts: string[] = [];
   const fake: DeleteFlowDeps = {
     preview: (id) => {
       asked.push(["preview", id]);
+      if (typeof preview === "function") return preview(id);
       return preview instanceof Error ? Promise.reject(preview.message) : Promise.resolve(preview);
     },
     remove: async (id, confirmed) => void asked.push(["delete", id, confirmed]),
@@ -330,6 +335,56 @@ test("confirm waits for the host's answer, then takes the keyboard", async () =>
   await settle();
   assert.equal(confirm.disabled, false);
   focusIs(confirm, "the confirm takes the keyboard once it can be pressed");
+});
+
+/** A host whose answers wait until the test gives them, one per opening. */
+function heldAnswers() {
+  const waiting: ((preview: DeletePreview) => void)[] = [];
+  return {
+    preview: () => new Promise<DeletePreview>((resolve) => waiting.push(resolve)),
+    async answer(preview: DeletePreview) {
+      const next = waiting.shift();
+      assert.ok(next, "an answer is being waited for");
+      next(preview);
+      await settle();
+    },
+  };
+}
+
+for (const [count, lands, keyboard] of [
+  ["dirty", { tree: "removed", changes: 2 }, "Cancel"],
+  ["uncounted", { tree: "removed", changes: null }, "Cancel"],
+  ["clean", { tree: "removed", changes: 0 }, "Delete Workspace"],
+] as const) {
+  test(`Cancel holds the keyboard until the count lands, then ${keyboard} has it (${count})`, async () => {
+    const host = heldAnswers();
+    await mount(host.preview);
+    await chooseDelete("claude-1");
+    focusIs(button("Cancel"), "while the host counts");
+    await settle();
+    focusIs(button("Cancel"), "still, a tick later");
+    await host.answer(lands);
+    focusIs(button(keyboard), `once the ${count} count lands`);
+  });
+}
+
+test("a second opening does not take the first one's answer for its own", async () => {
+  // The first row's clean answer must not reach the second opening's
+  // dialog: until the second count lands, nothing is known about it.
+  const host = heldAnswers();
+  await mount(host.preview);
+  await chooseDelete("claude-1");
+  await host.answer({ tree: "removed", changes: 0 });
+  focusIs(button("Delete Workspace"), "the first, clean, opening");
+  button("Cancel").click();
+  await settle();
+
+  await chooseDelete("shell-1");
+  assert.equal(button("Delete").disabled, true, "the second opening is still counting");
+  focusIs(button("Cancel"), "while the second count is out");
+  await host.answer({ tree: "removed", changes: 4 });
+  assert.ok(button("Force Delete"), "the second opening's own answer");
+  focusIs(button("Cancel"), "a dirty tree keeps the keyboard off Force Delete");
 });
 
 test("a failed check says why and cannot be confirmed; Cancel keeps the keyboard", async () => {
