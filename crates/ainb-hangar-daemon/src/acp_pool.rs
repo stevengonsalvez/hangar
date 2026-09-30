@@ -410,7 +410,9 @@ pub(crate) struct AcpAdapterToml {
     models: Vec<String>,
 }
 
-/// Read `[acp.adapters]` from the hangar home's `config/config.toml`.
+/// Read `[acp.adapters]` from the hangar home's `config/config.toml`
+/// (`$AINB_HANGAR_HOME` when set and non-empty, else `~/.agents-in-a-box`; see
+/// [`crate::spawn::config_path_in`]).
 ///
 /// Empty on any failure (no hangar home, no file, bad TOML, malformed
 /// table), with a warning: the built-in adapters are always the floor.
@@ -439,16 +441,9 @@ pub(crate) fn acp_adapters_in(path: &std::path::Path) -> HashMap<String, AcpAdap
     let Some(table) = root.get("acp").and_then(|acp| acp.get("adapters")) else {
         return HashMap::new();
     };
-    table.clone().try_into().unwrap_or_else(|_| {
-        // Never serde's message: it quotes the offending value, and an
-        // adapter's command may carry a token. Name the entries instead.
-        let malformed: Vec<&String> = table.as_table().map_or_else(Vec::new, |adapters| {
-            adapters
-                .iter()
-                .filter(|(_, adapter)| (*adapter).clone().try_into::<AcpAdapterToml>().is_err())
-                .map(|(name, _)| name)
-                .collect()
-        });
+    // Never serde's message: it quotes the offending value, and an adapter's
+    // command may carry a token. `decode` names the entries instead.
+    ainb_hangar_core::config_file::decode(table).unwrap_or_else(|malformed| {
         tracing::warn!(
             path = %path.display(),
             ?malformed,
@@ -629,10 +624,15 @@ impl PoolConfig {
     /// adapter installed anywhere but `PATH` could not be reached. A named
     /// adapter here overrides the built-in entry; a new name adds one.
     ///
-    /// Read directly off config.toml rather than through `ainb`, which this
-    /// crate does not depend on, mirroring how the session-reader plugin reads
-    /// `[session_reader]`. Every failure degrades to the built-ins: a malformed
-    /// table must not leave the daemon with no adapters at all.
+    /// Read directly off the hangar home's `config/config.toml`
+    /// (`$AINB_HANGAR_HOME` when set and non-empty, else `~/.agents-in-a-box`,
+    /// never `$HOME` directly) through [`crate::hangar_config`], rather than
+    /// through `ainb`, which this crate does not depend on. Every failure
+    /// degrades to the built-ins: a malformed table must not leave the daemon
+    /// with no adapters at all.
+    ///
+    /// A parse error is logged by line and column and a malformed
+    /// `[acp.adapters]` by the names of its bad entries.
     #[must_use]
     pub fn from_config() -> Self {
         let mut config = Self::default();

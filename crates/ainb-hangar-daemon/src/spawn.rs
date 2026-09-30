@@ -82,11 +82,19 @@ pub fn served(env: Option<&std::ffi::OsStr>, file: bool) -> bool {
 
 /// The file [`SPAWN_CONFIG_KEY`] is read from: `<hangar home>/config/config.toml`.
 ///
-/// The user config, which the daemon also reads `[codex] app_server` from. A
-/// project's `.ainb/config.toml` never reaches the daemon.
+/// The hangar home is `$AINB_HANGAR_HOME` when set and non-empty, else
+/// `~/.agents-in-a-box` (see [`crate::hangar_dir`]); never `$HOME` directly.
+///
+/// The user config, which the daemon also reads `[codex] app_server` and
+/// `[acp.adapters]` from, all through [`crate::hangar_config`], and the notifyd
+/// and session-reader plugins read their own tables from. A project's
+/// `.ainb/config.toml` never reaches the daemon.
+///
+/// Delegates to [`ainb_hangar_core::paths::config_path_in`], the one place the
+/// layout lives.
 #[must_use]
 pub fn config_path_in(hangar_home: &Path) -> PathBuf {
-    hangar_home.join("config").join("config.toml")
+    ainb_hangar_core::paths::config_path_in(hangar_home)
 }
 
 /// Whether a daemon whose [`SPAWN_ENV`] is `value` serves the spawn verbs.
