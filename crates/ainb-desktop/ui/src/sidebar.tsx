@@ -8,6 +8,7 @@ import type {
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
+import { PrBadgeButton } from "./pr_badge.tsx";
 import { opensRowMenu, rowMenuItems, sessionIn, type RowPick } from "./row_menu.ts";
 import { RowMenu } from "./row_menu.tsx";
 import { isSelected, label } from "./sessions.ts";
@@ -52,6 +53,11 @@ interface Props {
   /** An item was chosen in a row's context menu (`row_menu.ts`). Without
    * it a right-click on a row is left to the webview. */
   onRowPick?(pick: RowPick): void;
+  /** The host's `pr_badge` for a card's session. Without it, or without
+   * `onOpenUrl`, no card draws a PR badge. */
+  prBadge?(sessionId: string): Promise<unknown>;
+  /** Open a PR badge's URL: the host's `open_url`, never the webview. */
+  onOpenUrl?(url: string): void;
   /** The sidebar element, for Esc Esc to return focus to. */
   ref(element: HTMLElement): void;
 }
@@ -240,6 +246,8 @@ export function Sidebar(props: Props) {
                                 acks={props.acks}
                                 onOpen={props.onOpen}
                                 onMenu={props.onRowPick ? openMenu : undefined}
+                                prBadge={props.prBadge}
+                                onOpenUrl={props.onOpenUrl}
                               />
                             )}
                           </Show>
@@ -287,6 +295,8 @@ function Card(props: {
   acks?: AckMap;
   onOpen(sessionId: string): void;
   onMenu?(at: MenuAt): void;
+  prBadge?(sessionId: string): Promise<unknown>;
+  onOpenUrl?(url: string): void;
 }) {
   const rows = createMemo(() => keyedList(props.card.sessions, (session) => session.id));
   const rowKeys = createMemo(() => rows().keys, [], { equals: sameKeys });
@@ -320,6 +330,18 @@ function Card(props: {
           {(changes) => <span class="git-counts">{formatGitChanges(changes())}</span>}
         </Show>
         <Show when={props.card.model}>{(model) => <span class="model">{label(model())}</span>}</Show>
+        {/* Beside the branch it is for, outside every row's button: a click
+            on it opens the PR and never a row. */}
+        <Show when={props.prBadge && props.onOpenUrl ? { fetch: props.prBadge, open: props.onOpenUrl } : null}>
+          {(host) => (
+            <PrBadgeButton
+              sessionId={props.card.sessionId}
+              branch={props.card.branch}
+              fetch={host().fetch}
+              onOpenUrl={host().open}
+            />
+          )}
+        </Show>
       </div>
       <ul class="agent-rows">
         <For each={rowKeys()}>

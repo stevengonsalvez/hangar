@@ -27,6 +27,9 @@ export interface WorktreeCard {
    * host, a test fixture): stable across a drain either way, so `For` never
    * rebuilds the card just because the frame refreshed. */
   key: string;
+  /** The primary session's id: what the card's PR badge asks the host
+   * about, since the host resolves a session, never a folder. */
+  sessionId: string;
   /** The primary session's display name, or its name: `session.rs` calls
    * `display_name` the operator's own label, overriding the auto-generated
    * one when set. */
@@ -85,6 +88,7 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
   const dirty = changes && (changes.added > 0 || changes.modified > 0 || changes.deleted > 0) ? changes : null;
   return {
     key,
+    sessionId: primary.id,
     title: primary.display_name ?? primary.name,
     branch: primary.branch_name,
     gitChanges: dirty,
