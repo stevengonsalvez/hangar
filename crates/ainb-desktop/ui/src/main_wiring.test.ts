@@ -97,3 +97,29 @@ test("the delete confirmation is a modal the window draws, and the only way to t
   );
   assert.ok(!MAIN.includes('"session_delete"'), "main never deletes except through the flow");
 });
+
+test("each pane strip carries one + menu, on that pane's shown tab; the top strip none", () => {
+  const top = MAIN.slice(MAIN.indexOf('<nav class="tabs"'), MAIN.indexOf("</nav>"));
+  assert.doesNotMatch(top, /TabCreateMenu/, "the Board/Review strip holds no +");
+  assert.doesNotMatch(MAIN, /NewTerminalButton|NewAgentButton/, "no standalone control beside the menu");
+  assert.equal(MAIN.match(/<TabCreateMenu\b/g)?.length, 1, "one menu, drawn per pane through Panes' stripEnd");
+  const panes = MAIN.slice(MAIN.indexOf("<Panes"), MAIN.indexOf("terminal={(key, visible)"));
+  assert.match(panes, /stripEnd=\{\(shown\) => \(\s*<TabCreateMenu/);
+  // The pane's shown tab (a shell tab's included), else the sidebar's
+  // selection: the bare selection can sit on another worktree than the pane.
+  assert.match(panes, /target=\{worktreeTarget\(shown\(\)\?\.target, sessions\(\)\?\.selected_session_id \?\? null\)\}/);
+  assert.match(panes, /onNewTerminal=\{\(target\) => void shellTabs\.open\(target\)\}/);
+  assert.match(panes, /agents=\{newAgent\}/);
+  assert.match(panes, /restoreFocus=\{focusShown\}/);
+  // Mod+T opens on the focused pane's target, by the same rule.
+  const plus = body("plusTarget", "const shellTabs");
+  assert.match(
+    plus,
+    /worktreeTarget\(shownTargetOf\(showing\("terminal"\), tabs\(\), active\(\)\), sessions\(\)\?\.selected_session_id \?\? null\)/,
+  );
+  assert.match(MAIN, /createShellTabs\(\{ target: plusTarget, toast \}\)/);
+  const flow = body("newAgent", "const onAccelerator");
+  assert.match(flow, /createNewAgentFlow\(/);
+  assert.match(flow, /sessions: \(\) => sessions\(\),/);
+  assert.match(flow, /select: \(sessionId\) => dispatch\(selectRowIntent\(\{ session: sessionId \}\)\)/);
+});

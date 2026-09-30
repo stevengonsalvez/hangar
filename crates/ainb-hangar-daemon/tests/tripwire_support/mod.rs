@@ -787,13 +787,13 @@ pub fn fake_acp_adapter() -> PathBuf {
 /// Point the daemon's `claude-agent-acp` adapter at `command`, through the same
 /// `[acp.adapters]` table an operator edits.
 ///
-/// Read from `$HOME`, so the caller must export `HOME` into the daemon's
-/// environment alongside `AINB_HANGAR_HOME`.
-pub fn write_acp_adapter_config(home: &Path, command: &Path, permission_mode: &str) {
-    let dir = home.join(".agents-in-a-box").join("config");
-    std::fs::create_dir_all(&dir).expect("create config dir");
+/// Written to `hangar_home`'s `config/config.toml`, so the caller must export
+/// `AINB_HANGAR_HOME` as `hangar_home` into the daemon's environment.
+pub fn write_acp_adapter_config(hangar_home: &Path, command: &Path, permission_mode: &str) {
+    let path = ainb_hangar_daemon::spawn::config_path_in(hangar_home);
+    std::fs::create_dir_all(path.parent().expect("config dir")).expect("create config dir");
     std::fs::write(
-        dir.join("config.toml"),
+        &path,
         format!(
             "[acp.adapters.claude-agent-acp]\ncommand = \"{}\"\npermission_mode = \"{permission_mode}\"\n",
             command.display()

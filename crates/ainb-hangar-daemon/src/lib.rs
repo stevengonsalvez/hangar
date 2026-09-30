@@ -639,8 +639,8 @@ fn codex_app_server_in(path: &std::path::Path) -> ConfigSetting {
 
 /// Read and parse the hangar home's config file at `path` (see
 /// [`spawn::config_path_in`]): the one reader behind every key the daemon
-/// takes from it, `[hangar] spawn` and `[codex] app_server`. One read per
-/// call; each caller keeps its own answer for each outcome.
+/// takes from that file. One read per call; each caller keeps its own answer
+/// for each outcome.
 ///
 /// `Ok(None)` is nothing at `path` at all. A link to nowhere is not that: it
 /// is a [`HangarConfigError::Read`] of kind `NotFound`, so a caller for which
@@ -1859,10 +1859,8 @@ mod tests {
         );
     }
 
-    /// What the daemon log actually gets from a config with a token on a
-    /// malformed line, through both readers of the file: where, never what.
-    #[test]
-    fn neither_config_reader_logs_the_line_of_a_parse_error() {
+    /// Everything logged while `run` runs, as the daemon's fmt layer writes it.
+    fn captured_log(run: impl FnOnce()) -> String {
         #[derive(Clone, Default)]
         struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
         impl std::io::Write for Captured {
@@ -1875,6 +1873,21 @@ mod tests {
             }
         }
 
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, run);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// What the daemon log actually gets from a config with a token on a
+    /// malformed line, through every reader of the file: where, never what.
+    #[test]
+    fn no_config_reader_logs_the_line_of_a_parse_error() {
         let home = tempfile::tempdir().unwrap();
         let path = crate::spawn::config_path_in(home.path());
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1884,28 +1897,49 @@ mod tests {
         )
         .unwrap();
 
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
+        let log = captured_log(|| {
             assert!(!crate::spawn::served_by_config(&path), "spawn kept off");
             assert_eq!(
                 super::codex_app_server_in(&path),
                 super::ConfigSetting::Unreadable,
                 "codex keeps its own server"
             );
+            assert!(
+                crate::acp_pool::acp_adapters_in(&path).is_empty(),
+                "acp keeps the built-in adapters"
+            );
         });
-
-        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         assert!(!log.contains("sk-SECRET"), "{log}");
         assert_eq!(
             log.matches("at line 3, column 23").count(),
-            2,
+            3,
             "one located warning per reader: {log}"
         );
+    }
+
+    /// An `[acp.adapters]` entry of the wrong shape is named, never quoted:
+    /// serde's type error would echo the value, and it may be a token.
+    #[test]
+    fn a_malformed_acp_adapter_is_logged_by_name_not_value() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[acp.adapters.fine]\ncommand = \"/bin/fine\"\n\
+             [acp.adapters.leaky]\nmodels = \"sk-SECRET-456\"\n",
+        )
+        .unwrap();
+
+        let log = captured_log(|| {
+            assert!(
+                crate::acp_pool::acp_adapters_in(&path).is_empty(),
+                "one bad entry keeps the built-in adapters"
+            );
+        });
+        assert!(!log.contains("sk-SECRET"), "{log}");
+        assert!(log.contains("[acp.adapters] is malformed"), "{log}");
+        assert!(log.contains("malformed=[\"leaky\"]"), "{log}");
     }
 
     /// A parse error names where it is and never what the line holds: the

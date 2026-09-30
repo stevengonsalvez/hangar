@@ -87,6 +87,10 @@ let nextCallback = 1;
         return null;
       case "clipboard_read":
         return host.inView.includes(args.key as string) ? "pasted" : "";
+      case "worktree_agent_add":
+        // A created session the list never carries: the window follows it
+        // for a while and gives up, as it would for a slow daemon.
+        return { session_id: "u-added", tmux_session_name: "tmux_added", worktree_path: "/wt", branch: "feat" };
       default:
         return null;
     }

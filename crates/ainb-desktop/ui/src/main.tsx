@@ -40,6 +40,8 @@ import { Palette } from "./palette.tsx";
 import { emptyPaneView } from "./pane_empty.ts";
 import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
+import { createNewAgentFlow } from "./new_agent.ts";
+import { TabCreateMenu } from "./tab_create_menu.tsx";
 import { cardForSession, sessionForCard, statusForTarget } from "./status.ts";
 import {
   activateTab,
@@ -55,7 +57,6 @@ import {
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
 import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
-import { NewTerminalButton } from "./shell_tab.tsx";
 import { shownTargetOf, worktreeTarget } from "./worktree_target.ts";
 import { Composer } from "./composer.tsx";
 import { createDeleteFlow } from "./delete_dialog.ts";
@@ -477,11 +478,15 @@ function Shell() {
   // The palette is mounted only while it is open: each opening lists the
   // commands afresh, with the host's answer for which of them run now.
   const [palette, setPalette] = createSignal(false);
-  const closePalette = () => {
-    setPalette(false);
+  /** Give the keyboard back to the shown tab's terminal, else the sidebar. */
+  const focusShown = () => {
     const key = active();
     if (key !== null) focusers.get(key)?.();
     else sidebar?.focus();
+  };
+  const closePalette = () => {
+    setPalette(false);
+    focusShown();
   };
   const choose = (tab: Tab) => {
     // A shell has no row to re-attach through: the host re-attaches it.
@@ -551,11 +556,14 @@ function Shell() {
   // closing the view never stops a create already running on the host.
   const composer = createComposerFlow({
     toast: (message) => toast(message),
-    restoreFocus: () => {
-      const key = active();
-      if (key !== null) focusers.get(key)?.();
-      else sidebar?.focus();
-    },
+    restoreFocus: focusShown,
+    sessions: () => sessions(),
+    select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
+  });
+  // The "+" menu's agents: one more agent in a pane's shown worktree
+  // (`new_agent.ts`); the host opens and focuses its tab.
+  const newAgent = createNewAgentFlow({
+    toast: (message) => toast(message),
     sessions: () => sessions(),
     select: (sessionId) => dispatch(selectRowIntent({ session: sessionId })),
   });
@@ -699,7 +707,9 @@ function Shell() {
     setTimeout(() => setToasts((shown) => shown.filter((entry) => entry.id !== id)), TOAST_MS);
   };
 
-  // "New terminal" and every tab close: a shell's tab ends its shell.
+  // "New terminal" and every tab close: a shell's tab ends its shell. Mod+T
+  // opens in the focused pane's worktree, by the rule each pane's "+" applies
+  // to its own shown tab.
   const plusTarget = () =>
     worktreeTarget(shownTargetOf(showing("terminal"), tabs(), active()), sessions()?.selected_session_id ?? null);
   const shellTabs = createShellTabs({ target: plusTarget, toast });
@@ -1027,11 +1037,6 @@ function Shell() {
                   </span>
                 )}
               </Show>
-              <NewTerminalButton
-                ready={plusTarget() !== null}
-                mac={MAC}
-                onOpen={() => void shellTabs.open()}
-              />
             </nav>
             {/* One banner per open request, latched for a short grace across
                 frames that carry none (#1266): `AnswerSlot`. */}
@@ -1122,6 +1127,15 @@ function Shell() {
                 onLayout={applyLayout}
                 onFocusGroup={focusPaneGroup}
                 onCloseGroup={closePaneGroup}
+                stripEnd={(shown) => (
+                  <TabCreateMenu
+                    target={worktreeTarget(shown()?.target, sessions()?.selected_session_id ?? null)}
+                    mac={MAC}
+                    onNewTerminal={(target) => void shellTabs.open(target)}
+                    agents={newAgent}
+                    restoreFocus={focusShown}
+                  />
+                )}
                 terminal={(key, visible) => (
                   <Show when={tabs().find((tab) => tab.key === key)}>
                     {(tab) => (
