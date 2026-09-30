@@ -23,7 +23,8 @@ use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
-use ainb_desktop::notify::{self, Gate, Notice, Notifier};
+use ainb_desktop::notify::{self, Gate, Notifier};
+use ainb_desktop::notify_delivery::{self, OsDelivery};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
@@ -107,16 +108,29 @@ impl Notifications {
     }
 }
 
-/// Hand `notice` to the OS as a notification, from the host: the webview
-/// never sends one. The plugin delivers it on a task of its own and drops a
-/// delivery error, so what is logged here is the hand-off.
-fn show_notice(handle: &tauri::AppHandle, notice: &Notice) {
-    use tauri_plugin_notification::NotificationExt;
-    let shown = handle.notification().builder().title(&notice.title).body(&notice.body).show();
-    match shown {
-        Ok(()) => tracing::info!(session = ?notice.session_key, "OS notification handed to the OS"),
-        Err(error) => {
-            tracing::warn!(%error, session = ?notice.session_key, "OS notification not sent");
+/// What the page hears when a person clicks a session's notification: the
+/// card key it names, for the page to select that session's row.
+#[derive(Clone, serde::Serialize)]
+struct NotifyOpen {
+    session_key: String,
+}
+
+/// A click on a notification: the window is brought forward, and the page
+/// told which session to select (`notify:open`). A summary names none, so its
+/// click only brings the window forward. Runs on the notice's own thread.
+fn open_from_notice(handle: &tauri::AppHandle, session: Option<String>) {
+    if let Some(window) = handle.get_webview_window("main") {
+        // Best effort: a window that is not minimized or hidden refuses nothing
+        // that matters, and `set_focus` below is the one that must land.
+        let _ = window.unminimize();
+        let _ = window.show();
+        if let Err(error) = window.set_focus() {
+            tracing::warn!(%error, "the window did not take focus for a notification click");
+        }
+    }
+    if let Some(session_key) = session {
+        if let Err(error) = handle.emit("notify:open", NotifyOpen { session_key }) {
+            tracing::warn!(%error, "notification click not delivered to the webview");
         }
     }
 }
@@ -1043,8 +1057,6 @@ compile_error!("a release build must carry `bundled`, or the window loads build.
 fn main() {
     // The native confirmation in front of the onboarding writes (#1175).
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
-    // The OS notification a session's move into Needs or Done raises.
-    let builder = builder.plugin(tauri_plugin_notification::init());
     // Only a `wdio` build carries the embedded WebDriver the journey drives.
     #[cfg(feature = "wdio")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
@@ -1060,6 +1072,17 @@ fn main() {
                 shown: Mutex::new(None),
                 window_focused: AtomicBool::new(false),
             });
+            // macOS posts a notification as an app it knows: this bundle, or
+            // Terminal from a dev build, which has none (the rule
+            // tauri-plugin-notification used).
+            #[cfg(target_os = "macos")]
+            if let Err(error) = notify_rust::set_application(if tauri::is_dev() {
+                "com.apple.Terminal"
+            } else {
+                app.config().identifier.as_str()
+            }) {
+                tracing::warn!(?error, "notifications will post as the default application");
+            }
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme = Arc::new(ThemePick::load(hangar_home.join(theme::THEME_FILE)));
@@ -1234,6 +1257,11 @@ fn main() {
                 // it last saw of every session.
                 let mut seen = 0;
                 let mut notifier = Notifier::default();
+                let os = OsDelivery::default();
+                let open: notify_delivery::Open = {
+                    let handle = handle.clone();
+                    Arc::new(move |session| open_from_notice(&handle, session))
+                };
                 loop {
                     interval.tick().await;
                     let window = handle.state::<Window>();
@@ -1241,9 +1269,8 @@ fn main() {
                     if let Some(sessions) = window.shell.agent_sessions_since(&mut seen) {
                         let gate = handle.state::<Notifications>().gate();
                         let now = ainb_app::fleet::daemons::heartbeat::now_ms();
-                        for notice in notifier.observe(sessions, &gate, now) {
-                            show_notice(&handle, &notice);
-                        }
+                        let notices = notifier.observe(sessions, &gate, now);
+                        notify_delivery::announce(&os, notices, &open);
                     }
                 }
             });
