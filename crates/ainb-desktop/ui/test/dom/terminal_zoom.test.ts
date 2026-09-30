@@ -10,6 +10,7 @@ import { afterEach, test } from "node:test";
 import { createComponent, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { FitAddon } from "@xterm/addon-fit";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import type { Accelerator } from "../../src/tabs.ts";
 import { TerminalView } from "../../src/terminal.tsx";
@@ -171,34 +172,97 @@ test("a zoom refits the grid and tells the shell its new size", async () => {
   }
 });
 
-test("a zoom repaints every row once the grid is refit, not at the shell's next byte", async () => {
+/** Frames the pane asked for, run only when a test steps them. */
+const frames: FrameRequestCallback[] = [];
+Object.defineProperty(globalThis, "requestAnimationFrame", {
+  value: (callback: FrameRequestCallback) => frames.push(callback),
+  configurable: true,
+  writable: true,
+});
+afterEach(() => {
+  frames.length = 0;
+});
+/** Run the frames asked for so far; ones they ask for wait for the next step. */
+const frame = () => {
+  for (const callback of frames.splice(0)) callback(0);
+};
+
+/**
+ * Record, in order, the zoom's refit, WebGL atlas wipes and repaints, with
+ * the rows each repaint covered. `webgl`: the pane loads a WebGL addon (its
+ * renderer stubbed, as happy-dom has no WebGL); otherwise it has none.
+ */
+async function recordRepaint(webgl: boolean) {
+  const activate = WebglAddon.prototype.activate;
+  if (webgl) WebglAddon.prototype.activate = function () {};
   const pane = await mountPane(true);
+  WebglAddon.prototype.activate = activate;
   Object.defineProperty(pane.container.querySelector(".xterm-host"), "offsetParent", { get: () => document.body });
   const fit = FitAddon.prototype.fit;
   const refresh = Terminal.prototype.refresh;
+  const clearTextureAtlas = WebglAddon.prototype.clearTextureAtlas;
   const seen: string[] = [];
-  let painted: { start: number; end: number; rows: number } | undefined;
   FitAddon.prototype.fit = function (this: FitAddon) {
     seen.push("fit");
     return fit.call(this);
   };
+  WebglAddon.prototype.clearTextureAtlas = function (this: WebglAddon) {
+    seen.push("clearTextureAtlas");
+    return clearTextureAtlas.call(this);
+  };
   Terminal.prototype.refresh = function (this: Terminal, start: number, end: number) {
-    seen.push("refresh");
-    painted = { start, end, rows: this.rows };
+    seen.push(start === 0 && end === this.rows - 1 ? "refresh every row" : `refresh ${start}..${end} of ${this.rows}`);
     return refresh.call(this, start, end);
   };
-  try {
-    for (const chord of [CMD_EQUAL, CMD_MINUS, CMD_0]) {
-      seen.length = 0;
-      painted = undefined;
-      await pane.zoom(chord);
-      assert.deepEqual(seen, ["fit", "refresh"], `${chord.key}: refit, then repainted`);
-      assert.deepEqual(painted, { start: 0, end: painted!.rows - 1, rows: painted!.rows }, `${chord.key}: every row`);
-    }
-  } finally {
+  cleanups.push(() => {
     FitAddon.prototype.fit = fit;
     Terminal.prototype.refresh = refresh;
+    WebglAddon.prototype.clearTextureAtlas = clearTextureAtlas;
+  });
+  return { pane, seen };
+}
+
+test("a zoom wipes the WebGL glyph atlas and repaints every row two frames after the refit, as Orca's repaint does", async () => {
+  const { pane, seen } = await recordRepaint(true);
+  for (const chord of [CMD_EQUAL, CMD_MINUS, CMD_0]) {
+    seen.length = 0;
+    await pane.zoom(chord);
+    assert.deepEqual(seen, ["fit"], `${chord.key}: refit at once, the repaint waits for layout`);
+    frame();
+    assert.deepEqual(seen, ["fit"], `${chord.key}: not on the first frame`);
+    frame();
+    assert.deepEqual(seen, ["fit", "clearTextureAtlas", "refresh every row"], `${chord.key}: atlas wiped, then every row`);
   }
+});
+
+test("a pane with no WebGL renderer still repaints every row after a zoom", async () => {
+  const { pane, seen } = await recordRepaint(false);
+  await pane.zoom(CMD_EQUAL);
+  frame();
+  frame();
+  assert.deepEqual(seen, ["fit", "refresh every row"]);
+});
+
+test("a zoom sends the shell no input: the new size reaches it as a resize, never as a key", async () => {
+  const pane = await mountPane(true);
+  Object.defineProperty(pane.container.querySelector(".xterm-host"), "offsetParent", { get: () => document.body });
+  // With their key codes, so a zoom chord xterm took would reach the shell too.
+  const chords = [
+    { ...CMD_EQUAL, keyCode: 187 },
+    { ...CMD_PLUS, keyCode: 187 },
+    { ...CMD_MINUS, keyCode: 189 },
+    { ...CMD_0, keyCode: 48 },
+  ];
+  hostCalls.delete("terminal_input");
+  hostCalls.delete("terminal_resize");
+  for (const chord of chords) {
+    await pane.zoom(chord);
+    frame();
+    frame();
+    await paint();
+  }
+  assert.equal(hostCalls.get("terminal_input"), undefined, "no byte for any zoom, nor for its repaint");
+  assert.ok(hostCalls.get("terminal_resize"), "the zooms did run: the shell heard the new size");
 });
 
 test("the size lives with its pane: another pane keeps its own, and a hidden pane keeps its zoom", async () => {
