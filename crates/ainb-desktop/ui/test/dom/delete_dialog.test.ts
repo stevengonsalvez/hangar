@@ -368,6 +368,23 @@ for (const [count, lands, keyboard] of [
   });
 }
 
+for (const [count, lands] of [
+  ["dirty", { tree: "removed", changes: 2 }],
+  ["uncounted", { tree: "removed", changes: null }],
+  ["clean", { tree: "removed", changes: 0 }],
+] as const) {
+  test(`a count that lands after the keyboard moved leaves it where it is (${count})`, async () => {
+    const host = heldAnswers();
+    await mount(host.preview);
+    await chooseDelete("claude-1");
+    // The person moves the keyboard off Cancel while the host counts.
+    dialog()!.focus();
+    await settle();
+    await host.answer(lands);
+    focusIs(dialog()!, `the ${count} count did not take the keyboard back`);
+  });
+}
+
 test("a second opening does not take the first one's answer for its own", async () => {
   // The first row's clean answer must not reach the second opening's
   // dialog: until the second count lands, nothing is known about it.
