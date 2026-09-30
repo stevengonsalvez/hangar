@@ -32,6 +32,17 @@ export type CreatedWorktree = {
 	branch: string,
 };
 
+/**  What the delete dialog says before anything is removed. */
+export type DeletePreview = {
+	tree: TreeFate,
+	/**
+	 *  Uncommitted and untracked files the removal takes with it: only asked
+	 *  when the tree is [`TreeFate::Removed`], and `None` there when git could
+	 *  not answer.
+	 */
+	changes: number | null,
+};
+
 /**
  *  A catalog dependency as the page lists it: detected, never installed by
  *  the page itself.
@@ -157,6 +168,21 @@ export type ThemePreference =
 "light" | 
 /**  Always dark. */
 "dark";
+
+/**
+ *  What deleting a session does to the folder it runs in. Sent back with the
+ *  delete, so the host deletes only what the person was told.
+ */
+export type TreeFate = 
+/**  No other session uses the worktree: it is removed from git and disk. */
+"removed" | 
+/**  Another session still works in the worktree: only this session goes. */
+"shared" | 
+/**
+ *  Not a worktree ainb made (the person's own checkout), or nothing on
+ *  disk: only the session goes.
+ */
+"kept";
 
 /**  A worktree, as the page may name one. */
 export type WorktreeTarget = 

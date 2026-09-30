@@ -31,6 +31,7 @@ pub fn typescript() -> Result<String, specta_typescript::Error> {
         .register::<crate::create::CreateWorktreeArgs>()
         .register::<crate::create::CreatedWorktree>()
         .register::<crate::worktree_target::WorktreeTarget>()
+        .register::<crate::delete::DeletePreview>()
         .register::<crate::theme::ThemePreference>()
         .register::<crate::projects::RegisteredProject>();
     specta_typescript::Typescript::default()

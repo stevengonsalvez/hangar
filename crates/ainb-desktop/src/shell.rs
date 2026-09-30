@@ -143,6 +143,13 @@ impl<S: FrameSink> Shell<S> {
         self.core()
     }
 
+    /// Scan the workspaces now rather than on the next cadence, for a change
+    /// this window made itself (a deleted session) and wants drawn at once.
+    /// Must be called inside a tokio runtime.
+    pub fn reload_workspaces(&self) {
+        self.core().host.start_workspace_load();
+    }
+
     /// Every command the palette may offer; see [`DesktopHost::palette`].
     #[must_use]
     pub fn palette(&self) -> Vec<crate::host::PaletteEntry> {

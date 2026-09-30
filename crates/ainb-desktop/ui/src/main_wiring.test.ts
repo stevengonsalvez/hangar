@@ -71,9 +71,29 @@ test("a sidebar row's menu runs through the window's own open, ordered dispatch 
   // right pick; this is the one place those deps become real host calls.
   assert.match(
     MAIN,
-    /onRowPick=\{\(pick\) =>(?:\s*\/\/[^\n]*)*\s*runRowPick\(pick, \{\s*open: \(id\) => void answer\(\[openRowIntent\(\{ session: id \}\)\]\),\s*run: \(intents\) => void answer\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*reselect: shownRowIntents,\s*\}\)\s*\}/,
+    /onRowPick=\{\(pick\) =>(?:\s*\/\/[^\n]*)*\s*runRowPick\(pick, \{\s*open: \(id\) => void answer\(\[openRowIntent\(\{ session: id \}\)\]\),\s*run: \(intents\) => void answer\(intents\),\s*copy: \(text\) => void invoke\("clipboard_write", \{ text \}\),\s*reselect: shownRowIntents,\s*confirmDelete: deletion\.open,\s*\}\)\s*\}/,
   );
   // The row that goes back is the shown terminal's, and only while one is shown.
   const shown = body("shownRowIntents", "onMount(");
   assert.match(shown, /showing\("terminal"\) && key !== null \? selectIntentFor\(tabs\(\), key\) : null/);
+});
+
+test("the delete confirmation is a modal the window draws, and the only way to the host's delete", () => {
+  // `test/dom/delete_dialog.test.ts` drives the dialog; this is where it is
+  // mounted over the flow the row menu opens.
+  assert.match(
+    MAIN,
+    /<Show when=\{deletion\.target\(\)\}>\s*\{\(target\) => \(\s*<DeleteDialog\s*target=\{target\(\)\}\s*state=\{deletion\.state\(\)\}\s*onConfirm=\{deletion\.confirm\}\s*onClose=\{deletion\.close\}/,
+  );
+  // Open, the shell behind it is inert and no chord runs behind it.
+  assert.match(MAIN, /const modalOpen = \(\) => composer\.open\(\) \|\| deletion\.target\(\) !== null;/);
+  assert.ok(MAIN.includes('element.toggleAttribute("inert", modalOpen())'));
+  assert.ok(MAIN.includes("shellKeydown({ mac: MAC, modalOpen, run: onAccelerator })"));
+  assert.ok(MAIN.includes("if (modalBlocks(shell, modalOpen())) return;"));
+  assert.match(
+    MAIN,
+    /if \(modalBlocks\(shell, modalOpen\(\)\)\) return;(?:\s*\/\/[^\n]*)*\s*if \(deletion\.target\(\) !== null\) return;/,
+    "no chord, Mod+N included, runs under the delete confirmation",
+  );
+  assert.ok(!MAIN.includes('"session_delete"'), "main never deletes except through the flow");
 });

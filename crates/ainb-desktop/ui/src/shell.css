@@ -1187,6 +1187,139 @@ body {
   cursor: default;
 }
 
+/* Orca's destructive menu item: Delete reads red. */
+.row-menu-item.destructive:not([aria-disabled="true"]) {
+  color: var(--destructive);
+}
+
+/* The row menu's Delete confirmation (`delete_dialog.tsx`): Orca's small
+   `max-w-md` dialog, on the composer's elevated surface. */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-block: 18vh;
+  background: color-mix(in srgb, var(--background) 60%, transparent);
+}
+
+.delete-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(420px, 92vw);
+  padding: 20px;
+  border: 1px solid var(--float-border);
+  border-radius: var(--radius-xl);
+  background: var(--float-bg);
+  box-shadow: var(--float-shadow);
+  outline: none;
+}
+
+.delete-dialog-title {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--text-row);
+  font-weight: 600;
+}
+
+.delete-dialog-description {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: var(--text-sub);
+}
+
+.delete-dialog-target {
+  color: var(--text);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.delete-dialog-preview {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--muted) 35%, transparent);
+  font-size: var(--text-sub);
+}
+
+.delete-dialog-name {
+  color: var(--text);
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.delete-dialog-path {
+  margin-top: 4px;
+  color: var(--muted-foreground);
+  word-break: break-all;
+}
+
+.delete-dialog-dirty {
+  margin-top: 4px;
+  color: var(--destructive);
+  font-weight: 500;
+}
+
+.delete-dialog-dirty::before {
+  content: "⚠ ";
+}
+
+.delete-dialog-unchecked {
+  margin-top: 4px;
+  color: var(--muted-foreground);
+}
+
+.delete-dialog-error {
+  padding: 8px 12px;
+  border: 1px solid color-mix(in srgb, var(--destructive) 40%, transparent);
+  border-radius: var(--radius-md);
+  color: var(--destructive);
+  font-size: var(--text-sub);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.delete-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.delete-dialog-cancel,
+.delete-dialog-confirm {
+  padding: 6px 14px;
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--text-row);
+  cursor: pointer;
+}
+
+.delete-dialog-cancel {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+}
+
+.delete-dialog-confirm {
+  border: none;
+  background: var(--destructive);
+  color: var(--background);
+}
+
+.delete-dialog-confirm:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.delete-dialog-cancel:focus-visible,
+.delete-dialog-confirm:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 1px;
+}
+
 /* The new-worktree composer (Mod+N): a floating surface like the palette's,
    over `--float-bg`/`--float-border`/`--float-shadow` rather than the flat
    `--panel` the palette reads, since this one is a form, not a scrolling

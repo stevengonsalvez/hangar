@@ -6,9 +6,10 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 
-use super::util::{find_session, mutate_session_store};
+use super::util::{find_session, load_session_store, mutate_session_store};
 use super::{KillArgs, OutputFormat, StatusArgs};
 use crate::tmux::ClaudeProcessDetector;
 
@@ -183,23 +184,95 @@ pub async fn kill(args: KillArgs) -> Result<()> {
 
     println!("Session '{workspace_name}' removed.");
 
-    // Note: We don't remove the worktree by default
-    // The user can manually clean it up or we could add --cleanup-worktree flag
-    println!(
-        "\nNote: Worktree at '{}' was not removed.",
-        session.worktree_path.display()
-    );
-    println!(
-        "To clean up, run: rm -rf {}",
-        session.worktree_path.display()
-    );
+    // The worktree is never removed here. The removal hint is only for a
+    // tree ainb made that no other session is in: `rm -rf` on a shared tree
+    // pulls it out from under that session, and on a session run in the
+    // repository itself it names the user's own checkout.
+    // `for_reading`: a question about the tree must not create ainb's
+    // worktree directories as a side effect.
+    let note = match (
+        crate::git::WorktreeManager::for_reading(),
+        load_session_store(),
+    ) {
+        (Ok(manager), Ok(store)) => {
+            kill_note(&manager, &store, &session.worktree_path, session.session_id)
+        }
+        _ => kept_tree_note(&session.worktree_path, &KeptTree::Other),
+    };
+    println!("\n{note}");
 
     Ok(())
+}
+
+/// What `ainb kill` may say about the worktree it leaves behind.
+#[derive(Debug, PartialEq, Eq)]
+enum KeptTree {
+    /// A tree ainb made that no other session uses: safe to remove. The
+    /// path is the tree itself, resolved, never a `by-session` link to it.
+    Removable(std::path::PathBuf),
+    /// A tree ainb made that another session still works in.
+    Shared,
+    /// Not a tree ainb made (a session run in the repository itself), or
+    /// one whose users could not be read: never offered for removal.
+    Other,
+}
+
+/// Which [`KeptTree`] `tree` is once `killed`'s row is gone, by the one
+/// check every path that may remove a session's tree asks
+/// ([`crate::interactive::session_manager::tree_in_use_by_another`]).
+fn kept_tree(
+    manager: &crate::git::WorktreeManager,
+    store: &crate::interactive::session_manager::SessionStore,
+    tree: &Path,
+    killed: uuid::Uuid,
+) -> KeptTree {
+    let Some(resolved) = manager.managed_tree(tree) else {
+        return KeptTree::Other;
+    };
+    if crate::interactive::session_manager::tree_in_use_by_another(
+        manager,
+        store,
+        tree,
+        Some(killed),
+    ) {
+        KeptTree::Shared
+    } else {
+        KeptTree::Removable(resolved)
+    }
+}
+
+/// What `ainb kill` prints about `tree`, the killed session's worktree, once
+/// its row is gone.
+fn kill_note(
+    manager: &crate::git::WorktreeManager,
+    store: &crate::interactive::session_manager::SessionStore,
+    tree: &Path,
+    killed: uuid::Uuid,
+) -> String {
+    kept_tree_note(tree, &kept_tree(manager, store, tree, killed))
+}
+
+/// The note `ainb kill` prints about the worktree it leaves behind.
+fn kept_tree_note(tree: &Path, kept: &KeptTree) -> String {
+    let tree = tree.display();
+    match kept {
+        // Quoted: the base comes from `$HOME` or `$AINB_HOME`, which may
+        // hold a space or an apostrophe, and the line is meant to be pasted.
+        KeptTree::Removable(resolved) => {
+            let word = shell_escape::escape(resolved.to_string_lossy());
+            format!("Note: Worktree at '{tree}' was not removed.\nTo clean up, run: rm -rf {word}")
+        }
+        KeptTree::Shared => {
+            format!("Note: Worktree at '{tree}' was not removed: another session still uses it.")
+        }
+        KeptTree::Other => format!("Note: Worktree at '{tree}' was not removed."),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::interactive::session_manager::SessionMetadata;
     use crate::models::session::SessionAgentType;
     use chrono::Utc;
@@ -222,6 +295,105 @@ mod tests {
             codex_model: None,
             codex_thread_id: None,
             claude_session_id: None,
+        }
+    }
+
+    /// Only a tree ainb made that no other session uses gets the `rm -rf`
+    /// hint.
+    #[test]
+    fn the_removal_hint_is_only_for_a_removable_tree() {
+        let tree = Path::new("/w/app--feat--1a2b3c4d");
+        let removable = kept_tree_note(tree, &KeptTree::Removable(tree.to_path_buf()));
+        assert!(
+            removable.ends_with("To clean up, run: rm -rf /w/app--feat--1a2b3c4d"),
+            "{removable}"
+        );
+        let shared = kept_tree_note(tree, &KeptTree::Shared);
+        assert!(!shared.contains("rm -rf"), "{shared}");
+        assert!(shared.contains("another session still uses it"), "{shared}");
+        let other = kept_tree_note(tree, &KeptTree::Other);
+        assert!(!other.contains("rm -rf"), "{other}");
+    }
+
+    /// The killed session's own `by-session` link does not count as a user;
+    /// another session's row or link does; a folder ainb did not make is
+    /// never offered for removal.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_is_removable_only_when_ainb_made_it_and_no_one_else_uses_it() {
+        use crate::interactive::session_manager::SessionStore;
+        let root = tempfile::tempdir().unwrap();
+        let manager =
+            crate::git::WorktreeManager::with_base_dir(root.path().join("worktrees")).unwrap();
+        let by_name = root.path().join("worktrees/by-name");
+        let by_session = root.path().join("worktrees/by-session");
+        std::fs::create_dir_all(&by_session).unwrap();
+        let tree = by_name.join("app--feat--1a2b3c4d");
+        std::fs::create_dir_all(&tree).unwrap();
+        let (killed, other) = (Uuid::new_v4(), Uuid::new_v4());
+        std::os::unix::fs::symlink(&tree, by_session.join(killed.to_string())).unwrap();
+
+        let empty = SessionStore::default();
+        assert_eq!(
+            kept_tree(&manager, &empty, &tree, killed),
+            KeptTree::Removable(std::fs::canonicalize(&tree).unwrap())
+        );
+
+        let mut joined = SessionStore::default();
+        let mut row = create_test_session(other, "app", "ainb-joined");
+        row.worktree_path = tree.clone();
+        joined.upsert(row);
+        assert_eq!(
+            kept_tree(&manager, &joined, &tree, killed),
+            KeptTree::Shared
+        );
+
+        std::os::unix::fs::symlink(&tree, by_session.join(other.to_string())).unwrap();
+        assert_eq!(kept_tree(&manager, &empty, &tree, killed), KeptTree::Shared);
+
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert_eq!(kept_tree(&manager, &empty, &repo, killed), KeptTree::Other);
+    }
+
+    /// The hint names the tree ainb made, resolved (not a `by-session` link
+    /// to it), quoted so a home with a space or an apostrophe stays one
+    /// argument to `rm`.
+    #[cfg(unix)]
+    #[test]
+    fn the_hint_names_the_resolved_tree_quoted_for_the_shell() {
+        use crate::interactive::session_manager::SessionStore;
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().join("Jane O'Doe/.agents-in-a-box/worktrees");
+        let manager = crate::git::WorktreeManager::with_base_dir(base.clone()).unwrap();
+        let by_session = base.join("by-session");
+        std::fs::create_dir_all(&by_session).unwrap();
+        let tree = base.join("by-name/app--feat--1a2b3c4d");
+        std::fs::create_dir_all(&tree).unwrap();
+        let killed = Uuid::new_v4();
+        let link = by_session.join(killed.to_string());
+        std::os::unix::fs::symlink(&tree, &link).unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let resolved = std::fs::canonicalize(&tree).unwrap();
+        let expected = format!(
+            "To clean up, run: rm -rf '{}/Jane O'\\''Doe/.agents-in-a-box/worktrees/by-name/app--feat--1a2b3c4d'",
+            root.display()
+        );
+
+        for input in [&tree, &link] {
+            let note = kill_note(&manager, &SessionStore::default(), input, killed);
+            assert!(note.ends_with(&expected), "{}: {note}", input.display());
+            // The quoted word is exactly the tree to a real shell.
+            let word = note.rsplit("rm -rf ").next().unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {word}")])
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                resolved.to_string_lossy(),
+                "{note}"
+            );
         }
     }
 

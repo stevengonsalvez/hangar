@@ -19,6 +19,7 @@ use ainb_app::config::AppConfig;
 use ainb_app::wire::frame::{FrameBatch, HostId, Subscription};
 use ainb_app::{Intent, Keymap};
 use ainb_desktop::create::{CreateWorktreeArgs, CreatedWorktree};
+use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
@@ -167,7 +168,7 @@ fn clipboard_write(text: String) {
 
 /// The terminal's paste: the clipboard's text for the pane `key` is showing.
 ///
-/// Answered only for the tab the window has in front of the operator, which is
+/// Answered only for a tab the window has in front of the operator, which is
 /// the only caller: paste is a pane's own accelerator, so no other renderer
 /// path, and no driver on a `wdio` build, reads what was last copied. Empty
 /// when the clipboard holds no text, cannot be read, or holds more than a
@@ -274,6 +275,13 @@ fn terminal_resize(window: tauri::State<'_, Window>, key: String, cols: u16, row
     if let Some(terminals) = &window.terminals {
         terminals.resize(&key, cols, rows);
     }
+}
+
+/// The tabs the layout has on screen, exactly `keys`: the cap spares each,
+/// and each may paste. `false`, changing nothing, for too many keys.
+#[tauri::command]
+fn terminal_visible(window: tauri::State<'_, Window>, keys: Vec<String>) -> bool {
+    window.terminals.as_ref().is_some_and(|terminals| terminals.set_visible(keys))
 }
 
 /// Cmd+K: clear the tab's scrollback in tmux and redraw its client. Off the
@@ -452,6 +460,36 @@ async fn worktree_create(
         }
     }
     Ok(created)
+}
+
+/// What deleting a session would remove, for the delete dialog to say before
+/// anything goes. Read-only; a failure is the sentence the dialog shows.
+#[tauri::command]
+async fn session_delete_preview(session_id: String) -> Result<DeletePreview, String> {
+    ainb_desktop::delete::preview(&session_id)
+        .await
+        .map_err(|error| intent::toast_text(&error))
+}
+
+/// Delete a session as the terminal's `d` then Delete does, if it still
+/// removes what the dialog said (`expected`, and no more uncommitted changes
+/// than `expected_changes`; `force` accepts the dirty or uncounted work the
+/// dialog showed), then rescan so its row leaves the sidebar now rather than
+/// on the next cadence.
+#[tauri::command]
+async fn session_delete(
+    window: tauri::State<'_, Window>,
+    session_id: String,
+    expected: TreeFate,
+    expected_changes: Option<u32>,
+    force: bool,
+) -> Result<(), String> {
+    let outcome =
+        ainb_desktop::delete::delete(&session_id, expected, expected_changes, force).await;
+    // Rescanned either way: a removal that failed part-way may still have
+    // taken the session's tmux or its row.
+    window.shell.reload_workspaces();
+    outcome.map_err(|error| intent::toast_text(&error))
 }
 
 /// The composer's Project select: every repository in a folder the daemon
@@ -1253,12 +1291,15 @@ fn main() {
             terminal_ack,
             terminal_input,
             terminal_resize,
+            terminal_visible,
             terminal_clear,
             terminal_close,
             shell_open,
             shell_close,
             shell_reattach,
             worktree_create,
+            session_delete_preview,
+            session_delete,
             projects_list,
             project_add,
             update_check,

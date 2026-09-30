@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use ainb_app::{CommandId, Intent};
 use ainb_desktop::terminal::{
-    MAX_ATTACHED_TABS, TabEvents, TabState, TabTarget, TabsView, Terminals, Tmux, WINDOW_BYTES,
+    MAX_ATTACHED_TABS, MAX_VISIBLE_TABS, TabEvents, TabState, TabTarget, TabsView, Terminals, Tmux,
+    WINDOW_BYTES,
 };
 
 /// One test's private tmux server.
@@ -626,6 +627,215 @@ fn the_tab_in_view_is_not_evicted_for_being_quiet() {
             .count(),
         1
     );
+}
+
+fn attached_count(terminals: &Terminals) -> usize {
+    terminals
+        .view()
+        .tabs
+        .iter()
+        .filter(|tab| tab.state == TabState::Attached)
+        .count()
+}
+
+/// Open `count` tabs on sessions named `{prefix}{i}`, oldest first, with
+/// distinct open times so "idle longest" has one answer.
+fn open_quiet_tabs<'a>(
+    server: &'a Server,
+    terminals: &Terminals,
+    prefix: &str,
+    count: usize,
+    total: usize,
+) -> (Vec<String>, Vec<Session<'a>>) {
+    let names: Vec<String> = (0..total).map(|i| format!("{prefix}{i}")).collect();
+    let sessions = names.iter().map(|name| server.start(name, "sleep 600")).collect();
+    for name in &names[..count] {
+        assert_eq!(terminals.open(tmux_tab(name)), None, "{name} opened");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (names, sessions)
+}
+
+/// Each layout change names the panes on screen; the set is replaced, not
+/// added to, and only a listed tab in it may paste.
+#[test]
+fn the_visible_set_is_replaced_and_gates_paste_per_pane() {
+    let server = Server::new();
+    let (terminals, _recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(&server, &terminals, "d1c-vis", 3, 4);
+    let showing = |name: &String| terminals.showing(name);
+
+    assert!(terminals.set_visible(vec![names[0].clone(), names[1].clone(), names[0].clone(),]));
+    assert!(
+        showing(&names[0]) && showing(&names[1]),
+        "each pane on screen may paste"
+    );
+    assert!(!showing(&names[2]), "a tab off screen may not paste");
+
+    assert!(terminals.set_visible(vec![names[2].clone(), names[3].clone()]));
+    assert!(showing(&names[2]));
+    assert!(
+        !showing(&names[0]) && !showing(&names[1]),
+        "the new set replaced the old one"
+    );
+    assert!(!showing(&names[3]), "a key no tab has yet may not paste");
+    assert_eq!(terminals.open(tmux_tab(&names[3])), None);
+    assert!(showing(&names[3]), "the kept key counts once its tab lists");
+
+    assert!(terminals.set_visible(Vec::new()));
+    assert!(names.iter().all(|name| !showing(name)), "nothing on screen");
+}
+
+/// More than [`MAX_VISIBLE_TABS`] keys is refused whole: the set stays as
+/// it was rather than growing with whatever a client sends.
+#[test]
+fn an_oversized_visible_set_is_refused_and_changes_nothing() {
+    let server = Server::new();
+    let (terminals, _recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(&server, &terminals, "d1c-big", 1, 1);
+    assert!(terminals.set_visible(names.clone()));
+
+    let flood: Vec<String> = (0..=MAX_VISIBLE_TABS).map(|i| format!("d1c-none{i}")).collect();
+    assert!(
+        !terminals.set_visible(flood),
+        "one key over the bound is refused"
+    );
+    assert!(terminals.showing(&names[0]), "the earlier set stands");
+
+    let repeated = vec![names[0].clone(); MAX_VISIBLE_TABS * 4];
+    assert!(terminals.set_visible(repeated), "duplicates count once");
+}
+
+/// Before the webview names its set, sizing a tab makes it the only one in
+/// view, as today's single-pane window has it. Once it has named one, sizing
+/// a pane leaves the set alone.
+#[test]
+fn sizing_marks_the_only_tab_in_view_until_the_webview_names_a_set() {
+    let server = Server::new();
+    let (terminals, _recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(&server, &terminals, "d1c-size", 2, 2);
+
+    terminals.resize(&names[0], 80, 24);
+    assert!(terminals.showing(&names[0]));
+    terminals.resize(&names[1], 80, 24);
+    assert!(terminals.showing(&names[1]));
+    assert!(
+        !terminals.showing(&names[0]),
+        "sizing replaced the tab in view"
+    );
+
+    assert!(terminals.set_visible(names.clone()));
+    terminals.resize(&names[1], 100, 30);
+    assert!(
+        terminals.showing(&names[0]) && terminals.showing(&names[1]),
+        "sizing one split pane did not take the other off screen"
+    );
+}
+
+/// Every pane on screen is spared by the cap however quiet; the tabs idle
+/// longest off screen go instead.
+#[test]
+fn every_visible_pane_survives_the_cap() {
+    let server = Server::new();
+    let (terminals, recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(
+        &server,
+        &terminals,
+        "d1c-split",
+        MAX_ATTACHED_TABS,
+        MAX_ATTACHED_TABS + 2,
+    );
+    // The three oldest tabs are on screen, then every other tab has input:
+    // the panes in view are the ones idle longest.
+    assert!(terminals.set_visible(names[..3].to_vec()));
+    for name in &names[3..MAX_ATTACHED_TABS] {
+        terminals.input(name, Vec::new());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    for name in &names[MAX_ATTACHED_TABS..] {
+        assert_eq!(terminals.open(tmux_tab(name)), None);
+    }
+
+    for name in &names[..3] {
+        assert_eq!(
+            state_of(&terminals, name),
+            Some(TabState::Attached),
+            "{name} is on screen and stays"
+        );
+    }
+    assert_eq!(state_of(&terminals, &names[3]), Some(TabState::Detached));
+    assert_eq!(state_of(&terminals, &names[4]), Some(TabState::Detached));
+    assert_eq!(attached_count(&terminals), MAX_ATTACHED_TABS);
+    assert!(
+        !recorder.toasts.lock().unwrap().iter().any(|toast| names[..3]
+            .iter()
+            .any(|name| toast.starts_with(&format!("Detached {name}:")))),
+        "no pane on screen was detached"
+    );
+}
+
+/// With more panes on screen than the cap, none is detached: the cap gives
+/// way while they show. The next open after they leave the screen brings the
+/// attached tabs back down to the cap.
+#[test]
+fn more_visible_panes_than_the_cap_are_all_kept_until_they_leave() {
+    let server = Server::new();
+    let (terminals, recorder, _reports) = terminals(&server);
+    let total = MAX_ATTACHED_TABS + 3;
+    let (names, _sessions) =
+        open_quiet_tabs(&server, &terminals, "d1c-many", MAX_ATTACHED_TABS, total);
+    // Named before the last tabs open, as a layout can be.
+    assert!(terminals.set_visible(names[..=MAX_ATTACHED_TABS].to_vec()));
+
+    assert_eq!(terminals.open(tmux_tab(&names[MAX_ATTACHED_TABS])), None);
+    assert_eq!(
+        attached_count(&terminals),
+        MAX_ATTACHED_TABS + 1,
+        "no pane on screen was detached to keep the cap"
+    );
+    assert!(
+        !recorder
+            .toasts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|toast| toast.starts_with("Detached")),
+        "nothing was detached"
+    );
+
+    // Only the newest is left on screen; opening one more restores the cap.
+    assert!(terminals.set_visible(vec![names[MAX_ATTACHED_TABS].clone()]));
+    assert_eq!(
+        terminals.open(tmux_tab(&names[MAX_ATTACHED_TABS + 1])),
+        None
+    );
+    assert_eq!(attached_count(&terminals), MAX_ATTACHED_TABS);
+    assert_eq!(
+        state_of(&terminals, &names[MAX_ATTACHED_TABS]),
+        Some(TabState::Attached)
+    );
+    assert_eq!(state_of(&terminals, &names[0]), Some(TabState::Detached));
+    assert_eq!(state_of(&terminals, &names[1]), Some(TabState::Detached));
+}
+
+/// A closed tab leaves the set in view: opened again under the same key, it
+/// is not in view until the webview names it.
+#[test]
+fn a_closed_tab_leaves_the_visible_set() {
+    let server = Server::new();
+    let (terminals, _recorder, _reports) = terminals(&server);
+    let (names, _sessions) = open_quiet_tabs(&server, &terminals, "d1c-gone", 2, 2);
+    assert!(terminals.set_visible(names.clone()));
+
+    terminals.close(&names[0]);
+    assert_eq!(terminals.open(tmux_tab(&names[0])), None);
+
+    assert!(
+        !terminals.showing(&names[0]),
+        "the reopened tab is not in view"
+    );
+    assert!(terminals.showing(&names[1]), "the other pane stays in view");
 }
 
 /// The history size tmux holds for the session's active pane.

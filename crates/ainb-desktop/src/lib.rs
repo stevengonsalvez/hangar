@@ -10,6 +10,8 @@
 //! - [`worktree_target`] is how the page names a worktree for the strip's
 //!   "+", and how the host resolves it.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
+//! - [`delete`] deletes a session from the window, and first says what
+//!   that removes: the folder, or only the session when another shares it.
 //! - [`projects`] lists the repositories the composer may create into,
 //!   sessions or not.
 //! - [`setup`] is the desktop-native path for the onboarding writes the
@@ -34,6 +36,7 @@ pub mod bindings;
 pub mod clipboard;
 pub mod create;
 pub mod daemons_panel;
+pub mod delete;
 pub mod executor;
 pub mod host;
 pub mod intent;

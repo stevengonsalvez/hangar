@@ -68,3 +68,29 @@ export function tauriTransport(key: string, bridge: Bridge = TAURI): TerminalTra
     },
   };
 }
+
+/** The last visible set sent, settled or not. */
+let inFlight: Promise<void> = Promise.resolve();
+
+/**
+ * The tabs the layout has on screen: exactly `keys`, one per pane showing,
+ * sent on mount and on every layout change, since the host keeps the last set
+ * across a reload. The host spares each from the attached-tab cap and lets
+ * each paste. `false` when the host refused the set (more keys than
+ * it takes) and kept the one it had.
+ */
+export function setVisibleTerminals(keys: readonly string[], bridge: Bridge = TAURI): Promise<boolean> {
+  const sent = bridge.invoke("terminal_visible", { keys: [...keys] }).then((taken) => taken === true);
+  // Settled either way: a set the host never took must not hold a paste.
+  inFlight = sent.then(() => undefined, () => undefined);
+  return sent;
+}
+
+/**
+ * Resolves once the host has answered the last visible set sent. A paste
+ * waits on it, so one right after a layout change reads the clipboard against
+ * the panes now on screen, not the ones before.
+ */
+export function visibleTerminalsSettled(): Promise<void> {
+  return inFlight;
+}
