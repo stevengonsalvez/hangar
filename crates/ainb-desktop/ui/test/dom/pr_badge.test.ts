@@ -2,7 +2,8 @@
 // has a PR draws its badge and CI dot, a click on the badge opens the PR
 // through the host's `open_url` and never opens or selects a row, and a card
 // whose lookup missed, or whose command failed, draws no badge at all, even
-// one that drew a badge before its refresh missed.
+// one that drew a badge before its refresh missed. A right-click on the badge
+// opens no row menu.
 
 import "./window.ts";
 import { drain, host, mountWindow, until } from "./window_host.ts";
@@ -72,6 +73,19 @@ test("clicking the badge opens the PR through open_url and does not open or sele
   assert.equal(document.querySelector(".session-row[aria-current]") !== null, false, "no row is drawn selected");
   assert.equal(document.activeElement?.closest(".session-row") != null, false, "no row took the keyboard");
   assert.equal(cardHeard, 0, "the click stopped at the badge");
+});
+
+test("right-clicking the badge opens no row menu, while the card's row still has one", async () => {
+  await until(() => hasBadge("u-1"), "u-1's PR badge");
+  const rightClick = (target: Element) =>
+    target.dispatchEvent(new window.MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 5, clientY: 5 }));
+  rightClick(badgeOf("u-1")!);
+  await drain();
+  assert.equal(document.querySelector(".row-menu") !== null, false, "no menu on the badge");
+  rightClick(cardOf("u-1")!.querySelector(".session-row")!);
+  await until(() => document.querySelector(".row-menu") !== null, "the row's own menu");
+  (document.activeElement ?? document.body).dispatchEvent(new window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+  await until(() => document.querySelector(".row-menu") === null, "the menu closed");
 });
 
 test("a card whose refresh misses or fails drops the badge it drew", async () => {

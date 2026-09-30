@@ -309,6 +309,8 @@ function Card(props: {
   /** A right-click anywhere on the card, as on Orca's: on a row it acts on
    * that row's session, elsewhere on the card's first. */
   const onContextMenu = (event: MouseEvent) => {
+    // The PR badge is the branch's, not a row's: no row menu opens on it.
+    if ((event.target as Element).closest(".pr-badge")) return;
     const card = event.currentTarget as HTMLElement;
     const row =
       (event.target as Element).closest<HTMLElement>(".session-row") ?? card.querySelector<HTMLElement>(".session-row");
