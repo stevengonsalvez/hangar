@@ -461,8 +461,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_IN_FLIGHT, MAX_OUTPUT_BYTES, Miss, PrBadge, PrBadges, PrChecks, PrState, TTL, lookup,
-        parse,
+        MAX_ENTRIES, MAX_IN_FLIGHT, MAX_OUTPUT_BYTES, Miss, PrBadge, PrBadges, PrChecks, PrState,
+        SETTLED_TTL, TTL, lookup, parse, plausible_branch,
     };
 
     const URL: &str = "https://github.com/o/r/pull/7";
@@ -589,7 +589,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_re_run_check_counts_only_its_latest_run() {
+        let run = |workflow: &str, name: &str, conclusion: &str, at: &str| {
+            format!(
+                r#"{{"__typename":"CheckRun","workflowName":"{workflow}","name":"{name}","status":"COMPLETED","conclusion":"{conclusion}","startedAt":"{at}"}}"#
+            )
+        };
+        let failed = run("CI", "Lint", "FAILURE", "2026-09-29T10:00:00Z");
+        let passed = run("CI", "Lint", "SUCCESS", "2026-09-29T11:00:00Z");
+        assert_eq!(checks_of(&format!("[{failed},{passed}]")), PrChecks::Pass);
+        assert_eq!(
+            checks_of(&format!("[{passed},{failed}]")),
+            PrChecks::Pass,
+            "in any order"
+        );
+        let failed_again = run("CI", "Lint", "FAILURE", "2026-09-29T12:00:00Z");
+        assert_eq!(
+            checks_of(&format!("[{passed},{failed_again}]")),
+            PrChecks::Fail
+        );
+        // The same job name in another workflow is another check.
+        let other = run("Deploy", "Lint", "FAILURE", "2026-09-29T09:00:00Z");
+        assert_eq!(checks_of(&format!("[{passed},{other}]")), PrChecks::Fail);
+        // A commit status re-reported under the same context.
+        let status = |state: &str, at: &str| {
+            format!(
+                r#"{{"__typename":"StatusContext","context":"ci/jenkins","state":"{state}","startedAt":"{at}"}}"#
+            )
+        };
+        let statuses = [
+            status("FAILURE", "2026-09-29T10:00:00Z"),
+            status("SUCCESS", "2026-09-29T11:00:00Z"),
+        ];
+        assert_eq!(
+            checks_of(&format!("[{}]", statuses.join(","))),
+            PrChecks::Pass
+        );
+        // Entries with no name are never folded together.
+        assert_eq!(checks_of(&format!("[{PASS},{FAIL}]")), PrChecks::Fail);
+    }
+
+    #[test]
+    fn a_branch_gh_would_read_as_a_pr_number_or_a_flag_is_refused() {
+        for branch in ["", "42", "#42", "##7", "-R", "--repo=evil/x", "a b", "a\nb"] {
+            assert!(!plausible_branch(branch), "{branch:?}");
+        }
+        for branch in [
+            "main",
+            "feature/42",
+            "42a",
+            "v2",
+            "#fix",
+            "ainb/o16-pr-badge",
+        ] {
+            assert!(plausible_branch(branch), "{branch:?}");
+        }
+    }
+
     /// A fake `gh` in a fresh folder: `script` is its `sh` body.
+    #[cfg(unix)]
     fn fake_gh(script: &str) -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -603,6 +662,22 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// [`lookup`], again while the kernel calls the just-written fake busy:
+    /// another test thread's fork can hold its write descriptor until that
+    /// child execs (`ETXTBSY`, as in `ainb-app`'s headroom tests, #1129).
+    async fn run(gh: &Path, worktree: &Path, branch: &str) -> Result<PrBadge, Miss> {
+        for _ in 0..500 {
+            match lookup(gh, worktree, branch).await {
+                Err(Miss::Spawn(std::io::ErrorKind::ExecutableFileBusy)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                answered => return answered,
+            }
+        }
+        panic!("the fake gh stayed busy for 5 s");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_real_answer_is_read_through_argv() {
         // Echoes its own argv back as the URL's path, so the test sees exactly
@@ -610,7 +685,7 @@ mod tests {
         let (_dir, gh) = fake_gh(&format!(
             r#"printf '{{"state":"OPEN","isDraft":false,"number":7,"url":"{URL}?argv=%s","statusCheckRollup":[{FAIL}]}}' "$(echo "$@" | tr ' ' '+')""#
         ));
-        let got = lookup(&gh, here(), "feature/x").await.unwrap();
+        let got = run(&gh, here(), "feature/x").await.unwrap();
         assert_eq!(got.checks, PrChecks::Fail);
         assert_eq!(
             got.url,
@@ -630,62 +705,78 @@ mod tests {
         assert_eq!(PrBadges::new(None).badge(here(), "main").await, None);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_non_zero_exit_is_a_miss_named_by_its_stderr() {
         let (_dir, gh) = fake_gh(
             "echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4",
         );
-        assert_eq!(
-            lookup(&gh, here(), "main").await,
-            Err(Miss::Unauthenticated)
-        );
+        assert_eq!(run(&gh, here(), "main").await, Err(Miss::Unauthenticated));
         let (_dir, gh) = fake_gh("echo 'no pull requests found for branch \"x\"' >&2; exit 1");
-        assert_eq!(lookup(&gh, here(), "x").await, Err(Miss::NoPr));
+        assert_eq!(run(&gh, here(), "x").await, Err(Miss::NoPr));
         let (_dir, gh) = fake_gh(
             "echo 'none of the git remotes configured for this repository point to a known GitHub host' >&2; exit 1",
         );
-        assert_eq!(lookup(&gh, here(), "main").await, Err(Miss::Exit(Some(1))));
+        assert_eq!(run(&gh, here(), "main").await, Err(Miss::Exit(Some(1))));
         // Valid JSON on stdout does not rescue a failed exit.
         let (_dir, gh) = fake_gh(&format!("echo '{}'; exit 2", pr("OPEN", false, "[]")));
-        assert_eq!(lookup(&gh, here(), "main").await, Err(Miss::Exit(Some(2))));
+        assert_eq!(run(&gh, here(), "main").await, Err(Miss::Exit(Some(2))));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chatty_stderr_is_drained_not_closed_on_gh() {
+        // Nearly 1 MiB of stderr from the shell itself, then the answer: with
+        // its stderr closed after the head, the shell dies of SIGPIPE first.
+        let (_dir, gh) = fake_gh(&format!(
+            "i=0; while [ $i -lt 3000 ]; do printf '%0300d\\n' 0 >&2; i=$((i+1)); done; echo '{}'",
+            pr("OPEN", false, "[]")
+        ));
+        assert_eq!(
+            run(&gh, here(), "main").await,
+            Ok(badge(PrState::Open, PrChecks::None))
+        );
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn malformed_output_is_a_miss() {
         let (_dir, gh) = fake_gh("echo '{\"state\": '");
         assert!(matches!(
-            lookup(&gh, here(), "main").await,
+            run(&gh, here(), "main").await,
             Err(Miss::Malformed(_))
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn oversized_output_is_a_miss_and_gh_is_not_waited_on() {
         // `yes` never stops on its own: only the bound ends this.
         let (_dir, gh) = fake_gh("exec yes");
         let started = std::time::Instant::now();
-        assert_eq!(lookup(&gh, here(), "main").await, Err(Miss::Oversized));
+        assert_eq!(run(&gh, here(), "main").await, Err(Miss::Oversized));
         assert!(started.elapsed() < Duration::from_secs(10));
         // Exactly at the bound it is read, and fails only as JSON.
         let (_dir, gh) = fake_gh(&format!("head -c {MAX_OUTPUT_BYTES} /dev/zero"));
         assert!(matches!(
-            lookup(&gh, here(), "main").await,
+            run(&gh, here(), "main").await,
             Err(Miss::Malformed(_))
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_branch_that_could_be_a_flag_or_a_missing_worktree_never_runs_gh() {
         let (dir, gh) = fake_gh(r#"touch "$(dirname "$0")/ran""#);
-        for branch in ["", "-R", "--repo=evil/x", "a b", "a\nb"] {
+        for branch in ["", "42", "#42", "-R", "--repo=evil/x", "a b", "a\nb"] {
             assert_eq!(
-                lookup(&gh, here(), branch).await,
+                run(&gh, here(), branch).await,
                 Err(Miss::Branch),
                 "{branch:?}"
             );
         }
         assert_eq!(
-            lookup(&gh, &here().join("no-such-dir"), "main").await,
+            run(&gh, &here().join("no-such-dir"), "main").await,
             Err(Miss::NoWorktree)
         );
         assert!(!dir.path().join("ran").exists());
@@ -757,5 +848,54 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 10, "one call per key");
         assert_eq!(peak.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_merged_or_closed_pr_stands_for_the_settled_ttl() {
+        let badges = PrBadges::new(None);
+        for state in [PrState::Merged, PrState::Closed] {
+            let calls = AtomicUsize::new(0);
+            let fetch = || async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(badge(state, PrChecks::Pass))
+            };
+            let key = key(&format!("{state:?}"));
+            badges.cached(key.clone(), fetch).await;
+            tokio::time::advance(TTL).await;
+            badges.cached(key.clone(), fetch).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{state:?} outlives TTL");
+            tokio::time::advance(SETTLED_TTL - TTL).await;
+            badges.cached(key, fetch).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "{state:?} is asked again");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_ask_dropped_mid_call_leaves_the_key_to_the_next() {
+        let badges = PrBadges::new(None);
+        let slow = || async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(badge(PrState::Open, PrChecks::Pending))
+        };
+        let dropped = tokio::time::timeout(Duration::from_secs(1), badges.cached(key("a"), slow));
+        assert!(dropped.await.is_err(), "the first ask was dropped mid-call");
+        let fast = || async { Ok(badge(PrState::Open, PrChecks::Pass)) };
+        assert_eq!(
+            badges.cached(key("a"), fast).await,
+            Some(badge(PrState::Open, PrChecks::Pass))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn past_the_bound_stale_keys_are_dropped() {
+        let badges = PrBadges::new(None);
+        for index in 0..MAX_ENTRIES {
+            badges.cached(key(&format!("b{index}")), || async { Err(Miss::NoPr) }).await;
+        }
+        let held = || badges.slots.lock().unwrap().len();
+        assert_eq!(held(), MAX_ENTRIES);
+        tokio::time::advance(TTL).await;
+        badges.cached(key("new"), || async { Err(Miss::NoPr) }).await;
+        assert_eq!(held(), 1, "only the new key is left");
     }
 }
