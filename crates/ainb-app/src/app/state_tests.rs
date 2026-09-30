@@ -5398,6 +5398,96 @@ mod tests {
         })
         .await;
     }
+
+    #[test]
+    fn a_bulk_delete_with_failures_names_the_first_one() {
+        let text = crate::app::state::bulk_delete_warning(
+            1,
+            3,
+            2,
+            "tmux session tmux_repo-1 is still running after kill-session",
+        );
+        assert_eq!(
+            text,
+            "Deleted 1/3 sessions (2 failed): tmux session tmux_repo-1 is still running after kill-session"
+        );
+    }
+
+    /// A delete the removal refuses (here sessions.json does not parse, so
+    /// which tmux session is this one's is unknown) leaves the row, and the
+    /// person is told why on screen, not only in the log.
+    #[tokio::test]
+    async fn a_refused_delete_says_why_in_a_notification() {
+        with_ainb_home_async(|| async {
+            use crate::interactive::session_manager::SessionStore;
+            use crate::models::SessionStatus;
+
+            let session = resumable_session(
+                "refused",
+                SessionMode::Interactive,
+                SessionAgentType::Claude,
+                SessionStatus::Running,
+            );
+            let id = session.id;
+            let mut ws = crate::models::Workspace::new("ws".to_string(), PathBuf::from("/tmp/ws"));
+            ws.add_session(session);
+            let mut state = AppState::new();
+            state.sessions.workspaces.push(ws);
+            let store = SessionStore::storage_path();
+            std::fs::create_dir_all(store.parent().expect("store dir")).expect("store dir");
+            std::fs::write(&store, "{ not json").expect("damage the store");
+
+            state.shell.pending_async_action = Some(AsyncAction::DeleteSession(id));
+            state.process_async_action().await.expect("the action ran");
+
+            let said: Vec<&str> = state
+                .shell
+                .notifications
+                .iter()
+                .map(|notification| notification.message.as_str())
+                .filter(|message| message.starts_with("Delete failed:"))
+                .collect();
+            assert_eq!(said.len(), 1, "{:?}", state.shell.notifications);
+        })
+        .await;
+    }
+
+    /// The orphaned Boss fallback reads the store before it removes a tree:
+    /// a damaged sessions.json cannot say who else works in it, so the tree
+    /// stays and the fallback fails, rather than reading as "nobody".
+    #[tokio::test]
+    async fn a_damaged_store_keeps_an_orphaned_boss_tree() {
+        with_ainb_home_async(|| async {
+            use crate::interactive::session_manager::SessionStore;
+            use crate::test_support::{git_available, git_ok};
+
+            if !git_available() {
+                return;
+            }
+            let scratch = tempfile::tempdir().expect("scratch");
+            let repo = scratch.path().join("repo");
+            std::fs::create_dir_all(&repo).expect("repo dir");
+            assert!(git_ok(&repo, &["init"]), "git init");
+            std::fs::write(repo.join("README.md"), "hi").expect("readme");
+            assert!(git_ok(&repo, &["add", "README.md"]), "git add");
+            assert!(git_ok(&repo, &["commit", "-m", "init"]), "git commit");
+            let id = uuid::Uuid::new_v4();
+            let tree = crate::git::WorktreeManager::new()
+                .expect("worktree manager")
+                .create_worktree(id, &repo, "boss", None)
+                .expect("create")
+                .path;
+            let store = SessionStore::storage_path();
+            std::fs::create_dir_all(store.parent().expect("store dir")).expect("store dir");
+            std::fs::write(&store, "{ not json").expect("damage the store");
+
+            let kept = AppState::remove_orphaned_boss_tree(id).await;
+
+            assert!(kept.is_err(), "a damaged store removed the tree");
+            assert!(tree.is_dir(), "the tree was removed");
+        })
+        .await;
+    }
 }
 
 #[cfg(test)]
@@ -6004,20 +6094,6 @@ mod quiet_ticks {
             |state: &mut AppState| {
                 state.apply_shell_preview(9, "$ ".to_string());
             },
-        );
-    }
-
-    #[test]
-    fn a_bulk_delete_with_failures_names_the_first_one() {
-        let text = crate::app::state::bulk_delete_warning(
-            1,
-            3,
-            2,
-            "tmux session tmux_repo-1 is still running after kill-session",
-        );
-        assert_eq!(
-            text,
-            "Deleted 1/3 sessions (2 failed): tmux session tmux_repo-1 is still running after kill-session"
         );
     }
 }
