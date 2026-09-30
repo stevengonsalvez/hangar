@@ -10,6 +10,7 @@ import { afterEach, test } from "node:test";
 import { createComponent, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
 import type { Accelerator } from "../../src/tabs.ts";
 import { TerminalView } from "../../src/terminal.tsx";
 import type { ByteChannel } from "../../src/transport.ts";
@@ -167,6 +168,36 @@ test("a zoom refits the grid and tells the shell its new size", async () => {
     assert.equal(fits, 2, "a reset refits too");
   } finally {
     FitAddon.prototype.fit = fit;
+  }
+});
+
+test("a zoom repaints every row once the grid is refit, not at the shell's next byte", async () => {
+  const pane = await mountPane(true);
+  Object.defineProperty(pane.container.querySelector(".xterm-host"), "offsetParent", { get: () => document.body });
+  const fit = FitAddon.prototype.fit;
+  const refresh = Terminal.prototype.refresh;
+  const seen: string[] = [];
+  let painted: { start: number; end: number; rows: number } | undefined;
+  FitAddon.prototype.fit = function (this: FitAddon) {
+    seen.push("fit");
+    return fit.call(this);
+  };
+  Terminal.prototype.refresh = function (this: Terminal, start: number, end: number) {
+    seen.push("refresh");
+    painted = { start, end, rows: this.rows };
+    return refresh.call(this, start, end);
+  };
+  try {
+    for (const chord of [CMD_EQUAL, CMD_MINUS, CMD_0]) {
+      seen.length = 0;
+      painted = undefined;
+      await pane.zoom(chord);
+      assert.deepEqual(seen, ["fit", "refresh"], `${chord.key}: refit, then repainted`);
+      assert.deepEqual(painted, { start: 0, end: painted!.rows - 1, rows: painted!.rows }, `${chord.key}: every row`);
+    }
+  } finally {
+    FitAddon.prototype.fit = fit;
+    Terminal.prototype.refresh = refresh;
   }
 });
 
