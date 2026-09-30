@@ -132,6 +132,11 @@ test("reopen takes the newest entry that can come back, dropping those above it 
   assert.deepEqual(popReopenable([closed(session("u-9"))], [], sessions), { found: null, rest: [] });
 });
 
+test("before the first sessions frame, reopen drops nothing", () => {
+  const stack = [closed(session("u-1")), closed(shell("ainb-dsh-1", "/a/one"))];
+  assert.deepEqual(popReopenable(stack, [], undefined), { found: null, rest: stack });
+});
+
 test("a reopened tab goes back to its pane and place once the layout holds it", () => {
   // g1: b, c, x | g2: a. `a` came back into the focused g2; it was g1's first.
   const layout = splitGroup(initialLayout(["a", "b", "c", "x"]), "g1", "right");
