@@ -1594,13 +1594,15 @@ pub fn remove_session_worktree(
 }
 
 /// [`remove_session_worktree`] against the session store as it is now. A
-/// store that cannot be read cannot say who else is in the tree, so the
-/// tree is kept (an error) rather than risk a live one.
+/// store that cannot be read, a damaged `sessions.json` included (read with
+/// [`crate::cli::util::load_session_store_checked_async`], never as an empty
+/// store), cannot say who else is in the tree, so the tree is kept (an
+/// error) rather than risk a live one.
 pub async fn remove_session_worktree_now(
     manager: &WorktreeManager,
     session_id: Uuid,
 ) -> Result<SessionTreeRemoval, crate::git::WorktreeError> {
-    let store = crate::cli::util::load_session_store_async().await.map_err(|e| {
+    let store = crate::cli::util::load_session_store_checked_async().await.map_err(|e| {
         crate::git::WorktreeError::CommandFailed(format!(
             "session store unavailable, so another session may share the tree: {e}"
         ))
@@ -6761,6 +6763,30 @@ mod shared_worktree_tests {
         assert!(
             alive.status.success(),
             "the second session's tmux was ended"
+        );
+        assert!(
+            fx.resolved.is_dir(),
+            "the second session's tree was removed"
+        );
+    }
+
+    /// A damaged sessions.json is not an empty one: the removal must not read
+    /// it as "nobody else is in the tree" and take a tree the second session
+    /// still works in.
+    #[tokio::test]
+    async fn a_damaged_store_keeps_the_tree_an_orphan_delete_would_take() {
+        if !git_available() {
+            return;
+        }
+        let fx = shared_tree();
+        fx.store.save().expect("seed store");
+        std::fs::write(SessionStore::storage_path(), "{ not json").expect("damage the store");
+
+        let refused = remove_session_worktree_now(&fx.manager, fx.first).await;
+
+        assert!(
+            refused.is_err(),
+            "a damaged store removed the tree: {refused:?}"
         );
         assert!(
             fx.resolved.is_dir(),
