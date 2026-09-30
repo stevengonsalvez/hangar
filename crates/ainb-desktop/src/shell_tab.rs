@@ -62,10 +62,6 @@ pub fn close_params(tmux_session_name: &str, op_id: OpId) -> ShellCloseParams {
     }
 }
 
-/// What an open that may have made its shell says: the shell is not known to
-/// be gone, so another press could make a second one.
-pub const MAY_STILL_OPEN: &str = "The terminal may still open; check before opening another.";
-
 /// Ask the daemon for a shell in `worktree_path`.
 ///
 /// # Errors
@@ -211,6 +207,7 @@ pub async fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::create::MAY_STILL_OPEN;
     use ainb_app::config::AppConfig;
     use ainb_hangar_proto::spawn::{REPO_NOT_REGISTERED, SPAWN_STARTED};
 

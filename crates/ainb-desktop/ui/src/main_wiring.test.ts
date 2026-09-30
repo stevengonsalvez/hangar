@@ -110,7 +110,8 @@ test("each pane strip carries one + menu, on that pane's shown tab; the top stri
   assert.match(panes, /target=\{worktreeTarget\(shown\(\)\?\.target, sessions\(\)\?\.selected_session_id \?\? null\)\}/);
   assert.match(panes, /onNewTerminal=\{\(target\) => void shellTabs\.open\(target\)\}/);
   assert.match(panes, /agents=\{newAgent\}/);
-  assert.match(panes, /restoreFocus=\{focusShown\}/);
+  // The keyboard goes back to this pane, not the focused one.
+  assert.match(panes, /restoreFocus=\{\(\) => \{\s*const tab = shown\(\);\s*if \(tab !== undefined\) activate\(tab\.key, false\);\s*else focusShown\(\);/);
   // Mod+T opens on the focused pane's target, by the same rule.
   const plus = body("plusTarget", "const shellTabs");
   assert.match(

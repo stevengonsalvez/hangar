@@ -123,6 +123,8 @@ for (const mac of [true, false]) {
       "shell:hosts",
       "shell:clear",
       "shell:sidebar",
+      "shell:recent",
+      "shell:reopen",
       ...(mac ? ["shell:worktree"] : ["shell:copy", "shell:paste"]),
     ];
     assert.deepEqual([...actions].sort(), expected.sort());
@@ -142,6 +144,14 @@ const KNOWN_STOLEN: Record<string, string> = {
   "Alt+Shift+KeyD": "\x1bD",
   // The context menu's keyboard chord, the platform's own menu key (#258).
   "Shift+F10": "\x1b[21;2~",
+  // The recent-tab switcher, which Orca takes from its terminal too
+  // (`allowInTerminal`, orca `definitions-core-2.ts:199-207`). Plain Tab and
+  // Shift+Tab still send the pane these same bytes (the probe below).
+  "Ctrl+Tab": "\t",
+  "Ctrl+Shift+Tab": "\x1b[Z",
+  // Reopen closed tab off macOS: Orca's Mod+Shift+T is this window's Mod+T
+  // there, so it adds Alt. Ctrl+Alt+T still sends the pane this same C-M-t.
+  "Ctrl+Alt+Shift+KeyT": "\x1b\x14",
 };
 
 test("no chord in the table takes a key the terminal would send its pane", async () => {
@@ -199,6 +209,9 @@ test("the xterm probe is live: the pane's own keys do send bytes", () => {
   assert.equal(probe("KeyC", "c", 67, { ctrlKey: true }), "\x03", "Ctrl+C");
   assert.equal(probe("Minus", "_", 189, { ctrlKey: true, shiftKey: true }), "\x1f", "Ctrl+_, the undo #254 kept");
   assert.equal(probe("ArrowUp", "ArrowUp", 38, { ctrlKey: true, shiftKey: true }), "\x1b[1;6A", "Ctrl+Shift+Up, left to the pane");
+  assert.equal(probe("Tab", "Tab", 9, {}), "\t", "Tab, the byte Ctrl+Tab would send");
+  assert.equal(probe("Tab", "Tab", 9, { shiftKey: true }), "\x1b[Z", "Shift+Tab, the byte Ctrl+Shift+Tab would send");
+  assert.equal(probe("KeyT", "t", 84, { ctrlKey: true, altKey: true }), "\x1b\x14", "Ctrl+Alt+T, the byte Ctrl+Alt+Shift+T would send");
   term.dispose();
   host.remove();
 });

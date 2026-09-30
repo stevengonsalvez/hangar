@@ -18,8 +18,6 @@ use ainb_hangar_proto::spawn::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::shell_tab::MAY_STILL_OPEN;
-
 /// The JSON-RPC code for a method the daemon does not serve.
 const METHOD_NOT_FOUND: i32 = -32601;
 /// The JSON-RPC code for params the daemon refused.
@@ -188,6 +186,10 @@ pub fn mint_op_id(verb: SpawnVerb) -> OpId {
     OpId::parse(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
         .expect("a uuid op id is always well formed")
 }
+
+/// What an open that may have made its shell says: the shell is not known to
+/// be gone, so another press could make a second one.
+pub const MAY_STILL_OPEN: &str = "The terminal may still open; check before opening another.";
 
 /// A daemon error as the sentence the window shows for `verb`: the one place
 /// a code becomes words. Chosen by the error's code, never its words; the

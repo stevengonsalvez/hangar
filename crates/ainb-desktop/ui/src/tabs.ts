@@ -112,7 +112,11 @@ export type Accelerator =
   /** Show the next (`1`) or previous (`-1`) worktree in the sidebar. */
   | { kind: "worktree"; step: 1 | -1 }
   | { kind: "copy" }
-  | { kind: "paste" };
+  | { kind: "paste" }
+  /** Ctrl+Tab held: the recent-tab switcher steps on (`1`) or back (`-1`). */
+  | { kind: "recent"; step: 1 | -1 }
+  /** Bring back the tab closed last. */
+  | { kind: "reopen" };
 
 interface KeyLike {
   /** The physical key (`KeyW`, `Digit1`), so Shift does not change it. */
@@ -136,10 +140,22 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
   if (!mac && event.altKey && event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === "KeyD") {
     return { kind: "split", direction: "down" };
   }
+  // Orca's `tab.previousRecent`, Ctrl+Tab on every platform, Shift stepping
+  // back, taken from the terminal too (`allowInTerminal`,
+  // `orca:src/shared/keybindings/definitions-core-2.ts:199-207`).
+  if (event.ctrlKey && !event.metaKey && !event.altKey && event.code === "Tab") {
+    return { kind: "recent", step: event.shiftKey ? -1 : 1 };
+  }
+  // Orca's `tab.reopenClosed`, Mod+Shift+T (`definitions-core-2.ts:158-165`).
+  // Off macOS Ctrl+Shift+T is this window's Mod+T, so it adds Alt.
+  if (!mac && event.ctrlKey && event.shiftKey && event.altKey && !event.metaKey && event.code === "KeyT") {
+    return { kind: "reopen" };
+  }
   const mod = mac ? event.metaKey && !event.ctrlKey : event.ctrlKey && event.shiftKey && !event.metaKey;
   if (!mod || event.altKey) return null;
   if (event.code === "KeyH" && (!mac || event.shiftKey)) return { kind: "hosts" };
   if (mac && event.shiftKey && event.code === "KeyD") return { kind: "split", direction: "down" };
+  if (mac && event.shiftKey && event.code === "KeyT") return { kind: "reopen" };
   if (mac && event.shiftKey) return worktreeChord(event.code);
   // Copy and paste: macOS has them on the Edit menu, natively. Elsewhere the
   // pane owns ctrl+c and ctrl+v, so the shell's ctrl+shift pair does it.

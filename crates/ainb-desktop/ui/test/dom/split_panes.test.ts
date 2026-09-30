@@ -75,14 +75,19 @@ test("each pane's + opens its menu on that pane's shown tab, and the top strip h
     const shown = pane.querySelector<HTMLElement>(".tab.active[data-key]")!.dataset.key!.slice(5);
     pane.querySelector<HTMLButtonElement>(".pane-strip .tab-new")!.click();
     await until(() => document.querySelector(".tab-create-menu") !== null, "the + menu");
+    // By command, not the last call: a pick also focuses its pane, whose
+    // row selection goes to the host after the pick's own call.
+    const call = (command: string) => host.calls.find((one) => one.command === command);
+    host.calls = [];
     document.querySelector<HTMLButtonElement>('.tab-create-menu [data-item="terminal"]')!.click();
-    await until(() => host.calls.at(-1)?.command === "shell_open", "a shell asked for");
-    assert.deepEqual(host.calls.at(-1)!.args, { target: { kind: "session", id: `u-${shown}` } }, `${pane.dataset.group}'s + opens in ${shown}`);
+    await until(() => call("shell_open") !== undefined, "a shell asked for");
+    assert.deepEqual(call("shell_open")!.args, { target: { kind: "session", id: `u-${shown}` } }, `${pane.dataset.group}'s + opens in ${shown}`);
     pane.querySelector<HTMLButtonElement>(".pane-strip .tab-new")!.click();
     await until(() => document.querySelector(".tab-create-menu") !== null, "the + menu again");
+    host.calls = [];
     document.querySelector<HTMLButtonElement>('.tab-create-menu [data-agent="codex"]')!.click();
-    await until(() => host.calls.at(-1)?.command === "worktree_agent_add", "an agent asked for");
-    assert.deepEqual(host.calls.at(-1)!.args, { args: { target: { kind: "session", id: `u-${shown}` }, agent: "codex" } });
+    await until(() => call("worktree_agent_add") !== undefined, "an agent asked for");
+    assert.deepEqual(call("worktree_agent_add")!.args, { args: { target: { kind: "session", id: `u-${shown}` }, agent: "codex" } });
     await tick();
   }
 });

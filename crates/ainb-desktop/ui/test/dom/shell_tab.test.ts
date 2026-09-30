@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 /** The host's sentence for an open that may have made its shell
- * (`shell_tab::MAY_STILL_OPEN` and the daemon's detail). */
+ * (`create::MAY_STILL_OPEN` and the daemon's detail). */
 const MAY_STILL_OPEN_TEXT =
   "The terminal may still open; check before opening another. (tmux did not answer within 10s; the shell may still appear as ainb-dsh-0123abcd)";
 
