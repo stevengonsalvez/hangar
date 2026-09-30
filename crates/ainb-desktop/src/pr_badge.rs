@@ -887,6 +887,48 @@ mod tests {
         assert!(!dir.path().join("ran").exists());
     }
 
+    /// A branch carrying `$(...)`, backticks and `${IFS}` passes the loose
+    /// filter (none of it is whitespace, control, a leading `-`, or a PR
+    /// number), so the only thing standing between it and a shell is that
+    /// `lookup` never asks for one: `Command::new(gh).args([...])` execs `gh`
+    /// directly, so this whole string is one argv element to it, not text a
+    /// shell parses. Proven two ways: the fake `gh` gets it back byte for
+    /// byte, unsplit, and nothing it names (`pwned`) is ever created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_shell_metacharacter_branch_reaches_gh_as_one_argv_element_and_spawns_no_shell() {
+        const INJECTION: &str = "feature/x$(touch${IFS}pwned)`id`";
+        assert!(
+            plausible_branch(INJECTION),
+            "the filter is not what stops this; argv-only spawning is"
+        );
+        let (dir, gh) = fake_gh(
+            r#"for last; do :; done
+printf '%s' "$last" > "$(dirname "$0")/last-arg""#,
+        );
+        // A tempdir, not `here()`: if a shell ever ran, `pwned` would land in
+        // the child's cwd, and this must never be the crate's own source
+        // tree.
+        let worktree = tempfile::tempdir().unwrap();
+        let outcome = run(&gh, worktree.path(), INJECTION).await;
+        // The fake `gh` wrote no JSON; what this test cares about is what it
+        // was handed, not what it answered.
+        assert!(matches!(outcome, Err(Miss::Malformed(_))), "{outcome:?}");
+        let last_arg = std::fs::read_to_string(dir.path().join("last-arg")).unwrap();
+        assert_eq!(
+            last_arg, INJECTION,
+            "the branch reached gh as one untouched argv element"
+        );
+        assert!(
+            !worktree.path().join("pwned").is_file(),
+            "no shell ran to expand the branch's $(...) or `...`"
+        );
+        assert!(
+            !dir.path().join("pwned").is_file(),
+            "no shell ran in gh's own folder either"
+        );
+    }
+
     fn key(branch: &str) -> (PathBuf, String) {
         (PathBuf::from("/w"), branch.to_string())
     }
