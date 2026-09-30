@@ -284,9 +284,11 @@ fn plausible_branch(branch: &str) -> bool {
 }
 
 /// Whether `gh pr view` takes `arg` for a PR number rather than a branch:
-/// `42` and `#42` both name PR 42.
+/// `42` and `#42` both name PR 42, and so do `+42` and `#+42` (`gh` parses
+/// the number with Go's `strconv.Atoi`, which accepts one leading sign).
 fn reads_as_pr_number(arg: &str) -> bool {
     let digits = arg.trim_start_matches('#');
+    let digits = digits.strip_prefix(['+', '-']).unwrap_or(digits);
     !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -540,7 +542,7 @@ mod tests {
 
     use super::{
         MAX_ENTRIES, MAX_IN_FLIGHT, MAX_OUTPUT_BYTES, Miss, PrBadge, PrBadges, PrChecks, PrState,
-        SETTLED_TTL, TTL, lookup, parse, plausible_branch,
+        SETTLED_TTL, TTL, lookup, parse, plausible_branch, reads_as_pr_number,
     };
 
     const URL: &str = "https://github.com/o/r/pull/7";
@@ -710,7 +712,18 @@ mod tests {
 
     #[test]
     fn a_branch_gh_would_read_as_a_pr_number_or_a_flag_is_refused() {
-        for branch in ["", "42", "#42", "##7", "-R", "--repo=evil/x", "a b", "a\nb"] {
+        for branch in [
+            "",
+            "42",
+            "#42",
+            "##7",
+            "+42",
+            "#+42",
+            "-R",
+            "--repo=evil/x",
+            "a b",
+            "a\nb",
+        ] {
             assert!(!plausible_branch(branch), "{branch:?}");
         }
         for branch in [
@@ -719,9 +732,23 @@ mod tests {
             "42a",
             "v2",
             "#fix",
+            "+build",
             "ainb/o16-pr-badge",
         ] {
             assert!(plausible_branch(branch), "{branch:?}");
+        }
+    }
+
+    /// `gh pr view` reads a bare number, or one after `#`, as a PR number,
+    /// with an optional leading sign (Go's `strconv.Atoi`): `+42` and `#+42`
+    /// name PR 42 exactly as `42` and `#42` do.
+    #[test]
+    fn a_signed_pr_number_is_refused_the_same_as_a_bare_one() {
+        for arg in ["42", "#42", "+42", "#+42", "-42", "#-42"] {
+            assert!(reads_as_pr_number(arg), "{arg:?}");
+        }
+        for arg in ["", "+", "-", "#", "42a", "+4a", "feature/+42"] {
+            assert!(!reads_as_pr_number(arg), "{arg:?}");
         }
     }
 
