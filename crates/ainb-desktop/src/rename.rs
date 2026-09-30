@@ -8,13 +8,16 @@
 //! checked here, never trusted from the page.
 //!
 //! The store is read from disk for each rename, not taken from the one this
-//! window loaded at launch: the terminal writes the same file, and the write
-//! here saves the whole store, so a stale copy would put back every label the
-//! terminal changed since.
+//! window loaded at launch: the terminal writes the same file, so the names
+//! other rows show are the ones on disk. The write is the store's one write,
+//! [`SessionLabelStore::set_label`]: this session's label, set on the file as
+//! it stands under the file's lock. It lands before the rename returns, so a
+//! write the store refuses (a label file that does not parse, left as it is)
+//! is the field's refusal and nothing is framed.
 //!
 //! ```text
-//!  field ──session_rename(id, name)──▶ checked_name ──▶ label store + row
-//!                                                         └─▶ Persist::SessionLabels
+//!  field ──session_rename(id, name)──▶ checked_name ──▶ set_label ──▶ row
+//!                                                         └─▶ refusal: field
 //! ```
 
 use ainb_app::AppState;
@@ -26,6 +29,9 @@ const EMPTY: &str = "A name cannot be empty.";
 const NOT_LISTED: &str = "This session is not in the session list, so it cannot be renamed.";
 const NO_TMUX: &str = "This session has no tmux session to keep a name under.";
 const INVISIBLE: &str = "A name cannot contain invisible formatting characters.";
+const UNREADABLE: &str = "The saved names file (session-labels.json) cannot be read, so this \
+     name was not saved and the file was left as it is.";
+const NOT_SAVED: &str = "This name could not be saved to the saved names file.";
 
 /// The id the window sent, or the sentence the field shows when that is not
 /// one. The sentence does not repeat what was sent: it came from the page.
@@ -78,15 +84,15 @@ fn shown<'a>(labels: &'a SessionLabelStore, session: &'a Session) -> &'a str {
 }
 
 /// Give `session` the display name `raw`, if [`checked_name`] allows it
-/// against the other rows of its project, and queue the label store's write.
+/// against the other rows of its project, and write it to the label store.
 /// Returns the name kept.
 ///
 /// # Errors
 /// The sentence the rename field shows: the session is not listed, it has no
-/// tmux session to key the label by, or the name is refused. Nothing is
-/// written then.
+/// tmux session to key the label by, the name is refused, or the store
+/// refused the write. Nothing is written or framed then.
 pub fn rename(state: &mut AppState, session: Uuid, raw: &str) -> Result<String, String> {
-    let mut labels = SessionLabelStore::load();
+    let labels = SessionLabelStore::load();
     // Read through `Deref`: a write through the section bumps its version, and
     // a refused rename must not reframe anything.
     let (at, tmux, name) = {
@@ -104,10 +110,18 @@ pub fn rename(state: &mut AppState, session: Uuid, raw: &str) -> Result<String, 
         let others = project.iter().filter(|row| row.id != session).map(|row| shown(&labels, row));
         ((w, s), tmux, checked_name(raw, others)?)
     };
-    labels.set(tmux, Some(name.clone()));
+    let labels = SessionLabelStore::set_label(&tmux, Some(name.clone())).map_err(|error| {
+        // The error may quote a label out of the file, and neither the log
+        // nor the field repeats a label: the field gets the host's sentence.
+        tracing::warn!(%session, kind = ?error.kind(), "session label not saved");
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            UNREADABLE.to_string()
+        } else {
+            NOT_SAVED.to_string()
+        }
+    })?;
     state.sessions.workspaces[at.0].sessions[at.1].display_name = Some(name.clone());
     state.session_labels.session_label_store = labels;
-    state.persist_session_labels();
     Ok(name)
 }
 
