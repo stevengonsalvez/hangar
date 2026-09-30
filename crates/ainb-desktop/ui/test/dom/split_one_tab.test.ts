@@ -53,6 +53,10 @@ function panes(): string[] {
   });
 }
 const cmdD = () => press({ code: "KeyD", key: "d", metaKey: true });
+const cmdShiftD = () => press({ code: "KeyD", key: "D", metaKey: true, shiftKey: true });
+/** How many seams split panes side by side (`row`) and one over another
+ * (`column`). */
+const seams = (axis: "row" | "column") => document.querySelectorAll(`.pane-divider[data-axis="${axis}"]`).length;
 const toasts = () => [...document.querySelectorAll(".toast")].map((toast) => toast.textContent ?? "");
 
 pretendMac();
@@ -91,4 +95,15 @@ test("a refused open shows the host's sentence and splits nothing", async () => 
   await drain();
   assert.equal(opens.length, 3);
   assert.deepEqual(panes(), ["u-1*u-1", "u-2*u-2", "sh1*sh1", "sh2*sh2!"], "no pane and no tab for a refused open");
+});
+
+test("Cmd+Shift+D on a pane of one tab splits the new shell down, not right", async () => {
+  answer = "strip-after";
+  const [rows, columns] = [seams("row"), seams("column")];
+  cmdShiftD();
+  await until(() => panes().length === 5, "the one-tab pane to split down");
+  assert.deepEqual(opens.at(-1), { target: { kind: "shell", key: "ainb-dsh-00000002" } }, "the shell opens in the focused shell's worktree");
+  assert.deepEqual(panes(), ["u-1*u-1", "u-2*u-2", "sh1*sh1", "sh2*sh2", "sh4*sh4!"]);
+  assert.equal(seams("column"), columns + 1, "the new pane sits under the old one");
+  assert.equal(seams("row"), rows, "no pane was put beside another");
 });
