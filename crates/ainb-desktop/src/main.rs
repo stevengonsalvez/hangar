@@ -209,7 +209,7 @@ fn clipboard_write(text: String) {
 
 /// The terminal's paste: the clipboard's text for the pane `key` is showing.
 ///
-/// Answered only for the tab the window has in front of the operator, which is
+/// Answered only for a tab the window has in front of the operator, which is
 /// the only caller: paste is a pane's own accelerator, so no other renderer
 /// path, and no driver on a `wdio` build, reads what was last copied. Empty
 /// when the clipboard holds no text, cannot be read, or holds more than a
@@ -316,6 +316,13 @@ fn terminal_resize(window: tauri::State<'_, Window>, key: String, cols: u16, row
     if let Some(terminals) = &window.terminals {
         terminals.resize(&key, cols, rows);
     }
+}
+
+/// The tabs the layout has on screen, exactly `keys`: the cap spares each,
+/// and each may paste. `false`, changing nothing, for too many keys.
+#[tauri::command]
+fn terminal_visible(window: tauri::State<'_, Window>, keys: Vec<String>) -> bool {
+    window.terminals.as_ref().is_some_and(|terminals| terminals.set_visible(keys))
 }
 
 /// Cmd+K: clear the tab's scrollback in tmux and redraw its client. Off the
@@ -1267,6 +1274,7 @@ fn main() {
             terminal_ack,
             terminal_input,
             terminal_resize,
+            terminal_visible,
             terminal_clear,
             terminal_close,
             worktree_create,

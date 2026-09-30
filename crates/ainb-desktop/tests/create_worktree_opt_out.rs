@@ -44,6 +44,8 @@ async fn a_daemon_started_with_the_opt_out_is_named_as_the_reason() {
     std::env::set_var("AINB_HANGAR_SPAWN", "0");
     let home = Home(tempfile::tempdir().unwrap());
     let hangar = home.0.path().join(".agents-in-a-box");
+    // As the app runs: the window and the daemon it starts share one home.
+    std::env::set_var("AINB_HANGAR_HOME", &hangar);
     let mut config = SidecarConfig::new(hangar.clone(), daemon_bin());
     config.hello_budget = BOOT_BUDGET;
     let sidecar = Sidecar::start(config);
@@ -79,5 +81,10 @@ async fn a_daemon_started_with_the_opt_out_is_named_as_the_reason() {
     .await
     .expect_err("the verb is dark with the opt-out");
     assert!(refusal.contains("AINB_HANGAR_SPAWN=0"), "{refusal}");
+    let file = ainb_hangar_daemon::spawn::config_path_in(&hangar);
+    assert!(
+        refusal.contains(&format!("in {} ", file.display())),
+        "names the file this daemon reads: {refusal}"
+    );
     drop(sidecar);
 }
