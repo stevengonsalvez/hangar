@@ -106,3 +106,15 @@ test("a card whose refresh misses or fails drops the badge it drew", async () =>
   await refresh();
   assert.equal(hasBadge("u-1"), false, "a failed command after a badge draws nothing");
 });
+
+test("a hidden window asks for no refresh, and a shown one asks again", async () => {
+  const hidden = (value: boolean) => Object.defineProperty(document, "hidden", { value, configurable: true });
+  hidden(true);
+  const asked = host.prAsked.length;
+  mock.timers.tick(PR_BADGE_REFRESH_MS);
+  await drain();
+  assert.equal(host.prAsked.length, asked, "no card asked while hidden");
+  hidden(false);
+  mock.timers.tick(PR_BADGE_REFRESH_MS);
+  await until(() => host.prAsked.length > asked, "a refresh once shown");
+});
