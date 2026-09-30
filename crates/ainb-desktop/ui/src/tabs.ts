@@ -4,7 +4,12 @@
 // 300 ms returns focus to the sidebar.
 
 /** `ainb_desktop::terminal::TabTarget`. */
-export type TabTarget = { kind: "session"; id: string; tmux: string } | { kind: "tmux"; tmux: string };
+export type TabTarget =
+  | { kind: "session"; id: string; tmux: string }
+  | { kind: "tmux"; tmux: string }
+  // A plain shell the daemon opened in the worktree `dir`: no session-list
+  // row, the tab is its only place.
+  | { kind: "shell"; tmux: string; dir: string };
 
 /** `ainb_desktop::terminal::TabView`. */
 export type Tab = { key: string; target: TabTarget } & (
@@ -63,7 +68,8 @@ export function selectRowIntent(row: RowId): RendererIntent {
  */
 export function selectIntentFor(tabs: readonly Tab[], key: string): RendererIntent | null {
   const tab = tabs.find((candidate) => candidate.key === key);
-  return tab === undefined ? null : selectRowIntent(rowOf(tab.target));
+  // A shell has no row: the sidebar stays on the session it was opened from.
+  return tab === undefined || tab.target.kind === "shell" ? null : selectRowIntent(rowOf(tab.target));
 }
 
 /**
@@ -96,6 +102,7 @@ export type Accelerator =
   | { kind: "palette" }
   | { kind: "new" }
   | { kind: "split"; direction: "right" | "down" }
+  | { kind: "terminal" }
   | { kind: "attention" }
   | { kind: "hosts" }
   /** Clear the focused terminal's scrollback. */
@@ -165,6 +172,10 @@ export function accelerator(event: KeyLike, mac: boolean): Accelerator | null {
     // shell, completion in vim), so off macOS it needs the Shift.
     case "KeyN":
       return { kind: "new" };
+    // A plain terminal in the selected worktree, Orca's Mod+T
+    // (`orca:src/shared/keybindings/definitions-core-2.ts:71-76`).
+    case "KeyT":
+      return { kind: "terminal" };
     case "KeyU":
       return { kind: "attention" };
     // Split the focused pane: Cmd+D, as Orca splits (its

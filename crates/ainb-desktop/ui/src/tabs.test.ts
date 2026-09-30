@@ -104,6 +104,20 @@ test("clear is always the focused pane's; a worktree step is a text field's own 
   assert.equal(leftToFocus({ kind: "palette" }, field), false, "every other chord is the window's");
 });
 
+test("a new terminal opens on Cmd+T on macOS and Ctrl+Shift+T elsewhere", () => {
+  assert.deepEqual(accelerator(key("KeyT", { meta: true }), true), { kind: "terminal" });
+  assert.deepEqual(accelerator(key("KeyT", { ctrl: true, shift: true }), false), { kind: "terminal" });
+  // Plain Ctrl+T is the pane's (transpose in a shell): never taken.
+  assert.equal(accelerator(key("KeyT", { ctrl: true }), false), null);
+  assert.equal(accelerator(key("KeyT", { meta: true, shift: true }), true), null);
+  assert.equal(accelerator(key("KeyT"), true), null);
+});
+
+test("a shell tab has no row: activating it selects nothing", () => {
+  const tabs = [{ key: "ainb-dsh-0123abcd", target: { kind: "shell", tmux: "ainb-dsh-0123abcd", dir: "/w/app" }, state: "attached" }] as Tab[];
+  assert.equal(selectIntentFor(tabs, "ainb-dsh-0123abcd"), null);
+});
+
 test("copy and paste are the shell's only elsewhere, and native on macOS", () => {
   assert.deepEqual(accelerator(key("KeyC", { ctrl: true, shift: true }), false), { kind: "copy" });
   assert.deepEqual(accelerator(key("KeyV", { ctrl: true, shift: true }), false), { kind: "paste" });
@@ -198,6 +212,7 @@ test("under the open composer no chord reaches the shell but new", () => {
     { kind: "next" },
     { kind: "close" },
     { kind: "palette" },
+    { kind: "terminal" },
     { kind: "attention" },
     { kind: "hosts" },
     { kind: "copy" },

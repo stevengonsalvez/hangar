@@ -7,6 +7,8 @@
 //!   and answers the ones this shell cannot run yet with their documented
 //!   failure report.
 //! - [`intent::RendererIntent`] is what the webview may send.
+//! - [`worktree_target`] is how the page names a worktree for the strip's
+//!   "+", and how the host resolves it.
 //! - [`clipboard`] holds the size rule a copy and a paste share.
 //! - [`delete`] deletes a session from the window, and first says what
 //!   that removes: the folder, or only the session when another shares it.
@@ -20,6 +22,8 @@
 //!   page draws it.
 //! - [`shell::Shell`] locks the host and the executor together for the
 //!   window's commands and tick.
+//! - [`shell_tab`] opens a plain shell tab in a worktree through the daemon,
+//!   and ends it with the tab.
 //! - [`sidecar`] finds or starts the bundled hangar daemon and holds this
 //!   surface's presence against it.
 //! - [`notify`] decides which session moves raise an OS notification: into
@@ -47,7 +51,9 @@ pub mod projects;
 pub mod rename;
 pub mod setup;
 pub mod shell;
+pub mod shell_tab;
 pub mod sidecar;
 pub mod terminal;
 pub mod theme;
 pub mod updater;
+pub mod worktree_target;

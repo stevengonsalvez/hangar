@@ -118,6 +118,7 @@ for (const mac of [true, false]) {
       "shell:close",
       "shell:palette",
       "shell:new",
+      "shell:terminal",
       "shell:attention",
       "shell:hosts",
       "shell:clear",

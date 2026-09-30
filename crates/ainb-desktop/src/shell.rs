@@ -74,6 +74,13 @@ impl<S: FrameSink> Shell<S> {
         host.answer_home(executor);
     }
 
+    /// The worktree folder of the listed session `session_id`; see
+    /// [`crate::shell_tab::session_worktree`].
+    #[must_use]
+    pub fn session_worktree(&self, session_id: uuid::Uuid) -> Option<String> {
+        crate::shell_tab::session_worktree(self.core().host.state(), session_id)
+    }
+
     /// The reducer's current screen id, for a test to read.
     #[must_use]
     pub fn current_screen(&self) -> String {
