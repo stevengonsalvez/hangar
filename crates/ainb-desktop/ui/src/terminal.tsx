@@ -5,7 +5,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebglAddon } from "@xterm/addon-webgl";
 import "@xterm/xterm/css/xterm.css";
-import { accelerator, escEsc, openRowIntent, REDIALS, rowOf, type Accelerator, type Tab } from "./tabs.ts";
+import { accelerator, escEsc, REDIALS, type Accelerator, type Tab } from "./tabs.ts";
+import { reattach } from "./shell_tab.ts";
 import { tauriTransport, visibleTerminalsSettled } from "./transport.ts";
 import { terminalAppearance, type Theme } from "./theme/theme.ts";
 import { findChord, TerminalSearch } from "./terminal_search.tsx";
@@ -267,10 +268,7 @@ export function TerminalView(props: Props) {
             fallback={
               <>
                 <span>{props.title} is detached</span>
-                <button
-                  type="button"
-                  onClick={() => void invoke("dispatch", { intent: openRowIntent(rowOf(props.tab.target)) })}
-                >
+                <button type="button" onClick={() => reattach(props.tab)}>
                   Reattach
                 </button>
               </>
