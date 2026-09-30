@@ -47,6 +47,9 @@ pub const SETTLED_TTL: Duration = Duration::from_secs(600);
 /// How long a `gh` rate limit pauses every further lookup, for every key, once
 /// hit: GitHub's secondary limits typically clear well within this.
 pub const RATE_LIMIT_PAUSE: Duration = Duration::from_secs(15 * 60);
+// Shorter, and every key would be asked again before the limit could have
+// cleared, defeating the pause.
+const _: () = assert!(RATE_LIMIT_PAUSE.as_secs() > TTL.as_secs());
 /// The most `gh` processes running at once, Orca's own `MAX_CONCURRENT`.
 pub const MAX_IN_FLIGHT: usize = 4;
 /// How long one `gh` call may take before it is killed and counted a miss.
@@ -567,8 +570,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        MAX_ENTRIES, MAX_IN_FLIGHT, MAX_OUTPUT_BYTES, Miss, PrBadge, PrBadges, PrChecks, PrState,
-        SETTLED_TTL, TTL, lookup, parse, plausible_branch, reads_as_pr_number,
+        Instant, MAX_ENTRIES, MAX_IN_FLIGHT, MAX_OUTPUT_BYTES, Miss, PrBadge, PrBadges, PrChecks,
+        PrState, SETTLED_TTL, TTL, lookup, parse, plausible_branch, reads_as_pr_number,
     };
 
     const URL: &str = "https://github.com/o/r/pull/7";
@@ -1102,6 +1105,41 @@ fi"#,
             Some(9),
             "warm still has not blinked after the limiting call"
         );
+    }
+
+    /// The call that itself discovers the rate limit falls back to the
+    /// key's last good badge exactly as any other paused call does, rather
+    /// than answering with the blink `Miss::RateLimited` alone would give.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_key_with_a_last_good_badge_keeps_it_even_when_this_call_discovers_the_limit() {
+        let (_dir, gh) = fake_gh("echo 'API rate limit exceeded for user ID 123.' >&2; exit 1");
+        let _ = run(&gh, here(), "warmup").await;
+        let badges = PrBadges::with_rate_limit_pause(Some(gh), Duration::from_secs(60));
+        badges.last_good.lock().unwrap().insert(
+            (here().to_path_buf(), "warm".to_string()),
+            badge(PrState::Open, PrChecks::None),
+        );
+
+        let got = badges.badge(here(), "warm").await;
+        assert_eq!(got.map(|badge| badge.number), Some(7));
+        assert!(badges.paused(Instant::now()));
+    }
+
+    /// Once paused, `cached` never calls `fetch` at all: the recheck inside
+    /// the permit answers `Miss::Paused` on its own, so a `fetch` that
+    /// panics if it ever ran is the proof, and the pause it left behind is
+    /// untouched (only a fresh `RateLimited` may move it).
+    #[tokio::test]
+    async fn cached_never_calls_fetch_once_paused_and_leaves_the_pause_untouched() {
+        let badges = PrBadges::new(None);
+        let until = Instant::now() + Duration::from_secs(5);
+        *badges.paused_until.lock().unwrap() = Some(until);
+
+        let got = badges.cached(key("q"), || async { panic!("fetch ran while paused") }).await;
+
+        assert_eq!(got, None);
+        assert_eq!(*badges.paused_until.lock().unwrap(), Some(until));
     }
 
     #[tokio::test(start_paused = true)]
