@@ -292,7 +292,8 @@ function row(setting: ConfigSetting_Serialize, dirty: readonly string[], current
       break;
     case "choice": {
       const [list, index] = value.Choice ?? [[], 0];
-      options = list.map(label);
+      // Not `map(label)`: the index would be read as `label`'s cap.
+      options = list.map((item) => label(item));
       selected = index;
       shown = options[index] ?? "";
       break;
