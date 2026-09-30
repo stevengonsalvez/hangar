@@ -194,7 +194,8 @@ async fn a_shell_tab_opens_reattaches_and_ends_through_the_daemon() {
         Quiet,
         reports.clone(),
     );
-    let failed = shell_tab::open_tab(&client, &broken, &repo.display().to_string())
+    let never = |_| panic!("a shell the daemon made is not looked for again");
+    let failed = shell_tab::open_tab(&client, &broken, &repo.display().to_string(), never)
         .await
         .expect_err("the tab cannot attach");
     assert!(
