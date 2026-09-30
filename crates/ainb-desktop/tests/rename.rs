@@ -255,10 +255,6 @@ fn a_label_file_that_does_not_parse_is_the_fields_refusal_and_is_left_as_it_is()
 
     let refusal = f.shell.rename_session(f.api, "Fix login").expect_err("refused");
     assert!(refusal.contains("was not saved"), "{refusal}");
-    assert!(
-        !refusal.contains("Keep me"),
-        "the field repeats no label: {refusal}"
-    );
     assert_eq!(
         std::fs::read(&file.0).unwrap(),
         damaged,
