@@ -28,6 +28,31 @@ interface Props {
   theme: Theme;
 }
 
+/** A mounted pane, and its WebGL renderer while it has one. */
+interface Painter {
+  term: Terminal;
+  webgl?: WebglAddon;
+}
+
+const painters = new Set<Painter>();
+
+/**
+ * Redraw every pane from its buffer once a zoom's layout has settled, as
+ * Orca's reveal repaint does (`pane-reveal-repaint.ts`): two frames on, wipe
+ * the glyph atlases, then refresh every row. xterm shares one atlas between
+ * panes drawn at the same font and theme (`CharAtlasCache.ts`), so a wipe for
+ * the zoomed pane is a wipe for a sibling too: every pane's is wiped before
+ * any repaints, as Orca's `resetAndRefreshAllTerminalWebglAtlases` does.
+ */
+function repaintOnSettledFrame(): void {
+  requestAnimationFrame(() =>
+    requestAnimationFrame(() => {
+      for (const painter of painters) painter.webgl?.clearTextureAtlas();
+      for (const { term } of painters) term.refresh(0, term.rows - 1);
+    }),
+  );
+}
+
 /**
  * One tab's terminal. It stays mounted while the tab is listed, hidden when
  * another is active, so its buffer survives a tab switch and a reconnect.
@@ -85,10 +110,16 @@ export function TerminalView(props: Props) {
     // the default browser (`open_url`): the webview opens nothing itself.
     loadTerminalLinks(term, pane, props.mac, (url) => void invoke("open_url", { url }));
     focusTerminal = () => term.focus();
+    const painter: Painter = { term };
+    painters.add(painter);
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        painter.webgl = undefined;
+        webgl.dispose();
+      });
       term.loadAddon(webgl);
+      painter.webgl = webgl;
     } catch {
       // No WebGL in this webview: xterm keeps its DOM renderer.
     }
@@ -211,6 +242,10 @@ export function TerminalView(props: Props) {
         // so it refits and the shell hears the new size.
         term.options.fontSize = nextFontSize(term.options.fontSize ?? TERMINAL_FONT_SIZE, zoom);
         resize();
+        // On macOS the refit grid kept the old cells on screen until the
+        // shell next wrote. The redraw waits for the settled frame and wipes
+        // the glyph atlas first, as Orca's repaint does.
+        repaintOnSettledFrame();
         return false;
       }
       if (event.key === "Escape" && leave(event.timeStamp)) {
@@ -235,6 +270,7 @@ export function TerminalView(props: Props) {
     });
 
     onCleanup(() => {
+      painters.delete(painter);
       observer.disconnect();
       term.dispose();
     });
