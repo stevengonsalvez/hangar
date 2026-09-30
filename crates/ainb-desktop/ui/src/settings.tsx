@@ -45,6 +45,11 @@ interface Props {
   theme?: ThemePreference;
   /** Pick a theme; the Appearance panel draws only when this is given. */
   onTheme?(next: ThemePreference): void;
+  /** Whether a session that needs you or is done raises an OS notification. */
+  notifications?: boolean;
+  /** Turn notifications on or off; the Notifications panel draws only when
+   * this is given. */
+  onNotifications?(next: boolean): void;
 }
 
 /**
@@ -119,6 +124,24 @@ export function SettingsPage(props: Props) {
               <span class="appearance-label">Theme</span>
               <ThemeSwitch value={props.theme ?? "system"} onChange={(next) => onTheme()(next)} />
             </div>
+          </section>
+        )}
+      </Show>
+      <Show when={props.onNotifications}>
+        {(onNotifications) => (
+          <section class="appearance-panel" aria-label="Notifications">
+            <h3>Notifications</h3>
+            <label class="appearance-row">
+              <input
+                type="checkbox"
+                data-notifications-toggle
+                checked={props.notifications ?? true}
+                onChange={(event) => onNotifications()(event.currentTarget.checked)}
+              />
+              <span class="appearance-label">
+                Notify me when a session needs me or is done, unless I am looking at it
+              </span>
+            </label>
           </section>
         )}
       </Show>

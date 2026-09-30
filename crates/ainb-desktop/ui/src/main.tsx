@@ -42,7 +42,7 @@ import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
 import { createNewAgentFlow } from "./new_agent.ts";
 import { TabCreateMenu } from "./tab_create_menu.tsx";
-import { cardForSession, statusForTarget } from "./status.ts";
+import { cardForSession, sessionForCard, statusForTarget } from "./status.ts";
 import {
   activateTab,
   focusGroup,
@@ -92,6 +92,7 @@ import "@fontsource-variable/geist-mono";
 import "./theme/tokens.css";
 import "./shell.css";
 import { startTheme } from "./theme/theme.ts";
+import { startNotifications } from "./notifications.ts";
 
 /** How long batches gather before one drain applies them all. */
 const DRAIN_MS = 16;
@@ -145,6 +146,9 @@ function Shell() {
     listen<SidecarState>("sidecar", (event) => setSidecar(event.payload)),
     listen<TabsView>("terminal_tabs", (event) => showTabs(event.payload)),
     listen<string>("toast", (event) => toast(event.payload)),
+    // A click on a session's OS notification; the host already brought the
+    // window forward (`notify_delivery.rs`).
+    listen<{ session_key: string }>("notify:open", (event) => openFromNotice(event.payload.session_key)),
     listen<UpdatePhase>("update", (event) => {
       setUpdatePhase(event.payload);
       if (updateDone(event.payload)) setTimeout(() => setUpdatePhase(null), TOAST_MS);
@@ -452,6 +456,18 @@ function Shell() {
     if (intents.length === 0) return null;
     await invoke("answer_home");
     return run(intents);
+  };
+  /**
+   * The session a clicked OS notification names, by its card key: its row is
+   * selected, as a click on its board card selects it, after `answer_home` so
+   * no page refuses it. An ACP agent has no row; its transcript opens.
+   */
+  const openFromNotice = (sessionKey: string) => {
+    const card = agentStatus()?.view?.cards.find((one) => one.session_key === sessionKey);
+    if (card === undefined) return;
+    const row = sessionForCard(card, allSessions(sessions()), fleet()?.fleet_metadata);
+    if (row !== undefined) void answer([selectRowIntent({ session: row.id })]);
+    else if (card.provider === "acp") void invoke("answer_home").then(() => openTranscript(sessionKey));
   };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
@@ -789,6 +805,18 @@ function Shell() {
   /** The session whose terminal the work area shows: `undefined` when no
    * terminal is shown, `null` for a tab of no session (`questionOver`). */
   const shownSession = createMemo(() => shownSessionOf(showing("terminal"), tabs(), active()));
+  /** The card key of the session the work area shows, its transcript card's
+   * or its terminal's, `null` for none: the host raises no OS notification
+   * for that session while this window has focus (`notify.rs`). */
+  const focusedCard = createMemo(() => {
+    // Settings and the Inbox cover the work area, a transcript card too.
+    if (settings() || inboxOpen()) return null;
+    const transcript = transcriptKey();
+    if (transcript !== null) return transcript;
+    const key = active();
+    return pane() === "terminal" && key !== null ? (cardForTabKey(key)?.session_key ?? null) : null;
+  });
+  createEffect(on(focusedCard, (session) => void invoke("notify_focus", { session }).catch(() => {})));
 
   // The reducer speaks through its notices: a refused send says why in the
   // reducer's own words (a daemon that is gone, a native picker, nothing typed),
@@ -1052,6 +1080,8 @@ function Shell() {
                 onRefreshSetup={refreshSetup}
                 theme={theme.preference()}
                 onTheme={theme.set}
+                notifications={notifications.enabled()}
+                onNotifications={notifications.set}
                 onClose={() => {
                   closeSettings();
                   setPane("board");
@@ -1181,4 +1211,7 @@ function Shell() {
 // The host keeps a copy so the next launch's window opens in the pick; a copy
 // that fails to land costs that launch's first frame, nothing else.
 const theme = startTheme((preference) => void invoke("theme_set", { preference }).catch(() => {}));
+// The notifications toggle the settings page reads and sets (Notifications).
+// The host sends the notifications, so it is told now and on every change.
+const notifications = startNotifications((enabled) => void invoke("notifications_set", { enabled }).catch(() => {}));
 render(() => <Shell />, document.getElementById("root")!);
