@@ -540,7 +540,6 @@ async fn an_acp_turn_past_the_task_budget_times_out_and_tells_the_adapter() {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_CLAUDE_PATH", &claude),
@@ -614,7 +613,6 @@ async fn the_pool_deadline_does_not_cap_a_task_that_outlives_it() {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_CLAUDE_PATH", &claude),
@@ -677,7 +675,6 @@ fn spawn_acp_daemon(
         home,
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_CLAUDE_PATH", &claude),

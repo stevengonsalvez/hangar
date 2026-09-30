@@ -28,11 +28,14 @@ fn health() -> DaemonHealth {
 
 /// A private home whose config opts out, published before any dispatch in
 /// this process reads the switch. Every dispatching test calls this first.
+///
+/// The hangar home is NOT `$HOME/.agents-in-a-box`: a reader that wrongly
+/// roots at `$HOME` would then find the opt-out anyway and hide the bug.
 fn opted_out_by_file() -> &'static PathBuf {
     static HOME: OnceLock<PathBuf> = OnceLock::new();
     HOME.get_or_init(|| {
         let root = tempfile::tempdir().unwrap().keep();
-        let hangar = root.join(".agents-in-a-box");
+        let hangar = root.join("hangar-home");
         let config = ainb_hangar_daemon::spawn::config_path_in(&hangar);
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
         std::fs::write(&config, "[hangar]\nspawn = false\n").unwrap();

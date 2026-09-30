@@ -257,7 +257,6 @@ async fn run_process_executor() -> Run {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "process"),
             ("HANGAR_CLAUDE_PATH", &claude),
@@ -347,7 +346,6 @@ async fn run_acp_executor() -> Run {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),
             ("HANGAR_CLAUDE_PATH", &claude),
