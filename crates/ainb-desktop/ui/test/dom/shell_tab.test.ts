@@ -169,8 +169,9 @@ test("a refusal shows the host's sentence as it came", async () => {
 
 test("a long refusal is cleaned and cut at a toast's cap, not a label's", async () => {
   await showTab("u-1");
-  // The host cuts at 300 (`intent::MAX_TOAST_CHARS`); a bidi override or an
-  // escape in its detail must not restyle the toast.
+  // The page cuts a refusal at TOAST_CHARS (300, held equal to
+  // intent::MAX_TOAST_CHARS); a bidi override or an escape in its detail
+  // must not restyle the toast.
   const detail = "d".repeat(400);
   refuse.set("shell_open", `\u202EOpening the terminal failed:\u001b ${detail}`);
   await newTerminal();
