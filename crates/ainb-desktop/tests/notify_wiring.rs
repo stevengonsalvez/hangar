@@ -2,7 +2,9 @@
 //! from, checked at the source (as `window_paint_wiring.rs` checks the theme
 //! paint): the tick hands every move of section 20 to the notifier under the
 //! gate the page and the window keep current, and only then shows what it
-//! returns. The rule itself is `notify::decide`'s own unit tests.
+//! returns, and a click on one brings the window forward and names the
+//! session to the page. The rule itself is `notify::decide`'s own unit tests,
+//! and the OS round trip is `notify_click_dbus.rs`.
 
 use std::path::Path;
 
@@ -61,21 +63,39 @@ fn the_tick_shows_only_what_the_notifier_decides_under_the_live_gate() {
     );
     let show = at(
         &source,
-        "show_notice(&handle, &notice)",
-        "what it returns is shown",
+        "notify_delivery::announce(&os, notices, &open)",
+        "what it returns is handed to the OS",
     );
     assert!(
         tick < read && read < gate && gate < observe && observe < show,
         "tick, read, gate, decide, show: in that order"
     );
-    assert!(
-        body(&source, "show_notice").contains(".notification()"),
-        "the host sends it through the plugin"
+    at(
+        &source,
+        "let os = OsDelivery::default();",
+        "the OS delivery is notify-rust's",
     );
     at(
         &source,
-        ".plugin(tauri_plugin_notification::init())",
-        "the plugin is registered",
+        "Arc::new(move |session| open_from_notice(&handle, session))",
+        "a click runs open_from_notice",
+    );
+}
+
+#[test]
+fn a_click_brings_the_window_forward_then_tells_the_page_the_session() {
+    let source = main_rs();
+    let open = body(&source, "open_from_notice");
+    let focus = at(open, ".set_focus()", "the window takes focus");
+    let emit = at(
+        open,
+        "handle.emit(\"notify:open\", NotifyOpen { session_key })",
+        "the page hears the session",
+    );
+    assert!(focus < emit, "forward first, then the page selects");
+    assert!(
+        !source.contains("tauri_plugin_notification"),
+        "no plugin: it drops the click"
     );
 }
 

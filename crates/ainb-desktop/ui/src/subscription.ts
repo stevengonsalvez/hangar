@@ -11,6 +11,7 @@ import type {
   GitViewView_Serialize,
   HostId,
   InboxView_Serialize,
+  SessionLabelsView,
   SessionsView_Serialize,
   UsageView,
 } from "../../../ainb-app/bindings/AppState";
@@ -33,6 +34,7 @@ export const SUBSCRIBED: SectionName[] = [
   "git_view",
   "usage",
   "inbox",
+  "session_labels",
 ];
 
 /**
@@ -45,6 +47,15 @@ export const AHEAD_OF_READERS: SectionName[] = ["shell", "tmux"];
 /** The sidebar's rows and the tab titles: the host's Sessions section. */
 export function shellSessions(store: FrameStore, host: HostId | undefined): SessionsView_Serialize | undefined {
   return host === undefined ? undefined : store.section(host, "sessions");
+}
+
+/**
+ * The sidebar cards' titles: the host's label store, by tmux session name. A
+ * session row in the Sessions frame leaves its label off (#983 M19); this
+ * section is where the window reads it, and where a rename lands.
+ */
+export function shellLabels(store: FrameStore, host: HostId | undefined): SessionLabelsView | undefined {
+  return host === undefined ? undefined : store.section(host, "session_labels");
 }
 
 /** The board's cards and their health: the host's agent status section. */

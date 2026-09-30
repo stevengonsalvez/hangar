@@ -4,7 +4,13 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { tauriTransport, type Bridge, type ByteChannel } from "./transport.ts";
+import {
+  setVisibleTerminals,
+  tauriTransport,
+  visibleTerminalsSettled,
+  type Bridge,
+  type ByteChannel,
+} from "./transport.ts";
 
 interface Call {
   command: string;
@@ -81,4 +87,50 @@ test("a paint that throws or rejects still returns its credit", async () => {
     await settle();
     assert.deepEqual(calls[1], { command: "terminal_ack", args: { key: "tab-1", bytes: 1 } });
   }
+});
+
+test("the panes on screen reach the host as one set, and a refusal comes back", async () => {
+  const calls: Call[] = [];
+  let answer: unknown = true;
+  const spy: Bridge = {
+    invoke(command, args) {
+      calls.push({ command, args });
+      return Promise.resolve(answer);
+    },
+    channel: () => assert.fail("no channel for the visible set"),
+  };
+  assert.equal(await setVisibleTerminals(["tab-1", "tab-2"], spy), true);
+  assert.deepEqual(calls, [{ command: "terminal_visible", args: { keys: ["tab-1", "tab-2"] } }]);
+  answer = false;
+  assert.equal(await setVisibleTerminals([], spy), false, "a refused set says so");
+  assert.deepEqual(calls[1], { command: "terminal_visible", args: { keys: [] } });
+});
+
+test("a paste's wait holds until the host answers the last set, and a failed set does not hold it", async () => {
+  const answers: ((value: unknown) => void)[] = [];
+  const failures: ((error: unknown) => void)[] = [];
+  const slow: Bridge = {
+    invoke: () =>
+      new Promise((resolve, reject) => {
+        answers.push(resolve);
+        failures.push(reject);
+      }),
+    channel: () => assert.fail("no channel for the visible set"),
+  };
+  let settled = false;
+  void setVisibleTerminals(["tab-1"], slow);
+  void visibleTerminalsSettled().then(() => (settled = true));
+  await settle();
+  assert.equal(settled, false, "the set is still in flight");
+  answers[0](true);
+  await settle();
+  assert.equal(settled, true, "the host's answer lets the paste read");
+
+  const refused = setVisibleTerminals(["tab-2"], slow);
+  refused.catch(() => undefined);
+  let released = false;
+  void visibleTerminalsSettled().then(() => (released = true));
+  failures[1](new Error("no host"));
+  await settle();
+  assert.equal(released, true, "a set the host never took releases the paste");
 });

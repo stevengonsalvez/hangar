@@ -120,6 +120,27 @@ test("a card's title, branch and model come from its newest session", () => {
   assert.equal(card.model, "opus");
 });
 
+test("a card's title is its newest session's label, keyed by tmux name, over the row's own name", () => {
+  const rows = [
+    session({ id: "older", workspace_path: "/repo/wt", tmux_session_name: "ainb-older" }),
+    session({
+      id: "newer",
+      workspace_path: "/repo/wt",
+      created_at: "2024-06-01T00:00:00Z",
+      tmux_session_name: "ainb-newer",
+      display_name: "Loaded name",
+    }),
+  ];
+  // The rename lands in the label store; the frame's row never carries it.
+  const [renamed] = worktreeCards(rows, "/repo", { "ainb-newer": "Fix login", "ainb-older": "Not the title" });
+  assert.equal(renamed.title, "Fix login");
+  assert.equal(renamed.primaryId, "newer", "a rename of the card renames the session the title names");
+  // No label for it: the row's own display name, then its name.
+  assert.equal(worktreeCards(rows, "/repo", { "ainb-older": "Not the title" })[0].title, "Loaded name");
+  const [plain] = worktreeCards([session({ id: "solo", tmux_session_name: null })], "/repo", { "": "Nothing" });
+  assert.equal(plain.title, "solo", "a row with no tmux name has no label to find");
+});
+
 test("zero git counts hide: a card with nothing dirty carries no gitChanges", () => {
   const [clean] = worktreeCards([session({ id: "clean", workspace_path: "/repo/a" })], "/repo");
   assert.equal(clean.gitChanges, null);

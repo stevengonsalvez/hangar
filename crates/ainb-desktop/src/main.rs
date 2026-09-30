@@ -23,7 +23,8 @@ use ainb_desktop::delete::{DeletePreview, TreeFate};
 use ainb_desktop::executor::DesktopExecutor;
 use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
-use ainb_desktop::notify::{self, Gate, Notice, Notifier};
+use ainb_desktop::notify::{self, Gate, Notifier};
+use ainb_desktop::notify_delivery::{self, OsDelivery};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
@@ -107,16 +108,29 @@ impl Notifications {
     }
 }
 
-/// Hand `notice` to the OS as a notification, from the host: the webview
-/// never sends one. The plugin delivers it on a task of its own and drops a
-/// delivery error, so what is logged here is the hand-off.
-fn show_notice(handle: &tauri::AppHandle, notice: &Notice) {
-    use tauri_plugin_notification::NotificationExt;
-    let shown = handle.notification().builder().title(&notice.title).body(&notice.body).show();
-    match shown {
-        Ok(()) => tracing::info!(session = %notice.session_key, "OS notification handed to the OS"),
-        Err(error) => {
-            tracing::warn!(%error, session = %notice.session_key, "OS notification not sent");
+/// What the page hears when a person clicks a session's notification: the
+/// card key it names, for the page to select that session's row.
+#[derive(Clone, serde::Serialize)]
+struct NotifyOpen {
+    session_key: String,
+}
+
+/// A click on a notification: the window is brought forward, and the page
+/// told which session to select (`notify:open`). A summary names none, so its
+/// click only brings the window forward. Runs on the notice's own thread.
+fn open_from_notice(handle: &tauri::AppHandle, session: Option<String>) {
+    if let Some(window) = handle.get_webview_window("main") {
+        // Best effort: a window that is not minimized or hidden refuses nothing
+        // that matters, and `set_focus` below is the one that must land.
+        let _ = window.unminimize();
+        let _ = window.show();
+        if let Err(error) = window.set_focus() {
+            tracing::warn!(%error, "the window did not take focus for a notification click");
+        }
+    }
+    if let Some(session_key) = session {
+        if let Err(error) = handle.emit("notify:open", NotifyOpen { session_key }) {
+            tracing::warn!(%error, "notification click not delivered to the webview");
         }
     }
 }
@@ -224,7 +238,7 @@ fn clipboard_write(text: String) {
 
 /// The terminal's paste: the clipboard's text for the pane `key` is showing.
 ///
-/// Answered only for the tab the window has in front of the operator, which is
+/// Answered only for a tab the window has in front of the operator, which is
 /// the only caller: paste is a pane's own accelerator, so no other renderer
 /// path, and no driver on a `wdio` build, reads what was last copied. Empty
 /// when the clipboard holds no text, cannot be read, or holds more than a
@@ -333,6 +347,13 @@ fn terminal_resize(window: tauri::State<'_, Window>, key: String, cols: u16, row
     }
 }
 
+/// The tabs the layout has on screen, exactly `keys`: the cap spares each,
+/// and each may paste. `false`, changing nothing, for too many keys.
+#[tauri::command]
+fn terminal_visible(window: tauri::State<'_, Window>, keys: Vec<String>) -> bool {
+    window.terminals.as_ref().is_some_and(|terminals| terminals.set_visible(keys))
+}
+
 /// Cmd+K: clear the tab's scrollback in tmux and redraw its client. Off the
 /// main thread: it forks tmux twice, and a wedged tmux must not stall the
 /// window. A failure is the toast `Terminals::clear` shows.
@@ -351,6 +372,109 @@ async fn terminal_clear(window: tauri::State<'_, Window>, key: String) -> Result
 fn terminal_close(window: tauri::State<'_, Window>, key: String) {
     if let Some(terminals) = &window.terminals {
         terminals.close(&key);
+    }
+}
+
+/// The daemon client this window asks, or the sentence saying why not.
+fn daemon_client(
+    verb: ainb_desktop::shell_tab::Verb,
+) -> Result<ainb_hangar_client::DaemonClient, String> {
+    ainb_app::fleet::bridge::daemon::surface_client(
+        ainb_hangar_proto::connections::SurfaceKind::Desktop,
+    )
+    .map_err(|error| ainb_desktop::shell_tab::refusal_text(verb, &error))
+}
+
+/// The folder `target` names, resolved from the host's own session list or
+/// shell tabs, never from the page.
+fn resolve_worktree(
+    window: &Window,
+    target: &ainb_desktop::worktree_target::WorktreeTarget,
+) -> Result<String, String> {
+    target.resolve(
+        |id| window.shell.session_worktree(id),
+        |key| match window.terminals.as_ref()?.target(key)? {
+            TabTarget::Shell { dir, .. } => Some(dir),
+            _ => None,
+        },
+    )
+}
+
+/// Open a plain shell in the worktree `target` names, as a tab, and answer
+/// the tab's key. The folder is the host's, from its own session list or
+/// shell tabs, never the page's; the daemon opens the shell, and closes it
+/// again when its tab cannot attach (`shell_tab::open_tab`).
+#[tauri::command]
+async fn shell_open(
+    window: tauri::State<'_, Window>,
+    target: ainb_desktop::worktree_target::WorktreeTarget,
+) -> Result<String, String> {
+    use ainb_desktop::shell_tab::{self, Verb};
+    let terminals =
+        window.terminals.as_ref().ok_or("No tmux was found, so no terminal can open.")?;
+    let dir = resolve_worktree(&window, &target)?;
+    match shell_tab::open_tab(&daemon_client(Verb::Open)?, terminals, &dir).await {
+        Ok(key) => {
+            tracing::info!(tmux = %key, "window opened a shell");
+            Ok(key)
+        }
+        Err(failed) => {
+            // The reducer shows a failed attach in its own words.
+            if let Some(report) = failed.report {
+                window.shell.dispatch(report);
+            }
+            Err(failed.message)
+        }
+    }
+}
+
+/// Close the shell tab `key` and end its shell (`shell/close`). Any other
+/// tab is refused: this ends only shells the daemon opened.
+#[tauri::command]
+async fn shell_close(window: tauri::State<'_, Window>, key: String) -> Result<(), String> {
+    use ainb_desktop::shell_tab::{self, Verb};
+    let terminals = window.terminals.as_ref().ok_or("No terminal tabs are open.")?;
+    shell_tab::close_tab(terminals, &daemon_client(Verb::Close)?, &key)
+        .await
+        .map(|_| ())
+}
+
+/// Re-attach the detached shell tab `key`: it has no session-list row to go
+/// through.
+#[tauri::command]
+fn shell_reattach(window: tauri::State<'_, Window>, key: String) {
+    if let Some(report) = window
+        .terminals
+        .as_ref()
+        .and_then(|terminals| ainb_desktop::shell_tab::reattach(terminals, &key))
+    {
+        window.shell.dispatch(report);
+    }
+}
+
+/// Reattach, as tabs, the shells the daemon still runs from an earlier
+/// launch. Once per launch; a daemon without the verb, or none reachable,
+/// leaves the strip as it is.
+async fn restore_shells(handle: tauri::AppHandle) {
+    let window = handle.state::<Window>();
+    let Some(terminals) = window.terminals.as_ref() else {
+        return;
+    };
+    let client = match daemon_client(ainb_desktop::shell_tab::Verb::Open) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "shells not restored");
+            return;
+        }
+    };
+    match ainb_desktop::shell_tab::restore(&client, terminals).await {
+        Ok((listed, reports)) => {
+            tracing::info!(listed, failed = reports.len(), "restored shell tabs");
+            for report in reports {
+                window.shell.dispatch(report);
+            }
+        }
+        Err(error) => tracing::warn!(%error, "shells not restored"),
     }
 }
 
@@ -436,6 +560,25 @@ async fn session_delete(
     // taken the session's tmux or its row.
     window.shell.reload_workspaces();
     outcome.map_err(|error| intent::toast_text(&error))
+}
+
+/// Rename a sidebar row: the session's display name only, never its branch or
+/// its folder. The host checks the name (`ainb_desktop::rename`); a refusal is
+/// the sentence the rename field shows, as written: each is the host's own, and
+/// the one name it repeats has passed the check, so it carries no control or
+/// format character (a toast's path scrub would turn `feat/login` into a
+/// placeholder). The log names the session, never the name, which is the
+/// operator's own label.
+#[tauri::command]
+fn session_rename(
+    window: tauri::State<'_, Window>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let session = ainb_desktop::rename::session_id(&id)?;
+    window.shell.rename_session(session, &name)?;
+    tracing::info!(%session, "window renamed a session");
+    Ok(())
 }
 
 /// The composer's Project select: every repository in a folder the daemon
@@ -1051,8 +1194,6 @@ compile_error!("a release build must carry `bundled`, or the window loads build.
 fn main() {
     // The native confirmation in front of the onboarding writes (#1175).
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
-    // The OS notification a session's move into Needs or Done raises.
-    let builder = builder.plugin(tauri_plugin_notification::init());
     // Only a `wdio` build carries the embedded WebDriver the journey drives.
     #[cfg(feature = "wdio")]
     let builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
@@ -1068,6 +1209,17 @@ fn main() {
                 shown: Mutex::new(None),
                 window_focused: AtomicBool::new(false),
             });
+            // macOS posts a notification as an app it knows: this bundle, or
+            // Terminal from a dev build, which has none (the rule
+            // tauri-plugin-notification used).
+            #[cfg(target_os = "macos")]
+            if let Err(error) = notify_rust::set_application(if tauri::is_dev() {
+                "com.apple.Terminal"
+            } else {
+                app.config().identifier.as_str()
+            }) {
+                tracing::warn!(?error, "notifications will post as the default application");
+            }
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme = Arc::new(ThemePick::load(hangar_home.join(theme::THEME_FILE)));
@@ -1200,6 +1352,7 @@ fn main() {
 
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut shells_restored = false;
                 loop {
                     let (view, connected) = {
                         let state = states.borrow_and_update();
@@ -1225,6 +1378,10 @@ fn main() {
                             }
                             window.shell.set_host(host_id);
                         }
+                        if !shells_restored {
+                            shells_restored = true;
+                            tauri::async_runtime::spawn(restore_shells(handle.clone()));
+                        }
                     }
                     if let Err(error) = handle.emit("sidecar", view) {
                         tracing::warn!(%error, "sidecar state not delivered to the webview");
@@ -1242,6 +1399,11 @@ fn main() {
                 // it last saw of every session.
                 let mut seen = 0;
                 let mut notifier = Notifier::default();
+                let os = OsDelivery::default();
+                let open: notify_delivery::Open = {
+                    let handle = handle.clone();
+                    Arc::new(move |session| open_from_notice(&handle, session))
+                };
                 loop {
                     interval.tick().await;
                     let window = handle.state::<Window>();
@@ -1249,9 +1411,8 @@ fn main() {
                     if let Some(sessions) = window.shell.agent_sessions_since(&mut seen) {
                         let gate = handle.state::<Notifications>().gate();
                         let now = ainb_app::fleet::daemons::heartbeat::now_ms();
-                        for notice in notifier.observe(sessions, &gate, now) {
-                            show_notice(&handle, &notice);
-                        }
+                        let notices = notifier.observe(sessions, &gate, now);
+                        notify_delivery::announce(&os, notices, &open);
                     }
                 }
             });
@@ -1283,11 +1444,16 @@ fn main() {
             terminal_ack,
             terminal_input,
             terminal_resize,
+            terminal_visible,
             terminal_clear,
             terminal_close,
+            shell_open,
+            shell_close,
+            shell_reattach,
             worktree_create,
             session_delete_preview,
             session_delete,
+            session_rename,
             projects_list,
             project_add,
             update_check,

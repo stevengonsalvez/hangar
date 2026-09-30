@@ -183,3 +183,14 @@ export type TreeFate =
  *  disk: only the session goes.
  */
 "kept";
+
+/**  A worktree, as the page may name one. */
+export type WorktreeTarget = 
+/**  The worktree of a session in the host's session list. */
+{ kind: "session"; 
+/**  The session's id. */
+id: string } | 
+/**  The folder of a shell tab the host opened (`shell_open`). */
+{ kind: "shell"; 
+/**  The shell tab's key. */
+key: string };

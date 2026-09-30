@@ -332,6 +332,26 @@ impl<S: FrameSink> DesktopHost<S> {
         effects
     }
 
+    /// Give `session` the display name `raw` ([`crate::rename::rename`]),
+    /// frame it, and return the label store write it queued.
+    ///
+    /// A write outside dispatch, as the tick's are: the reducer's own label
+    /// rename is the terminal's popup, driven by the selection and typed keys,
+    /// and the window edits the name in its own field and sends it whole.
+    ///
+    /// # Errors
+    /// Why the name was refused; nothing was written or framed then.
+    pub fn rename_session(
+        &mut self,
+        session: uuid::Uuid,
+        raw: &str,
+    ) -> Result<Vec<Effect>, String> {
+        crate::rename::rename(&mut self.state, session, raw)?;
+        let effects = self.state.take_effects();
+        self.pump();
+        Ok(effects)
+    }
+
     /// Load the workspaces in the background, under the state's own load
     /// policy; a later [`Self::tick`] applies the result. Must be called inside
     /// a tokio runtime.
