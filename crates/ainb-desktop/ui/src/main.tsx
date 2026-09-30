@@ -1163,7 +1163,14 @@ function Shell() {
                     mac={MAC}
                     onNewTerminal={(target) => void shellTabs.open(target)}
                     agents={newAgent}
-                    restoreFocus={focusShown}
+                    // This pane's, not the focused one's: a pick in another
+                    // pane focuses that pane and its shown terminal, where
+                    // the new tab then lands.
+                    restoreFocus={() => {
+                      const tab = shown();
+                      if (tab !== undefined) activate(tab.key, false);
+                      else focusShown();
+                    }}
                   />
                 )}
                 terminal={(key, visible) => (
