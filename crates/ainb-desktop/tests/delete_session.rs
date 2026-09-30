@@ -124,6 +124,163 @@ async fn deleting_the_only_session_in_a_tree_takes_the_tree_and_its_row() {
     assert!(!listed(session), "the row is gone");
 }
 
+/// Ends one tmux session by exact name on the test's own socket when the
+/// test is done, whatever the delete did.
+struct EndOnDrop {
+    socket: PathBuf,
+    name: String,
+}
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        eprintln!(
+            "ending tmux session {} on {}",
+            self.name,
+            self.socket.display()
+        );
+        let _ = tmux(
+            &self.socket,
+            &["kill-session", "-t", &format!("={}", self.name)],
+        );
+    }
+}
+
+/// Clears the test server's `session-closed` hook, so the sessions can end.
+struct Unhook(PathBuf);
+
+impl Drop for Unhook {
+    fn drop(&mut self) {
+        let _ = tmux(&self.0, &["set-hook", "-gu", "session-closed"]);
+    }
+}
+
+fn tmux_available() -> bool {
+    let found = Command::new("tmux").arg("-V").output().is_ok_and(|o| o.status.success());
+    assert!(
+        found || std::env::var_os("CI").is_none(),
+        "tmux is missing under CI"
+    );
+    found
+}
+
+/// The socket a bare `tmux` reaches under the private TMUX_TMPDIR [`home`]
+/// set: the one the removal's own tmux calls reach.
+fn private_socket() -> PathBuf {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let tmux_dir = PathBuf::from(std::env::var_os("TMUX_TMPDIR").expect("home() set it"));
+    let uid = std::fs::metadata(&tmux_dir).unwrap().uid();
+    let socket_dir = tmux_dir.join(format!("tmux-{uid}"));
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::set_permissions(&socket_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    socket_dir.join("default")
+}
+
+/// The name `ainb run` gives `session`'s tmux session, for workspace `repo`.
+fn ainb_run_name(session: Uuid) -> String {
+    format!("tmux_repo-{}", &session.simple().to_string()[..8])
+}
+
+fn tmux(socket: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args(args)
+        .output()
+        .expect("tmux runs")
+}
+
+fn start(socket: &Path, name: &str, dir: &Path) {
+    let dir = dir.to_str().unwrap();
+    let started = tmux(
+        socket,
+        &["new-session", "-d", "-s", name, "-c", dir, "sleep 600"],
+    );
+    assert!(started.status.success(), "{started:?}");
+}
+
+fn running(socket: &Path, name: &str) -> bool {
+    tmux(socket, &["has-session", "-t", &format!("={name}")]).status.success()
+}
+
+#[tokio::test]
+async fn deleting_a_session_ends_its_agents_tmux_session() {
+    // The desktop makes sessions through `ainb run`, which names the tmux
+    // session `tmux_<workspace>-<id>`, not the `tmux_<folder>_<branch>` a
+    // name derived from the worktree would be. The delete must end the one
+    // the row names, or the agent keeps running in a deleted folder.
+    if !tmux_available() {
+        return;
+    }
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    let socket = private_socket();
+    let name = ainb_run_name(session);
+    let _end = EndOnDrop {
+        socket: socket.clone(),
+        name: name.clone(),
+    };
+    start(&socket, &name, &tree);
+    let mut agent = row(session, &tree);
+    agent.tmux_session_name = name.clone();
+    save(&[agent]);
+
+    delete(&session.to_string(), TreeFate::Removed, Some(0), false)
+        .await
+        .expect("deleted");
+
+    assert!(!tree.exists(), "the worktree folder is gone");
+    assert!(!listed(session), "the row is gone");
+    assert!(
+        !running(&socket, &name),
+        "the agent's tmux session {name} is still running in a deleted folder"
+    );
+}
+
+#[tokio::test]
+async fn a_tmux_session_that_will_not_end_refuses_the_delete() {
+    // A kill that leaves the agent running must not be logged and passed
+    // over: the folder and the row stay, and the window hears why.
+    if !tmux_available() {
+        return;
+    }
+    let _one = STORE.lock().await;
+    let base = home();
+    let (session, tree) = managed_tree(&base);
+    let socket = private_socket();
+    let name = ainb_run_name(session);
+    let keeper = format!("keeper-{}", session.simple());
+    let _end = EndOnDrop {
+        socket: socket.clone(),
+        name: name.clone(),
+    };
+    let _end_keeper = EndOnDrop {
+        socket: socket.clone(),
+        name: keeper.clone(),
+    };
+    // The server outlives the agent's session, and brings it straight back.
+    start(&socket, &keeper, &tree);
+    start(&socket, &name, &tree);
+    let revive = format!(
+        "new-session -d -s {name} -c {} \"sleep 600\"",
+        tree.display()
+    );
+    assert!(tmux(&socket, &["set-hook", "-g", "session-closed", &revive]).status.success());
+    // Dropped first: the hook goes before the sessions are ended.
+    let _unhook = Unhook(socket.clone());
+    let mut agent = row(session, &tree);
+    agent.tmux_session_name = name.clone();
+    save(&[agent]);
+
+    let error = delete(&session.to_string(), TreeFate::Removed, Some(0), false)
+        .await
+        .expect_err("refused while the agent runs");
+
+    assert!(error.contains("still running"), "{error}");
+    assert!(tree.is_dir(), "the running agent's folder stays");
+    assert!(listed(session), "the row stays");
+}
+
 #[tokio::test]
 async fn a_file_written_after_the_preview_refuses_the_delete_and_survives() {
     // A live agent writes while the dialog is open: the tree was clean when
