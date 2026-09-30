@@ -410,7 +410,9 @@ pub(crate) struct AcpAdapterToml {
     models: Vec<String>,
 }
 
-/// Read `[acp.adapters]` from the hangar home's `config/config.toml`.
+/// Read `[acp.adapters]` from the hangar home's `config/config.toml`
+/// (`$AINB_HANGAR_HOME` when set and non-empty, else `~/.agents-in-a-box`; see
+/// [`crate::spawn::config_path_in`]).
 ///
 /// Empty on any failure (no hangar home, no file, bad TOML, malformed
 /// table), with a warning: the built-in adapters are always the floor.
@@ -439,16 +441,9 @@ pub(crate) fn acp_adapters_in(path: &std::path::Path) -> HashMap<String, AcpAdap
     let Some(table) = root.get("acp").and_then(|acp| acp.get("adapters")) else {
         return HashMap::new();
     };
-    table.clone().try_into().unwrap_or_else(|_| {
-        // Never serde's message: it quotes the offending value, and an
-        // adapter's command may carry a token. Name the entries instead.
-        let malformed: Vec<&String> = table.as_table().map_or_else(Vec::new, |adapters| {
-            adapters
-                .iter()
-                .filter(|(_, adapter)| (*adapter).clone().try_into::<AcpAdapterToml>().is_err())
-                .map(|(name, _)| name)
-                .collect()
-        });
+    // Never serde's message: it quotes the offending value, and an adapter's
+    // command may carry a token. `decode` names the entries instead.
+    ainb_hangar_core::config_file::decode(table).unwrap_or_else(|malformed| {
         tracing::warn!(
             path = %path.display(),
             ?malformed,
@@ -629,18 +624,31 @@ impl PoolConfig {
     /// adapter installed anywhere but `PATH` could not be reached. A named
     /// adapter here overrides the built-in entry; a new name adds one.
     ///
-    /// Read directly off config.toml rather than through `ainb`, which this
-    /// crate does not depend on, mirroring how the session-reader plugin reads
-    /// `[session_reader]`. Every failure degrades to the built-ins: a malformed
-    /// table must not leave the daemon with no adapters at all.
+    /// Read directly off the hangar home's `config/config.toml`
+    /// (`$AINB_HANGAR_HOME` when set and non-empty, else `~/.agents-in-a-box`,
+    /// never `$HOME` directly) through [`crate::hangar_config`], rather than
+    /// through `ainb`, which this crate does not depend on. Every failure
+    /// degrades to the built-ins: a malformed table must not leave the daemon
+    /// with no adapters at all.
+    ///
+    /// Nothing the file holds is logged. A parse error is logged by line and
+    /// column, a malformed `[acp.adapters]` by the names of its bad entries, and
+    /// an unknown `permission_mode` by its adapter's name.
     #[must_use]
     pub fn from_config() -> Self {
+        Self::with_config_adapters(acp_adapters_from_config())
+    }
+
+    /// [`PoolConfig::from_config`] over `adapters` already read, so the
+    /// overlay is testable without touching `$AINB_HANGAR_HOME`.
+    #[must_use]
+    pub(crate) fn with_config_adapters(adapters: HashMap<String, AcpAdapterToml>) -> Self {
         let mut config = Self::default();
-        for (name, adapter) in acp_adapters_from_config() {
+        for (name, adapter) in adapters {
             let entry = config
                 .adapters
                 .entry(name.clone())
-                .or_insert_with(|| AdapterConfig::new(name, DEFAULT_PERMISSION_MODE));
+                .or_insert_with(|| AdapterConfig::new(name.as_str(), DEFAULT_PERMISSION_MODE));
             // `filter(|c| !c.trim().is_empty())`: the registry seeds this row with
             // `""` and its help says blank resolves the adapter's name on PATH. A
             // hand-edited empty string would otherwise become an empty program path
@@ -661,8 +669,10 @@ impl PoolConfig {
                 if MODES.contains(&mode.as_str()) {
                     entry.permission_mode = mode;
                 } else {
+                    // The adapter, not the value: this warning must not
+                    // quote the file either.
                     tracing::warn!(
-                        %mode,
+                        adapter = %name,
                         "unknown acp permission_mode in config; using \"default\""
                     );
                 }

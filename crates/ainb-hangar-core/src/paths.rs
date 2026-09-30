@@ -7,7 +7,7 @@
 //! delegates here and only appends its own leaf (`hangar.db`, `hangar/logs`,
 //! `hangar/state.toml`, …).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The environment variable that overrides the Hangar home directory.
 ///
@@ -41,6 +41,26 @@ pub fn hangar_home() -> Option<PathBuf> {
     }
 }
 
+/// The user config file under `hangar_home`: `<hangar home>/config/config.toml`.
+///
+/// The one file the daemon and the notifyd and session-reader plugins take
+/// their own tables from (`[hangar]`, `[codex]`, `[acp]`, `[notifyd]`,
+/// `[session_reader]`). A project's `.ainb/config.toml` never reaches them.
+#[must_use]
+pub fn config_path_in(hangar_home: &Path) -> PathBuf {
+    hangar_home.join("config").join("config.toml")
+}
+
+/// [`config_path_in`] of [`hangar_home`]: `$AINB_HANGAR_HOME/config/config.toml`
+/// when the override is set and non-empty, else
+/// `~/.agents-in-a-box/config/config.toml`.
+///
+/// `None` exactly when [`hangar_home`] is.
+#[must_use]
+pub fn config_path() -> Option<PathBuf> {
+    hangar_home().map(|home| config_path_in(&home))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,6 +91,25 @@ mod tests {
         assert!(
             !home.ends_with(HANGAR_DIR),
             "the override path must NOT have the `.agents-in-a-box` segment appended"
+        );
+
+        match prior {
+            Some(v) => std::env::set_var(HANGAR_HOME_ENV, v),
+            None => std::env::remove_var(HANGAR_HOME_ENV),
+        }
+    }
+
+    /// The config file follows the override like everything else under the
+    /// home: a reader built on `$HOME` would miss it.
+    #[test]
+    fn config_path_follows_the_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prior = std::env::var_os(HANGAR_HOME_ENV);
+        std::env::set_var(HANGAR_HOME_ENV, "/tmp/custom-hangar-home");
+
+        assert_eq!(
+            config_path(),
+            Some(PathBuf::from("/tmp/custom-hangar-home/config/config.toml"))
         );
 
         match prior {

@@ -25,6 +25,8 @@ specta = { workspace = true, optional = true }
 # agents-in-a-box-fyq). Both are leaf type/wire crates — notifyd stays independent
 # of the hangar STORE; it only speaks the daemon's PUBLIC RPC surface, and honours
 # the OS channel only when a daemon answers (fail-open otherwise).
+# ainb-hangar-core also carries the hangar home rule and the config sanitiser
+# that `[notifyd]` is read through, shared with the daemon and session-reader.
 ainb-hangar-core = { path = "../ainb-hangar-core", version = "0.1.0" }
 ainb-hangar-proto = { path = "../ainb-hangar-proto", version = "0.1.0" }
 anyhow = { workspace = true }
@@ -37,9 +39,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-# Reads the host's `[notifyd]` table off config.toml, the same way
-# ainb-plugin-session-reader reads `[session_reader]`.
-toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }

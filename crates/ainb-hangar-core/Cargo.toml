@@ -51,6 +51,10 @@ dirs = { workspace = true }
 # daemon can stamp `agent_task_queue.result.pr_url`. Pure string match — no IO —
 # so the crate's no-IO charter is preserved. Compiled once via `std::sync::LazyLock`.
 regex = { workspace = true }
+# `config_file`: parse the hangar home's config.toml and describe what is wrong
+# with it without quoting it, for the daemon and the plugins alike. Pure parse,
+# no IO: each reader does its own read.
+toml = { workspace = true }
 
 [features]
 # Exposes the deterministic test doubles (`FixedClock`, `FixedIdGen`) to

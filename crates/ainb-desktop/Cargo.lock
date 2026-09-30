@@ -371,6 +371,7 @@ dependencies = [
  "sha2",
  "subtle",
  "thiserror 1.0.69",
+ "toml 0.8.23",
  "ulid",
 ]
 
@@ -518,7 +519,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -577,6 +577,7 @@ dependencies = [
 name = "ainb-plugin-session-reader"
 version = "0.1.0"
 dependencies = [
+ "ainb-hangar-core",
  "ainb-model-rates",
  "ainb-plugin-sdk-rust",
  "ainb-plugin-types-sessions",
@@ -590,7 +591,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "toml 0.8.23",
  "tracing",
 ]
 
