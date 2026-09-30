@@ -12,7 +12,7 @@ import { allSessions } from "./sessions.ts";
 import { selectRowIntent, type RendererIntent } from "./tabs.ts";
 
 /** What a menu item does when chosen. */
-export type RowMenuAction = "open" | "editor" | "copy_path" | "copy_name" | "delete";
+export type RowMenuAction = "open" | "rename" | "editor" | "copy_path" | "copy_name" | "delete";
 
 export interface RowMenuItem {
   action: RowMenuAction;
@@ -29,10 +29,17 @@ const NO_PATH = "This session has no worktree path";
 const LOCAL_ONLY = "Local only: this session runs on a remote host";
 
 /**
- * The items for `session`'s row, in Orca's order: Open in, Copy Path, Copy
- * Worktree Name, and Delete last, destructive (stablyai/orca@3c1af16,
- * `WorktreeContextMenuView.tsx:344-387`). Open leads, as the row's own click
- * does.
+ * The items for `session`'s row, in Orca's order: the name first, then Open
+ * in, Copy Path, Copy Worktree Name, and Delete last, destructive
+ * (stablyai/orca@3c1af16, `WorktreeContextMenuView.tsx:344-387`). Open leads,
+ * as the row's own click does.
+ *
+ * Rename edits the card's title in place. Orca's first item edits the same
+ * name (stablyai/orca@59b746f, `WorktreeContextMenuView.tsx:160-165`), there
+ * in its metadata dialog; its inline field opens from a double-click on the
+ * title (`WorktreeTitleInlineRename.tsx:356`), which the card offers too. The
+ * host decides whether a session can take a name, so Rename is never
+ * disabled here: a refusal is shown in the field.
  *
  * A row with no worktree path has nothing to open or copy as a path. A remote
  * row's path is on another machine, so a local editor cannot open it: Orca's
@@ -47,6 +54,7 @@ export function rowMenuItems(session: Session_Serialize): RowMenuItem[] {
   const deleteReason = remote ? LOCAL_ONLY : session.mode === "Boss" ? "A Boss session is deleted from the terminal" : undefined;
   return [
     { action: "open", label: "Open", disabled: false },
+    { action: "rename", label: "Rename", disabled: false },
     { action: "editor", label: "Open in Editor", disabled: editorReason !== undefined, reason: editorReason },
     { action: "copy_path", label: "Copy Path", disabled: !hasPath, reason: hasPath ? undefined : NO_PATH },
     { action: "copy_name", label: "Copy Worktree Name", disabled: false },
@@ -130,6 +138,10 @@ export function runRowPick(pick: RowPick, deps: RowPickDeps): void {
   switch (pick.action) {
     case "open":
       return deps.open(pick.session.id);
+    // The sidebar turns the card's title into its rename field itself; a
+    // pick never carries it this far.
+    case "rename":
+      return;
     case "editor":
       // The selection scopes the answer banner (`questionOver`): left on this
       // row, it would hide the shown terminal's own question.
