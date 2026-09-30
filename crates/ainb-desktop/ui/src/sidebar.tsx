@@ -9,6 +9,7 @@ import type {
 import type { AckMap } from "./acks.ts";
 import type { PendingWorktree } from "./composer.ts";
 import { keyedList, sameKeys } from "./keyed.ts";
+import { PrBadgeButton } from "./pr_badge.tsx";
 import { opensRowMenu, rowMenuItems, sessionIn, type RowPick } from "./row_menu.ts";
 import { RowMenu } from "./row_menu.tsx";
 import { RenameField } from "./rename_field.tsx";
@@ -60,6 +61,11 @@ interface Props {
   /** Ask the host to rename `sessionId` to `name`, as typed. Resolves `null`
    * when it did, else the host's reason. Without it no title is editable. */
   onRename?(sessionId: string, name: string): Promise<string | null>;
+  /** The host's `pr_badge` for a card's session. Without it, or without
+   * `onOpenUrl`, no card draws a PR badge. */
+  prBadge?(sessionId: string): Promise<unknown>;
+  /** Open a PR badge's URL: the host's `open_url`, never the webview. */
+  onOpenUrl?(url: string): void;
   /** The sidebar element, for Esc Esc to return focus to. */
   ref(element: HTMLElement): void;
 }
@@ -266,6 +272,8 @@ export function Sidebar(props: Props) {
                                 // Only its own field: a commit that lands after
                                 // another card's field opened leaves that one.
                                 onRenameDone={() => setRenaming((key) => (key === card().key ? null : key))}
+                                prBadge={props.prBadge}
+                                onOpenUrl={props.onOpenUrl}
                               />
                             )}
                           </Show>
@@ -319,6 +327,8 @@ function Card(props: {
   onRename?(sessionId: string, name: string): Promise<string | null>;
   onRenameStart(): void;
   onRenameDone(): void;
+  prBadge?(sessionId: string): Promise<unknown>;
+  onOpenUrl?(url: string): void;
 }) {
   let item!: HTMLLIElement;
   const rows = createMemo(() => keyedList(props.card.sessions, (session) => session.id));
@@ -340,6 +350,8 @@ function Card(props: {
   /** A right-click anywhere on the card, as on Orca's: on a row it acts on
    * that row's session, elsewhere on the card's first. */
   const onContextMenu = (event: MouseEvent) => {
+    // The PR badge is the branch's, not a row's: no row menu opens on it.
+    if ((event.target as Element).closest(".pr-badge")) return;
     const card = event.currentTarget as HTMLElement;
     const row =
       (event.target as Element).closest<HTMLElement>(".session-row") ?? card.querySelector<HTMLElement>(".session-row");
@@ -388,6 +400,18 @@ function Card(props: {
           {(changes) => <span class="git-counts">{formatGitChanges(changes())}</span>}
         </Show>
         <Show when={props.card.model}>{(model) => <span class="model">{label(model())}</span>}</Show>
+        {/* Beside the branch it is for, outside every row's button: a click
+            on it opens the PR and never a row. */}
+        <Show when={props.prBadge && props.onOpenUrl ? { fetch: props.prBadge, open: props.onOpenUrl } : null}>
+          {(host) => (
+            <PrBadgeButton
+              sessionId={props.card.primaryId}
+              branch={props.card.branch}
+              fetch={host().fetch}
+              onOpenUrl={host().open}
+            />
+          )}
+        </Show>
       </div>
       <ul class="agent-rows">
         <For each={rowKeys()}>

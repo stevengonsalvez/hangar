@@ -26,6 +26,7 @@ use ainb_desktop::host::{DesktopHost, FrameSink, agent_status_dialer};
 use ainb_desktop::intent::{self, Refusal, RendererIntent, update};
 use ainb_desktop::notify::{self, Gate, Notifier};
 use ainb_desktop::notify_delivery::{self, OsDelivery};
+use ainb_desktop::pr_badge::{PrBadge, PrBadges};
 use ainb_desktop::shell::Shell;
 use ainb_desktop::sidecar::{Sidecar, SidecarConfig, SidecarState, SidecarView};
 use ainb_desktop::terminal::{TabEvents, TabTarget, TabsView, Terminals, Tmux};
@@ -216,6 +217,24 @@ fn open_url(url: String) {
     if let Err(reason) = opened {
         tracing::warn!(%reason, "terminal link not opened");
     }
+}
+
+/// The PR badge a sidebar card draws: the pull request on `session_id`'s
+/// branch and how its CI stands, read through `gh` off the main thread and
+/// cached (`ainb_desktop::pr_badge`). The webview names a session, never a
+/// folder: the worktree and branch are the session list's own. `None` for any
+/// miss, which is logged at debug only, so a machine without `gh` or its
+/// login draws no badge and no noise.
+#[tauri::command]
+async fn pr_badge(
+    window: tauri::State<'_, Window>,
+    badges: tauri::State<'_, PrBadges>,
+    session_id: String,
+) -> Result<Option<PrBadge>, ()> {
+    let Some((worktree, branch)) = window.shell.worktree_of(&session_id) else {
+        return Ok(None);
+    };
+    Ok(badges.badge(&worktree, &branch).await)
 }
 
 /// The terminal's copy: put the selection on the platform clipboard.
@@ -1257,6 +1276,8 @@ fn main() {
             }) {
                 tracing::warn!(?error, "notifications will post as the default application");
             }
+            // `gh` is looked for once; without it every card draws no badge.
+            app.manage(PrBadges::new(ainb_desktop::pr_badge::find_gh()));
             // First, so the window is on screen as early as before, and in
             // the right theme from its first frame.
             let theme = Arc::new(ThemePick::load(hangar_home.join(theme::THEME_FILE)));
@@ -1478,6 +1499,7 @@ fn main() {
             clipboard_read,
             clipboard_write,
             open_url,
+            pr_badge,
             terminal_tabs,
             answer_home,
             terminal_output,

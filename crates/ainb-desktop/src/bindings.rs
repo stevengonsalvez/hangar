@@ -34,6 +34,7 @@ pub fn typescript() -> Result<String, specta_typescript::Error> {
         .register::<crate::worktree_target::WorktreeTarget>()
         .register::<crate::delete::DeletePreview>()
         .register::<crate::theme::ThemePreference>()
+        .register::<crate::pr_badge::PrBadge>()
         .register::<crate::projects::RegisteredProject>();
     specta_typescript::Typescript::default()
         .header(

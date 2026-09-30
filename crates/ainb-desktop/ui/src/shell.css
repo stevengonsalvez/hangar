@@ -513,6 +513,65 @@ body {
   font-weight: 400;
 }
 
+/* A card's PR badge (`pr_badge.tsx`): the PR's state and number, and a CI
+   dot, at the end of the meta line. A button, so the keyboard reaches it,
+   drawn as a quiet pill so it reads as the card's status, not a control.
+   The state word takes the state's colour: open green, merged blue, closed
+   red, a draft muted. */
+.pr-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-inline-start: auto;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted-foreground);
+  font: inherit;
+  font-family: var(--font-mono);
+  cursor: pointer;
+}
+
+.pr-badge:hover,
+.pr-badge:focus-visible {
+  border-color: var(--blue);
+  color: var(--text);
+}
+
+.pr-badge[data-state="open"] .pr-state {
+  color: var(--green);
+}
+
+.pr-badge[data-state="merged"] .pr-state {
+  color: var(--blue);
+}
+
+.pr-badge[data-state="closed"] .pr-state {
+  color: var(--red);
+}
+
+.ci-dot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+}
+
+.ci-dot[data-checks="pass"] {
+  background: var(--green);
+}
+
+.ci-dot[data-checks="fail"] {
+  background: var(--red);
+}
+
+.ci-dot[data-checks="pending"] {
+  background: var(--gold);
+}
+
 /* The composer's card while it creates: muted rather than bold, so it reads
    as "on its way" beside the real cards it will join. */
 .worktree-card[data-pending="true"] .worktree-card-title {

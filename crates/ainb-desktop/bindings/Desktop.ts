@@ -98,6 +98,29 @@ export type PaletteEntry = {
 	active: boolean,
 };
 
+/**  What a card's badge draws, and where a click on it goes. */
+export type PrBadge = {
+	state: PrState,
+	number: number,
+	/**  Already passed by `links::web_url`, the rule `open_url` asks again. */
+	url: string,
+	checks: PrChecks,
+};
+
+/**  The pull request's checks, rolled up into one dot. */
+export type PrChecks = 
+/**  Every check that concluded passed (or was skipped). */
+"pass" | 
+/**  At least one check failed, whatever the others did. */
+"fail" | 
+/**  None failed, and at least one has not finished. */
+"pending" | 
+/**  No checks, or only neutral ones: no dot. */
+"none";
+
+/**  Where the pull request stands. */
+export type PrState = "open" | "draft" | "merged" | "closed";
+
 /**  One repository the composer may create into. */
 export type RegisteredProject = {
 	/**  The repository folder's own name. */

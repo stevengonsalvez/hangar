@@ -1042,6 +1042,10 @@ function Shell() {
                 (why: unknown) => String(why),
               )
             }
+            // A miss is `null` from the host; a command that failed (the
+            // window's state not managed yet) draws no badge either.
+            prBadge={(sessionId) => invoke<unknown>("pr_badge", { sessionId }).catch(() => null)}
+            onOpenUrl={(url) => void invoke("open_url", { url })}
             onRowPick={(pick) =>
               // Through `answer`, home first: the sidebar is drawn over
               // Settings and the Inbox, whose screens refuse a row.

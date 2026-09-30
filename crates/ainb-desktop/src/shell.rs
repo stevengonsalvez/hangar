@@ -206,6 +206,28 @@ impl<S: FrameSink> Shell<S> {
         Some(view.cards().map(crate::notify::Session::of).collect())
     }
 
+    /// The worktree folder and branch of session `id` as the session list
+    /// holds them, for its card's PR badge; `None` for an id the list does
+    /// not hold, so the webview names a session and never a folder.
+    pub fn worktree_of(&self, id: &str) -> Option<(std::path::PathBuf, String)> {
+        let id = uuid::Uuid::parse_str(id).ok()?;
+        let core = self.core();
+        core.host
+            .state()
+            .sessions
+            .get()
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.sessions)
+            .find(|session| session.id == id)
+            .map(|session| {
+                (
+                    session.workspace_path.clone().into(),
+                    session.branch_name.clone(),
+                )
+            })
+    }
+
     /// The host every frame names.
     pub fn host_id(&self) -> HostId {
         self.core().host.host_id().clone()

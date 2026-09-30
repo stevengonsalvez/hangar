@@ -202,3 +202,41 @@ fn the_banners_sequence_lands_from_any_page() {
         }
     }
 }
+
+/// A card's PR badge names a session, and the host answers with that
+/// session's own worktree and branch: an id the list does not hold, or text
+/// that is no id, names no folder for `gh` to run in.
+#[test]
+fn a_pr_badge_resolves_only_a_session_the_list_holds() {
+    use ainb_app::AppState;
+    use ainb_app::models::{Session, Workspace};
+
+    support::isolated_home();
+    let mut state = AppState::new();
+    let mut session = Session::new("api".to_string(), "/work/repo/wt".to_string());
+    session.branch_name = "feat/badge".to_string();
+    let session_id = session.id;
+    let mut workspace = Workspace::new("repo".to_string(), std::path::PathBuf::from("/work/repo"));
+    workspace.sessions.push(session);
+    state.sessions.workspaces.push(workspace);
+    let host = DesktopHost::hosting(
+        state,
+        Keymap::defaults(),
+        HostId::local(),
+        Subscription::only(&[SectionId::Shell]),
+        |_: FrameBatch| {},
+    )
+    .without_attention_poll();
+    let shell = Shell::new(host, DesktopExecutor::new(None));
+
+    assert_eq!(
+        shell.worktree_of(&session_id.to_string()),
+        Some((
+            std::path::PathBuf::from("/work/repo/wt"),
+            "feat/badge".to_string()
+        ))
+    );
+    assert_eq!(shell.worktree_of(&uuid::Uuid::new_v4().to_string()), None);
+    assert_eq!(shell.worktree_of("/etc"), None);
+    assert_eq!(shell.worktree_of(""), None);
+}

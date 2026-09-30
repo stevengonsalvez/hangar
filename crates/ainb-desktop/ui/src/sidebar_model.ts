@@ -34,7 +34,9 @@ export interface WorktreeCard {
    * so the label comes from the `session_labels` section, keyed by the row's
    * tmux session name (`titleOf`). */
   title: string;
-  /** The session the title names: what a rename of the card renames. */
+  /** The session the title names: what a rename of the card renames, and
+   * what its PR badge asks the host about (the host resolves a session,
+   * never a folder). */
   primaryId: string;
   /** The primary session's branch. */
   branch: string;

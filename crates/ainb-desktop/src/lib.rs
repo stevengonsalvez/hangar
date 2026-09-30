@@ -29,6 +29,8 @@
 //!   and ends it with the tab.
 //! - [`sidecar`] finds or starts the bundled hangar daemon and holds this
 //!   surface's presence against it.
+//! - [`pr_badge`] reads the PR on a card's branch and how its CI stands
+//!   through `gh`, cached, and draws nothing when `gh` cannot answer.
 //! - [`notify`] decides which session moves raise an OS notification: into
 //!   Needs or Done, once per move, unless off or already on screen;
 //!   [`notify_delivery`] shows them on the OS and hears their click.
@@ -52,6 +54,7 @@ pub mod intent;
 pub mod links;
 pub mod notify;
 pub mod notify_delivery;
+pub mod pr_badge;
 pub mod projects;
 pub mod rename;
 pub mod setup;
