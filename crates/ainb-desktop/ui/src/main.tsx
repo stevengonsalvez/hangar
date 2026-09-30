@@ -39,7 +39,7 @@ import { Palette } from "./palette.tsx";
 import { emptyPaneView } from "./pane_empty.ts";
 import { EmptyPane } from "./pane_empty.tsx";
 import { createComposerFlow } from "./composer.ts";
-import { cardForSession, statusForTarget } from "./status.ts";
+import { cardForSession, sessionForCard, statusForTarget } from "./status.ts";
 import {
   activateTab,
   focusGroup,
@@ -128,6 +128,9 @@ function Shell() {
     listen<SidecarState>("sidecar", (event) => setSidecar(event.payload)),
     listen<TabsView>("terminal_tabs", (event) => showTabs(event.payload)),
     listen<string>("toast", (event) => toast(event.payload)),
+    // A click on a session's OS notification; the host already brought the
+    // window forward (`notify_delivery.rs`).
+    listen<{ session_key: string }>("notify:open", (event) => openFromNotice(event.payload.session_key)),
     listen<UpdatePhase>("update", (event) => {
       setUpdatePhase(event.payload);
       if (updateDone(event.payload)) setTimeout(() => setUpdatePhase(null), TOAST_MS);
@@ -435,6 +438,18 @@ function Shell() {
     if (intents.length === 0) return null;
     await invoke("answer_home");
     return run(intents);
+  };
+  /**
+   * The session a clicked OS notification names, by its card key: its row is
+   * selected, as a click on its board card selects it, after `answer_home` so
+   * no page refuses it. An ACP agent has no row; its transcript opens.
+   */
+  const openFromNotice = (sessionKey: string) => {
+    const card = agentStatus()?.view?.cards.find((one) => one.session_key === sessionKey);
+    if (card === undefined) return;
+    const row = sessionForCard(card, allSessions(sessions()), fleet()?.fleet_metadata);
+    if (row !== undefined) void answer([selectRowIntent({ session: row.id })]);
+    else if (card.provider === "acp") void invoke("answer_home").then(() => openTranscript(sessionKey));
   };
   /** The shell confirms in its own dialog, runs the write, and toasts the outcome. */
   const setupWrite = (write: SetupWrite) =>
