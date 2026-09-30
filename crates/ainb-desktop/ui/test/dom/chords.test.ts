@@ -74,11 +74,10 @@ test("Esc Esc from a terminal with the sidebar hidden shows it and gives it the 
 test("off macOS Ctrl+Shift+Up and Ctrl+Shift+Down stay the pane's: no worktree moves", async () => {
   await showTab("u-1");
   host.sent = [];
-  for (const code of ["ArrowUp", "ArrowDown"]) {
-    const event = press({ code, key: code, ctrlKey: true, shiftKey: true });
-    assert.equal(event.defaultPrevented, false, `${code} was taken from the pane`);
-  }
+  host.typed = [];
+  for (const code of ["ArrowUp", "ArrowDown"]) press({ code, key: code, ctrlKey: true, shiftKey: true });
   await drain();
+  assert.deepEqual(host.typed, ["\x1b[1;6A", "\x1b[1;6B"], "the pane got both keys");
   assert.deepEqual(host.sent, [], "nothing sent");
   assert.equal(shownTerminal(), "tmux_u-1");
   assert.deepEqual(refusals(), []);
