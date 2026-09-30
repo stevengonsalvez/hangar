@@ -1,4 +1,4 @@
-import { createEffect, createSignal, For, on, onCleanup, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, Show } from "solid-js";
 import { SPAWN_AGENTS } from "./composer.ts";
 import type { NewAgentFlow } from "./new_agent.ts";
 import { NO_SESSION } from "./shell_tab.ts";
@@ -49,8 +49,15 @@ export function TabCreateMenu(props: Props) {
     window.removeEventListener("resize", close);
     window.removeEventListener("scroll", close, true);
   });
-  // A menu opened for one worktree never acts on another.
-  createEffect(on(() => props.target, close, { defer: true }));
+  // A menu opened for one worktree never acts on another. Compared by the
+  // ids it names, not the object: every tab-strip answer and sessions frame
+  // makes the target anew, and the same worktree must not close the menu.
+  const named = createMemo(() => {
+    const target = props.target;
+    if (target === null) return "";
+    return target.kind === "session" ? `session:${target.id}` : `shell:${target.key}`;
+  });
+  createEffect(on(named, close, { defer: true }));
 
   const items = () => [...(menu?.querySelectorAll<HTMLButtonElement>("[role=menuitem]:not(:disabled)") ?? [])];
   const toggle = () => {
