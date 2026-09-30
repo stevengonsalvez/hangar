@@ -261,15 +261,21 @@ pub fn parse(stdout: &[u8]) -> Result<PrBadge, Miss> {
 }
 
 /// A branch name `gh` is handed: non-empty, bounded, never read as a flag or
-/// as a PR number (`gh pr view 42` and `#42` name PR 42, not a branch), and
-/// free of the whitespace and control characters git refuses in one.
+/// as a PR number, and free of the whitespace and control characters git
+/// refuses in one.
 fn plausible_branch(branch: &str) -> bool {
-    let number = branch.trim_start_matches('#');
     !branch.is_empty()
         && branch.len() <= 255
         && !branch.starts_with('-')
-        && !(!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        && !reads_as_pr_number(branch)
         && !branch.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Whether `gh pr view` takes `arg` for a PR number rather than a branch:
+/// `42` and `#42` both name PR 42.
+fn reads_as_pr_number(arg: &str) -> bool {
+    let digits = arg.trim_start_matches('#');
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Why `gh` exited non-zero, from the head of its stderr.
