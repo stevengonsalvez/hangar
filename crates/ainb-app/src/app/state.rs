@@ -3617,10 +3617,16 @@ impl AppState {
         self.persist(crate::app::effect::Persist::AppConfig { config, keys });
     }
 
-    /// Queue a write of the session labels as they stand now.
-    pub fn persist_session_labels(&mut self) {
-        let labels = crate::app::effect::Snapshot(self.session_labels.session_label_store.clone());
-        self.persist(crate::app::effect::Persist::SessionLabels(labels));
+    /// Set the durable label for `tmux_session` (`None` clears it) in this
+    /// state's copy of the label store, and queue the write of that one label
+    /// to the store on disk. The copy is never written whole: another process
+    /// may have changed other labels since it was loaded.
+    pub fn set_session_label(&mut self, tmux_session: String, label: Option<String>) {
+        self.session_labels.session_label_store.set(tmux_session.clone(), label.clone());
+        self.persist(crate::app::effect::Persist::SessionLabel {
+            tmux_session,
+            label,
+        });
     }
 
     /// Hand the queued effects to the host, oldest first.
@@ -7284,24 +7290,21 @@ impl AppState {
         }
 
         let new_name = self.ssh.ssh_session_rename_buffer.trim().to_string();
-        if let Some(idx) = self.ssh.selected_ssh_session_index {
-            if let Some(session) = self.ssh.ssh_sessions.get_mut(idx) {
-                // Get tmux session name for persistence key
-                let tmux_name = session.tmux_session_name.clone();
-
-                if new_name.is_empty() {
-                    // Empty = clear custom name, revert to auto-generated
-                    session.display_name = None;
-                } else {
-                    session.display_name = Some(new_name.clone());
-                }
-
-                // Persist to disk
-                if let Some(key) = tmux_name {
-                    self.session_labels.session_label_store.set(key, session.display_name.clone());
-                    self.persist_session_labels();
-                }
-            }
+        let renamed = self
+            .ssh
+            .selected_ssh_session_index
+            .and_then(|idx| self.ssh.ssh_sessions.get_mut(idx))
+            .and_then(|session| {
+                // Empty = clear custom name, revert to auto-generated
+                session.display_name = (!new_name.is_empty()).then(|| new_name.clone());
+                // The tmux session name is the persistence key.
+                Some((
+                    session.tmux_session_name.clone()?,
+                    session.display_name.clone(),
+                ))
+            });
+        if let Some((key, label)) = renamed {
+            self.set_session_label(key, label);
         }
 
         self.ssh.ssh_session_rename_mode = false;
@@ -7400,8 +7403,7 @@ impl AppState {
         });
 
         if let Some(tmux_name) = tmux_name {
-            self.session_labels.session_label_store.set(tmux_name, label);
-            self.persist_session_labels();
+            self.set_session_label(tmux_name, label);
         }
         self.cancel_session_label_rename();
     }
@@ -8456,10 +8458,7 @@ impl AppState {
                         .find_session(session_id)
                         .and_then(|session| session.tmux_session_name.clone());
                     if let Some(tmux_name) = tmux_name {
-                        self.session_labels
-                            .session_label_store
-                            .set(tmux_name, Some(prefix.clone()));
-                        self.persist_session_labels();
+                        self.set_session_label(tmux_name, Some(prefix.clone()));
                         if let Some(session) = self.find_session_mut(session_id) {
                             session.display_name = Some(prefix.clone());
                         }
