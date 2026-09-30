@@ -126,20 +126,40 @@ export function popReopenable(
   return { found: null, rest: [] };
 }
 
+/** How long a reopened tab waits to be put back where it was: past a shell
+ * open's own 10 s tmux wait and the host's reply, and short enough that a
+ * tab opened later some other way is not taken for it. */
+export const PLACE_MS = 30_000;
+
+/** A reopened tab on its way back: where it goes, and until when. */
+export interface Placing {
+  closed: ClosedTab;
+  until: number;
+}
+
 /**
  * `layout` with each reopened tab it now holds moved back to the pane and
  * place it closed from (`placing`, by the key it came back as), as Orca puts
  * a reopened tab back in its group at its index
  * (`src/renderer/src/store/slices/recently-closed-tab-position.ts:119-167`),
- * and the keys it placed. A pane closed since leaves the tab where it landed.
+ * and the keys done with: placed, or past their `until` at `now` and left
+ * alone. A pane closed since leaves the tab where it landed.
  */
-export function placeReopened(layout: Layout, placing: ReadonlyMap<string, ClosedTab>): { layout: Layout; placed: string[] } {
+export function placeReopened(
+  layout: Layout,
+  placing: ReadonlyMap<string, Placing>,
+  now: number,
+): { layout: Layout; done: string[] } {
   let next = layout;
-  const placed: string[] = [];
-  for (const [key, closed] of placing) {
+  const done: string[] = [];
+  for (const [key, { closed, until }] of placing) {
+    if (now >= until) {
+      done.push(key);
+      continue;
+    }
     if (groupOf(next, key) === null) continue;
-    placed.push(key);
+    done.push(key);
     if (closed.group !== null && closed.index >= 0) next = moveTab(next, key, closed.group, closed.index);
   }
-  return { layout: next, placed };
+  return { layout: next, done };
 }
