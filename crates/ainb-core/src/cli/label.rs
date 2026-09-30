@@ -22,9 +22,7 @@ pub fn execute(args: LabelArgs) -> Result<()> {
         )
     };
 
-    let mut labels = SessionLabelStore::load();
-    labels.set(tmux_name.clone(), label.clone());
-    labels.save()?;
+    SessionLabelStore::set_label(&tmux_name, label.clone())?;
 
     match label {
         Some(label) => println!("Session label set: {tmux_name} -> {label}"),
