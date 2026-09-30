@@ -112,6 +112,11 @@ pub enum Miss {
     Unauthenticated,
     /// GitHub's API rate limit: pauses every key, not just this one.
     RateLimited,
+    /// Another concurrent lookup's rate limit is still pausing every key: an
+    /// ask that queued for a permit found this out only once it got one, and
+    /// spawned no `gh` for it. Never itself extends the pause, or concurrent
+    /// misses while paused would keep pushing it out indefinitely.
+    Paused,
     /// The branch has no pull request.
     NoPr,
     /// `gh` exited non-zero for another reason: offline, no GitHub remote.
@@ -424,7 +429,11 @@ pub struct PrBadges {
     paused_until: Mutex<Option<Instant>>,
     /// Every key's last actual badge, kept across a rate-limit pause (and
     /// past its own TTL) so the pause dims nothing that was already shown.
-    /// Pruned alongside `slots` in [`Self::slot`], so it cannot outgrow it.
+    /// Its key set is always a subset of `slots`'s: a key enters here only
+    /// once `slot` has already made room for it, and leaves in lockstep with
+    /// it there. Not a hard cap of its own: like `slots`, it only sheds a key
+    /// once that key's own slot goes stale, so both can hold more than
+    /// [`MAX_ENTRIES`] while every key stays within its TTL.
     last_good: Mutex<HashMap<(PathBuf, String), PrBadge>>,
 }
 
@@ -453,16 +462,14 @@ impl PrBadges {
     ///
     /// While a rate limit pauses every key, this spawns no `gh` at all: it
     /// answers with the last badge this key actually got, or nothing for a
-    /// key that never had one.
+    /// key that never had one. True of every such answer, not just the fast
+    /// path below: an ask that queued for a permit before the pause was set,
+    /// and so only discovers it in [`Self::cached`] (as a [`Miss::Paused`]),
+    /// gets the same fallback rather than a bare blink to nothing.
     pub async fn badge(&self, worktree: &Path, branch: &str) -> Option<PrBadge> {
         let key = (worktree.to_path_buf(), branch.to_string());
         if self.paused(Instant::now()) {
-            return self
-                .last_good
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&key)
-                .cloned();
+            return self.last_badge(&key);
         }
         let answer = self
             .cached(key.clone(), || async {
@@ -472,13 +479,22 @@ impl PrBadges {
                 lookup(gh, worktree, branch).await
             })
             .await;
-        if let Some(badge) = &answer {
-            self.last_good
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(key, badge.clone());
+        match answer {
+            Some(badge) => {
+                self.last_good
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(key, badge.clone());
+                Some(badge)
+            }
+            None if self.paused(Instant::now()) => self.last_badge(&key),
+            None => None,
         }
-        answer
+    }
+
+    /// `key`'s last actual badge, or `None` for a key that never had one.
+    fn last_badge(&self, key: &(PathBuf, String)) -> Option<PrBadge> {
+        self.last_good.lock().unwrap_or_else(PoisonError::into_inner).get(key).cloned()
     }
 
     /// Whether a rate limit still holds every key back.
@@ -500,7 +516,17 @@ impl PrBadges {
             .get_or_init(|| async {
                 // Never closed, so this only ever waits for a permit.
                 let _permit = self.in_flight.acquire().await.ok();
-                let answer = fetch().await;
+                // Another ask may have set the pause while this one waited
+                // for its permit: rechecked right here, the last point
+                // before a real `gh` would spawn, so the wait never turns
+                // into a spawn anyway. `Miss::Paused` never itself extends
+                // the pause (only a fresh `RateLimited` from `gh` does), or
+                // concurrent misses while paused would keep pushing it out.
+                let answer = if self.paused(Instant::now()) {
+                    Err(Miss::Paused)
+                } else {
+                    fetch().await
+                };
                 if let Err(miss) = &answer {
                     tracing::debug!(?miss, branch = %key.1, "no PR badge");
                     if matches!(miss, Miss::RateLimited) {
