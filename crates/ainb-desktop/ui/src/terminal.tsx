@@ -211,6 +211,9 @@ export function TerminalView(props: Props) {
         // so it refits and the shell hears the new size.
         term.options.fontSize = nextFontSize(term.options.fontSize ?? TERMINAL_FONT_SIZE, zoom);
         resize();
+        // On macOS the refit grid kept the old cells on screen until the
+        // shell next wrote: repaint every row now, not at the next byte.
+        term.refresh(0, term.rows - 1);
         return false;
       }
       if (event.key === "Escape" && leave(event.timeStamp)) {
