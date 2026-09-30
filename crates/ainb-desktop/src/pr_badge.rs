@@ -291,6 +291,17 @@ async fn read_bounded(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> Vec
     bytes
 }
 
+/// The first `limit` bytes of `pipe`, with the rest read and dropped: `gh`
+/// dies of a closed stderr (SIGPIPE), so a chatty one must still be drained.
+async fn read_head(pipe: Option<impl AsyncRead + Unpin>, limit: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = (&mut pipe).take(limit as u64).read_to_end(&mut bytes).await;
+        let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
+    }
+    bytes
+}
+
 /// Ask `gh` at `gh` for the PR on `branch`, from inside `worktree`. The
 /// program is started directly with its argv, never through a shell, and is
 /// killed if it outruns [`GH_TIMEOUT`] or [`MAX_OUTPUT_BYTES`].
@@ -322,7 +333,7 @@ pub async fn lookup(gh: &Path, worktree: &Path, branch: &str) -> Result<PrBadge,
     let run = async {
         let (stdout, stderr) = tokio::join!(
             read_bounded(child.stdout.take(), MAX_OUTPUT_BYTES + 1),
-            read_bounded(child.stderr.take(), STDERR_HEAD),
+            read_head(child.stderr.take(), STDERR_HEAD),
         );
         if stdout.len() > MAX_OUTPUT_BYTES {
             return Err(Miss::Oversized);
