@@ -151,7 +151,7 @@ test("a right-click on a row opens the menu at the pointer, instead of the webvi
   assert.equal(open.style.top, "60px");
   assert.deepEqual(
     [...open.querySelectorAll('[role="menuitem"]')].map((el) => el.textContent),
-    ["Open", "Open in Editor", "Copy Path", "Copy Worktree Name", "Delete"],
+    ["Open", "Rename", "Open in Editor", "Copy Path", "Copy Worktree Name", "Delete"],
   );
   focusIs(item("Open"), "the first item takes the keyboard");
 });
@@ -215,7 +215,7 @@ test("the context-menu key and Shift+F10 open the menu from a focused row, and a
   assert.ok(menu(), "the context-menu key opens it");
   focusIs(item("Open"));
   await key(document.activeElement!, { key: "ArrowDown" });
-  focusIs(item("Open in Editor"));
+  focusIs(item("Rename"));
   await key(document.activeElement!, { key: "ArrowUp" });
   await key(document.activeElement!, { key: "ArrowUp" });
   focusIs(item("Delete"), "up from the first wraps to the last");
@@ -240,7 +240,7 @@ test("a row that cannot take an action draws it disabled, skips it, and never ru
   await settle();
   assert.deepEqual(calls, [], "a disabled item runs nothing");
   assert.ok(menu(), "and the menu stays open");
-  item("Open").focus();
+  item("Rename").focus();
   await key(document.activeElement!, { key: "ArrowDown" });
   focusIs(item("Copy Path"), "the arrows skip the disabled item");
 });
@@ -361,4 +361,41 @@ test("a right-click near the window's corner keeps the whole menu on screen", as
   } finally {
     proto.getBoundingClientRect = real;
   }
+});
+
+test("Rename on any row of a card edits the card's title and renames the session it names", async () => {
+  const renames: Array<[string, string]> = [];
+  const container = document.createElement("div");
+  document.body.appendChild(container);
+  cleanup = render(
+    () =>
+      createComponent(Sidebar, {
+        sessions: frame(SESSIONS),
+        stale: false,
+        loading: false,
+        pending: null,
+        onOpen() {},
+        onNew() {},
+        ref() {},
+        onRowPick() {},
+        onRename: async (id: string, name: string) => {
+          renames.push([id, name]);
+          return null;
+        },
+      }),
+    container,
+  );
+  await settle();
+  // `shell-1` shares `claude-1`'s worktree; the card's title is `claude-1`'s.
+  await rightClick(row("shell-1"));
+  item("Rename").click();
+  await settle();
+  const input = document.querySelector<HTMLInputElement>(".rename-input");
+  assert.ok(input, "the card's title is the field");
+  assert.equal(input.value, "Fix login", "starting from the title, not the row's own name");
+  input.value = "Fix signup";
+  input.dispatchEvent(new window.Event("input", { bubbles: true }) as unknown as Event);
+  await key(input, { key: "Enter" });
+  assert.deepEqual(renames, [["claude-1", "Fix signup"]], "the title's session, not the row right-clicked");
+  assert.equal(document.querySelector(".rename-input"), null, "the field closed");
 });
