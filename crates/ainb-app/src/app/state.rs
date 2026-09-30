@@ -10637,7 +10637,6 @@ impl AppState {
     /// Delete a Boss mode session
     async fn delete_boss_session(&mut self, session_id: Uuid) -> anyhow::Result<()> {
         use crate::docker::{ContainerManager, SessionLifecycleManager};
-        use crate::git::WorktreeManager;
 
         info!("Deleting Boss mode session: {}", session_id);
 
@@ -10684,32 +10683,40 @@ impl AppState {
             Err(e) => {
                 warn!("Session not found in lifecycle manager: {}", e);
                 info!("Attempting to remove orphaned worktree directly");
-
-                // Remove the worktree directly, unless another session still
-                // works in it.
-                let worktree_manager = WorktreeManager::new()?;
-                match crate::interactive::session_manager::remove_session_worktree_now(
-                    &worktree_manager,
-                    session_id,
-                )
-                .await
-                {
-                    Ok(removal) => info!("Orphaned worktree: {removal:?}"),
-                    // Refused (a store that cannot say who else is in the
-                    // tree) or failed: the tree stays, and the delete is not
-                    // a success, so it is audited as the failure it is.
-                    Err(worktree_err) => {
-                        warn!("Orphaned worktree kept for {session_id}: {worktree_err}");
-                        return Err(anyhow::anyhow!(
-                            "the worktree of Boss session {session_id} was kept: {worktree_err}"
-                        ));
-                    }
-                }
+                Self::remove_orphaned_boss_tree(session_id).await?;
             }
         }
 
         info!("Successfully deleted Boss session: {}", session_id);
         Ok(())
+    }
+
+    /// Remove the worktree of a Boss session the lifecycle manager does not
+    /// hold, unless another session still works in it.
+    ///
+    /// # Errors
+    /// The tree was kept: refused (a store that cannot say who else is in the
+    /// tree, a damaged `sessions.json` included) or failed. Logged at warn and
+    /// returned, so the delete is audited as the failure it is.
+    async fn remove_orphaned_boss_tree(session_id: Uuid) -> anyhow::Result<()> {
+        let worktree_manager = crate::git::WorktreeManager::new()?;
+        match crate::interactive::session_manager::remove_session_worktree_now(
+            &worktree_manager,
+            session_id,
+        )
+        .await
+        {
+            Ok(removal) => {
+                info!("Orphaned worktree: {removal:?}");
+                Ok(())
+            }
+            Err(worktree_err) => {
+                warn!("Orphaned worktree kept for {session_id}: {worktree_err}");
+                Err(anyhow::anyhow!(
+                    "the worktree of Boss session {session_id} was kept: {worktree_err}"
+                ))
+            }
+        }
     }
 
     /// Reseed the `Hangar Daemon` settings rows from the `daemon_config` table.
