@@ -1935,6 +1935,33 @@ mod tests {
         assert!(log.contains("malformed=[\"leaky\"]"), "{log}");
     }
 
+    /// An unknown `permission_mode` is named by its adapter, never quoted: it is
+    /// a value from the file, and the file may hold a token anywhere.
+    #[test]
+    fn an_unknown_acp_permission_mode_is_logged_by_adapter_not_value() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[acp.adapters.leaky]\npermission_mode = \"sk-SECRET-789\"\n",
+        )
+        .unwrap();
+
+        let log = captured_log(|| {
+            let config = crate::acp_pool::PoolConfig::with_config_adapters(
+                crate::acp_pool::acp_adapters_in(&path),
+            );
+            assert_eq!(
+                config.adapters["leaky"].permission_mode, "default",
+                "an unknown mode is pinned to the default"
+            );
+        });
+        assert!(!log.contains("sk-SECRET"), "{log}");
+        assert!(log.contains("unknown acp permission_mode"), "{log}");
+        assert!(log.contains("adapter=leaky"), "{log}");
+    }
+
     /// A parse error names where it is and never what the line holds: the
     /// description goes to the daemon log, and the bad line may carry a token.
     #[test]
