@@ -139,6 +139,27 @@ fn an_unparseable_label_file_is_refused_left_as_it_is_and_reported() {
 }
 
 #[test]
+fn a_legacy_file_that_does_not_parse_is_left_alone_and_does_not_block_a_write() {
+    let home = ScopedHome::new();
+    let legacy = home.path().join(".agents-in-a-box").join("ssh_display_names.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    let damaged = b"{\"ssh-a-22\": ";
+    std::fs::write(&legacy, damaged).unwrap();
+
+    desktop_renames("tmux-a", "New").expect("the current file is written");
+
+    assert_eq!(
+        std::fs::read(&legacy).unwrap(),
+        damaged,
+        "the legacy file was rewritten"
+    );
+    assert_eq!(
+        SessionLabelStore::load().get("tmux-a").map(String::as_str),
+        Some("New")
+    );
+}
+
+#[test]
 fn a_load_waits_for_a_writer_that_holds_the_lock() {
     let home = ScopedHome::new();
     let file = label_file(&home);
