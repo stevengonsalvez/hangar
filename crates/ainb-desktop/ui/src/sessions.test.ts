@@ -60,6 +60,13 @@ test("a label drops control and format characters and stops at the cap", () => {
   assert.equal(label("\u{1F600}".repeat(100)), "\u{1F600}".repeat(LABEL_CHARS));
 });
 
+test("a label given its own cap cleans the same way and stops there", () => {
+  // A toast's 300, not a sidebar's 80: one cleaner, two caps.
+  assert.equal(label("a\u202Eb\u001bc", 2), "ab");
+  assert.equal(label("x".repeat(400), 300), "x".repeat(300));
+  assert.equal(label("x".repeat(400)), "x".repeat(LABEL_CHARS), "the sidebar's cap by default");
+});
+
 test("the selected row is named by id, not by its place in the list", () => {
   // The frame carries only the rows the filter shows, so an index into the
   // reducer's full list would name the wrong one (#1180).
