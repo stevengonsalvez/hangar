@@ -172,8 +172,10 @@ export function createDeleteFlow(deps: DeleteFlowDeps): DeleteFlow {
     open(pick) {
       const token = ++opening;
       const sessionId = pick.session.id;
-      setTarget({ sessionId, name: pick.name, path: pick.session.workspace_path });
+      // The state first: the dialog is drawn as the target is set, and must
+      // not draw, or focus by, the last opening's answer.
       setState({ kind: "checking" });
+      setTarget({ sessionId, name: pick.name, path: pick.session.workspace_path });
       preview(sessionId).then(
         (answer) => token === opening && setState({ kind: "ready", preview: answer }),
         (error: unknown) => token === opening && setState({ kind: "failed", reason: String(error) }),

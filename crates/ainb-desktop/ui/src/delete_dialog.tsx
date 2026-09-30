@@ -13,7 +13,9 @@ interface Props {
  * The row menu's Delete confirmation, the way Orca's behaves (a Radix dialog
  * in `DeleteWorktreeDialog.tsx:336-423`): on a clean tree the confirm button
  * takes the keyboard so Delete then Enter confirms (`:340-351`); on a dirty
- * or uncounted one the button reads Force Delete and Cancel takes it instead.
+ * or uncounted one the button reads Force Delete and Cancel keeps it. Cancel
+ * holds it while the host counts, since the count may come after the dialog
+ * is drawn.
  * Tab stays inside, Esc
  * or a press on the scrim cancels, and the keyboard goes back to where it was
  * (the row) when it closes.
@@ -33,13 +35,16 @@ export function DeleteDialog(props: Props) {
   const sidebar = opener?.closest<HTMLElement>(".sidebar") ?? null;
   onCleanup(() => queueMicrotask(() => (opener?.isConnected ? opener : sidebar)?.focus()));
 
-  onMount(() => dialog.focus());
-  // The confirm button is disabled while the host checks. Once it can be
-  // pressed, a clean delete puts the keyboard on it, as Orca does; a Force
-  // Delete puts it on Cancel, so Enter never wipes work by reflex. Unless the
-  // keyboard already moved on.
+  // Cancel holds the keyboard from the start: until the host has counted,
+  // nothing is known about the tree, and Enter on Cancel loses nothing.
+  onMount(() => cancel.focus());
+  // Once the count lands, a clean delete puts the keyboard on the confirm,
+  // as Orca does; a Force Delete leaves it on Cancel, so Enter never wipes
+  // work by reflex. Only while Cancel still holds it: a person who moved the
+  // keyboard keeps it where they put it.
   createEffect(() => {
-    if (copy().ready && document.activeElement === dialog) (copy().force ? cancel : confirm).focus();
+    const { ready, force } = copy();
+    if (ready && !force && document.activeElement === cancel) confirm.focus();
   });
 
   const onWindowKey = (event: KeyboardEvent) => {
