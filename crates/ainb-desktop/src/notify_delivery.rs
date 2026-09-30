@@ -4,18 +4,30 @@
 //! The window sends through [`OsDelivery`]: `notify-rust`, straight to the
 //! platform (D-Bus on Linux, the notification centre on macOS). The Tauri
 //! notification plugin drops the handle a click arrives on, so a click on its
-//! banner could never reach the window. Each notice gets a short-lived thread
-//! of its own: it sends, logs what the OS answered, and waits for the click or
-//! the close. At most [`MAX_WAITERS`] wait at once; a notice past them is still
-//! sent, without a click.
+//! banner could never reach the window.
+//!
+//! The two platforms answer very differently, so each gets its own design:
+//!
+//! - **Linux** sends over D-Bus, and a click or close arrives later as its
+//!   own `ActionInvoked`/`NotificationClosed` signal naming the notification
+//!   by its D-Bus id. One shared listener (one thread, one connection,
+//!   started the first time a notice is sent) owns that signal stream for
+//!   the life of an [`OsDelivery`] and dispatches to whichever notice's id it
+//!   names. Sending a notice is: call `show()`, note the id it returns, hand
+//!   the click to the listener's map. No thread, wait, or connection per
+//!   notice; see the [`linux`] module.
+//! - **macOS**'s `notify-rust` handle is lazy: `show()` only prepares the
+//!   notification locally, and the actual, synchronous call to the
+//!   notification centre is inside `wait_for_response`. So macOS still runs
+//!   one thread per notice, holding a counted slot (see [`MAX_WAITERS`]) for
+//!   as long as that call runs; see the [`macos`] module.
 //!
 //! ```text
-//!  Notice ──announce──▶ Deliver::deliver ──thread──▶ OS ──click──▶ open(session)
+//!  Linux:  Notice ──announce──▶ show() ──id──▶ listener's map ──signal──▶ open(session)
+//!  macOS:  Notice ──announce──▶ thread ──wait_for_response (the actual send)──▶ open(session)
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use crate::notify::Notice;
 
@@ -41,213 +53,96 @@ pub fn announce(os: &dyn Deliver, notices: Vec<Notice>, open: &Open) {
     }
 }
 
-/// The most notices waiting for a click at once: each holds a thread until
-/// the OS reports the click or the close.
+/// The most notices whose click is tracked at once: on Linux, entries in the
+/// shared listener's id map (see [`linux::Listener`]); on macOS, threads each
+/// holding a counted slot while `wait_for_response` runs. A notice past the
+/// cap is still sent; its click is just not tracked.
 pub const MAX_WAITERS: usize = 64;
 
-/// How long a waiter gives an unresponsive OS notification server before
-/// giving up on that one notice's click, on platforms where the wait has no
-/// deadline of its own (Linux/D-Bus). `ActionInvoked`/`NotificationClosed`
-/// never arrive for a crashed or hung notification daemon, so without a
-/// bound here that notice's thread, and the waiter slot it holds, would
-/// never be released; see [`wait_for_click`] for the platform split.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+#[cfg(all(unix, not(target_os = "macos")))]
+mod linux;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// The platform's notification service, through `notify-rust`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OsDelivery {
-    waiting: Arc<AtomicUsize>,
-    wait_timeout: Duration,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux: Arc<linux::Listener>,
+    #[cfg(target_os = "macos")]
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for OsDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsDelivery").field("waiting", &self.waiting()).finish()
+    }
 }
 
 impl Default for OsDelivery {
     fn default() -> Self {
         Self {
-            waiting: Arc::new(AtomicUsize::new(0)),
-            wait_timeout: WAIT_TIMEOUT,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            linux: linux::Listener::new(),
+            #[cfg(target_os = "macos")]
+            waiting: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
 
 impl OsDelivery {
-    /// How many notices are waiting for a click now.
+    /// How many notices' clicks are tracked right now: pending id -> click
+    /// entries on Linux, threads still waiting on macOS.
     #[must_use]
     pub fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::SeqCst)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        return self.linux.waiting();
+        #[cfg(target_os = "macos")]
+        return self.waiting.load(std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Test-only: a stuck wait gives up after `timeout` instead of
-    /// [`WAIT_TIMEOUT`], so a test can prove the bound without waiting for
-    /// the real one.
-    #[cfg(any(test, feature = "test-seams"))]
+    /// Test-only (Linux): entries older than `pending_ttl` are swept away as
+    /// abandoned, and the sweep runs every `sweep_interval`, instead of the
+    /// real (much longer) bounds, so a test can prove the sweep without
+    /// waiting for them.
+    #[cfg(all(unix, not(target_os = "macos"), any(test, feature = "test-seams")))]
     #[must_use]
-    pub fn with_wait_timeout(timeout: Duration) -> Self {
+    pub fn with_linux_pending_ttl(
+        pending_ttl: std::time::Duration,
+        sweep_interval: std::time::Duration,
+    ) -> Self {
         Self {
-            wait_timeout: timeout,
-            ..Self::default()
+            linux: linux::Listener::with_bounds(pending_ttl, sweep_interval),
         }
+    }
+
+    /// Test-only (Linux): how many times the shared listener has dialed a
+    /// session bus connection, so a test can prove one notice, or a burst of
+    /// them, shares a single connection, and that a dropped connection is
+    /// re-dialed rather than left dead.
+    #[cfg(all(unix, not(target_os = "macos"), any(test, feature = "test-seams")))]
+    #[must_use]
+    pub fn linux_connect_attempts(&self) -> usize {
+        self.linux.connect_attempts()
     }
 }
 
 impl Deliver for OsDelivery {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn deliver(&self, notice: Notice, clicked: Click) {
+        linux::send(&notice, &self.linux, clicked);
+    }
+
+    #[cfg(target_os = "macos")]
     fn deliver(&self, notice: Notice, clicked: Click) {
         let waiting = Arc::clone(&self.waiting);
-        let wait_timeout = self.wait_timeout;
         let spawned = std::thread::Builder::new()
             .name("os-notice".to_string())
-            .spawn(move || send(&notice, &waiting, clicked, wait_timeout));
+            .spawn(move || macos::send(&notice, &waiting, clicked));
         if let Err(error) = spawned {
             tracing::warn!(%error, "OS notification not sent: no thread to send it on");
         }
-    }
-}
-
-/// Releases one counted waiter slot on drop: a normal return, an early
-/// return past [`MAX_WAITERS`], or a panic unwinding through the wait all go
-/// through the same release, so there is exactly one place that frees a
-/// claimed slot.
-struct WaiterGuard<'a> {
-    waiting: &'a AtomicUsize,
-}
-
-impl<'a> WaiterGuard<'a> {
-    /// Claims a slot, returning the guard and how many were already claimed
-    /// (before this one) so the caller can compare against [`MAX_WAITERS`].
-    fn claim(waiting: &'a AtomicUsize) -> (Self, usize) {
-        let already_waiting = waiting.fetch_add(1, Ordering::SeqCst);
-        (Self { waiting }, already_waiting)
-    }
-}
-
-impl Drop for WaiterGuard<'_> {
-    fn drop(&mut self) {
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// A caller gave up waiting for `work`, run on its own thread, before it
-/// finished.
-struct TimedOut;
-
-/// Runs `work` on a thread named `thread_name` and waits at most `timeout`
-/// for it to finish.
-///
-/// On timeout the thread is abandoned, not cancelled: nothing in
-/// `notify-rust`'s blocking API lets us interrupt a call already parked on
-/// the OS notification server, so a notice whose server never answers still
-/// leaks one OS thread. What this bounds is the caller's own accounting (a
-/// waiter slot held by [`WaiterGuard`]) so a single stuck notice cannot make
-/// every later notice silently unclickable too. A late, genuine response
-/// `work` produces after the timeout is not lost: it still runs, on its own
-/// thread, so a click sent by the server a moment after we stopped waiting
-/// still reaches the caller.
-fn bounded_wait<T: Send + 'static>(
-    timeout: Duration,
-    thread_name: &str,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, TimedOut> {
-    let (sent, received) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new().name(thread_name.to_string()).spawn(move || {
-        let _ = sent.send(work());
-    });
-    if spawned.is_err() {
-        return Err(TimedOut);
-    }
-    received.recv_timeout(timeout).map_err(|_| TimedOut)
-}
-
-/// Waits for `handle`'s click or close, running `clicked` on a click.
-///
-/// On Linux the D-Bus signal this waits on carries no deadline, so the wait
-/// is bounded by `wait_timeout` (see [`bounded_wait`]). macOS's
-/// `wait_for_response` already returns once the notification center has
-/// closed the banner, so it is not further bounded here.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn wait_for_click(
-    handle: notify_rust::NotificationHandle,
-    clicked: Click,
-    wait_timeout: Duration,
-) -> notify_rust::error::Result<()> {
-    let waited = bounded_wait(wait_timeout, "os-notice-wait", move || {
-        handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
-            if matches!(response, notify_rust::NotificationResponse::Default) {
-                clicked();
-            }
-        })
-    });
-    match waited {
-        Ok(result) => result,
-        Err(TimedOut) => Err(
-            "OS notification click wait timed out: the notification server never answered".into(),
-        ),
-    }
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn wait_for_click(
-    handle: notify_rust::NotificationHandle,
-    clicked: Click,
-    _wait_timeout: Duration,
-) -> notify_rust::error::Result<()> {
-    handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
-        if matches!(response, notify_rust::NotificationResponse::Default) {
-            clicked();
-        }
-    })
-}
-
-/// Send `notice`, log what the OS answered, and wait for its click in one of
-/// the [`MAX_WAITERS`] slots when one is free.
-fn send(notice: &Notice, waiting: &AtomicUsize, clicked: Click, wait_timeout: Duration) {
-    let session = notice.session_key.as_deref().unwrap_or("summary");
-    let mut notification = notify_rust::Notification::new();
-    notification.summary(&notice.title).body(&notice.body).appname("ainb");
-    // A click on the banner is the `default` action on D-Bus. macOS reports
-    // it without one, and a named action there would draw a button.
-    #[cfg(not(target_os = "macos"))]
-    notification.action("default", "Open");
-    // On D-Bus `show` is the send, and its result is the server's answer. On
-    // macOS it only queues the notice: the send is `wait_for_response` below,
-    // or the handle's drop, and that is where its result is.
-    let handle = match notification.show() {
-        Ok(handle) => {
-            #[cfg(not(target_os = "macos"))]
-            tracing::info!(session, "OS notification delivered");
-            #[cfg(target_os = "macos")]
-            tracing::info!(
-                session,
-                "OS notification queued with the notification center"
-            );
-            handle
-        }
-        Err(error) => {
-            tracing::warn!(session, %error, "OS notification not delivered");
-            return;
-        }
-    };
-    let (guard, already_waiting) = WaiterGuard::claim(waiting);
-    if already_waiting >= MAX_WAITERS {
-        drop(guard);
-        drop(handle);
-        tracing::warn!(
-            session,
-            waiting = already_waiting,
-            "OS notification sent without waiting for its click: {MAX_WAITERS} already wait"
-        );
-        return;
-    }
-    let waited = wait_for_click(handle, clicked, wait_timeout);
-    drop(guard);
-    match waited {
-        Ok(()) => {
-            #[cfg(target_os = "macos")]
-            tracing::info!(
-                session,
-                "OS notification delivered: the notification center confirmed the send"
-            );
-            tracing::debug!(session, "OS notification clicked or closed");
-        }
-        Err(error) => tracing::warn!(session, %error, "OS notification not delivered"),
     }
 }
 
@@ -312,87 +207,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_claimed_waiter_guard_releases_its_slot_on_normal_drop() {
-        let waiting = AtomicUsize::new(0);
-        {
-            let (_guard, already_waiting) = WaiterGuard::claim(&waiting);
-            assert_eq!(
-                already_waiting, 0,
-                "the first claim sees nobody ahead of it"
-            );
-            assert_eq!(
-                waiting.load(Ordering::SeqCst),
-                1,
-                "the claim is counted while held"
-            );
-        }
-        assert_eq!(
-            waiting.load(Ordering::SeqCst),
-            0,
-            "dropping the guard frees its slot"
-        );
-    }
-
-    #[test]
-    fn a_claimed_waiter_guard_releases_its_slot_on_an_early_return() {
-        let waiting = AtomicUsize::new(0);
-        // Mirrors the cap-hit branch in `send`: it returns early while a
-        // guard from `WaiterGuard::claim` is still in scope.
-        fn claim_then_bail(waiting: &AtomicUsize) {
-            let (_guard, _already_waiting) = WaiterGuard::claim(waiting);
-        }
-        claim_then_bail(&waiting);
-        assert_eq!(
-            waiting.load(Ordering::SeqCst),
-            0,
-            "an early return still drops the guard"
-        );
-    }
-
-    #[test]
-    fn a_claimed_waiter_guard_releases_its_slot_on_a_panic() {
-        let waiting = AtomicUsize::new(0);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let (_guard, _already_waiting) = WaiterGuard::claim(&waiting);
-            panic!("simulated failure while a waiter is held");
-        }));
-        assert!(
-            result.is_err(),
-            "the panic is expected to propagate out of catch_unwind"
-        );
-        assert_eq!(
-            waiting.load(Ordering::SeqCst),
-            0,
-            "unwinding through the guard still runs its Drop and frees the slot"
-        );
-    }
-
-    #[test]
-    fn bounded_wait_returns_the_result_when_work_finishes_in_time() {
-        let result = bounded_wait(Duration::from_secs(5), "bounded-wait-test-fast", || 42);
-        assert_eq!(result.ok(), Some(42));
-    }
-
-    #[test]
-    fn bounded_wait_times_out_on_a_stuck_worker_instead_of_blocking_forever() {
-        // The worker sleeps far longer than the bound; a fixed `recv()` here
-        // (no timeout) is exactly the bug this closes, and would hang this
-        // test until the sandbox's own runner timeout killed it.
-        let result = bounded_wait(Duration::from_millis(20), "bounded-wait-test-stuck", || {
-            std::thread::sleep(Duration::from_secs(2));
-            "too late"
-        });
-        assert!(
-            result.is_err(),
-            "a worker slower than the bound must not be waited for"
-        );
-    }
-
-    // The cap-hit path's `tracing::warn!` is exercised end to end, against a
-    // real (private, test-only) D-Bus notification daemon, in
-    // `tests/notify_click_dbus.rs`: it drives `send()` past `MAX_WAITERS` and
-    // asserts a `WARN` event naming the count. A unit test here would have
-    // to re-invoke `notify_rust::Notification::show()` without an OS to
-    // answer it, so it cannot reach that branch on its own.
+    // Everything platform-specific (the Linux shared listener's connection
+    // lifecycle and TTL sweep, the macOS waiter guard and its cap) has its
+    // own unit tests in its module, plus the real-D-Bus end-to-end proof in
+    // `tests/notify_click_dbus.rs`.
 }
