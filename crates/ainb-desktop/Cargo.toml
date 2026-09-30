@@ -97,6 +97,15 @@ specta = { version = "=2.0.0-rc.25", features = ["derive", "uuid", "chrono", "se
 specta-serde = { version = "=0.0.12", optional = true }
 specta-typescript = { version = "=0.0.12", optional = true }
 
+# The shared click listener (`notify_delivery/linux.rs`) dials its own
+# session-bus connection to hear `ActionInvoked`/`NotificationClosed`
+# directly; `notify-rust`'s own per-send connection only covers the `Notify`
+# call itself, not hearing the click later. Same major version and feature
+# set `notify-rust` itself asks for on this target, so it is one zbus build
+# in the binary, not two.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
 [build-dependencies]
 tauri-build = { version = "~2.6.3", optional = true }
 
@@ -110,6 +119,8 @@ base64 = "0.22"
 ed25519-dalek = "2.1"
 
 # The notification click test serves a fake notification daemon on a private
-# session bus (`tests/notify_click_dbus.rs`).
+# session bus (`tests/notify_click_dbus.rs`), and captures its tracing output
+# to prove the waiter-cap warning and the shared listener's behaviour.
+# `zbus` itself is a normal (non-dev) dependency on this target now, see above.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+tracing-subscriber = { version = "0.3", features = ["registry"] }

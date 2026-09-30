@@ -4,17 +4,30 @@
 //! The window sends through [`OsDelivery`]: `notify-rust`, straight to the
 //! platform (D-Bus on Linux, the notification centre on macOS). The Tauri
 //! notification plugin drops the handle a click arrives on, so a click on its
-//! banner could never reach the window. Each notice gets a short-lived thread
-//! of its own: it sends, logs what the OS answered, and waits for the click or
-//! the close. At most [`MAX_WAITERS`] wait at once; a notice past them is still
-//! sent, without a click.
+//! banner could never reach the window.
+//!
+//! The two platforms answer very differently, so each gets its own design:
+//!
+//! - **Linux** sends over D-Bus, and a click or close arrives later as its
+//!   own `ActionInvoked`/`NotificationClosed` signal naming the notification
+//!   by its D-Bus id. One shared listener (one thread, one connection,
+//!   started the first time a notice is sent) owns that signal stream for
+//!   the life of an [`OsDelivery`] and dispatches to whichever notice's id it
+//!   names. Sending a notice is: call `show()`, note the id it returns, hand
+//!   the click to the listener's map. No thread, wait, or connection per
+//!   notice; see the [`linux`] module.
+//! - **macOS**'s `notify-rust` handle is lazy: `show()` only prepares the
+//!   notification locally, and the actual, synchronous call to the
+//!   notification centre is inside `wait_for_response`. So macOS still runs
+//!   one thread per notice, holding a counted slot (see [`MAX_WAITERS`]) for
+//!   as long as that call runs; see the [`macos`] module.
 //!
 //! ```text
-//!  Notice ──announce──▶ Deliver::deliver ──thread──▶ OS ──click──▶ open(session)
+//!  Linux:  Notice ──announce──▶ show() ──id──▶ listener's map ──signal──▶ open(session)
+//!  macOS:  Notice ──announce──▶ thread ──wait_for_response (the actual send)──▶ open(session)
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::notify::Notice;
 
@@ -40,82 +53,96 @@ pub fn announce(os: &dyn Deliver, notices: Vec<Notice>, open: &Open) {
     }
 }
 
-/// The most notices waiting for a click at once: each holds a thread until
-/// the OS reports the click or the close.
-pub const MAX_WAITERS: usize = 8;
+/// The most notices whose click is tracked at once: on Linux, entries in the
+/// shared listener's id map (see [`linux::Listener`]); on macOS, threads each
+/// holding a counted slot while `wait_for_response` runs. A notice past the
+/// cap is still sent; its click is just not tracked.
+pub const MAX_WAITERS: usize = 64;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod linux;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// The platform's notification service, through `notify-rust`.
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct OsDelivery {
-    waiting: Arc<AtomicUsize>,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    linux: Arc<linux::Listener>,
+    #[cfg(target_os = "macos")]
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for OsDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsDelivery").field("waiting", &self.waiting()).finish()
+    }
+}
+
+impl Default for OsDelivery {
+    fn default() -> Self {
+        Self {
+            #[cfg(all(unix, not(target_os = "macos")))]
+            linux: linux::Listener::new(),
+            #[cfg(target_os = "macos")]
+            waiting: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl OsDelivery {
-    /// How many notices are waiting for a click now.
+    /// How many notices' clicks are tracked right now: pending id -> click
+    /// entries on Linux, threads still waiting on macOS.
     #[must_use]
     pub fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::SeqCst)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        return self.linux.waiting();
+        #[cfg(target_os = "macos")]
+        return self.waiting.load(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test-only (Linux): entries older than `pending_ttl` are swept away as
+    /// abandoned, and the sweep runs every `sweep_interval`, instead of the
+    /// real (much longer) bounds, so a test can prove the sweep without
+    /// waiting for them.
+    #[cfg(all(unix, not(target_os = "macos"), any(test, feature = "test-seams")))]
+    #[must_use]
+    pub fn with_linux_pending_ttl(
+        pending_ttl: std::time::Duration,
+        sweep_interval: std::time::Duration,
+    ) -> Self {
+        Self {
+            linux: linux::Listener::with_bounds(pending_ttl, sweep_interval),
+        }
+    }
+
+    /// Test-only (Linux): how many times the shared listener has dialed a
+    /// session bus connection, so a test can prove one notice, or a burst of
+    /// them, shares a single connection, and that a dropped connection is
+    /// re-dialed rather than left dead.
+    #[cfg(all(unix, not(target_os = "macos"), any(test, feature = "test-seams")))]
+    #[must_use]
+    pub fn linux_connect_attempts(&self) -> usize {
+        self.linux.connect_attempts()
     }
 }
 
 impl Deliver for OsDelivery {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn deliver(&self, notice: Notice, clicked: Click) {
+        linux::send(&notice, &self.linux, clicked);
+    }
+
+    #[cfg(target_os = "macos")]
     fn deliver(&self, notice: Notice, clicked: Click) {
         let waiting = Arc::clone(&self.waiting);
         let spawned = std::thread::Builder::new()
             .name("os-notice".to_string())
-            .spawn(move || send(&notice, &waiting, clicked));
+            .spawn(move || macos::send(&notice, &waiting, clicked));
         if let Err(error) = spawned {
             tracing::warn!(%error, "OS notification not sent: no thread to send it on");
         }
-    }
-}
-
-/// Send `notice`, log what the OS answered, and wait for its click in one of
-/// the [`MAX_WAITERS`] slots when one is free.
-fn send(notice: &Notice, waiting: &AtomicUsize, clicked: Click) {
-    let session = notice.session_key.as_deref().unwrap_or("summary");
-    let mut notification = notify_rust::Notification::new();
-    notification.summary(&notice.title).body(&notice.body).appname("ainb");
-    // A click on the banner is the `default` action on D-Bus. macOS reports
-    // it without one, and a named action there would draw a button.
-    #[cfg(not(target_os = "macos"))]
-    notification.action("default", "Open");
-    // On D-Bus `show` is the send, and its result is the server's answer. On
-    // macOS it only queues the notice: the send is `wait_for_response` below,
-    // or the handle's drop, and that is where its result is.
-    let handle = match notification.show() {
-        Ok(handle) => {
-            #[cfg(not(target_os = "macos"))]
-            tracing::info!(session, "OS notification delivered");
-            handle
-        }
-        Err(error) => {
-            tracing::warn!(session, %error, "OS notification not delivered");
-            return;
-        }
-    };
-    if waiting.fetch_add(1, Ordering::SeqCst) >= MAX_WAITERS {
-        waiting.fetch_sub(1, Ordering::SeqCst);
-        drop(handle);
-        tracing::info!(
-            session,
-            "OS notification sent without waiting for its click: {MAX_WAITERS} already wait"
-        );
-        return;
-    }
-    let waited = handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
-        if matches!(response, notify_rust::NotificationResponse::Default) {
-            clicked();
-        }
-    });
-    waiting.fetch_sub(1, Ordering::SeqCst);
-    match waited {
-        Ok(()) => {
-            #[cfg(target_os = "macos")]
-            tracing::info!(session, "OS notification delivered");
-            tracing::debug!(session, "OS notification clicked or closed");
-        }
-        Err(error) => tracing::warn!(session, %error, "OS notification not delivered"),
     }
 }
 
@@ -179,4 +206,9 @@ mod tests {
             ]
         );
     }
+
+    // Everything platform-specific (the Linux shared listener's connection
+    // lifecycle and TTL sweep, the macOS waiter guard and its cap) has its
+    // own unit tests in its module, plus the real-D-Bus end-to-end proof in
+    // `tests/notify_click_dbus.rs`.
 }
