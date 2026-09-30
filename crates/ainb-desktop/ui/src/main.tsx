@@ -57,7 +57,16 @@ import {
 import { beginRestore, followHost, rebuild, restoreDone, type Restore } from "./panes.ts";
 import { Panes } from "./panes.tsx";
 import { createShellTabs, reattach, shellTitle } from "./shell_tab.ts";
-import { closedFrom, placeReopened, popReopenable, pushClosed, switcherOrder, type ClosedTab } from "./recent_tabs.ts";
+import {
+  closedFrom,
+  PLACE_MS,
+  placeReopened,
+  popReopenable,
+  pushClosed,
+  switcherOrder,
+  type ClosedTab,
+  type Placing,
+} from "./recent_tabs.ts";
 import { createSwitcher } from "./recent_tabs.tsx";
 import { shownTargetOf, worktreeTarget } from "./worktree_target.ts";
 import { Composer } from "./composer.tsx";
@@ -205,7 +214,13 @@ function Shell() {
   // their way back, by the key they come back as, still to be put where
   // they were (`placeReopened`).
   let closedTabs: ClosedTab[] = [];
-  const placing = new Map<string, ClosedTab>();
+  const placing = new Map<string, Placing>();
+  /** `next` with the reopened tabs it holds put back (`placeReopened`). */
+  const placeBack = (next: Layout) => {
+    const back = placeReopened(next, placing, Date.now());
+    back.done.forEach((key) => placing.delete(key));
+    return back.layout;
+  };
   // The session the last worktree step opened, until its tab is shown: the
   // next step goes on from it, not again from the tab still on screen.
   let steppedTo: string | null = null;
@@ -364,9 +379,7 @@ function Shell() {
     // changed, so a strip that only restates the tabs costs nothing; or,
     // while the stored layout comes back, rebuilt from it (`phase`).
     if (phase === "following") {
-      const back = placeReopened(followHost(layout(), keys, recent), placing);
-      back.placed.forEach((key) => placing.delete(key));
-      commitLayout(back.layout);
+      commitLayout(placeBack(followHost(layout(), keys, recent)));
     } else if (keys.length > 0) {
       const restore = phase === "waiting" ? beginRestore(readStored(safeStorage()), Date.now()) : phase;
       phase = restoreDone(restore, keys, Date.now()) ? "following" : restore;
@@ -502,20 +515,25 @@ function Shell() {
     closedTabs = rest;
     if (found === null) return;
     const { closed, reopen } = found;
+    /** Put the tab `key` back where `closed` was once the strip lists it,
+     * within `PLACE_MS`: a tab that never comes, or comes much later by some
+     * other open, is not moved. */
+    const expectBack = (key: string) => placing.set(key, { closed, until: Date.now() + PLACE_MS });
     if (reopen.kind === "row") {
-      placing.set(closed.key, closed);
-      void answer([openRowIntent(reopen.row)]).then((refusal) => {
-        if (refusal !== null) placing.delete(closed.key);
-      });
+      expectBack(closed.key);
+      void answer([openRowIntent(reopen.row)]).then(
+        (refusal) => {
+          if (refusal !== null) placing.delete(closed.key);
+        },
+        () => placing.delete(closed.key),
+      );
       return;
     }
     void shellTabs.open(reopen.target).then((key) => {
       if (key === null) return;
-      placing.set(key, closed);
+      expectBack(key);
       // The strip with the new shell can land before this answer does.
-      const back = placeReopened(layout(), placing);
-      back.placed.forEach((one) => placing.delete(one));
-      commitLayout(back.layout);
+      commitLayout(placeBack(layout()));
     });
   };
   /** Ctrl+Tab: the focused pane's tabs, most recently shown first. */
@@ -529,7 +547,10 @@ function Shell() {
       const tab = tabs().find((candidate) => candidate.key === key);
       return tab === undefined ? key : title(tab);
     },
+    // Not behind a modal or the palette, nor off the terminals: a chord
+    // pressed while Ctrl was held can have opened one.
     commit: (key) => {
+      if (modalOpen() || palette() || !showing("terminal")) return;
       const tab = tabs().find((candidate) => candidate.key === key);
       if (tab !== undefined) choose(tab);
     },
