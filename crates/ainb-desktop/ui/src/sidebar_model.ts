@@ -17,6 +17,7 @@
 import type {
   GitChanges,
   SessionAgentType,
+  SessionLabelStore,
   Session_Serialize,
   SessionsView_Serialize,
 } from "../../../ainb-app/bindings/AppState";
@@ -29,8 +30,12 @@ export interface WorktreeCard {
   key: string;
   /** The primary session's display name, or its name: `session.rs` calls
    * `display_name` the operator's own label, overriding the auto-generated
-   * one when set. */
+   * one when set. A frame leaves `display_name` off a session row (#983 M19),
+   * so the label comes from the `session_labels` section, keyed by the row's
+   * tmux session name (`titleOf`). */
   title: string;
+  /** The session the title names: what a rename of the card renames. */
+  primaryId: string;
   /** The primary session's branch. */
   branch: string;
   /** The primary session's dirty counts, or `null` when there is nothing to
@@ -79,13 +84,23 @@ function primaryOf(sessions: readonly Session_Serialize[]): Session_Serialize {
   return primary;
 }
 
-function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
+/** What a session's card title reads: its label in `labels` (the host's
+ * label store, by tmux session name), else a `display_name` the row carries
+ * itself, else its name. The host checks a rename against the same order
+ * (`ainb-desktop/src/rename.rs`, `shown`). */
+export function titleOf(session: Session_Serialize, labels: SessionLabelStore | undefined): string {
+  const tmux = session.tmux_session_name;
+  return (tmux ? labels?.[tmux] : undefined) ?? session.display_name ?? session.name;
+}
+
+function cardFor(key: string, sessions: Session_Serialize[], labels: SessionLabelStore | undefined): WorktreeCard {
   const primary = primaryOf(sessions);
   const changes = primary.git_changes;
   const dirty = changes && (changes.added > 0 || changes.modified > 0 || changes.deleted > 0) ? changes : null;
   return {
     key,
-    title: primary.display_name ?? primary.name,
+    title: titleOf(primary, labels),
+    primaryId: primary.id,
     branch: primary.branch_name,
     gitChanges: dirty,
     model: primary.model ?? null,
@@ -111,7 +126,11 @@ function cardFor(key: string, sessions: Session_Serialize[]): WorktreeCard {
  * every such session in one project folds into the SAME card rather than
  * one each, which is the closest a missing field can get to the real shape.
  */
-export function worktreeCards(sessions: readonly Session_Serialize[], fallbackPath: string): WorktreeCard[] {
+export function worktreeCards(
+  sessions: readonly Session_Serialize[],
+  fallbackPath: string,
+  labels?: SessionLabelStore,
+): WorktreeCard[] {
   const byPath = new Map<string, Session_Serialize[]>();
   for (const session of sessions) {
     const key = session.workspace_path || fallbackPath;
@@ -119,23 +138,24 @@ export function worktreeCards(sessions: readonly Session_Serialize[], fallbackPa
     if (bucket) bucket.push(session);
     else byPath.set(key, [session]);
   }
-  return [...byPath.entries()].map(([key, group]) => cardFor(key, group));
+  return [...byPath.entries()].map(([key, group]) => cardFor(key, group, labels));
 }
 
 /**
  * The Sessions frame as the sidebar draws it: one group per project, in the
  * frame's order, each holding the worktree cards its sessions fold
  * into. A project with no sessions is dropped, matching the frame's own rule
- * that an empty workspace draws nothing (`sidebar.test.ts`).
+ * that an empty workspace draws nothing (`sidebar.test.ts`). `labels` names
+ * each card as `titleOf` does.
  */
-export function projectGroups(view: SessionsView_Serialize | undefined): ProjectGroup[] {
+export function projectGroups(view: SessionsView_Serialize | undefined, labels?: SessionLabelStore): ProjectGroup[] {
   return (view?.workspaces ?? [])
     .filter((workspace) => workspace.sessions.length > 0)
     .map((workspace) => ({
       name: workspace.name,
       path: workspace.path,
       sessionCount: workspace.sessions.length,
-      cards: worktreeCards(workspace.sessions, workspace.path),
+      cards: worktreeCards(workspace.sessions, workspace.path, labels),
     }));
 }
 

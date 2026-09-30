@@ -444,6 +444,25 @@ async fn session_delete(
     outcome.map_err(|error| intent::toast_text(&error))
 }
 
+/// Rename a sidebar row: the session's display name only, never its branch or
+/// its folder. The host checks the name (`ainb_desktop::rename`); a refusal is
+/// the sentence the rename field shows, as written: each is the host's own, and
+/// the one name it repeats has passed the check, so it carries no control or
+/// format character (a toast's path scrub would turn `feat/login` into a
+/// placeholder). The log names the session, never the name, which is the
+/// operator's own label.
+#[tauri::command]
+fn session_rename(
+    window: tauri::State<'_, Window>,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let session = ainb_desktop::rename::session_id(&id)?;
+    window.shell.rename_session(session, &name)?;
+    tracing::info!(%session, "window renamed a session");
+    Ok(())
+}
+
 /// The composer's Project select: every repository in a folder the daemon
 /// creates from, sessions or not (`ainb_desktop::projects`). Read per open,
 /// off the main thread, because it walks the registered folders; a failure
@@ -1307,6 +1326,7 @@ fn main() {
             worktree_create,
             session_delete_preview,
             session_delete,
+            session_rename,
             projects_list,
             project_add,
             update_check,
