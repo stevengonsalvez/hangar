@@ -439,8 +439,21 @@ pub(crate) fn acp_adapters_in(path: &std::path::Path) -> HashMap<String, AcpAdap
     let Some(table) = root.get("acp").and_then(|acp| acp.get("adapters")) else {
         return HashMap::new();
     };
-    table.clone().try_into().unwrap_or_else(|error| {
-        tracing::warn!(%error, "acp: [acp.adapters] is malformed; using the built-in adapters");
+    table.clone().try_into().unwrap_or_else(|_| {
+        // Never serde's message: it quotes the offending value, and an
+        // adapter's command may carry a token. Name the entries instead.
+        let malformed: Vec<&String> = table.as_table().map_or_else(Vec::new, |adapters| {
+            adapters
+                .iter()
+                .filter(|(_, adapter)| (*adapter).clone().try_into::<AcpAdapterToml>().is_err())
+                .map(|(name, _)| name)
+                .collect()
+        });
+        tracing::warn!(
+            path = %path.display(),
+            ?malformed,
+            "acp: [acp.adapters] is malformed; using the built-in adapters"
+        );
         HashMap::new()
     })
 }

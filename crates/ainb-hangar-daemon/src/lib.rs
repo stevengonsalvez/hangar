@@ -1917,6 +1917,31 @@ mod tests {
         );
     }
 
+    /// An `[acp.adapters]` entry of the wrong shape is named, never quoted:
+    /// serde's type error would echo the value, and it may be a token.
+    #[test]
+    fn a_malformed_acp_adapter_is_logged_by_name_not_value() {
+        let home = tempfile::tempdir().unwrap();
+        let path = crate::spawn::config_path_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[acp.adapters.fine]\ncommand = \"/bin/fine\"\n\
+             [acp.adapters.leaky]\nmodels = \"sk-SECRET-456\"\n",
+        )
+        .unwrap();
+
+        let log = captured_log(|| {
+            assert!(
+                crate::acp_pool::acp_adapters_in(&path).is_empty(),
+                "one bad entry keeps the built-in adapters"
+            );
+        });
+        assert!(!log.contains("sk-SECRET"), "{log}");
+        assert!(log.contains("[acp.adapters] is malformed"), "{log}");
+        assert!(log.contains("malformed=[\"leaky\"]"), "{log}");
+    }
+
     /// A parse error names where it is and never what the line holds: the
     /// description goes to the daemon log, and the bad line may carry a token.
     #[test]
