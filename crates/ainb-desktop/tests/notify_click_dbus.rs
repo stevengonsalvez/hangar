@@ -130,10 +130,13 @@ impl Daemon {
     ) -> zbus::Result<()>;
 }
 
-/// A private session bus, stopped when dropped.
+/// A private session bus, stopped when dropped. `restart` kills and relaunches
+/// the daemon process at the same address, to prove the shared listener
+/// re-dials rather than going silently dead when the bus disappears.
 struct Bus {
     daemon: Child,
     address: String,
+    socket: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -142,19 +145,35 @@ impl Bus {
         let dir = tempfile::tempdir().unwrap();
         let socket: PathBuf = dir.path().join("bus");
         let address = format!("unix:path={}", socket.display());
-        let daemon = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--address", &address])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("dbus-daemon runs this test's private session bus");
+        let daemon = spawn_dbus_daemon(&address);
         until(|| socket.exists(), "the private bus socket");
         Self {
             daemon,
             address,
+            socket,
             _dir: dir,
         }
     }
+
+    fn restart(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+        let _ = std::fs::remove_file(&self.socket);
+        self.daemon = spawn_dbus_daemon(&self.address);
+        until(
+            || self.socket.exists(),
+            "the private bus socket to reappear after restart",
+        );
+    }
+}
+
+fn spawn_dbus_daemon(address: &str) -> Child {
+    Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--address", address])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("dbus-daemon runs this test's private session bus")
 }
 
 impl Drop for Bus {
@@ -181,11 +200,27 @@ fn notice(session: &str) -> Notice {
     }
 }
 
+/// Serves the fake `Daemon` on `address`, returning the connection (which
+/// must stay alive as long as the daemon should answer) and the `Daemon`
+/// itself (to read what it recorded).
+fn serve_daemon(address: &str) -> (zbus::blocking::Connection, Daemon) {
+    let daemon = Daemon::default();
+    let connection = zbus::blocking::connection::Builder::address(address)
+        .unwrap()
+        .name("org.freedesktop.Notifications")
+        .unwrap()
+        .serve_at(PATH, daemon.clone())
+        .unwrap()
+        .build()
+        .unwrap();
+    (connection, daemon)
+}
+
 #[test]
 fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
-    // `send()` logs from its own `os-notice` thread, not this test's thread,
-    // so the capture has to be the process-wide default: `set_default` is
-    // thread-local and would miss every event `notify_delivery` emits.
+    // `send()`/the listener log off this test's thread, so the capture has
+    // to be the process-wide default: `set_default` is thread-local and
+    // would miss every event `notify_delivery` emits.
     let log: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::DEBUG)
@@ -195,18 +230,10 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("the only test in this binary sets the global subscriber once");
 
-    let bus = Bus::start();
+    let mut bus = Bus::start();
     // The only test in this binary, and before anything here dials a bus.
     std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &bus.address);
-    let daemon = Daemon::default();
-    let connection = zbus::blocking::connection::Builder::address(bus.address.as_str())
-        .unwrap()
-        .name("org.freedesktop.Notifications")
-        .unwrap()
-        .serve_at(PATH, daemon.clone())
-        .unwrap()
-        .build()
-        .unwrap();
+    let (connection, daemon) = serve_daemon(&bus.address);
     let interface = connection.object_server().interface::<_, Daemon>(PATH).unwrap();
     let emitter = interface.signal_emitter();
     let shown = |count: usize| daemon.shown.lock().unwrap().len() >= count;
@@ -230,7 +257,7 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     let session = loop {
-        // Again until heard: the waiter subscribes a moment after the send.
+        // Again until heard: the listener subscribes a moment after the send.
         zbus::block_on(Daemon::action_invoked(emitter, first.id, "default")).unwrap();
         if let Ok(session) = clicked.recv_timeout(Duration::from_millis(100)) {
             break session;
@@ -241,9 +268,22 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
         );
     };
     assert_eq!(session, "claude:a");
-    until(|| os.waiting() == 0, "the clicked notice's waiter to end");
+    until(
+        || os.waiting() == 0,
+        "the clicked notice's entry to be removed",
+    );
 
-    // Dismissed: no click, and the waiter ends.
+    // Looked up once: a click's id is removed from the pending map as soon
+    // as it fires, so a duplicate signal for the same id (a daemon quirk, or
+    // just the daemon replaying a message) must not click a second time.
+    zbus::block_on(Daemon::action_invoked(emitter, first.id, "default")).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        clicked.try_recv().is_err(),
+        "a duplicate signal for an already-resolved id must not click again"
+    );
+
+    // Dismissed: no click, and the entry is removed.
     let tx = clicks.clone();
     os.deliver(
         notice("claude:b"),
@@ -251,7 +291,7 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     );
     until(|| shown(2), "the second notification");
     let second = daemon.shown.lock().unwrap()[1].id;
-    until(|| os.waiting() == 1, "the second notice to wait");
+    until(|| os.waiting() == 1, "the second notice to be pending");
     let deadline = Instant::now() + Duration::from_secs(10);
     while os.waiting() > 0 {
         zbus::block_on(Daemon::notification_closed(emitter, second, 2)).unwrap();
@@ -260,7 +300,8 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
     }
     assert!(clicked.try_recv().is_err(), "a dismissal is not a click");
 
-    // Bounded: past MAX_WAITERS a notice is still shown, and nothing more waits.
+    // Bounded: past MAX_WAITERS a notice is still shown, and nothing more is
+    // tracked.
     let burst = MAX_WAITERS + 2;
     for n in 0..burst {
         os.deliver(notice(&format!("claude:{n}")), Box::new(|| {}));
@@ -269,7 +310,7 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
         || shown(2 + burst),
         "every notice past the cap to be shown too",
     );
-    until(|| os.waiting() == MAX_WAITERS, "the cap's waiters");
+    until(|| os.waiting() == MAX_WAITERS, "the cap's pending entries");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(os.waiting(), MAX_WAITERS, "never more than the cap");
     {
@@ -289,6 +330,15 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
             cap_hit.message
         );
     }
+
+    // One connection, reused: the first notice, its duplicate-signal check,
+    // the dismissal, and the whole burst above never redialed the bus.
+    assert_eq!(
+        os.linux_connect_attempts(),
+        1,
+        "one shared listener connection across every notice sent so far"
+    );
+
     let ids: Vec<u32> = daemon.shown.lock().unwrap()[2..].iter().map(|shown| shown.id).collect();
     let deadline = Instant::now() + Duration::from_secs(10);
     while os.waiting() > 0 {
@@ -299,31 +349,55 @@ fn a_click_on_the_os_notification_reaches_its_session_and_every_waiter_ends() {
         assert!(Instant::now() < deadline, "expired notices kept waiting");
     }
 
-    // Stuck: a notification server that never answers (a hung/crashed daemon,
-    // modelled by simply never emitting its close/click signal) must not
-    // block that notice's waiter slot forever. `with_wait_timeout` is the
-    // test seam for `WAIT_TIMEOUT`; production uses ten minutes, this proves
-    // the same bound with one it does not have to sit through.
-    let stuck = OsDelivery::with_wait_timeout(Duration::from_millis(200));
-    stuck.deliver(notice("claude:stuck"), Box::new(|| {}));
-    until(|| shown(3 + burst), "the stuck notice to be shown too");
-    until(|| stuck.waiting() == 1, "the stuck notice to start waiting");
+    // Restart: the notification daemon, and the private bus under it, goes
+    // away and comes back. The listener must notice its connection died and
+    // re-dial, not stay silently dead for the rest of the process.
+    bus.restart();
+    let (connection, daemon) = serve_daemon(&bus.address);
+    let interface = connection.object_server().interface::<_, Daemon>(PATH).unwrap();
+    let emitter = interface.signal_emitter();
+    until(
+        || os.linux_connect_attempts() >= 2,
+        "the listener to notice the dropped connection and re-dial",
+    );
+
+    let tx = clicks.clone();
+    os.deliver(
+        notice("claude:after-restart"),
+        Box::new(move || tx.send("claude:after-restart").unwrap()),
+    );
+    until(
+        || !daemon.shown.lock().unwrap().is_empty(),
+        "the daemon (after restart) to receive a notification",
+    );
+    let after_restart = daemon.shown.lock().unwrap()[0].clone();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while stuck.waiting() > 0 {
-        std::thread::sleep(Duration::from_millis(20));
+    let session = loop {
+        zbus::block_on(Daemon::action_invoked(emitter, after_restart.id, "default")).unwrap();
+        if let Ok(session) = clicked.recv_timeout(Duration::from_millis(100)) {
+            break session;
+        }
         assert!(
             Instant::now() < deadline,
-            "a server that never answers must not wait past its bound"
+            "the click never reached the window after the bus restarted"
+        );
+    };
+    assert_eq!(session, "claude:after-restart");
+
+    // Stuck: a notification server that never answers at all (a hung/crashed
+    // daemon, modelled by simply never emitting its close/click signal) must
+    // not track that notice's entry forever. `with_linux_pending_ttl` is the
+    // test seam for the real (much longer) TTL and sweep interval.
+    let stuck =
+        OsDelivery::with_linux_pending_ttl(Duration::from_millis(50), Duration::from_millis(20));
+    stuck.deliver(notice("claude:stuck"), Box::new(|| {}));
+    until(|| stuck.waiting() == 1, "the stuck notice to be registered");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stuck.waiting() > 0 {
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            Instant::now() < deadline,
+            "an entry with no signal ever coming must not be tracked past its TTL"
         );
     }
-    let captured = log.lock().unwrap();
-    let timed_out = captured
-        .iter()
-        .find(|event| event.message.contains("click wait timed out"))
-        .unwrap_or_else(|| panic!("no timeout line among {captured:?}"));
-    assert_eq!(
-        timed_out.level,
-        tracing::Level::WARN,
-        "a timed-out wait is a warning"
-    );
 }
