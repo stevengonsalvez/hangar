@@ -1,6 +1,8 @@
 //! What a reader of the hangar home's `config/config.toml`
-//! ([`crate::paths::config_path`]) may say about it: where a parse error is,
-//! and which entries of a table are malformed. Never the file's text.
+//! ([`crate::paths::config_path`]) may say about it: for a parse error, its
+//! message plus a line and column; for a malformed table, the names of the
+//! entries that failed to decode. Never a value from the file, and never the
+//! raw source line a parse error sits on.
 //!
 //! Lives here because every reader of that file depends on this crate: the
 //! daemon, and the notifyd and session-reader plugins, which must not depend on
@@ -45,8 +47,8 @@ fn describe(error: &toml::de::Error, text: &str) -> String {
 /// # Errors
 ///
 /// The names of the entries of `value` that do not decode as part of a `T` on
-/// their own, in the table's iteration order; empty when `value` is not a table at all. Never
-/// serde's message, which quotes the value.
+/// their own, in the table's iteration order; empty when `value` is not a
+/// table at all. Never quotes a value; may name a key.
 ///
 /// Exact for a `T` that accepts any subset of the entries: a struct whose
 /// fields all default, or a map. For any other `T` the names may include
@@ -123,6 +125,10 @@ mod tests {
         );
         let names = decode::<Knobs>(&value).expect_err("a string is not a u32");
         assert_eq!(names, ["window_days"]);
+        assert!(
+            !names.iter().any(|name| name.contains("sk-SECRET")),
+            "{names:?}"
+        );
     }
 
     #[test]
