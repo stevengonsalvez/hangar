@@ -39,6 +39,10 @@ interface Props {
   /** Tab `key`'s terminal, shown while `visible` holds. Mounted once per
    * key, and only ever repositioned. */
   terminal(key: string, visible: () => boolean): JSX.Element;
+  /** Drawn at the end of each group's strip, after its tabs, as Orca's "+"
+   * sits there (`orca:src/renderer/src/components/tab-bar/tab-bar-surface.tsx:205-215`);
+   * `shown` is that group's shown tab, which the "+" acts on. */
+  stripEnd?(shown: () => Tab | undefined): JSX.Element;
 }
 
 /** How far a pointer travels on a tab before a press is a drag. */
@@ -291,6 +295,7 @@ export function Panes(props: Props) {
           </Show>
         )}
       </For>
+      {props.stripEnd?.(() => byKey().get(group()?.active ?? ""))}
       <Show when={split() && props.layout.focused === id}>
         <button
           type="button"

@@ -288,7 +288,6 @@ async fn an_acp_run_streams_the_same_transcript_it_later_re_reads() {
         home.path(),
         &[
             ("AINB_HANGAR_HOME", &home_str),
-            // The `[acp.adapters]` table is read from $HOME, not the hangar home.
             ("HOME", &home_str),
             ("HANGAR_DAEMON_RUNTIME_ID", &ids.runtime_id),
             ("HANGAR_TASK_EXECUTOR", "acp"),

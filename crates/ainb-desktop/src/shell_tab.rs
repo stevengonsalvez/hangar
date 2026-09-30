@@ -20,17 +20,11 @@ use ainb_app::Intent;
 use ainb_app::app::state::AppState;
 use ainb_hangar_client::{DaemonClient, DaemonError};
 use ainb_hangar_proto::mutation::{MutationEnvelope, OpId};
-use ainb_hangar_proto::spawn::{
-    REPO_NOT_REGISTERED, SPAWN_STARTED, ShellCloseParams, ShellCreateParams, ShellCreateResult,
-};
+use ainb_hangar_proto::spawn::{ShellCloseParams, ShellCreateParams, ShellCreateResult};
 use uuid::Uuid;
 
+use crate::create::{SpawnVerb, mint_op_id, spawn_refusal_text};
 use crate::terminal::{TabTarget, Terminals};
-
-/// The JSON-RPC code for a method the daemon does not serve.
-const METHOD_NOT_FOUND: i32 = -32601;
-/// The JSON-RPC code for params the daemon refused.
-const INVALID_PARAMS: i32 = -32602;
 
 /// The worktree folder of the listed session `session_id`, from the host's
 /// own state. `None` for a session the host does not list.
@@ -42,14 +36,6 @@ pub fn session_worktree(state: &AppState, session_id: Uuid) -> Option<String> {
         .iter()
         .find_map(|workspace| workspace.get_session(&session_id))
         .map(|session| session.workspace_path.clone())
-}
-
-/// A fresh op id for one press. Every open and every close mints its own, so
-/// two presses of "New terminal" are two shells, never one the daemon folds.
-#[must_use]
-pub fn mint_op_id() -> OpId {
-    OpId::parse(format!("desktop-shell-{}", uuid::Uuid::new_v4().simple()))
-        .expect("a uuid op id is always well formed")
 }
 
 /// The `shell/create` params for a shell in `worktree_path`.
@@ -76,74 +62,38 @@ pub fn close_params(tmux_session_name: &str, op_id: OpId) -> ShellCloseParams {
     }
 }
 
-/// Which request a refusal answers, for its sentence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verb {
-    Open,
-    Close,
-}
-
 /// What an open that may have made its shell says: the shell is not known to
 /// be gone, so another press could make a second one.
 pub const MAY_STILL_OPEN: &str = "The terminal may still open; check before opening another.";
 
-/// A daemon error as the sentence the window shows. Chosen by the error's
-/// code, never by its words; the daemon's own detail is shown where it has
-/// one to give.
-#[must_use]
-pub fn refusal_text(verb: Verb, error: &DaemonError) -> String {
-    let doing = match verb {
-        Verb::Open => "Opening the terminal",
-        Verb::Close => "Closing the terminal",
-    };
-    match error {
-        DaemonError::Rpc { code, .. } if *code == METHOD_NOT_FOUND => format!(
-            "{doing} failed: this daemon does not run shells. It is older than this app, or \
-             was started with AINB_HANGAR_SPAWN=0. Update it, or start it without that setting."
-        ),
-        DaemonError::Rpc { code, message } if *code == REPO_NOT_REGISTERED => format!(
-            "{doing} failed: this worktree's repository is not in a registered project folder. \
-             Use Add project to pick its folder, then try again. ({message})"
-        ),
-        DaemonError::Rpc { code, message } if *code == INVALID_PARAMS => {
-            format!("{doing} failed: the daemon refused it: {message}")
-        }
-        // tmux ran and did not settle, or the daemon went quiet: the shell
-        // may exist. The op id is spent, so another press is another shell.
-        DaemonError::Rpc { code, message } if *code == SPAWN_STARTED && verb == Verb::Open => {
-            format!("{MAY_STILL_OPEN} ({message})")
-        }
-        DaemonError::Timeout(_) if verb == Verb::Open => {
-            format!("{MAY_STILL_OPEN} (the daemon did not answer in time)")
-        }
-        DaemonError::Rpc { message, .. } => format!("{doing} failed: {message}"),
-        DaemonError::Timeout(_) => format!("{doing} failed: the daemon did not answer in time."),
-        other => format!("{doing} failed: the daemon is not reachable: {other}"),
-    }
-}
-
 /// Ask the daemon for a shell in `worktree_path`.
 ///
 /// # Errors
-/// The sentence for the window ([`refusal_text`]).
+/// The sentence for the window ([`spawn_refusal_text`]).
 pub async fn open(client: &DaemonClient, worktree_path: &str) -> Result<ShellCreateResult, String> {
     client
-        .shell_create(&create_params(worktree_path, mint_op_id()))
+        .shell_create(&create_params(
+            worktree_path,
+            mint_op_id(SpawnVerb::OpenTerminal),
+        ))
         .await
-        .map_err(|error| refusal_text(Verb::Open, &error))
+        .map_err(|error| spawn_refusal_text(&error, SpawnVerb::OpenTerminal))
 }
 
 /// Ask the daemon to end the shell `tmux_session_name`. `Ok(false)` when it
 /// was already gone, or is not one the daemon opened (`@ainb_owner`).
 ///
 /// # Errors
-/// The sentence for the window ([`refusal_text`]).
+/// The sentence for the window ([`spawn_refusal_text`]).
 pub async fn close(client: &DaemonClient, tmux_session_name: &str) -> Result<bool, String> {
     client
-        .shell_close(&close_params(tmux_session_name, mint_op_id()))
+        .shell_close(&close_params(
+            tmux_session_name,
+            mint_op_id(SpawnVerb::CloseTerminal),
+        ))
         .await
         .map(|closed| closed.closed)
-        .map_err(|error| refusal_text(Verb::Close, &error))
+        .map_err(|error| spawn_refusal_text(&error, SpawnVerb::CloseTerminal))
 }
 
 /// Why a new shell tab did not open.
@@ -262,6 +212,12 @@ pub async fn restore(
 mod tests {
     use super::*;
     use ainb_app::config::AppConfig;
+    use ainb_hangar_proto::spawn::{REPO_NOT_REGISTERED, SPAWN_STARTED};
+
+    /// The JSON-RPC code for a method the daemon does not serve.
+    const METHOD_NOT_FOUND: i32 = -32601;
+    /// The JSON-RPC code for params the daemon refused.
+    const INVALID_PARAMS: i32 = -32602;
     use ainb_app::models::{Session, Workspace};
 
     fn state_with(session: &Session) -> AppState {
@@ -285,12 +241,16 @@ mod tests {
 
     #[test]
     fn every_press_carries_its_own_op_id() {
-        let first = create_params("/w", mint_op_id()).mutation.op_id;
-        let second = create_params("/w", mint_op_id()).mutation.op_id;
+        let first = create_params("/w", mint_op_id(SpawnVerb::OpenTerminal)).mutation.op_id;
+        let second = create_params("/w", mint_op_id(SpawnVerb::OpenTerminal)).mutation.op_id;
         assert!(first.is_some() && second.is_some());
         assert_ne!(first, second, "two presses are two shells");
-        let close_a = close_params("ainb-dsh-0123abcd", mint_op_id()).mutation.op_id;
-        let close_b = close_params("ainb-dsh-0123abcd", mint_op_id()).mutation.op_id;
+        let close_a = close_params("ainb-dsh-0123abcd", mint_op_id(SpawnVerb::CloseTerminal))
+            .mutation
+            .op_id;
+        let close_b = close_params("ainb-dsh-0123abcd", mint_op_id(SpawnVerb::CloseTerminal))
+            .mutation
+            .op_id;
         assert_ne!(close_a, close_b);
     }
 
@@ -300,19 +260,19 @@ mod tests {
             code: METHOD_NOT_FOUND,
             message: "unknown method: shell/create".into(),
         };
-        assert!(refusal_text(Verb::Open, &dark).contains("AINB_HANGAR_SPAWN=0"));
+        assert!(spawn_refusal_text(&dark, SpawnVerb::OpenTerminal).contains("AINB_HANGAR_SPAWN=0"));
         let unregistered = DaemonError::Rpc {
             code: REPO_NOT_REGISTERED,
             message: "worktree_path is neither a registered repository".into(),
         };
-        let text = refusal_text(Verb::Open, &unregistered);
+        let text = spawn_refusal_text(&unregistered, SpawnVerb::OpenTerminal);
         assert!(text.contains("Add project"), "{text}");
         assert!(text.contains("neither a registered repository"), "{text}");
         let bad = DaemonError::Rpc {
             code: INVALID_PARAMS,
             message: "tmux_session_name is not a daemon shell".into(),
         };
-        let text = refusal_text(Verb::Close, &bad);
+        let text = spawn_refusal_text(&bad, SpawnVerb::CloseTerminal);
         assert!(text.starts_with("Closing the terminal failed"), "{text}");
         assert!(text.contains("not a daemon shell"), "{text}");
         // The same words under another code are not the unregistered hint:
@@ -321,12 +281,15 @@ mod tests {
             code: INVALID_PARAMS,
             message: "not in a registered project folder".into(),
         };
-        assert!(!refusal_text(Verb::Open, &worded).contains("Add project"));
+        assert!(!spawn_refusal_text(&worded, SpawnVerb::OpenTerminal).contains("Add project"));
         let failed = DaemonError::Rpc {
             code: -32603,
             message: "tmux could not start the shell".into(),
         };
-        assert!(refusal_text(Verb::Open, &failed).ends_with("tmux could not start the shell"));
+        assert!(
+            spawn_refusal_text(&failed, SpawnVerb::OpenTerminal)
+                .ends_with("tmux could not start the shell")
+        );
         // tmux may have made the shell: not a failure, and not one to retry.
         let started = DaemonError::Rpc {
             code: SPAWN_STARTED,
@@ -334,7 +297,7 @@ mod tests {
                       ainb-dsh-0123abcd"
                 .into(),
         };
-        let text = refusal_text(Verb::Open, &started);
+        let text = spawn_refusal_text(&started, SpawnVerb::OpenTerminal);
         assert!(!text.contains("failed"), "{text}");
         assert!(text.starts_with(MAY_STILL_OPEN), "{text}");
         assert!(
@@ -342,10 +305,10 @@ mod tests {
             "{text}"
         );
         let slow = DaemonError::Timeout(std::time::Duration::from_secs(30));
-        let text = refusal_text(Verb::Open, &slow);
+        let text = spawn_refusal_text(&slow, SpawnVerb::OpenTerminal);
         assert!(text.starts_with(MAY_STILL_OPEN), "{text}");
         // A close that timed out opened nothing.
-        let text = refusal_text(Verb::Close, &slow);
+        let text = spawn_refusal_text(&slow, SpawnVerb::CloseTerminal);
         assert!(text.starts_with("Closing the terminal failed"), "{text}");
     }
 }
