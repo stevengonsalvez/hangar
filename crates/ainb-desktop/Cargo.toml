@@ -98,7 +98,7 @@ specta-serde = { version = "=0.0.12", optional = true }
 specta-typescript = { version = "=0.0.12", optional = true }
 
 [build-dependencies]
-tauri-build = { version = "~2.6.3", optional = true }
+tauri-build = { version = "~2.7.0", optional = true }
 
 [dev-dependencies]
 # This crate, with its own test seams on, for its integration tests only.
