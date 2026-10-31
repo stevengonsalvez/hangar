@@ -133,6 +133,18 @@ struct HookEventLine {
     matcher: String,
     #[serde(default, deserialize_with = "null_as_default")]
     agent: String,
+    /// The hook's own reading of its pane off `TMUX_PANE`
+    /// (`pane=%N;pid=P;session_started=S`): where an answer is typed, and
+    /// what must still run there for it to be. Empty outside tmux.
+    #[serde(default, deserialize_with = "null_as_default")]
+    process_start_fingerprint: String,
+}
+
+/// The fingerprint a line's pane is recorded under: only one that names a
+/// pane id (`%` and digits), so junk in the field cannot aim a delivery.
+fn pane_fingerprint_of(line: &HookEventLine) -> Option<&str> {
+    ainb_fleet_core::send::pane_id_of(&line.process_start_fingerprint)
+        .map(|_| line.process_start_fingerprint.as_str())
 }
 
 /// Deserialize a field that may be `null` into its `Default`.
@@ -643,6 +655,7 @@ impl AttentionIngest {
             if !applied.raised {
                 return LineOutcome::Processed;
             }
+            self.record_pane(&raised.id, &line).await;
             self.events.emit_attention(HangarEvent::AttentionRaised {
                 attention_id: raised.id,
                 session_id: line.session_id,
@@ -680,6 +693,7 @@ impl AttentionIngest {
                 return LineOutcome::Retry;
             }
         }
+        self.record_pane(&row.id, &line).await;
         self.events.emit_attention(HangarEvent::AttentionRaised {
             attention_id: raised.id,
             session_id: line.session_id,
@@ -1184,6 +1198,22 @@ fn write_cursor(path: &Path, offset: u64) {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     if std::fs::write(&tmp, offset.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+impl AttentionIngest {
+    /// Keep the pane `attention_id` was raised in beside the row: an answer
+    /// is typed into that pane exactly, and only while it still runs what
+    /// the line saw there, provider session id or none.
+    async fn record_pane(&self, attention_id: &str, line: &HookEventLine) {
+        let Some(fingerprint) = pane_fingerprint_of(line) else {
+            return;
+        };
+        if let Err(error) =
+            AttentionRepo::record_pane_fingerprint(&self.pool, attention_id, fingerprint).await
+        {
+            tracing::warn!(%error, attention_id, "the row's pane was not recorded");
+        }
     }
 }
 

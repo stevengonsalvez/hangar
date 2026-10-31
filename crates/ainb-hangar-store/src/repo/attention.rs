@@ -828,6 +828,49 @@ impl AttentionDrift {
 /// card", which is true and survivable. The count is logged so the condition
 /// is visible rather than silent. Note this can only ever help the NEXT new
 /// kind: a binary already shipped without this tolerance still breaks.
+impl AttentionRepo {
+    /// Keep the pane `attention_id` was raised in beside the row: the hook
+    /// line's process-start fingerprint (`pane=%N;pid=P;session_started=S`),
+    /// as the answer path hands it to the pane resolver. A later line for
+    /// the same row replaces it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sqlx error if the write fails.
+    pub async fn record_pane_fingerprint(
+        pool: &SqlitePool,
+        attention_id: &str,
+        fingerprint: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO attention_pane (attention_id, fingerprint) VALUES (?, ?) \
+             ON CONFLICT(attention_id) DO UPDATE SET fingerprint = excluded.fingerprint",
+        )
+        .bind(attention_id)
+        .bind(fingerprint)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The fingerprint of the pane `attention_id` was raised in, as
+    /// [`Self::record_pane_fingerprint`] kept it, or `None` for a row raised
+    /// outside tmux.
+    ///
+    /// # Errors
+    ///
+    /// Returns the sqlx error if the read fails.
+    pub async fn pane_fingerprint(
+        pool: &SqlitePool,
+        attention_id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT fingerprint FROM attention_pane WHERE attention_id = ?")
+            .bind(attention_id)
+            .fetch_optional(pool)
+            .await
+    }
+}
+
 fn row_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<Option<AttentionRow>, sqlx::Error> {
     let kind_token: String = row.try_get("kind")?;
     let Some(kind) = AttentionKind::parse(&kind_token) else {
@@ -1364,5 +1407,64 @@ mod tests {
             .unwrap();
         let board_only = AttentionRepo::get(store.pool(), "c2").await.unwrap().unwrap();
         assert!(board_only.channels.is_empty());
+    }
+
+    /// The pane key rides beside the row by its id: recorded, replaced,
+    /// absent for a row that never carried one, and gone with the row.
+    #[tokio::test]
+    async fn the_pane_fingerprint_is_kept_beside_the_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).await.unwrap();
+        let pool = store.pool();
+        sqlx::query(
+            "INSERT INTO workspace (id, slug, name, created_at) VALUES ('ws', 'ws', 'ws', 1)",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let row = NewAttention {
+            id: "att-pane".to_string(),
+            session_id: String::new(),
+            cwd: "/work".to_string(),
+            workspace_id: None,
+            kind: AttentionKind::AskUserQuestion,
+            payload: "{}".to_string(),
+            degraded: false,
+            created_at: 1,
+            raise_transcript: None,
+            channels: ChannelSet::NONE,
+        };
+        AttentionRepo::insert(pool, &row).await.unwrap();
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
+            None
+        );
+        AttentionRepo::record_pane_fingerprint(
+            pool,
+            "att-pane",
+            "pane=%4;pid=41;session_started=9",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
+            Some("pane=%4;pid=41;session_started=9".to_string())
+        );
+        // A later line for the same row replaces it.
+        AttentionRepo::record_pane_fingerprint(
+            pool,
+            "att-pane",
+            "pane=%6;pid=4242;session_started=9",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-pane").await.unwrap(),
+            Some("pane=%6;pid=4242;session_started=9".to_string())
+        );
+        assert_eq!(
+            AttentionRepo::pane_fingerprint(pool, "att-none").await.unwrap(),
+            None
+        );
     }
 }

@@ -1215,6 +1215,19 @@ fn last_prompt_line_pending(pane: &str, base: Option<PasteTally>) -> bool {
 }
 
 pub async fn tmux_session_exists(name: &str) -> bool {
+    // A pane id (`%N`, what the exact pane resolver hands back) is live when
+    // tmux can still name it: `has-session -t =%N` would read as a session
+    // named `%N` and refuse, so the pane is asked for itself.
+    if name.starts_with('%') {
+        return Command::new("tmux")
+            .args(["display-message", "-p", "-t", name, "#{pane_id}"])
+            .output()
+            .await
+            .is_ok_and(|output| {
+                output.status.success()
+                    && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            });
+    }
     // A target may name a window and a pane (`session:0.1`): the session is
     // what exists or not, matched exactly.
     let session = name.split(':').next().unwrap_or(name);

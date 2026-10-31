@@ -1292,6 +1292,35 @@ impl FleetRepo {
         rows.iter().map(session_from_row).collect()
     }
 
+    /// The pane the fleet row registered under `provider_session_id` was
+    /// observed in, from its newest visible row: the index target
+    /// (`session:window.pane`) and the process-start fingerprint, which
+    /// carries the pane's stable id. What an answer is typed into: a session's
+    /// active pane is not the agent's once the session is split. `None` when
+    /// no visible row carries the id.
+    ///
+    /// # Errors
+    /// Propagates the `SQLite` read failure.
+    pub async fn pane_for_provider_session(
+        pool: &SqlitePool,
+        provider_session_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT tmux_target, process_start_fingerprint FROM fleet_session \
+             WHERE provider_session_id = ? AND visible = 1 \
+             ORDER BY last_observed_at DESC LIMIT 1",
+        )
+        .bind(provider_session_id)
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|(target, fingerprint)| {
+            (
+                target.filter(|target| !target.is_empty()),
+                fingerprint.filter(|fingerprint| !fingerprint.is_empty()),
+            )
+        }))
+    }
+
     /// The ERR roster: every visible, still-running session the read model
     /// currently projects as `attention_state = 'ERROR'`, key-ordered.
     ///
@@ -1308,25 +1337,6 @@ impl FleetRepo {
     ///
     /// # Errors
     /// Propagates the `SQLite` read failure.
-    /// The exact tmux target (`session:window.pane`) the fleet row registered
-    /// under `provider_session_id` was observed in, newest observation first,
-    /// or `None` when no visible row names one. What an answer is typed into:
-    /// a session's active pane is not the agent's once the session is split.
-    pub async fn tmux_target_for_provider_session(
-        pool: &SqlitePool,
-        provider_session_id: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        let target: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT tmux_target FROM fleet_session \
-             WHERE provider_session_id = ? AND visible = 1 AND tmux_target IS NOT NULL \
-             ORDER BY last_observed_at DESC LIMIT 1",
-        )
-        .bind(provider_session_id)
-        .fetch_optional(pool)
-        .await?;
-        Ok(target.flatten().filter(|target| !target.is_empty()))
-    }
-
     pub async fn list_attention_error(
         pool: &SqlitePool,
     ) -> Result<Vec<FleetSessionRow>, sqlx::Error> {
@@ -4319,6 +4329,66 @@ mod tests {
         assert!(
             FleetRepo::list_archived(pool, 50).await.unwrap().is_empty(),
             "and must leave the archived list"
+        );
+    }
+
+    /// The pane an answer is typed into comes off the newest visible row for
+    /// the agent's session id: its index target and its fingerprint, either
+    /// absent when the row has none; no row, no pane.
+    #[tokio::test]
+    async fn the_pane_for_a_provider_session_is_its_target_and_fingerprint() {
+        let (_dir, store) = store().await;
+        let pool = store.pool();
+        FleetRepo::apply_event(
+            pool,
+            &event(
+                "e-pane",
+                "claude:sid-pane",
+                100,
+                ObservationAuthority::Inferred,
+                FleetSessionPatch {
+                    provider: Some("claude".to_string()),
+                    provider_session_id: Some("sid-pane".to_string()),
+                    tmux_target: Some("dev:1.2".to_string()),
+                    process_start_fingerprint: Some("pane=%7;pid=1;session_started=2".to_string()),
+                    ..FleetSessionPatch::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        FleetRepo::apply_event(
+            pool,
+            &event(
+                "e-bare",
+                "claude:sid-bare",
+                100,
+                ObservationAuthority::Inferred,
+                FleetSessionPatch {
+                    provider: Some("claude".to_string()),
+                    provider_session_id: Some("sid-bare".to_string()),
+                    ..FleetSessionPatch::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            FleetRepo::pane_for_provider_session(pool, "sid-pane").await.unwrap(),
+            Some((
+                Some("dev:1.2".to_string()),
+                Some("pane=%7;pid=1;session_started=2".to_string())
+            ))
+        );
+        assert_eq!(
+            FleetRepo::pane_for_provider_session(pool, "sid-bare").await.unwrap(),
+            Some((None, None)),
+            "a row with no pane recorded"
+        );
+        assert_eq!(
+            FleetRepo::pane_for_provider_session(pool, "sid-none").await.unwrap(),
+            None
         );
     }
 
