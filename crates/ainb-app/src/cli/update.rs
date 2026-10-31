@@ -17,7 +17,7 @@ use crate::cli::OutputFormat;
 /// tagged (prerelease) root are formed from.
 macro_rules! release_host {
     () => {
-        "https://github.com/stevengonsalvez/agents-in-a-box"
+        "https://github.com/stevengonsalvez/hangar"
     };
 }
 
@@ -831,7 +831,7 @@ impl InstallOwner {
                 c.args([
                     "install",
                     "--git",
-                    "https://github.com/stevengonsalvez/agents-in-a-box",
+                    "https://github.com/stevengonsalvez/hangar",
                     "--tag",
                     &format!("v{version}"),
                     "--locked",

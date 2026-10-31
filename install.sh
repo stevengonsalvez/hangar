@@ -8,7 +8,7 @@
 
 set -e
 
-REPO="stevengonsalvez/agents-in-a-box"
+REPO="stevengonsalvez/hangar"
 BINARY_NAME="ainb"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
 GITHUB_RELEASES="https://github.com/${REPO}/releases/download"

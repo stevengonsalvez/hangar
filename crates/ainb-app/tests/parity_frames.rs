@@ -49,8 +49,13 @@ const FIXED_INSTANT: &str = "1970-01-01T00:00:00Z";
 /// home carries that path in its text, and it is a new path every run.
 const FIXED_HOME: &str = "<home>";
 
+/// What the running release version is rewritten to. The config carries the
+/// crate version, so without this every release bump rewrote every dump.
+const FIXED_VERSION: &str = "<version>";
+
 /// `value`, canonical: object keys sorted, timestamps rewritten to
-/// [`FIXED_INSTANT`], the scratch home to [`FIXED_HOME`].
+/// [`FIXED_INSTANT`], the scratch home to [`FIXED_HOME`], and a `version` equal
+/// to the running release to [`FIXED_VERSION`].
 ///
 /// A map on the wire is a `HashMap` more often than not, and this workspace
 /// builds `serde_json` with insertion order preserved, so two runs of one fixture
@@ -80,6 +85,9 @@ fn canonical(value: serde_json::Value, homes: &[String], key: Option<&str>) -> s
             if key.is_some_and(holds_a_time) && chrono::DateTime::parse_from_rfc3339(&text).is_ok()
             {
                 return serde_json::Value::String(FIXED_INSTANT.to_string());
+            }
+            if key == Some("version") && text == env!("CARGO_PKG_VERSION") {
+                return serde_json::Value::String(FIXED_VERSION.to_string());
             }
             let mut text = text;
             for home in homes {

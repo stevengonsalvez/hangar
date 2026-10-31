@@ -25,7 +25,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Renderer-agnostic state and services, re-exported from `lib.rs`.
-ainb-app = { path = "../ainb-app", version = "1.28.2" }
+ainb-app = { path = "../ainb-app", version = "1.29.0-rc1" }
 # Core
 tokio = { workspace = true }
 ratatui = { workspace = true }
@@ -92,9 +92,9 @@ ainb-cli = { path = "../ainb-cli", version = "0.1.0" }
 # banner (spec §User Flow 1 / P5) to load + write `manifest.yaml`.
 ainb-skill-core = { path = "../ainb-skill-core", version = "0.1.0" }
 # Notification daemon — used in-process for the Inbox screen reader.
-ainb-plugin-notifyd = { path = "../ainb-plugin-notifyd", version = "1.1.0" }
+ainb-plugin-notifyd = { path = "../ainb-plugin-notifyd", version = "1.29.0-rc1" }
 # Read-only web dashboard — backs the `ainb web` subcommand.
-ainb-web = { path = "../ainb-web", version = "1.7.0" }
+ainb-web = { path = "../ainb-web", version = "1.29.0-rc1" }
 # CSPRNG for `ainb hangar auth token create` (the OsRng passed to the store's
 # `mint_pat` / `mint_daemon_token`). All hashing/encoding lives in the store +
 # core; the CLI only supplies the random source.
@@ -145,7 +145,7 @@ tmux-tests = ["cli-tests"]
 
 [dev-dependencies]
 # Unit tests here use `ainb_app::test_support` fixtures and helpers.
-ainb-app = { path = "../ainb-app", version = "1.28.2", features = ["test-support"] }
+ainb-app = { path = "../ainb-app", version = "1.29.0-rc1", features = ["test-support"] }
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
 rexpect = { workspace = true }

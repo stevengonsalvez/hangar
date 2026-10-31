@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **notifyd**, **session-reader**: a `config.toml` that does not parse is logged by line and column, and a wrong-typed value in `[notifyd]` or `[session_reader]` by its key, never quoted, so a token on a bad line no longer reaches the plugin log. Both now read `$AINB_HANGAR_HOME/config/config.toml` when that is set, as the daemon does, instead of always `~/.agents-in-a-box/config/config.toml`
 - **daemon**: an unknown `permission_mode` under `[acp.adapters.<name>]` is logged by the adapter's name, not the value
 
+## [1.29.0] - Unreleased
+### Changed
+- **release**: releases now come from https://github.com/stevengonsalvez/hangar. The update manifest, the curated catalog index, the Fleet appcast and `install.sh` all fetch from hangar, and cargo-owned installs build from hangar's tag
+- **release**: installed copies of 1.28.x move to hangar on their next `ainb update`, through a one-time bridge release in the old repository
+
+### Added
+- **desktop**: the first release of the ainb desktop app, one bundle per platform (macOS Apple Silicon and Intel `.dmg`, Linux x86_64 `.AppImage` and `.deb`), each carrying its hangar daemon sidecar and updated through the signed release manifest
+
+
 ## [1.28.5] - 2026-09-13
 ### Fixed
 - expire stale sidebar run state
